@@ -6,9 +6,9 @@
 #
 # rrouter's WAN is bridged at layer 2 onto a physical interface and gets its
 # own lease from your home router (double NAT). The Mac then sends all IPv4
-# traffic to rrouter via two /1 routes (more specific than the default route,
-# so macOS's own default route stays intact and untouched; added in the
-# explicit -netmask form, then verified) and uses
+# traffic to rrouter via 8 prefix routes (1/8 … 64/2 + 128/1: more specific
+# than the default route, so macOS's own default route stays untouched;
+# verified after adding) and uses
 # 192.168.1.1 as DNS server.
 #
 # Usage (in Terminal; sudo asks for your password):
@@ -31,6 +31,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 STATE=lab/cache/mac-internet.state
+# IPv4 space via rrouter, as "network netmask" pairs. The lower half is split
+# into 1/8 … 64/2 because a route keyed 0.0.0.0 (like 0.0.0.0/1) shares its
+# radix key with vmnet-host's interface-scoped default route on the LAN
+# bridge, and macOS then resolves lookups to that gateway-less route
+# ("Host is down"). 0.0.0.0/8 ("this network") is never routed anyway.
+SPLIT_ROUTES=(
+  "1.0.0.0 255.0.0.0" "2.0.0.0 254.0.0.0" "4.0.0.0 252.0.0.0" "8.0.0.0 248.0.0.0"
+  "16.0.0.0 240.0.0.0" "32.0.0.0 224.0.0.0" "64.0.0.0 192.0.0.0" "128.0.0.0 128.0.0.0"
+)
 ROUTER_LAN=192.168.1.1
 LAN_NET=192.168.1
 WORK=$(mktemp -d -t rrouter-macinet)
@@ -63,7 +72,7 @@ fail() { echo "  [FAIL] $*"; fails=$((fails + 1)); }
 info() { echo "  [INFO] $*"; }
 
 # ---- restore: driven only by the state file -------------------------------------------
-# State lines: SERVICE=<name>  DNS=<servers or Empty>  IPV6=<automatic|unchanged>  ROUTES=1
+# State lines: SERVICE=<name>  DNS=<servers or Empty>  IPV6=<automatic|unchanged>  ROUTES=split
 restore_network() {
   [[ -f "$STATE" ]] || return 0
   local svc dns v6 routes
@@ -72,10 +81,16 @@ restore_network() {
   v6=$(sed -n 's/^IPV6=//p' "$STATE")
   routes=$(sed -n 's/^ROUTES=//p' "$STATE")
   echo "== restoring network settings (from $STATE)"
-  if [[ "$routes" == 1 ]]; then
-    # Explicit netmask form: macOS mis-parses "0.0.0.0/1" (see switch_routes).
-    sudo route -n delete -net 0.0.0.0 -netmask 128.0.0.0 "$ROUTER_LAN" >/dev/null 2>&1 && echo "  removed route 0.0.0.0/1"
-    sudo route -n delete -net 128.0.0.0 -netmask 128.0.0.0 "$ROUTER_LAN" >/dev/null 2>&1 && echo "  removed route 128.0.0.0/1"
+  if [[ -n "$routes" ]]; then
+    local n=0 r
+    for r in "${SPLIT_ROUTES[@]}"; do
+      # shellcheck disable=SC2086 # "net mask" pair
+      set -- $r
+      sudo route -n delete -net "$1" -netmask "$2" "$ROUTER_LAN" >/dev/null 2>&1 && n=$((n + 1))
+    done
+    # Routes from earlier versions of this script (0.0.0.0/1 form).
+    sudo route -n delete -net 0.0.0.0 -netmask 128.0.0.0 "$ROUTER_LAN" >/dev/null 2>&1 && n=$((n + 1))
+    echo "  removed $n routes via $ROUTER_LAN"
   fi
   if [[ -n "$svc" && -n "$dns" ]]; then
     # shellcheck disable=SC2086 # intentional word splitting: list of servers
@@ -129,7 +144,7 @@ HOME_GW=$(route -n get default 2>/dev/null | awk '/gateway/{print $2}')
 
 echo "rrouter will become this Mac's IPv4 router:"
 echo "  WAN bridged onto : $WAN_IF ($PORT, service '$SERVICE'); home gateway $HOME_GW"
-echo "  Mac changes      : routes 0.0.0.0/1 + 128.0.0.0/1 via $ROUTER_LAN, DNS for '$SERVICE' -> $ROUTER_LAN$([[ $IPV4_ONLY == 1 ]] && echo ", IPv6 off")"
+echo "  Mac changes      : routes for 1.0.0.0-255.255.255.255 (8 prefixes) via $ROUTER_LAN, DNS for '$SERVICE' -> $ROUTER_LAN$([[ $IPV4_ONLY == 1 ]] && echo ", IPv6 off")"
 echo "  undo             : automatic on exit/Ctrl-C/watchdog; manual: scripts/mac-internet.sh --restore"
 if [[ "$PORT" == Wi-Fi* ]]; then
   echo "  WARNING: bridging over Wi-Fi often fails (the access point drops the VM's MAC)."
@@ -171,26 +186,27 @@ orig_dns=$(networksetup -getdnsservers "$SERVICE" | tr '\n' ' ' | sed 's/ *$//')
 v6_state=unchanged
 if [[ "$IPV4_ONLY" == 1 ]] && networksetup -getinfo "$SERVICE" | grep -q "^IPv6: Automatic"; then v6_state=automatic; fi
 mkdir -p "$(dirname "$STATE")"
-printf 'SERVICE=%s\nDNS=%s\nIPV6=%s\nROUTES=1\n' "$SERVICE" "$orig_dns" "$v6_state" >"$STATE"
+printf 'SERVICE=%s\nDNS=%s\nIPV6=%s\nROUTES=split\n' "$SERVICE" "$orig_dns" "$v6_state" >"$STATE"
 
 echo "== switching this Mac to rrouter"
-# Explicit -netmask form (as OpenVPN uses on macOS): with the CIDR form
-# "0.0.0.0/1" macOS installed the low half as a gateway-less interface
-# route, so the Mac ARPed for every destination itself ("Host is down").
-sudo -n route -n add -net 0.0.0.0 -netmask 128.0.0.0 "$ROUTER_LAN" >/dev/null
-sudo -n route -n add -net 128.0.0.0 -netmask 128.0.0.0 "$ROUTER_LAN" >/dev/null
-# Verify both halves before going further; restore at once if either is wrong.
-for probe in 1.1.1.1 8.8.8.8 172.66.0.1 208.67.222.222; do
+for r in "${SPLIT_ROUTES[@]}"; do
+  # shellcheck disable=SC2086 # "net mask" pair
+  set -- $r
+  sudo -n route -n add -net "$1" -netmask "$2" "$ROUTER_LAN" >/dev/null
+done
+# Verify addresses across the whole space before going further; restore at
+# once if any of them does not route via rrouter.
+for probe in 1.1.1.1 3.3.3.3 8.8.8.8 23.0.0.1 45.0.0.1 100.64.0.1 172.66.0.1 208.67.222.222; do
   got_gw=$(route -n get "$probe" 2>/dev/null | awk '/gateway:/{print $2}')
   got_if=$(route -n get "$probe" 2>/dev/null | awk '/interface:/{print $2}')
   if [[ "$got_gw" != "$ROUTER_LAN" || "$got_if" != "$MAC_IF" ]]; then
     echo "!! route check failed for $probe: gateway='$got_gw' interface='$got_if' (expected $ROUTER_LAN on $MAC_IF)"
     route -n get "$probe" 2>&1 | sed 's/^/     /'
-    netstat -rn -f inet | grep -E "^(0|128)(\.0)*/1|^0/1|^128/1|$MAC_IF" | sed 's/^/     /' || true
+    netstat -rn -f inet | grep -E "$MAC_IF" | sed 's/^/     /' || true
     echo "!! restoring network"; exit 1
   fi
 done
-echo "  verified: both halves of IPv4 route via $ROUTER_LAN on $MAC_IF"
+echo "  verified: all of IPv4 (outside local subnets) routes via $ROUTER_LAN on $MAC_IF"
 sudo -n networksetup -setdnsservers "$SERVICE" "$ROUTER_LAN"
 [[ "$v6_state" == automatic ]] && sudo -n networksetup -setv6off "$SERVICE"
 sudo -n dscacheutil -flushcache 2>/dev/null || true

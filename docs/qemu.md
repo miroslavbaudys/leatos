@@ -150,14 +150,18 @@ scripts/mac-internet.sh --restore        # undo a previous run (after a crash, k
   on one Wi-Fi client, so bridging over Wi-Fi often yields no WAN lease. The
   script detects that (no lease within 30 s) and stops *before* touching your
   network. A USB/Thunderbolt Ethernet adapter is the reliable option.
-- **Mac changes:** routes `0.0.0.0/1` + `128.0.0.0/1` via 192.168.1.1. These
-  are more specific than the default route, so macOS's own default route is
-  never modified. They're added in the explicit `-netmask 128.0.0.0` form:
-  with the CIDR form `0.0.0.0/1`, macOS installed the low half without a
-  gateway (first real run: 1.1.1.1 failed with "Host is down" while
-  172.x worked). After adding, test addresses in both halves are checked, and
-  the script restores at once if either half doesn't go via rrouter. DNS for the active network service is set to 192.168.1.1,
-  and with `--ipv4-only`, IPv6 is turned off.
+- **Mac changes:** 8 prefix routes via 192.168.1.1: `1/8, 2/7, 4/6, 8/5,
+  16/4, 32/3, 64/2, 128/1`. Together they cover all of IPv4 except
+  `0.0.0.0/8`, and they're more specific than the default route, so macOS's
+  own default route is never modified. **Why not `0.0.0.0/1`:** vmnet-host
+  installs an interface-scoped, gateway-less `default` route on the LAN
+  bridge. A route keyed `0.0.0.0` shares its radix key with that route, and
+  macOS then resolved lookups (e.g. 1.1.1.1) to the gateway-less route: the
+  Mac ARPed for the destination itself ("Host is down"), while `128.0.0.0/1`
+  worked. The split routes avoid the `0.0.0.0` key. After adding, test
+  addresses across the space are verified, and the script restores at once if
+  any doesn't route via rrouter. DNS for the active service is set to
+  192.168.1.1, and with `--ipv4-only`, IPv6 is turned off.
 - **Safety:**
   - it asks for confirmation;
   - it switches only after rrouter has a WAN lease and answers on the LAN;
