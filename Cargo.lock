@@ -43,6 +43,10 @@ name = "proto-pppoe"
 version = "0.1.0"
 
 [[package]]
+name = "qdisc"
+version = "0.1.0"
+
+[[package]]
 name = "rrouter-kernel"
 version = "0.1.0"
 dependencies = [

@@ -6,7 +6,9 @@ QEMU's `virt` machine (HVF-accelerated on Apple Silicon); real hardware comes
 later.
 
 Required features: PPPoE (WAN), DHCP (WAN client, LAN server, DHCPv6-PD,
-RA), DNS (forwarder, cache, local zone), NAT and a firewall, IPv4 and IPv6.
+RA), DNS (forwarder, cache, local zone), NAT and a firewall, IPv4 and IPv6,
+and **bufferbloat mitigation with CAKE** (a design driver; see
+`docs/bufferbloat-cake.md`).
 
 ## Why a unikernel
 A router appliance doesn't need processes, users, syscalls or a general
@@ -30,6 +32,8 @@ we need a panic handler that reboots plus a watchdog (milestone M7).
 │  L2: eth / VLAN / bridge+MAC learning / PPPoE encap            │
 │  L3: LPM route table · ARP/NDP neighbor cache · TTL · ICMP err │
 │  conntrack · NAPT · firewall rules · MSS clamp                 │
+│ Queue management (crates/qdisc): CAKE egress (WAN) + ingress   │
+│  shaper · FQ · COBALT · host isolation · tins · ACK filter     │
 ├───────────────────────────────────────────────────────────────┤
 │ Drivers: virtio-net ×2 (WAN, LAN) · virtio-blk · PL011 · PL031 │
 ├───────────────────────────────────────────────────────────────┤
@@ -44,14 +48,27 @@ we need a panic handler that reboots plus a watchdog (milestone M7).
    ARP/NDP for its IPs, PPPoE discovery or control frames), hand it to the local
    path (smoltcp or a protocol state machine). Otherwise it goes to the forwarding plane.
 3. Forwarding: decapsulate (VLAN or PPPoE), conntrack lookup or create,
-   firewall verdict, NAT rewrite, route lookup (LPM), neighbor resolution
-   (queue the packet if the neighbor is unresolved), TTL decrement and
-   incremental checksum update, encapsulate, then TX on the egress NIC.
+   firewall verdict, NAT rewrite, **classify** (fill `PacketMeta`: pre-NAT
+   flow and host hashes, tin, wire length), WAN-ingress CAKE (download
+   shaping), route lookup (LPM), neighbor resolution (queue the packet if the
+   neighbor is unresolved), TTL decrement and incremental checksum update.
+4. Egress: enqueue into the egress interface's qdisc (CAKE on the WAN). A TX
+   task **pulls** from the qdisc when the driver has ring space and the
+   shaper allows it, then encapsulates and transmits. The qdisc is the only
+   place packets wait (no hidden queues).
 
 ### Forwarding plane
 smoltcp is a *host* stack: it has no forwarding, NAT, conntrack, bridging or
 PPPoE. The `fwd` crate provides these. It is the largest and riskiest part of
 the project (it effectively replaces netfilter), and it must be fuzzed.
+
+## Latency rules (from the CAKE requirements)
+- Timers are **tickless** and high-resolution: program the next deadline in
+  `CNTV_CVAL`. There is no periodic tick.
+- The executor has **priority classes**. Datapath work (RX → forward → qdisc → TX) runs before service tasks.
+- Interrupt handlers only acknowledge hardware and set flags or wake
+  state. No allocation, no locks shared with thread context, no printing.
+- TX is pull-based with byte-limited driver rings (BQL-style).
 
 ## Event bus
 Services react to events instead of polling each other:
@@ -78,6 +95,7 @@ crates/proto-pppoe   PPPoE discovery, LCP, PAP/CHAP, IPCP, IPv6CP
 crates/proto-dhcp    DHCPv4 server/client, DHCPv6-PD, RA
 crates/proto-dns     forwarder, cache, local zone
 crates/fwd           LPM, neighbor cache, conntrack, NAT, firewall
+crates/qdisc         CoDel, FQ-CoDel, CAKE (simulation-tested with fake time)
 kernel/              bare-metal platform that drives the crates
 (platform-host)      planned: TAP/pcap harness to run the crates on a dev machine
 ```

@@ -1,0 +1,11 @@
+[package]
+name = "qdisc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Queue management for bufferbloat mitigation: CoDel, FQ-CoDel, CAKE."
+
+[dependencies]
+
+[lints]
+workspace = true
