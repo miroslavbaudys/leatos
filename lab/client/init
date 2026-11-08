@@ -1,0 +1,61 @@
+#!/usr/bin/busybox sh
+# rrouter lab client: PID 1 of the client VM (overlaid on Alpine's initramfs).
+# Gets a DHCP lease from the router's LAN, runs checks, prints machine-
+# readable "LAB ..." lines on the serial console, then powers off.
+bb=/usr/bin/busybox
+export PATH=/usr/bin:/usr/sbin:/bin:/sbin
+
+$bb mount -t proc proc /proc
+$bb mount -t sysfs sysfs /sys
+$bb mount -t devtmpfs devtmpfs /dev 2>/dev/null
+$bb mkdir -p /etc /tmp
+echo "LAB client up"
+
+for m in failover net_failover virtio_net af_packet; do
+  modprobe "$m" 2>/dev/null || $bb modprobe "$m" 2>/dev/null || echo "LAB WARN: modprobe $m failed"
+done
+$bb hostname labclient
+$bb ifconfig lo 127.0.0.1 up
+$bb ifconfig eth0 up || { echo "LAB FAIL: no eth0"; $bb poweroff -f; }
+
+fails=0
+pass() { echo "LAB PASS: $*"; }
+fail() { echo "LAB FAIL: $*"; fails=$((fails + 1)); }
+
+# --- DHCP ---------------------------------------------------------------
+if $bb udhcpc -i eth0 -n -q -t 10 -T 1 -x hostname:labclient -s /udhcpc.sh; then
+  . /tmp/lease
+  pass "dhcp lease ip=$ip router=$router dns=$dns domain=$domain"
+else
+  fail "dhcp: no lease"
+  echo "LAB DONE fails=$fails"; $bb poweroff -f
+fi
+
+# --- DNS ------------------------------------------------------------------
+lookup() { # name expect-substring description
+  out=$($bb nslookup "$1" 192.168.1.1 2>&1)
+  if echo "$out" | $bb grep -q "$2"; then pass "dns $3"; else fail "dns $3"; echo "$out" | $bb sed 's/^/    | /'; fi
+}
+lookup nas.lan        "192.168.1.10"   "static host nas.lan -> 192.168.1.10"
+lookup router.lan     "192.168.1.1"    "router.lan -> 192.168.1.1"
+lookup labclient.lan  "$ip"            "dhcp hostname labclient.lan -> $ip"
+lookup 192.168.1.10   "nas.lan"        "reverse 192.168.1.10 -> nas.lan"
+lookup ghost.lan      "NXDOMAIN\|can't find\|server can't" "unknown local name -> NXDOMAIN"
+
+# Upstream forwarding depends on the host's internet access: informational.
+out=$($bb nslookup example.com 192.168.1.1 2>&1)
+if echo "$out" | $bb grep -q "Address.*[0-9]\.[0-9]"; then
+  echo "LAB INFO: upstream example.com resolved via router"
+else
+  echo "LAB INFO: upstream example.com not resolved (no host internet?)"
+fi
+
+# --- reachability -----------------------------------------------------------
+if $bb ping -c 2 -W 2 192.168.1.1 >/tmp/ping 2>&1; then
+  pass "ping router ($($bb grep -o 'min/avg/max = [^ ]*' /tmp/ping))"
+else
+  fail "ping router"; $bb sed "s/^/    | /" /tmp/ping
+fi
+
+echo "LAB DONE fails=$fails"
+$bb poweroff -f

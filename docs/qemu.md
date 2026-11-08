@@ -16,6 +16,7 @@ Requirements: QEMU ≥ 8 (`brew install qemu`) and the Rust toolchain. The
 | `cargo kclippy` | clippy for the kernel |
 | `cargo kcheck-x86` | type-check the kernel for x86_64 against the arch skeleton |
 | `scripts/unsafe-report.sh` | list modules allowed to use `unsafe` and count unsafe constructs |
+| `scripts/lab-test.sh` | end-to-end LAN test with an Alpine client VM (see below) |
 
 `scripts/qemu-run.sh` reads these environment variables:
 
@@ -25,7 +26,7 @@ Requirements: QEMU ≥ 8 (`brew install qemu`) and the Rust toolchain. The
 | `QEMU_MEM` | `256M` | guest RAM, ≤ 3G (see boot-and-memory.md) |
 | `QEMU_SMP` | `1` | number of CPUs |
 | `QEMU_GDB` | `0` | `1` = start paused, with a gdb stub on `:1234` |
-| `QEMU_NET` | `none` | `user` = two virtio-net-pci NICs (WAN `52:54:00:00:00:01`, LAN `…:02`) |
+| `QEMU_NET` | `none` | `user` = two virtio-net-pci NICs on user-mode networking (WAN `52:54:00:00:00:01`, LAN `…:02`); `lab` = WAN user-mode, LAN on a UDP socket link to the lab client |
 | `QEMU_PCAP_DIR` | unset | with `QEMU_NET=user`, write `wan.pcap` and `lan.pcap` |
 | `QEMU_EXTRA` | unset | extra arguments passed to QEMU |
 
@@ -66,24 +67,27 @@ gdb target/aarch64-unknown-none/debug/rrouter -ex 'target remote :1234'
 Useful QEMU options: `QEMU_EXTRA="-d int,guest_errors -D qemu.log"` logs
 exceptions and invalid guest accesses (TCG only).
 
-## Planned network lab (milestone M2+)
-QEMU instances are connected with `-netdev dgram` UDP sockets, which needs no
-root on macOS:
+## LAN lab: router + client VM (`scripts/lab-test.sh`)
+```
+[client VM]  Alpine 3.24 aarch64 (kernel + initramfs only), mac 52:54:00:00:00:10
+    │ eth0 ── -netdev dgram  127.0.0.1:10004 <-> 127.0.0.1:10003 ── lan0
+[rrouter]    192.168.1.1/24: DHCP server, DNS forwarder
+    │ wan0 ── QEMU user-mode network (slirp): DHCP 10.0.2.15, DNS 10.0.2.3
+```
+- `scripts/lab/fetch-alpine.sh` downloads Alpine's netboot `vmlinuz-virt` +
+  `initramfs-virt` (~20 MB) into `lab/cache/` (gitignored) and checks
+  **pinned SHA-256s**. Alpine replaces netboot files on point releases, so
+  on a mismatch, review and update the pins.
+- `scripts/lab/build-client-initrd.sh` appends `lab/client/{init,udhcpc.sh}`
+  as a second cpio archive. Linux unpacks archives in order, so our `/init`
+  replaces Alpine's. The client loads `virtio_net` + `af_packet`, runs `udhcpc`,
+  checks DNS (`nas.lan`, `router.lan`, its own DHCP hostname, reverse
+  lookup, NXDOMAIN, upstream forwarding) and pings the router. It prints
+  `LAB PASS/FAIL` lines and powers off.
+- No root needed: the VMs talk over host UDP sockets.
+- Options: `LAB_VERBOSE=1` (both consoles), `LAB_PCAP_DIR=dir` (router
+  WAN/LAN pcaps), `LAB_KEEP_LOGS=1`, `QEMU_ACCEL=tcg`, `LAB_TIMEOUT=90`.
+- The upstream check is informational: it needs the host to have internet access.
 
-```
-[VM isp]      Alpine aarch64: pppoe-server (rp-pppoe / accel-ppp),
-              DHCPv6-PD (Kea/dnsmasq), upstream DNS, iperf3
-    │ dgram 127.0.0.1:10001 <-> :10002   (WAN)
-[VM rrouter]  this kernel, 2× virtio-net-pci
-    │ dgram 127.0.0.1:10003 <-> :10004   (LAN)
-[VM client]   Alpine: dhcpcd, dig, curl, rdisc6, iperf3
-```
-
-Example WAN link for the router VM:
-```
--netdev dgram,id=wan,local.type=inet,local.host=127.0.0.1,local.port=10001,remote.type=inet,remote.host=127.0.0.1,remote.port=10002
--device virtio-net-pci,netdev=wan,mac=52:54:00:00:00:01
--object filter-dump,id=d1,netdev=wan,file=wan.pcap
-```
-End-to-end tests: boot all three VMs, then on the client run `dhcpcd`,
-`dig nas.lan`, `curl http://isp`, `iperf3`, and assert on the results.
+Planned extensions: an **ISP VM** on the router's WAN (instead of slirp)
+for NAT/forwarding (M4) and PPPoE (M5), plus a flent/irtt load test for CAKE (M6).

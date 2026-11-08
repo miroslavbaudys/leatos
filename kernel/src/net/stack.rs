@@ -14,6 +14,7 @@
 
 use crate::drivers::virtio_net::VirtioNet;
 use crate::irq::{self, IrqEvent, Trigger};
+use crate::net::services::LanServices;
 use crate::pci::Pci;
 use crate::{arch, println, timer};
 use alloc::vec;
@@ -46,7 +47,7 @@ pub struct NetIf {
     pub name: &'static str,
     pub dev: VirtioNet,
     iface: Interface,
-    sockets: SocketSet<'static>,
+    pub(crate) sockets: SocketSet<'static>,
     irq: Option<(u32, &'static IrqEvent)>,
     masked: bool,
 }
@@ -213,14 +214,12 @@ impl Pinger {
     }
 }
 
-fn handle_dhcp(nif: &mut NetIf, pinger: &mut Pinger) {
-    let Some((handle, _)) = nif
+/// Returns the new upstream DNS server list when the lease changed.
+fn handle_dhcp(nif: &mut NetIf, pinger: &mut Pinger) -> Option<Vec<Ipv4Address>> {
+    let (handle, _) = nif
         .sockets
         .iter()
-        .find(|(_, s)| matches!(s, smoltcp::socket::Socket::Dhcpv4(_)))
-    else {
-        return;
-    };
+        .find(|(_, s)| matches!(s, smoltcp::socket::Socket::Dhcpv4(_)))?;
     let event = nif.sockets.get_mut::<dhcpv4::Socket>(handle).poll();
     match event {
         Some(dhcpv4::Event::Configured(cfg)) => {
@@ -255,6 +254,7 @@ fn handle_dhcp(nif: &mut NetIf, pinger: &mut Pinger) {
             );
             DHCP_OK.store(true, Ordering::Release);
             pinger.target = cfg.router;
+            Some(cfg.dns_servers.iter().copied().collect())
         }
         Some(dhcpv4::Event::Deconfigured) => {
             if DHCP_OK.load(Ordering::Acquire) {
@@ -264,8 +264,9 @@ fn handle_dhcp(nif: &mut NetIf, pinger: &mut Pinger) {
             nif.iface.routes_mut().remove_default_ipv4_route();
             DHCP_OK.store(false, Ordering::Release);
             pinger.target = None;
+            Some(Vec::new())
         }
-        None => {}
+        None => None,
     }
 }
 
@@ -275,6 +276,10 @@ pub async fn run(mut ifs: Vec<NetIf>) {
         return;
     }
     let mut pinger = Pinger::new(&mut ifs[0].sockets);
+    let mut services = (ifs.len() >= 2).then(|| {
+        let (wan, lan) = ifs.split_at_mut(1);
+        LanServices::new(&mut lan[0], Some(&mut wan[0]))
+    });
     let events: Vec<&'static IrqEvent> = ifs.iter().filter_map(|n| n.irq.map(|(_, e)| e)).collect();
 
     loop {
@@ -295,8 +300,16 @@ pub async fn run(mut ifs: Vec<NetIf>) {
         for nif in ifs.iter_mut() {
             nif.iface.poll(t, &mut nif.dev, &mut nif.sockets);
         }
-        handle_dhcp(&mut ifs[0], &mut pinger);
+        if let Some(upstreams) = handle_dhcp(&mut ifs[0], &mut pinger)
+            && let Some(svc) = services.as_mut()
+        {
+            svc.set_upstreams(&upstreams);
+        }
         pinger.step(&mut ifs[0].sockets);
+        if let Some(svc) = services.as_mut() {
+            let (wan, lan) = ifs.split_at_mut(1);
+            svc.step(&mut lan[0].sockets, Some(&mut wan[0].sockets));
+        }
         let t = now();
         for nif in ifs.iter_mut() {
             nif.iface.poll(t, &mut nif.dev, &mut nif.sockets);
@@ -320,6 +333,12 @@ pub async fn run(mut ifs: Vec<NetIf>) {
             .map(|d| Duration::from_micros(d.total_micros()))
             .min()
             .unwrap_or(Duration::from_secs(1));
+        if let Some(svc) = &services {
+            delay = delay.min(
+                svc.next_deadline()
+                    .saturating_duration_since(timer::Instant::now()),
+            );
+        }
         if let Some(at) = pinger.deadline() {
             delay = delay.min(at.saturating_duration_since(timer::Instant::now()));
         }

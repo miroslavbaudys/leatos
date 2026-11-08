@@ -3,4 +3,5 @@
 
 pub mod device;
 pub mod packet;
+pub mod services;
 pub mod stack;

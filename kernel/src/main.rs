@@ -18,6 +18,7 @@
 extern crate alloc;
 
 mod arch;
+mod config;
 mod console;
 mod drivers;
 mod executor;

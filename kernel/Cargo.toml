@@ -22,6 +22,8 @@ fault-wx = ["smoke-test"]
 fault-stack = ["smoke-test"]
 
 [dependencies]
+proto-dhcp.workspace = true
+proto-dns.workspace = true
 fdt = "0.1.5"
 linked_list_allocator = "0.10"
 spin = { version = "0.9", default-features = false, features = ["spin_mutex", "once"] }
@@ -30,6 +32,7 @@ safe-mmio = "0.3"
 smoltcp = { version = "0.14", default-features = false, features = [
     "alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6",
     "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "socket-dns",
+    "auto-icmp-echo-reply", # the router answers pings on its own addresses
 ] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]

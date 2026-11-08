@@ -28,9 +28,17 @@ Pitfalls:
   lands on one core. This doesn't matter for single-core QEMU.
 
 ## DHCP
-Crate: `crates/proto-dhcp`. Status: not started.
+Crate: `crates/proto-dhcp`. Status: v4 server done (M3); clients and v6 pending.
 
 ### DHCPv4 server (LAN), required
+**Status (M3): implemented** in `crates/proto-dhcp/src/v4/` (17 tests,
+including fuzzing) and wired up in `kernel/src/net/services.rs`. Done:
+DORA, static reservations, offer hold, returning client gets the same IP,
+renew/rebind, INIT-REBOOT, NAK, RELEASE, DECLINE (10 min hold), INFORM,
+expiry, hostname sanitising, and `Bound`/`Released` events to DNS. Replies
+are always broadcast. Open: lease persistence (M8), conflict probe, option
+121, multiple pools/VLANs, relay.
+
 - Pools, static reservations by MAC, lease time, T1/T2, DECLINE, RELEASE, INFORM.
 - Options: 1 subnet mask, 3 router, 6 DNS (= router IP), 15/119 domain, 42 NTP,
   12 hostname (from the client), optionally 121 classless routes.
@@ -58,7 +66,16 @@ Crate: `crates/proto-dhcp`. Status: not started.
   stateful DHCPv6 server is optional.
 
 ## DNS
-Crate: `crates/proto-dns`. Status: not started.
+Crate: `crates/proto-dns`. **Status (M3): forwarder implemented** (15
+tests, including fuzzing): local `.lan` zone (router, static hosts, DHCP
+hostnames, PTR for the LAN subnet; never forwarded), bounded cache with
+TTL aging and negative caching, upstreams from the WAN lease, random
+transaction IDs, response validation (server + question), merging of
+identical in-flight queries, retries across upstreams, SERVFAIL on
+timeout, rebind protection, bounded pending queries.
+**Open:** TCP port 53 and TC-bit retry, randomised upstream source port
+per query (Kaminsky hardening; one fixed random port today), DoT/DoH,
+blocklists, DNSSEC.
 
 | Function | Priority |
 |---|---|

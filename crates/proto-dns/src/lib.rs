@@ -1,22 +1,21 @@
-//! DNS: forwarder with cache, local .lan zone fed by DHCP leases, rebind protection.
+//! DNS for the LAN: forwarder with cache, local `.lan` zone fed by DHCP
+//! leases, rebind protection.
 //!
-//! Planned modules: `codec`, `cache` (TTL + negative caching), `zone`
-//! (static hosts + DHCP hostnames, PTR), `forwarder` (upstream selection).
+//! - [`wire`]: message parsing/building (bounds-checked, fuzz-tested)
+//! - [`zone`]: local authoritative names + reverse records
+//! - [`cache`]: bounded TTL cache with in-place TTL aging
+//! - [`resolver`]: zone → cache → upstream, with retries and merging
+//!
+//! Design rules (see `docs/architecture.md`): `#![no_std]` + `alloc`,
+//! sans-IO (bytes and `now_ms` in, [`resolver::Action`]s out).
 //! See `docs/soho-features.md#dns`.
-//!
-//! Design rules (see `docs/architecture.md`):
-//! - `#![no_std]` + `alloc`: the same code runs in the bare-metal kernel and
-//!   in host tests.
-//! - Sans-IO: no sockets, no clocks, no async runtime. Callers feed in bytes
-//!   and the current time, and get back bytes to send and events.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds() {}
-}
+pub mod cache;
+pub mod resolver;
+pub mod wire;
+pub mod zone;

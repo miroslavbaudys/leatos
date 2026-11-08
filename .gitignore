@@ -2,3 +2,4 @@
 *.pcap
 *.qcow2
 .DS_Store
+lab/cache/

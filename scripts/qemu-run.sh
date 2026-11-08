@@ -7,7 +7,12 @@
 #   QEMU_MEM=256M        guest RAM (max 3G: boot.S maps RAM in 1..4 GiB only)
 #   QEMU_SMP=1
 #   QEMU_GDB=1           start paused with a gdb stub on :1234
-#   QEMU_NET=none|user   none (default) or two user-mode virtio-net NICs (WAN, LAN)
+#   QEMU_NET=none|user|lab
+#                        none (default); user = WAN + LAN on QEMU user-mode
+#                        networking; lab = WAN on user-mode, LAN on a UDP
+#                        socket link to the client VM (scripts/lab-test.sh)
+#   LAB_LAN_PORT=10003   lab mode: local UDP port of the router's LAN link
+#                        (the client VM uses LAB_LAN_PORT+1)
 #   QEMU_PCAP_DIR=dir    with QEMU_NET=user: dump WAN/LAN traffic to pcap files
 #   QEMU_EXTRA="..."     extra QEMU arguments
 set -euo pipefail
@@ -35,6 +40,16 @@ if [[ "${QEMU_NET:-none}" == "user" ]]; then
     -netdev user,id=wan -device virtio-net-pci,netdev=wan,mac=52:54:00:00:00:01
     -netdev user,id=lan -device virtio-net-pci,netdev=lan,mac=52:54:00:00:00:02
   )
+fi
+if [[ "${QEMU_NET:-none}" == "lab" ]]; then
+  lp="${LAB_LAN_PORT:-10003}"
+  NET=(
+    -netdev user,id=wan -device virtio-net-pci,netdev=wan,mac=52:54:00:00:00:01
+    -netdev "dgram,id=lan,local.type=inet,local.host=127.0.0.1,local.port=$lp,remote.type=inet,remote.host=127.0.0.1,remote.port=$((lp + 1))"
+    -device virtio-net-pci,netdev=lan,mac=52:54:00:00:00:02
+  )
+fi
+if [[ "${QEMU_NET:-none}" == "user" || "${QEMU_NET:-none}" == "lab" ]]; then
   if [[ -n "${QEMU_PCAP_DIR:-}" ]]; then
     mkdir -p "$QEMU_PCAP_DIR"
     NET+=(

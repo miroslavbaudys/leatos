@@ -13,16 +13,19 @@ Goals: PPPoE, DHCP (v4 server/client, DHCPv6-PD, RA), a DNS forwarder, NAT, a fi
   - `src/mmio.rs`: `Region` = safe, bounds-checked MMIO over `safe-mmio`
   - `src/irq.rs` (dispatch + `IrqEvent`), `timer.rs` (tickless, `sleep`), `executor.rs` (priority async), `console.rs` (`println!`, `fatal_println!`), `pci.rs` (via `virtio-drivers` `PciRoot`), `selftest.rs`
   - `src/drivers/virtio_net.rs`: slot-owned DMA buffers, pull-based TX with a byte limit
-  - `src/net/`: `packet.rs` (bounded pool, headroom, `PacketMeta`), `device.rs` (smoltcp glue), `stack.rs` (WAN DHCP, LAN static, NAPI-style IRQ loop)
+  - `src/net/`: `packet.rs` (bounded pool, headroom, `PacketMeta`), `device.rs` (smoltcp glue), `stack.rs` (WAN DHCP client, LAN static, NAPI-style IRQ loop), `services.rs` (LAN DHCP server + DNS forwarder: smoltcp UDP sockets ↔ sans-IO crates)
+  - `src/config.rs`: compiled-in defaults (LAN 192.168.1.1/24, DHCP range, statics, DNS) until the config store exists
   - `linker.ld`: kernel at `0x4020_0000`, page-aligned sections, guard pages, 16 KiB exception stack + 256 KiB kernel stack
-- `crates/proto-pppoe`, `proto-dhcp`, `proto-dns`, `fwd`, `qdisc`: sans-IO logic (skeletons for now)
-- `scripts/qemu-run.sh` (cargo runner), `scripts/smoke-test.sh`, `scripts/unsafe-report.sh`
+- `crates/proto-dhcp` (DHCPv4 server: `v4::packet`, `v4::server`) and `crates/proto-dns` (`wire`, `zone`, `cache`, `resolver`): implemented and tested. `proto-pppoe`, `fwd`, `qdisc`: skeletons
+- `lab/client/`: `/init` + udhcpc script for the Alpine client VM; `lab/cache/` (gitignored) holds downloads
+- `scripts/qemu-run.sh` (cargo runner), `scripts/smoke-test.sh`, `scripts/lab-test.sh` (+ `scripts/lab/`), `scripts/unsafe-report.sh`
 - `docs/`: architecture, boot-and-memory, qemu, soho-features, bufferbloat-cake, safety-and-portability, roadmap
 
 ## Commands
 - `cargo kbuild [--release]`: build the kernel. `cargo krun` boots it (`Ctrl-A X` quits; `QEMU_NET=user` adds 2 NICs)
 - `scripts/smoke-test.sh`: cases boot (DHCP + ping), fault-wx, fault-stack. Also run `QEMU_ACCEL=tcg scripts/smoke-test.sh` after boot, MMU, IRQ, timer or driver changes
-- `cargo test`: host tests for `crates/*`
+- `scripts/lab-test.sh`: router + Alpine client VM; DHCP/DNS/ping end to end (`LAB_VERBOSE=1` for consoles). Run it after LAN-service, driver or network-stack changes
+- `cargo test`: host tests for `crates/*`; `cargo clippy --all-targets` for the crates
 - `cargo kclippy [--features <f>]`: run for each of `smoke-test`, `idle-poll`, `fault-wx`, `fault-stack`
 - `cargo kcheck-x86`: type-check neutral code against the x86_64 skeleton (**must stay green**)
 - `scripts/unsafe-report.sh`: the unsafe audit surface
@@ -44,4 +47,6 @@ Goals: PPPoE, DHCP (v4 server/client, DHCPv6-PD, RA), a DNS forwarder, NAT, a fi
 - **Packet buffers** come only from `net::packet` (bounded pool, no allocation per packet). On pool exhaustion, drop; never grow.
 - **IRQ handlers** (`irq::register` actions) only acknowledge or mask hardware and touch atomics. No allocation, no `println!`, no locks except ones thread context takes with IRQs masked (the irqchip lock). Work runs in tasks awaiting an `IrqEvent`. Device interrupts follow NAPI: mask → poll until empty → unmask.
 - Under QEMU on macOS, `wfi` wake-up adds up to ~3 ms; don't "fix" timer code for it (use the `idle-poll` feature; see docs/qemu.md).
+- Lab downloads are pinned by SHA-256 in `scripts/lab/fetch-alpine.sh`; never unpin. Update the hashes deliberately.
+- Shell scripts must run on macOS bash 3.2 (no associative arrays) and BSD tools (no `\s` in sed, no `timeout`).
 - Update the status column in `docs/roadmap.md` when a milestone is done.
