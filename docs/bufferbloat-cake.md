@@ -176,11 +176,17 @@ build, BFifo qdisc):
 | Date | Path | Idle p50 | Download | Added (p90) | Upload | Added (p90) |
 |---|---|---|---|---|---|---|
 | 2026-11-08 | rrouter-debug | 7.8 ms | 55.3 Mbit/s | +55.7 ms (B); p99 117 ms | 45.2 Mbit/s | +58.0 ms (B) |
+| 2026-11-08 | rrouter-release | 9.6 ms | 55.0 Mbit/s | +50.7 ms (B); p99 117 ms | 38.0 Mbit/s | +52.0 ms (B) |
 
-Still open: where the queue forms (home router/ISP, Wi-Fi, or rrouter's
-NIC rings and vmnet when CPU-bound). Next comparisons: `direct` (without
-rrouter) and `rrouter-release`. CAKE will only help if rrouter shapes
-slightly below the real bottleneck rate, so the queue moves into rrouter.
+**Interpretation (single runs, so treat ±10 % as noise):**
+- The release build is several times faster per packet but gives the same throughput, so
+  **rrouter is not the bottleneck**. About 55 Mbit/s is the real line or Wi-Fi limit.
+- The ~50 ms of added latency therefore most likely builds **upstream**
+  (home router, ISP or Wi-Fi), in front of that bottleneck. This is the case CAKE
+  addresses: shape slightly below the bottleneck (~50 Mbit/s here) so the
+  queue moves into rrouter, where COBALT and flow queueing keep it short.
+- Still to confirm: a `direct` run (without rrouter), which should show similar
+  added latency if the queue is upstream.
 
 ## 7. Performance
 CAKE costs more CPU than fq_codel. On Linux, low-end ARM routers saturate at a
