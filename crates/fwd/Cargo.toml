@@ -1,0 +1,11 @@
+[package]
+name = "fwd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Forwarding plane: LPM routing table, neighbor cache, conntrack, NAPT, firewall, MSS clamping."
+
+[dependencies]
+
+[lints]
+workspace = true

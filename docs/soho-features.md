@@ -1,0 +1,119 @@
+# SOHO feature specification: PPPoE, DHCP, DNS
+
+These are the requirements and the known pitfalls, gathered during the initial
+analysis. Each protocol is implemented as a sans-IO `no_std` crate (see
+architecture.md).
+
+## PPPoE
+Crate: `crates/proto-pppoe`. Status: not started.
+
+| Stage | Details |
+|---|---|
+| Discovery (EtherType `0x8863`) | PADI (broadcast) → PADO → PADR → PADS (session ID); PADT terminates. Handle multiple concentrators, Service-Name and AC-Name filtering, Host-Uniq |
+| Session (`0x8864`) | PPP frames inside the PPPoE header. On bare metal the forwarding plane does the encapsulation (no kernel PPP driver) |
+| LCP | MRU 1492, magic number, auth protocol; **echo request/reply keepalive** (for example a 10 s interval, 5 failures → reconnect) |
+| Auth | PAP (most common at ISPs), CHAP-MD5 |
+| IPCP | IPv4 address + DNS servers (RFC 1877 options 129/131) |
+| IPv6CP | interface identifier → link-local address; then DHCPv6-PD over the session |
+
+Pitfalls:
+- **MTU and MSS:** the WAN MTU is 1492, so **clamp TCP MSS** (1452 for IPv4)
+  on SYNs crossing the WAN. Without clamping, some websites hang.
+- **ISP VLAN:** many ISPs require PPPoE on a VLAN tag (some Czech ISPs, for
+  example O2 with VLAN 848; verify per ISP). Make `wan.vlan` configurable.
+- RFC 4638 (MTU 1500 over PPPoE) is optional and only works if the ISP supports it.
+- Reconnect with exponential backoff. Send PADT on shutdown so the ISP
+  doesn't keep a stale session. Handle forced daily disconnects.
+- On multi-core hardware, NIC RSS can't hash inside PPPoE, so all traffic
+  lands on one core. This doesn't matter for single-core QEMU.
+
+## DHCP
+Crate: `crates/proto-dhcp`. Status: not started.
+
+### DHCPv4 server (LAN), required
+- Pools, static reservations by MAC, lease time, T1/T2, DECLINE, RELEASE, INFORM.
+- Options: 1 subnet mask, 3 router, 6 DNS (= router IP), 15/119 domain, 42 NTP,
+  12 hostname (from the client), optionally 121 classless routes.
+- Lease persistence: in memory, flushed periodically and on shutdown. Batch
+  writes to limit flash wear.
+- Optional ARP or ICMP probe before handing out an address.
+- Emit `LeaseAdded{mac, ip, hostname}` so the DNS zone resolves `host.lan`.
+- One pool per LAN or VLAN (guest network later).
+
+### DHCPv4 client (WAN, non-PPPoE ISPs)
+- DISCOVER, OFFER, REQUEST, ACK, then renew, rebind and expire. Must work
+  before the interface has an IP address (raw L2 frames).
+- Some ISPs need option 60/61 or MAC cloning.
+- smoltcp has a DHCPv4 client socket that may cover this.
+
+### DHCPv6-PD client (WAN), required
+- SOLICIT, ADVERTISE, REQUEST, REPLY with an IA_PD prefix-size hint (/56).
+- Renewals, and **prefix changes** (some ISPs rotate prefixes): re-address
+  the LAN and send deprecating RAs.
+- Split the delegated prefix into /64s, one per LAN or VLAN.
+
+### IPv6 on the LAN
+- Router Advertisements with the prefix (SLAAC), **RDNSS** (RFC 8106) and the M/O flags.
+- **Android doesn't support DHCPv6**, so SLAAC with RA is mandatory. A
+  stateful DHCPv6 server is optional.
+
+## DNS
+Crate: `crates/proto-dns`. Status: not started.
+
+| Function | Priority |
+|---|---|
+| Forwarder + cache on LAN IPs, UDP **and** TCP port 53; TTLs, negative caching (RFC 2308), deduplicate in-flight queries | required |
+| Upstreams from IPCP/DHCP or config; failover and health tracking | required |
+| Local zone `.lan`: DHCP hostnames, static hosts, `router.lan`, PTR records for LAN subnets | required |
+| **Never resolve for the WAN side** (bind to LAN only, plus a firewall rule) | required |
+| DNS rebind protection (drop public answers that contain private IPs) | recommended |
+| Bounded LRU cache (memory cap) | recommended |
+| DoT/DoH upstream | later (TLS on no_std is hard) |
+| Blocklists (Pi-hole style) | later |
+| DNSSEC validation (needs correct time, so NTP) | optional |
+
+Resolution order in the request handler: local zone → blocklist → cache →
+forward to the current upstream (the upstream list is swapped atomically on `WanUp`).
+
+## Supporting pieces needed by all of the above
+- NAT (masquerade on the WAN) and a stateful firewall: LAN→WAN allowed,
+  WAN→LAN only established or related, input protection, an IPv6 firewall
+  that blocks inbound by default, and port forwarding.
+- An SNTP client (QEMU provides a PL031 RTC; real boards often have none).
+- Persistent config storage (virtio-blk; QEMU `fw_cfg` for early bring-up).
+
+## Target configuration UX
+```toml
+[wan]
+interface = "wan0"
+vlan = 848                 # optional, ISP-specific
+mode = "pppoe"             # "pppoe" | "dhcp" | "static"
+
+[wan.pppoe]
+username = "user@isp.cz"
+password = "secret"
+mtu = 1492
+lcp_echo_interval = 10
+lcp_echo_failure = 5
+
+[wan.ipv6]
+dhcpv6_pd = true
+prefix_hint = 56
+
+[lan]
+ipv4 = "192.168.1.1/24"
+domain = "lan"
+
+[lan.dhcp]
+range = ["192.168.1.100", "192.168.1.250"]
+lease_time = "12h"
+[[lan.dhcp.static]]
+mac = "aa:bb:cc:dd:ee:ff"
+ip = "192.168.1.10"
+hostname = "nas"
+
+[dns]
+upstream = "auto"          # from PPPoE/DHCP, or a list
+cache_size = 10000
+rebind_protection = true
+```

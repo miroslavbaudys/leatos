@@ -1,0 +1,11 @@
+[package]
+name = "proto-dhcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DHCP: DHCPv4 server and client, DHCPv6-PD client, IPv6 router advertisements."
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["kernel", "crates/*"]
+# `cargo build` / `cargo test` at the root only touch host-testable crates.
+# The kernel is built through the `cargo kbuild` / `cargo krun` aliases
+# (see .cargo/config.toml) because it needs --target aarch64-unknown-none.
+default-members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = ""
+
+[workspace.dependencies]
+proto-pppoe = { path = "crates/proto-pppoe" }
+proto-dhcp = { path = "crates/proto-dhcp" }
+proto-dns = { path = "crates/proto-dns" }
+fwd = { path = "crates/fwd" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+debug = true      # keep symbols for gdb; they are not loaded into guest memory
+lto = "thin"

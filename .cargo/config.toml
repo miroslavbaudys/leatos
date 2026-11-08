@@ -1,0 +1,12 @@
+# Do NOT set `build.target` here: it would force the host-testable
+# protocol crates onto the bare-metal target too. Use the aliases instead.
+
+[alias]
+kbuild = "build -p rrouter-kernel --target aarch64-unknown-none"
+krun = "run -p rrouter-kernel --target aarch64-unknown-none"
+kclippy = "clippy -p rrouter-kernel --target aarch64-unknown-none"
+ksmoke = "run -p rrouter-kernel --target aarch64-unknown-none --features smoke-test"
+
+[target.aarch64-unknown-none]
+# `cargo krun` hands the built ELF to this script, which boots it in QEMU.
+runner = "scripts/qemu-run.sh"
