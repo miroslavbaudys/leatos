@@ -11,7 +11,7 @@ Requirements: QEMU ≥ 8 (`brew install qemu`) and the Rust toolchain. The
 | `cargo kbuild --release` | build the kernel (release) |
 | `cargo krun` | build and boot in QEMU (quit with `Ctrl-A X`) |
 | `cargo ksmoke` | boot with the `smoke-test` feature (powers off after boot) |
-| `scripts/smoke-test.sh` | automated boot check, exits non-zero on failure |
+| `scripts/smoke-test.sh` | automated boot tests (cases `boot`, `fault-wx`, `fault-stack`); non-zero exit on failure |
 | `cargo test` | host unit tests for the `crates/*` protocol crates |
 | `cargo kclippy` | clippy for the kernel |
 
@@ -28,7 +28,30 @@ Requirements: QEMU ≥ 8 (`brew install qemu`) and the Rust toolchain. The
 | `QEMU_EXTRA` | unset | extra arguments passed to QEMU |
 
 Run both `scripts/smoke-test.sh` and `QEMU_ACCEL=tcg scripts/smoke-test.sh`
-before committing boot or MMU changes.
+before committing boot, MMU, IRQ or timer changes. `SMOKE_CASES="boot"`
+selects cases, and `SMOKE_VERBOSE=1` prints the full console output.
+
+### Kernel features
+| Feature | Effect |
+|---|---|
+| `smoke-test` | power off after the self-tests (automation) |
+| `idle-poll` | spin instead of `wfi` when idle; µs-precise timers on HVF, 100 % host CPU |
+| `fault-wx` / `fault-stack` | deliberately write to `.text` / overflow the stack (used by smoke-test.sh) |
+
+## Timer precision under QEMU: measured
+The boot self-test measures sleep overshoot. On an M4 Max with QEMU 11.1:
+
+| Mode | 100 µs | 1 ms | 10 ms | 100 ms |
+|---|---|---|---|---|
+| HVF, `wfi` idle (default) | +40 µs | +270 µs | +2.5 ms | +0.04–2.9 ms |
+| HVF, `idle-poll` | +4 µs | +1 µs | +1 µs | +0–3 µs |
+| TCG, `wfi` idle | +2.2 ms | +0.6 ms | +2.7 ms | +3.0 ms |
+
+**Conclusion:** the timer and IRQ path are µs-precise. The millisecond slack
+is the host waking an idle vCPU after `wfi` (it looks like macOS timer
+coalescing, roughly proportional to the sleep length). Real hardware wakes
+from `wfi` in microseconds. For latency and CAKE experiments in QEMU, build
+with `idle-poll` (see docs/bufferbloat-cake.md §3.2).
 
 ## Debugging with gdb
 ```sh

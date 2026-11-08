@@ -5,7 +5,7 @@
 // `virtualization=on` it may start at EL2, so we drop to EL1 if needed.
 //
 // Steps: park secondaries -> (EL2 -> EL1) -> enable FP/SIMD -> sane SCTLR ->
-//        stack -> zero .bss -> identity-map page tables -> MMU + caches on ->
+//        stacks -> zero .bss -> identity-map page tables -> MMU + caches on ->
 //        exception vectors -> kernel_main(dtb)
 //
 // NOTE: this file goes through `global_asm!`, so it must not contain braces.
@@ -45,9 +45,15 @@ at_el1:
     msr     sctlr_el1, x1
     isb
 
-    // ---- Stack ---------------------------------------------------------------
+    // ---- Stacks --------------------------------------------------------------
+    // SP_EL1 = exception stack, SP_EL0 = kernel (thread) stack. The kernel
+    // runs with SPSel=0 ("EL1t"), so every exception switches to SP_EL1 and
+    // a kernel stack overflow (guard page hit) can still be reported.
+    ldr     x1, =__exc_stack_top
+    mov     sp, x1                  // SPSel=1 here: writes SP_EL1
+    msr     spsel, #0
     ldr     x1, =__stack_top
-    mov     sp, x1
+    mov     sp, x1                  // SPSel=0 now: writes SP_EL0
 
     // ---- Zero .bss (16-byte aligned by the linker script) --------------------
     ldr     x1, =__bss_start
@@ -115,19 +121,117 @@ park:
     b       park
 
 // ---- Exception vector table -------------------------------------------------
-// 16 entries x 0x80 bytes. For now every exception is fatal: pass the vector
-// index and the syndrome registers to Rust, which reports and halts.
-// Order: [cur EL SP0 | cur EL SPx | lower EL A64 | lower EL A32] x
-//        [sync, irq, fiq, serror]
-.section .text, "ax"
-.balign 0x800
-.global exception_vectors
-exception_vectors:
-.irp i, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-.balign 0x80
+// 16 entries x 0x80 bytes. Order: [cur EL SP0 | cur EL SPx | lower EL A64 |
+// lower EL A32] x [sync, irq, fiq, serror]. The kernel runs on SP0 (EL1t),
+// so entry 1 is the normal IRQ path. Everything else is fatal for now.
+.macro FATAL i
+    .balign 0x80
     mov     x0, #\i
     mrs     x1, esr_el1
     mrs     x2, elr_el1
     mrs     x3, far_el1
     b       rust_exception
-.endr
+.endm
+
+.section .text, "ax"
+.balign 0x800
+.global exception_vectors
+exception_vectors:
+    FATAL   0
+    .balign 0x80
+    b       irq_entry              // 1: IRQ, current EL, SP0 = normal kernel IRQ
+    FATAL   2
+    FATAL   3
+    FATAL   4
+    FATAL   5
+    FATAL   6
+    FATAL   7
+    FATAL   8
+    FATAL   9
+    FATAL   10
+    FATAL   11
+    FATAL   12
+    FATAL   13
+    FATAL   14
+    FATAL   15
+
+// ---- IRQ entry ----------------------------------------------------------------
+// Runs on SP_EL1. Saves every caller-saved register (GPRs, all SIMD q
+// registers because rustc may use NEON anywhere, FPCR/FPSR, ELR/SPSR), calls
+// rust_irq, and restores. Frame (720 B): x0-x18, x29, x30, ELR @0..176,
+// SPSR @176, FPCR @184, FPSR @192, q0-q31 @208..720.
+irq_entry:
+    sub     sp, sp, #720
+    stp     x0, x1, [sp, #0]
+    stp     x2, x3, [sp, #16]
+    stp     x4, x5, [sp, #32]
+    stp     x6, x7, [sp, #48]
+    stp     x8, x9, [sp, #64]
+    stp     x10, x11, [sp, #80]
+    stp     x12, x13, [sp, #96]
+    stp     x14, x15, [sp, #112]
+    stp     x16, x17, [sp, #128]
+    stp     x18, x29, [sp, #144]
+    mrs     x0, elr_el1
+    stp     x30, x0, [sp, #160]
+    mrs     x0, spsr_el1
+    str     x0, [sp, #176]
+    stp     q0, q1, [sp, #208]
+    stp     q2, q3, [sp, #240]
+    stp     q4, q5, [sp, #272]
+    stp     q6, q7, [sp, #304]
+    stp     q8, q9, [sp, #336]
+    stp     q10, q11, [sp, #368]
+    stp     q12, q13, [sp, #400]
+    stp     q14, q15, [sp, #432]
+    stp     q16, q17, [sp, #464]
+    stp     q18, q19, [sp, #496]
+    stp     q20, q21, [sp, #528]
+    stp     q22, q23, [sp, #560]
+    stp     q24, q25, [sp, #592]
+    stp     q26, q27, [sp, #624]
+    stp     q28, q29, [sp, #656]
+    stp     q30, q31, [sp, #688]
+    mrs     x0, fpcr
+    str     x0, [sp, #184]
+    mrs     x0, fpsr
+    str     x0, [sp, #192]
+
+    bl      rust_irq
+
+    ldr     x0, [sp, #184]
+    msr     fpcr, x0
+    ldr     x0, [sp, #192]
+    msr     fpsr, x0
+    ldp     q0, q1, [sp, #208]
+    ldp     q2, q3, [sp, #240]
+    ldp     q4, q5, [sp, #272]
+    ldp     q6, q7, [sp, #304]
+    ldp     q8, q9, [sp, #336]
+    ldp     q10, q11, [sp, #368]
+    ldp     q12, q13, [sp, #400]
+    ldp     q14, q15, [sp, #432]
+    ldp     q16, q17, [sp, #464]
+    ldp     q18, q19, [sp, #496]
+    ldp     q20, q21, [sp, #528]
+    ldp     q22, q23, [sp, #560]
+    ldp     q24, q25, [sp, #592]
+    ldp     q26, q27, [sp, #624]
+    ldp     q28, q29, [sp, #656]
+    ldp     q30, q31, [sp, #688]
+    ldr     x0, [sp, #176]
+    msr     spsr_el1, x0
+    ldp     x30, x0, [sp, #160]
+    msr     elr_el1, x0
+    ldp     x18, x29, [sp, #144]
+    ldp     x16, x17, [sp, #128]
+    ldp     x14, x15, [sp, #112]
+    ldp     x12, x13, [sp, #96]
+    ldp     x10, x11, [sp, #80]
+    ldp     x8, x9, [sp, #64]
+    ldp     x6, x7, [sp, #48]
+    ldp     x4, x5, [sp, #32]
+    ldp     x2, x3, [sp, #16]
+    ldp     x0, x1, [sp, #0]
+    add     sp, sp, #720
+    eret

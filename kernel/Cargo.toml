@@ -14,6 +14,12 @@ bench = false
 [features]
 # Print the boot report, then power off via PSCI so QEMU exits (used by scripts/smoke-test.sh).
 smoke-test = []
+# Idle by spinning instead of `wfi`: lowest timer latency on hypervisors
+# whose WFI wake-up is slow (macOS HVF), at the cost of 100% host CPU.
+idle-poll = []
+# Deliberate crashes, used by scripts/smoke-test.sh to verify memory protection.
+fault-wx = ["smoke-test"]
+fault-stack = ["smoke-test"]
 
 [dependencies]
 fdt = "0.1.5"

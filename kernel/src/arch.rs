@@ -11,7 +11,7 @@ pub fn current_el() -> u64 {
 }
 
 /// Sleep until an interrupt (or event) is pending.
-#[cfg_attr(feature = "smoke-test", allow(dead_code))]
+#[cfg_attr(feature = "idle-poll", allow(dead_code))]
 pub fn wait_for_interrupt() {
     // SAFETY: `wfi` only suspends the core.
     unsafe { asm!("wfi", options(nomem, nostack)) };

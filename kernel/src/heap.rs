@@ -15,7 +15,11 @@ pub fn init(info: &BootInfo) {
     assert!(end > start, "no RAM left for the heap");
     let size = end - start;
     // SAFETY: [start, end) is RAM after the kernel image, mapped Normal by
-    // boot.S, unused by anything else, and `init` is called exactly once.
+    // boot.S (and later RW by mmu.rs), unused by anything else, and `init` is
+    // called exactly once.
     unsafe { HEAP.lock().init(start as *mut u8, size) };
-    println!("  heap            : {start:#x}..{end:#x} ({} MiB)", size >> 20);
+    println!(
+        "  heap            : {start:#x}..{end:#x} ({} MiB)",
+        size >> 20
+    );
 }

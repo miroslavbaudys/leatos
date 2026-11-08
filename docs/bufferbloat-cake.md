@@ -56,6 +56,14 @@ CAKE.
   needs **µs-precision wakeups**, so timers are **tickless**: program
   `CNTV_CVAL` to the next deadline. No periodic jiffies tick.
 - The generic timer runs at 24 MHz under HVF (about 42 ns resolution), which is good enough.
+- **Measured in M1:** tickless sleeps land within 0–6 µs while the CPU is
+  busy (`idle-poll`). When idle in `wfi`, the *host* (macOS HVF) adds 0.3–3 ms
+  of wake-up latency. This is a QEMU-on-macOS artifact, but it would ruin
+  shaping accuracy in lab tests. Plan for M6: **hybrid idle**. If the next
+  deadline is within a threshold (or the shaper has packets queued), arm the
+  comparator early and spin for the last stretch; otherwise `wfi`. Make the
+  threshold configurable (≈0 on real hardware). Until then, use the
+  `idle-poll` feature for QoS experiments (docs/qemu.md).
 - **Executor priorities:** the datapath (RX → forward → qdisc → TX) must
   never wait behind a slow service task (DNS, CLI). M1's executor gets at
   least two priority classes, and the datapath work runs first on every loop

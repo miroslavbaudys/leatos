@@ -10,8 +10,8 @@ earlier milestones (marked 🎂), even though CAKE itself lands in M6. See
 | # | Milestone | Done when | Est. | Status |
 |---|---|---|---|---|
 | M0 | Workspace scaffold: aarch64 boot, MMU identity map, PL011 console, DTB discovery, heap, generic timer, PSCI off, smoke test | `scripts/smoke-test.sh` passes under HVF and TCG | — | ✅ done |
-| M1 | Kernel core: 4 KiB page tables with W^X and guard pages, separate exception stack, GICv3 + IRQs, **tickless high-resolution timers** 🎂, async executor with **priority classes** 🎂, PCIe enumeration | timer IRQ ticks; async `sleep` is accurate to the µs level; faults are reported cleanly | 3–4 wk | ⏳ in progress |
-| M2 | virtio-net ×2, **pull-based TX with byte-limited rings** 🎂, packet buffer pools with **`PacketMeta`** 🎂, smoltcp, ping, DHCPv4 client on WAN | client VM can `ping` the router | 3–4 wk | |
+| M1 | Kernel core: 4 KiB page tables with W^X + WXN and guard pages, separate exception stack, GICv3 + IRQs, **tickless high-resolution timers** 🎂, async executor with **priority classes** 🎂, PCIe enumeration + BAR assignment | self-tests pass (sleep accuracy, priorities); W^X and guard-page faults caught; 2× virtio-net found | 3–4 wk | ✅ done (HVF `wfi` wake-up latency found, see qemu.md) |
+| M2 | virtio-net ×2, **pull-based TX with byte-limited rings** 🎂, packet buffer pools with **`PacketMeta`** 🎂, smoltcp, ping, DHCPv4 client on WAN | client VM can `ping` the router | 3–4 wk | ⏳ next |
 | M3 | DHCPv4 server + DNS forwarder/cache/`.lan` zone | client gets a lease; `dig nas.lan` works | 4–6 wk | |
 | M4 | Forwarding plane + conntrack + NAPT + basic firewall; **pipeline with qdisc hook points** and **pre-NAT flow/host hashes from conntrack** 🎂 | client `curl`s through to the ISP VM | 8–12 wk | |
 | M5 | PPPoE WAN, reconnect, MSS clamp; **exposes encapsulation overhead** 🎂 | stable session against `pppoe-server`; survives a PADT | 4–6 wk | |
