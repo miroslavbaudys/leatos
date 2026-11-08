@@ -130,9 +130,41 @@ scripts/mac-lab.sh --check   # start + checks, tear down; exit 1 on failure
 - Useful while it runs: `sudo tcpdump -ni bridgeN` or Wireshark on
   `bridgeN` to watch rrouter's traffic; `tail -f <logs>/router.log` for the console.
 
-**Full internet through rrouter (planned, "Level 3"):** the WAN would be
-`vmnet-bridged` on a physical interface (Ethernet strongly preferred:
-bridging over Wi-Fi is often refused by access points), and the Mac's
-default route and DNS would point to rrouter. The WAN must be bridged at
-layer 2: a slirp or `vmnet-shared` WAN would route through the Mac itself
-and loop.
+## Your Mac's internet through rrouter (`scripts/mac-internet.sh`, "Level 3")
+```
+MacBook ──bridgeN (vmnet-host, 192.168.1.2)── [rrouter LAN 192.168.1.1]
+                                              [rrouter WAN] ══ vmnet-bridged on enX ══ home router → internet
+```
+```sh
+scripts/mac-internet.sh                  # confirm, switch, run checks, stay up (Ctrl-C restores)
+scripts/mac-internet.sh --check --yes    # switch, run checks, restore, exit code = result
+scripts/mac-internet.sh --wan-if en7     # bridge onto a specific interface (e.g. USB Ethernet)
+scripts/mac-internet.sh --ipv4-only      # turn IPv6 off while running (rrouter has no IPv6 yet)
+scripts/mac-internet.sh --restore        # undo a previous run (after a crash, kill -9, reboot)
+```
+- **WAN:** `vmnet-bridged` puts rrouter's WAN NIC (52:54:00:00:00:01) directly
+  on your home network, where it gets its own DHCP lease (double NAT). It
+  must be layer-2 bridged: a slirp or `vmnet-shared` WAN would route through
+  the Mac itself and loop.
+- **Wi-Fi caveat:** many access points drop frames from a second MAC address
+  on one Wi-Fi client, so bridging over Wi-Fi often yields no WAN lease. The
+  script detects that (no lease within 30 s) and stops *before* touching your
+  network. A USB/Thunderbolt Ethernet adapter is the reliable option.
+- **Mac changes:** routes `0.0.0.0/1` + `128.0.0.0/1` via 192.168.1.1. These
+  are more specific than the default route, so macOS's own default route is
+  never modified. DNS for the active network service is set to 192.168.1.1,
+  and with `--ipv4-only`, IPv6 is turned off.
+- **Safety:**
+  - it asks for confirmation;
+  - it switches only after rrouter has a WAN lease and answers on the LAN;
+  - the original DNS/IPv6 settings go to `lab/cache/mac-internet.state` *before* any change;
+  - it restores on exit, Ctrl-C or error, and via `--restore` (a stale state file blocks new runs until restored);
+  - a **watchdog** restores the network if rrouter exits or stops answering for ~15 s.
+- **Checks:** the route for 1.1.1.1 goes via rrouter; traceroute hop 1 =
+  rrouter, hop 2 = home router; system DNS resolves through rrouter;
+  `router.lan`; HTTPS to example.com; ping 1.1.1.1.
+- **Known limits:**
+  - IPv6 traffic bypasses rrouter unless you use `--ipv4-only`;
+  - IP fragments are dropped;
+  - DNS rebind protection refuses home-LAN names that resolve to private addresses;
+  - QEMU-on-macOS timer slack (see above) adds latency jitter.

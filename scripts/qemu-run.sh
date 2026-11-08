@@ -18,7 +18,11 @@
 #                        mac = WAN to the ISP VM like lab, LAN on macOS
 #                        vmnet-host (the Mac itself joins the LAN; needs root,
 #                        see scripts/mac-lab.sh)
-#   MAC_LAN_RANGE=192.168.1.2,192.168.1.9   mac mode: vmnet's own address range
+#                        mac-internet = like mac, but the WAN is vmnet-bridged
+#                        onto the physical interface MAC_WAN_IF (real upstream;
+#                        see scripts/mac-internet.sh)
+#   MAC_WAN_IF=en0       mac-internet mode: interface to bridge the WAN onto
+#   MAC_LAN_RANGE=192.168.1.2,192.168.1.9   mac modes: vmnet's own address range
 #                        (its first address goes to the Mac's bridge interface)
 #   QEMU_PCAP_DIR=dir    with QEMU_NET=user: dump WAN/LAN traffic to pcap files
 #   QEMU_EXTRA="..."     extra QEMU arguments
@@ -58,17 +62,22 @@ if [[ "${QEMU_NET:-none}" == "lab" ]]; then
     -device virtio-net-pci,netdev=lan,mac=52:54:00:00:00:02
   )
 fi
-if [[ "${QEMU_NET:-none}" == "mac" ]]; then
+if [[ "${QEMU_NET:-none}" == "mac" || "${QEMU_NET:-none}" == "mac-internet" ]]; then
   wp="${LAB_WAN_PORT:-10005}"
   IFS=, read -r vstart vend <<<"${MAC_LAN_RANGE:-192.168.1.2,192.168.1.9}"
+  if [[ "$QEMU_NET" == "mac-internet" ]]; then
+    WAN_NETDEV="vmnet-bridged,id=wan,ifname=${MAC_WAN_IF:?MAC_WAN_IF required}"
+  else
+    WAN_NETDEV="dgram,id=wan,local.type=inet,local.host=127.0.0.1,local.port=$wp,remote.type=inet,remote.host=127.0.0.1,remote.port=$((wp + 1))"
+  fi
   NET=(
-    -netdev "dgram,id=wan,local.type=inet,local.host=127.0.0.1,local.port=$wp,remote.type=inet,remote.host=127.0.0.1,remote.port=$((wp + 1))"
+    -netdev "$WAN_NETDEV"
     -device virtio-net-pci,netdev=wan,mac=52:54:00:00:00:01
     -netdev "vmnet-host,id=lan,start-address=$vstart,end-address=$vend,subnet-mask=255.255.255.0"
     -device virtio-net-pci,netdev=lan,mac=52:54:00:00:00:02
   )
 fi
-if [[ "${QEMU_NET:-none}" == "user" || "${QEMU_NET:-none}" == "lab" || "${QEMU_NET:-none}" == "mac" ]]; then
+if [[ "${QEMU_NET:-none}" =~ ^(user|lab|mac|mac-internet)$ ]]; then
   if [[ -n "${QEMU_PCAP_DIR:-}" ]]; then
     mkdir -p "$QEMU_PCAP_DIR"
     NET+=(

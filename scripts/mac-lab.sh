@@ -66,17 +66,10 @@ info() { echo "  [INFO] $*"; }
 # ---- preflight -------------------------------------------------------------------
 QEMU_BIN=$(command -v qemu-system-aarch64) || { echo "qemu-system-aarch64 not found (brew install qemu)" >&2; exit 1; }
 "$QEMU_BIN" -machine virt -netdev help 2>&1 | grep -q vmnet-host || { echo "this QEMU has no vmnet support" >&2; exit 1; }
-if netstat -rn -f inet | awk '{print $1}' | grep -qE "^($LAN_NET(\.|/|$)|203\.0\.113)"; then
-  echo "mac-lab: this Mac already has routes for 192.168.1.0/24 or 203.0.113.0/24:" >&2
-  netstat -rn -f inet | grep -E "^($LAN_NET|203\.0\.113)" >&2
-  echo "mac-lab: refusing to start (would conflict). Disconnect that network first." >&2
-  exit 1
-fi
+check_no_subnet_conflict "192\\.168\\.1|203\\.0\\.113" || exit 1
 
 echo "== sudo (for vmnet, one route and two resolver files)"
-sudo -v
-( while true; do sudo -n true 2>/dev/null; sleep 50; done ) &
-KEEPALIVE_PID=$!
+sudo_keepalive
 
 echo "== build"
 cargo build -q -p rrouter-kernel --target aarch64-unknown-none
@@ -99,16 +92,7 @@ fi
 tr -d '\r' <"$WORK/router.log" | grep -E "net wan0 .*lease" | sed 's/^/  /'
 
 # ---- find the Mac side of the vmnet LAN -------------------------------------------------
-MAC_IF=""
-MAC_IP=""
-for _ in $(seq 1 75); do
-  for ifn in $(ifconfig -l); do
-    case " $BEFORE " in *" $ifn "*) continue ;; esac
-    ip=$(ifconfig "$ifn" 2>/dev/null | awk '$1=="inet"{print $2}' | grep "^$LAN_NET\." | head -1 || true)
-    if [[ -n "$ip" ]]; then MAC_IF=$ifn; MAC_IP=$ip; break 2; fi
-  done
-  sleep 0.2
-done
+find_new_lan_if "$BEFORE" "$LAN_NET" || true
 if [[ -z "$MAC_IF" ]]; then
   echo "mac-lab: no new interface with a $LAN_NET.x address appeared. Interfaces:" >&2
   ifconfig -l >&2

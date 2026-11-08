@@ -111,24 +111,40 @@ pub fn spawn(has_net: bool) {
             "datapath task did not run first"
         );
         if has_net {
-            // WAN must get a DHCP lease and the gateway must answer a ping.
+            // WAN should get a DHCP lease and the gateway should answer a ping.
+            // Fatal only in smoke tests (QEMU's slirp always answers); on real
+            // networks the gateway may ignore pings or DHCP may be slow.
             let deadline = timer::Instant::now()
                 .checked_add(Duration::from_secs(10))
                 .unwrap();
-            while !(net::stack::DHCP_OK.load(Ordering::Acquire)
-                && net::stack::PING_OK.load(Ordering::Acquire))
-            {
-                assert!(
-                    timer::Instant::now() < deadline,
-                    "net: no DHCP lease / ping reply"
+            let ok = loop {
+                let (dhcp, ping) = (
+                    net::stack::DHCP_OK.load(Ordering::Acquire),
+                    net::stack::PING_OK.load(Ordering::Acquire),
                 );
+                if dhcp && ping {
+                    break true;
+                }
+                if timer::Instant::now() >= deadline {
+                    #[cfg(feature = "smoke-test")]
+                    panic!("net: no DHCP lease / ping reply (dhcp={dhcp}, ping={ping})");
+                    #[cfg(not(feature = "smoke-test"))]
+                    {
+                        println!(
+                            "  net self-test   : WARN dhcp={dhcp} gateway-ping={ping} (continuing)"
+                        );
+                        break false;
+                    }
+                }
                 timer::sleep(Duration::from_millis(10)).await;
-            }
+            };
             let (free, cap, fails) = net::packet::pool_stats();
-            println!(
-                "  net self-test   : ok (dhcp + ping; pool {free}/{cap} free, {fails} alloc failures, {} tx drops)",
-                net::device::tx_drops()
-            );
+            if ok {
+                println!(
+                    "  net self-test   : ok (dhcp + ping; pool {free}/{cap} free, {fails} alloc failures, {} tx drops)",
+                    net::device::tx_drops()
+                );
+            }
         }
 
         let (polls, idles) = executor::stats();
