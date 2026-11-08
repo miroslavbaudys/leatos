@@ -12,7 +12,7 @@
 # 192.168.1.1 as DNS server.
 #
 # Usage (in Terminal; sudo asks for your password):
-#   scripts/mac-internet.sh [--wan-if enX] [--ipv4-only] [--yes] [--check]
+#   scripts/mac-internet.sh [--wan-if enX] [--ipv4-only] [--release] [--yes] [--check]
 #   scripts/mac-internet.sh --restore      undo everything from a previous run
 #                                          (after a crash, kill -9, reboot, …)
 #     --wan-if enX   physical interface to bridge the WAN onto (default: the
@@ -21,6 +21,8 @@
 #                    from the extra MAC address of a bridged VM.
 #     --ipv4-only    turn IPv6 off on that service while running (rrouter has
 #                    no IPv6 yet, so IPv6 traffic would bypass it); restored on exit
+#     --release      run an optimised (release) build of rrouter instead of
+#                    the debug build: much faster datapath (see bufferbloat.sh)
 #     --yes          don't ask for confirmation
 #     --check        run the checks, then restore and exit (exit 1 on failure)
 #
@@ -53,15 +55,17 @@ source scripts/lab/common.sh
 WAN_IF=""
 IPV4_ONLY=0
 ASSUME_YES=0
+PROFILE=debug
 MODE=interactive
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --wan-if) WAN_IF="${2:?--wan-if needs an interface}"; shift 2 ;;
     --ipv4-only) IPV4_ONLY=1; shift ;;
+    --release) PROFILE=release; shift ;;
     --yes) ASSUME_YES=1; shift ;;
     --check) MODE=check; shift ;;
     --restore) MODE=restore; shift ;;
-    -h | --help) sed -n '2,29p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,31p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -145,7 +149,7 @@ PORT=$(networksetup -listallhardwareports | awk -v dev="$WAN_IF" '/^Hardware Por
 check_no_subnet_conflict "192\\.168\\.1" || exit 1
 HOME_GW=$(route -n get default 2>/dev/null | awk '/gateway/{print $2}')
 
-echo "rrouter will become this Mac's IPv4 router:"
+echo "rrouter ($PROFILE build) will become this Mac's IPv4 router:"
 echo "  WAN bridged onto : $WAN_IF ($PORT, service '$SERVICE'); home gateway $HOME_GW"
 echo "  Mac changes      : routes for 1.0.0.0-255.255.255.255 (8 prefixes) via $ROUTER_LAN, DNS for '$SERVICE' -> $ROUTER_LAN$([[ $IPV4_ONLY == 1 ]] && echo ", IPv6 off")"
 echo "  undo             : automatic on exit/Ctrl-C/watchdog; manual: scripts/mac-internet.sh --restore"
@@ -160,13 +164,18 @@ fi
 
 sudo_keepalive
 
-echo "== build"
-cargo build -q -p rrouter-kernel --target aarch64-unknown-none
+echo "== build ($PROFILE)"
+if [[ "$PROFILE" == release ]]; then
+  cargo build -q -p rrouter-kernel --target aarch64-unknown-none --release
+else
+  cargo build -q -p rrouter-kernel --target aarch64-unknown-none
+fi
+KERNEL=target/aarch64-unknown-none/$PROFILE/rrouter
 BEFORE=$(ifconfig -l)
 
 echo "== start rrouter (WAN bridged on $WAN_IF, LAN on vmnet-host)"
 sudo -n env QEMU_BIN="$QEMU_BIN" QEMU_NET=mac-internet MAC_WAN_IF="$WAN_IF" QEMU_ACCEL="${QEMU_ACCEL:-hvf}" \
-  scripts/qemu-run.sh target/aarch64-unknown-none/debug/rrouter >"$WORK/router.log" 2>&1 &
+  scripts/qemu-run.sh "$KERNEL" >"$WORK/router.log" 2>&1 &
 ROUTER_PID=$!
 if ! wait_for "$WORK/router.log" "net wan0 .*dhcp lease" 30; then
   echo "rrouter got no WAN lease on $WAN_IF within 30 s."
@@ -189,7 +198,8 @@ orig_dns=$(networksetup -getdnsservers "$SERVICE" | tr '\n' ' ' | sed 's/ *$//')
 v6_state=unchanged
 if [[ "$IPV4_ONLY" == 1 ]] && networksetup -getinfo "$SERVICE" | grep -q "^IPv6: Automatic"; then v6_state=automatic; fi
 mkdir -p "$(dirname "$STATE")"
-printf 'SERVICE=%s\nDNS=%s\nIPV6=%s\nROUTES=split\n' "$SERVICE" "$orig_dns" "$v6_state" >"$STATE"
+# BUILD= is informational (read by scripts/bufferbloat.sh to label results).
+printf 'SERVICE=%s\nDNS=%s\nIPV6=%s\nROUTES=split\nBUILD=%s\n' "$SERVICE" "$orig_dns" "$v6_state" "$PROFILE" >"$STATE"
 
 echo "== switching this Mac to rrouter"
 for r in "${SPLIT_ROUTES[@]}"; do

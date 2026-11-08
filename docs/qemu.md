@@ -140,6 +140,7 @@ scripts/mac-internet.sh                  # confirm, switch, run checks, stay up 
 scripts/mac-internet.sh --check --yes    # switch, run checks, restore, exit code = result
 scripts/mac-internet.sh --wan-if en7     # bridge onto a specific interface (e.g. USB Ethernet)
 scripts/mac-internet.sh --ipv4-only      # turn IPv6 off while running (rrouter has no IPv6 yet)
+scripts/mac-internet.sh --release        # optimised rrouter build (faster datapath)
 scripts/mac-internet.sh --restore        # undo a previous run (after a crash, kill -9, reboot)
 ```
 - **WAN:** `vmnet-bridged` puts rrouter's WAN NIC (52:54:00:00:00:01) directly
@@ -176,3 +177,25 @@ scripts/mac-internet.sh --restore        # undo a previous run (after a crash, k
   - IP fragments are dropped;
   - DNS rebind protection refuses home-LAN names that resolve to private addresses;
   - QEMU-on-macOS timer slack (see above) adds latency jitter.
+
+## Bufferbloat measurements (`scripts/bufferbloat.sh`)
+```sh
+scripts/bufferbloat.sh                    # auto-labels the path: direct / rrouter-debug / rrouter-release
+scripts/bufferbloat.sh --label wifi-5ghz --streams 8 --duration 20 --no-upload
+```
+The script runs three phases while pinging 1.1.1.1 every 0.2 s: **idle**
+(10 s), **download** (15 s) and **upload** (15 s), each with 4 parallel
+streams of 25 MB transfers against Cloudflare's speed-test endpoints. It
+reports RTT p50/p90/p99/max, loss, throughput and the **added latency**
+(loaded p90 − idle p50), graded like Waveform (A+ < 5 ms, A < 30, B < 60,
+C < 200, D < 400, F). Results are appended to `lab/cache/bufferbloat.csv`.
+
+- **Validity check:** a run with HTTP errors, or less than 1 Mbit/s of load
+  in a phase, is marked `INVALID` and gets no grade. The first version of
+  the load generator silently produced no load (Cloudflare refuses single
+  downloads above about 50 MB; `curl --data-binary @-` buffers all of stdin)
+  and graded an idle line "A". Verified with a negative control (an
+  oversized chunk gives HTTP 403, and the run is INVALID).
+- No sudo needed; it uses roughly 100–500 MB of traffic, depending on your line.
+- Compare paths: run once direct, once through `scripts/mac-internet.sh`
+  (debug), once with `scripts/mac-internet.sh --release`, and later with CAKE (M6).

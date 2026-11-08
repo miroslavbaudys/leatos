@@ -25,7 +25,8 @@ Goals: PPPoE, DHCP (v4 server/client, DHCPv6-PD, RA), a DNS forwarder, NAT, a fi
 - `cargo kbuild [--release]`: build the kernel. `cargo krun` boots it (`Ctrl-A X` quits; `QEMU_NET=user` adds 2 NICs)
 - `scripts/smoke-test.sh`: cases boot (DHCP + ping), fault-wx, fault-stack. Also run `QEMU_ACCEL=tcg scripts/smoke-test.sh` after boot, MMU, IRQ, timer or driver changes
 - `scripts/lab-test.sh`: client VM + router + ISP VM; DHCP, DNS, NAT, ICMP, traceroute, firewall end to end (`LAB_VERBOSE=1` for consoles). Run it after any network change, also with `QEMU_ACCEL=tcg`
-- `scripts/mac-internet.sh [--check] [--wan-if enX] [--ipv4-only] | --restore`: route the Mac's real IPv4 internet + DNS through rrouter (WAN vmnet-bridged); state saved before changes, watchdog + `--restore` undo
+- `scripts/mac-internet.sh [--check] [--wan-if enX] [--ipv4-only] [--release] | --restore`: route the Mac's real IPv4 internet + DNS through rrouter (WAN vmnet-bridged); state saved before changes, watchdog + `--restore` undo
+- `scripts/bufferbloat.sh [--label X]`: latency idle vs. under download/upload load, throughput and grade. Runs are marked INVALID if the load failed; results go to `lab/cache/bufferbloat.csv`
 - `scripts/mac-lab.sh [--check]`: put the developer's Mac on rrouter's LAN (vmnet-host, needs sudo, so run it in Terminal); only 203.0.113.0/24 and `*.lan`/`*.example` DNS go via rrouter; cleans up on exit
 - `cargo test`: host tests for `crates/*`; `cargo clippy --all-targets` for the crates
 - `cargo kclippy [--features <f>]`: run for each of `smoke-test`, `idle-poll`, `fault-wx`, `fault-stack`
@@ -47,6 +48,8 @@ Goals: PPPoE, DHCP (v4 server/client, DHCPv6-PD, RA), a DNS forwarder, NAT, a fi
 - New MMIO must be mapped in `mm::mmu::init` (or `arch::mmu::PLATFORM_MMIO`). Writable memory is never executable.
 - **Latency-first datapath (CAKE):** the qdisc is the only place packets may wait (no other FIFOs). TX is pull-based (`can_transmit` before `transmit`). Timers are tickless, so no periodic tick. Datapath tasks run at `Priority::Datapath`.
 - **Ports:** NAT uses 10000–39999; router-local sockets (DNS upstream, future services) must bind ≥ 40000 so replies are never mistaken for NAT traffic.
+- Never edit a script in place while it may be running (bash reads scripts incrementally): write a temp file and rename it over the original.
+- Measurements must prove the load or condition actually happened (validity checks), or be reported as invalid.
 - New lab checks need a **negative control** (show that the check fails when the feature is broken), as done for the firewall probe.
 - **Packet buffers** come only from `net::packet` (bounded pool, no allocation per packet). On pool exhaustion, drop; never grow.
 - **IRQ handlers** (`irq::register` actions) only acknowledge or mask hardware and touch atomics. No allocation, no `println!`, no locks except ones thread context takes with IRQs masked (the irqchip lock). Work runs in tasks awaiting an `IrqEvent`. Device interrupts follow NAPI: mask → poll until empty → unmask.

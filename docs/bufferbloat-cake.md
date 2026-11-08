@@ -168,6 +168,20 @@ ecn = true
   per release.
 - **Real line:** the Waveform bufferbloat test, and flent against a remote netserver.
 
+## 6b. Baseline measurements (before CAKE)
+Measured with `scripts/bufferbloat.sh` on the developer's MacBook (Wi-Fi to the
+home router, rrouter in QEMU/HVF via `scripts/mac-internet.sh`, debug
+build, BFifo qdisc):
+
+| Date | Path | Idle p50 | Download | Added (p90) | Upload | Added (p90) |
+|---|---|---|---|---|---|---|
+| 2026-11-08 | rrouter-debug | 7.8 ms | 55.3 Mbit/s | +55.7 ms (B); p99 117 ms | 45.2 Mbit/s | +58.0 ms (B) |
+
+Still open: where the queue forms (home router/ISP, Wi-Fi, or rrouter's
+NIC rings and vmnet when CPU-bound). Next comparisons: `direct` (without
+rrouter) and `rrouter-release`. CAKE will only help if rrouter shapes
+slightly below the real bottleneck rate, so the queue moves into rrouter.
+
 ## 7. Performance
 CAKE costs more CPU than fq_codel. On Linux, low-end ARM routers saturate at a
 few hundred Mbit/s with CAKE (approximate; varies by SoC), and modern x86
