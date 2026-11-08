@@ -84,7 +84,9 @@ grade() { # added latency ms
 }
 
 # Run $STREAMS streams of back-to-back $CHUNK-byte transfers for $DURATION s.
-# Prints total Mbit/s; HTTP errors are recorded in $WORK/err.* (run invalid).
+# Prints total Mbit/s. Rate limiting (HTTP 429) and server errors (5xx) are
+# retried after 1 s and counted in $WORK/retry.*; other HTTP errors stop the
+# stream and are recorded in $WORK/fatal.* (run invalid).
 # Uploads send a prepared file: `--data-binary @-` would buffer all of
 # stdin in memory before sending anything.
 load() { # download|upload
@@ -108,7 +110,8 @@ load() { # download|upload
         total=$(( total + ${bytes:-0} ))
         case "$code" in
           200 | 000 | 100) ;; # 000/100: cut off by the phase deadline mid-transfer
-          *) echo "HTTP $code" >"$WORK/err.$i"; break ;;
+          429 | 5??) echo "HTTP $code" >>"$WORK/retry.$i"; sleep 1 ;;
+          *) echo "HTTP $code" >>"$WORK/fatal.$i"; break ;;
         esac
       done
       echo "$total" >"$WORK/bytes.$i"
@@ -130,6 +133,9 @@ phase() { # name -> sets <name>_p50/p90/p99/max/lost/mbps
     mbps=$(load "$name")
     wait "$pp" || true
   fi
+  eval "${name}_retries=$(cat "$WORK"/retry.* 2>/dev/null | wc -l | tr -d ' ')"
+  eval "${name}_fatal=\"$(cat "$WORK"/fatal.* 2>/dev/null | sort | uniq -c | tr -s ' ' | tr '\n' ';')\""
+  rm -f "$WORK"/retry.* "$WORK"/fatal.*
   samples "$WORK/$name.ping" >"$WORK/$name.sorted"
   eval "${name}_p50=$(pct "$WORK/$name.sorted" 50)"
   eval "${name}_p90=$(pct "$WORK/$name.sorted" 90)"
@@ -144,21 +150,25 @@ echo "  idle ..."
 phase idle
 echo "  download ..."
 phase download
+idle_retries=0 idle_fatal=""
 if [[ "$UPLOAD" == 1 ]]; then
   echo "  upload ..."
   phase upload
 else
-  upload_p50=nan upload_p90=nan upload_p99=nan upload_max=nan upload_lost=0 upload_mbps=-
+  upload_p50=nan upload_p90=nan upload_p99=nan upload_max=nan upload_lost=0 upload_mbps=- upload_retries=0 upload_fatal=""
 fi
 
-# A run is valid only if both load phases actually loaded the line.
+# A run is valid only if both load phases actually loaded the line and no
+# stream failed for good. Retried rate limits are reported, not fatal.
 valid=1
+reasons=""
 for n in download upload; do
-  eval "m=\$${n}_mbps"
+  eval "m=\$${n}_mbps r=\$${n}_retries f=\$${n}_fatal"
   [[ "$m" == "-" ]] && continue
-  if awk -v m="$m" 'BEGIN{exit !(m < 1.0)}'; then valid=0; echo "  !! $n load only $m Mbit/s"; fi
+  if awk -v m="$m" 'BEGIN{exit !(m < 1.0)}'; then valid=0; reasons+=" $n: only $m Mbit/s of load;"; fi
+  if [[ -n "$f" ]]; then valid=0; reasons+=" $n: streams failed ($f);"; fi
+  if [[ "$r" -gt 0 ]]; then echo "  note: $n phase retried $r rate-limited/5xx requests (1 s backoff each)"; fi
 done
-if ls "$WORK"/err.* >/dev/null 2>&1; then valid=0; echo "  !! transfer errors: $(cat "$WORK"/err.* | sort | uniq -c | tr -s ' ' | tr '\n' ';')"; fi
 
 added() { awk -v a="$1" -v b="$2" 'BEGIN{ if(a=="nan"||b=="nan") print "nan"; else printf "%.1f", a-b }'; }
 dl_add=$(added "$download_p90" "$idle_p50")
@@ -172,7 +182,7 @@ echo
 if [[ "$valid" == 1 ]]; then
   echo "  added latency (loaded p90 - idle p50): download ${dl_add} ms [$(grade "$dl_add")], upload ${ul_add} ms [$(grade "$ul_add")]"
 else
-  echo "  INVALID RUN: the load phases did not load the line; no grade (not a bufferbloat result)"
+  echo "  INVALID RUN:$reasons no grade (not a bufferbloat result)"
 fi
 
 mkdir -p "$(dirname "$CSV")"

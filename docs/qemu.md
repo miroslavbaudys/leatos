@@ -190,8 +190,12 @@ reports RTT p50/p90/p99/max, loss, throughput and the **added latency**
 (loaded p90 − idle p50), graded like Waveform (A+ < 5 ms, A < 30, B < 60,
 C < 200, D < 400, F). Results are appended to `lab/cache/bufferbloat.csv`.
 
-- **Validity check:** a run with HTTP errors, or less than 1 Mbit/s of load
-  in a phase, is marked `INVALID` and gets no grade. The first version of
+- **Validity check:** a run where a stream failed for good (non-retryable
+  HTTP error), or a phase had less than 1 Mbit/s of load, is marked `INVALID`
+  with the reason, and gets no grade. Rate limiting (HTTP 429) and 5xx errors
+  are retried after 1 s and reported per phase (Cloudflare rate-limits after
+  many runs in a short time; wait a few minutes between series). The retry
+  path is tested against a local server that answers 429 first. The first version of
   the load generator silently produced no load (Cloudflare refuses single
   downloads above about 50 MB; `curl --data-binary @-` buffers all of stdin)
   and graded an idle line "A". Verified with a negative control (an

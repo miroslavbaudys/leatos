@@ -185,8 +185,14 @@ build, BFifo qdisc):
   (home router, ISP or Wi-Fi), in front of that bottleneck. This is the case CAKE
   addresses: shape slightly below the bottleneck (~50 Mbit/s here) so the
   queue moves into rrouter, where COBALT and flow queueing keep it short.
-- Still to confirm: a `direct` run (without rrouter), which should show similar
-  added latency if the queue is upstream.
+- First `direct` run (without rrouter; **degraded**: 2 requests rate-limited,
+  so it's marked invalid): download +67 ms (p90), similar to rrouter, which is
+  consistent with an upstream queue. Upload **+299 ms p90, 600 ms max**, much
+  worse than through rrouter (+52–58 ms). A plausible cause: sending directly
+  fills macOS's deep Wi-Fi transmit queue, while through rrouter packets pass
+  its small bounded queues first (≤ 8 frames in flight, 128 KB FIFO). That
+  would be early evidence for the "no hidden queues" design. **Needs clean
+  repeats** before drawing conclusions.
 
 ## 7. Performance
 CAKE costs more CPU than fq_codel. On Linux, low-end ARM routers saturate at a
