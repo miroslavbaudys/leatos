@@ -31,28 +31,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-wait_for() { # file pattern seconds
-  local i=0
-  while ! tr -d '\r' <"$1" 2>/dev/null | grep -q -- "$2"; do
-    sleep 0.2
-    i=$((i + 1))
-    if [[ $i -gt $(($3 * 5)) ]]; then return 1; fi
-  done
-}
-
-if [[ -z "${QEMU_ACCEL:-}" ]]; then
-  if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then QEMU_ACCEL=hvf; else QEMU_ACCEL=tcg; fi
-fi
-if [[ "$QEMU_ACCEL" == "hvf" ]]; then CPU=(-accel hvf -cpu host); else CPU=(-accel tcg -cpu cortex-a76); fi
-
-linux_vm() { # name initrd mac local_port remote_port log
-  qemu-system-aarch64 -machine virt "${CPU[@]}" -m 512M -nographic \
-    -kernel "$ALPINE_DIR/vmlinuz-virt" -initrd "$2" \
-    -append "console=ttyAMA0 rdinit=/init quiet loglevel=3" \
-    -netdev "dgram,id=n0,local.type=inet,local.host=127.0.0.1,local.port=$4,remote.type=inet,remote.host=127.0.0.1,remote.port=$5" \
-    -device "virtio-net-pci,netdev=n0,mac=$3" >"$6" 2>&1 &
-  PIDS+=($!)
-}
+source scripts/lab/common.sh
+lab_cpu_flags
 
 echo "== build"
 cargo build -q -p rrouter-kernel --target aarch64-unknown-none
@@ -61,8 +41,7 @@ ISP_INITRD=$(scripts/lab/build-initrd.sh isp | tail -1)
 CLIENT_INITRD=$(scripts/lab/build-initrd.sh client | tail -1)
 
 echo "== start ISP (203.0.113.1)"
-linux_vm isp "$ISP_INITRD" 52:54:00:00:01:01 $((WAN_PORT + 1)) "$WAN_PORT" "$WORK/isp.log"
-wait_for "$WORK/isp.log" "LAB isp ready" 30 || { echo "ISP did not start:"; cat "$WORK/isp.log"; exit 1; }
+start_isp "$WAN_PORT" "$WORK/isp.log" || exit 1
 
 echo "== start rrouter"
 QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" QEMU_PCAP_DIR="${LAB_PCAP_DIR:-}" QEMU_ACCEL="$QEMU_ACCEL" \
@@ -71,7 +50,7 @@ PIDS+=($!)
 wait_for "$WORK/router.log" "rrouter: boot ok" 40 || { echo "router did not boot:"; cat "$WORK/router.log"; exit 1; }
 
 echo "== start client"
-linux_vm client "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log"
+linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 

@@ -96,3 +96,43 @@ Checks run by the client (`lab/client/init`), each printed as `LAB PASS/FAIL`:
 Options: `LAB_VERBOSE=1` (all consoles), `LAB_PCAP_DIR=dir` (router
 WAN/LAN pcaps), `LAB_KEEP_LOGS=1`, `QEMU_ACCEL=tcg`, `LAB_TIMEOUT=120`.
 Next: PPPoE server on the ISP VM (M5), flent/irtt load tests for CAKE (M6).
+
+## Your Mac on rrouter's LAN (`scripts/mac-lab.sh`)
+```
+MacBook ──bridgeN (vmnet-host)── [rrouter LAN 192.168.1.1]
+                                 [rrouter WAN] ──udp── [ISP VM 203.0.113.1]
+```
+The Mac joins rrouter's LAN through macOS **vmnet-host**. **Only lab traffic
+goes through rrouter:** the script adds one route (203.0.113.0/24 via
+192.168.1.1) and scoped DNS resolvers for `*.lan` / `*.example`
+(`/etc/resolver/`). Your normal internet keeps using Wi-Fi or Ethernet.
+Everything is removed on exit (Ctrl-C), including VMs, the route, and the
+resolver files it created (marked with a header line).
+
+```sh
+scripts/mac-lab.sh           # start + checks, then stay up for manual testing
+scripts/mac-lab.sh --check   # start + checks, tear down; exit 1 on failure
+```
+- **Run it in Terminal:** `sudo` asks for your password once. Homebrew's
+  QEMU has no Apple vmnet entitlement, so the router VM runs as root (the
+  ISP VM doesn't).
+- vmnet-host runs its own small DHCP service on the segment. The script sets
+  its range to 192.168.1.2–9 (`MAC_LAN_RANGE`), so the Mac's side gets
+  **192.168.1.2**, clear of rrouter (.1) and its DHCP pool (.100–.199). The
+  Mac is therefore statically addressed on this LAN; rrouter's DHCP server is
+  tested by the VM lab.
+- The script refuses to start if the Mac already uses 192.168.1.0/24 or 203.0.113.0/24.
+- Checks from the Mac: ping rrouter; `dig` for `nas.lan` and upstream
+  `isp.example`; the macOS resolver for `router.lan`; curl through NAT; the
+  NATed source as seen by the ISP; ping and traceroute through NAT. A
+  firewall probe into the Mac is informational only (the macOS application
+  firewall could also block it; the VM lab has the rigorous check).
+- Useful while it runs: `sudo tcpdump -ni bridgeN` or Wireshark on
+  `bridgeN` to watch rrouter's traffic; `tail -f <logs>/router.log` for the console.
+
+**Full internet through rrouter (planned, "Level 3"):** the WAN would be
+`vmnet-bridged` on a physical interface (Ethernet strongly preferred:
+bridging over Wi-Fi is often refused by access points), and the Mac's
+default route and DNS would point to rrouter. The WAN must be bridged at
+layer 2: a slirp or `vmnet-shared` WAN would route through the Mac itself
+and loop.

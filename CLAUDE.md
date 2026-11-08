@@ -18,13 +18,14 @@ Goals: PPPoE, DHCP (v4 server/client, DHCPv6-PD, RA), a DNS forwarder, NAT, a fi
   - `linker.ld`: kernel at `0x4020_0000`, page-aligned sections, guard pages, 16 KiB exception stack + 256 KiB kernel stack
 - Implemented and tested: `crates/proto-dhcp` (DHCPv4 server), `crates/proto-dns` (forwarder), `crates/fwd` (`wire`, `route`, `neigh`, `conntrack` with NAPT, `forwarder` pipeline), and `crates/qdisc` (`Qdisc` trait + `BFifo` placeholder). Skeleton: `proto-pppoe`
 - `lab/client/`, `lab/isp/`: overlays for the Alpine lab VMs (`/init`, configs, web/CGI); `lab/cache/` (gitignored) holds downloads
-- `scripts/qemu-run.sh` (cargo runner), `scripts/smoke-test.sh`, `scripts/lab-test.sh` (+ `scripts/lab/`), `scripts/unsafe-report.sh`
+- `scripts/qemu-run.sh` (cargo runner), `scripts/smoke-test.sh`, `scripts/lab-test.sh`, `scripts/mac-lab.sh` (+ `scripts/lab/`: fetch, initrd build, `common.sh`), `scripts/unsafe-report.sh`
 - `docs/`: architecture, boot-and-memory, qemu, soho-features, bufferbloat-cake, safety-and-portability, roadmap
 
 ## Commands
 - `cargo kbuild [--release]`: build the kernel. `cargo krun` boots it (`Ctrl-A X` quits; `QEMU_NET=user` adds 2 NICs)
 - `scripts/smoke-test.sh`: cases boot (DHCP + ping), fault-wx, fault-stack. Also run `QEMU_ACCEL=tcg scripts/smoke-test.sh` after boot, MMU, IRQ, timer or driver changes
 - `scripts/lab-test.sh`: client VM + router + ISP VM; DHCP, DNS, NAT, ICMP, traceroute, firewall end to end (`LAB_VERBOSE=1` for consoles). Run it after any network change, also with `QEMU_ACCEL=tcg`
+- `scripts/mac-lab.sh [--check]`: put the developer's Mac on rrouter's LAN (vmnet-host, needs sudo, so run it in Terminal); only 203.0.113.0/24 and `*.lan`/`*.example` DNS go via rrouter; cleans up on exit
 - `cargo test`: host tests for `crates/*`; `cargo clippy --all-targets` for the crates
 - `cargo kclippy [--features <f>]`: run for each of `smoke-test`, `idle-poll`, `fault-wx`, `fault-stack`
 - `cargo kcheck-x86`: type-check neutral code against the x86_64 skeleton (**must stay green**)
@@ -49,6 +50,7 @@ Goals: PPPoE, DHCP (v4 server/client, DHCPv6-PD, RA), a DNS forwarder, NAT, a fi
 - **Packet buffers** come only from `net::packet` (bounded pool, no allocation per packet). On pool exhaustion, drop; never grow.
 - **IRQ handlers** (`irq::register` actions) only acknowledge or mask hardware and touch atomics. No allocation, no `println!`, no locks except ones thread context takes with IRQs masked (the irqchip lock). Work runs in tasks awaiting an `IrqEvent`. Device interrupts follow NAPI: mask → poll until empty → unmask.
 - Under QEMU on macOS, `wfi` wake-up adds up to ~3 ms; don't "fix" timer code for it (use the `idle-poll` feature; see docs/qemu.md).
+- Never change the developer's main network config from scripts: mac-lab only adds lab-scoped routes and resolvers, and removes them on exit.
 - Lab downloads are pinned by SHA-256 in `scripts/lab/fetch-alpine.sh`; never unpin. Update the hashes deliberately.
 - Shell scripts must run on macOS bash 3.2 (no associative arrays) and BSD tools (no `\s` in sed, no `timeout`).
 - Update the status column in `docs/roadmap.md` when a milestone is done.
