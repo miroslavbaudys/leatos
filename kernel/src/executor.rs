@@ -6,12 +6,11 @@
 //!   delay the datapath by the length of **one poll**. Keep polls short.
 //!   Datapath tasks must yield after a bounded batch, or they starve services.
 //! - Wakers may only be called from thread context (never from IRQ
-//!   handlers); handlers set flags that the executor loop turns into wakeups.
+//!   handlers); handlers signal an `irq::IrqEvent`, which the executor loop
+//!   turns into a wakeup.
 //! - Idle: mask IRQs, re-check for work, `wfi`, unmask. A pending interrupt
 //!   always ends `wfi` even while masked, so no wakeup is lost.
 
-#[cfg(not(feature = "idle-poll"))]
-use crate::arch;
 use crate::{irq, timer};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -75,7 +74,7 @@ fn pop() -> Option<Arc<Task>> {
 }
 
 fn has_work() -> bool {
-    timer::pending() || QUEUES.iter().any(|q| !q.lock().is_empty())
+    timer::pending() || irq::has_pending_wakeups() || QUEUES.iter().any(|q| !q.lock().is_empty())
 }
 
 fn poll_task(task: Arc<Task>) {
@@ -102,8 +101,9 @@ pub fn stats() -> (u64, u64) {
 /// Run forever.
 pub fn run() -> ! {
     loop {
-        // Deferred interrupt work first (timer expiries → wakeups).
+        // Deferred interrupt work first: timer expiries and device events → wakeups.
         timer::process();
+        irq::wake_fired();
 
         if let Some(task) = pop() {
             poll_task(task);
@@ -114,7 +114,7 @@ pub fn run() -> ! {
         if !has_work() {
             IDLE_WAITS.fetch_add(1, Ordering::Relaxed);
             #[cfg(not(feature = "idle-poll"))]
-            arch::wait_for_interrupt();
+            crate::arch::cpu::wait_for_interrupt();
         }
         irq::enable(); // pending IRQs are taken here
     }

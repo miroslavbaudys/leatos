@@ -6,8 +6,7 @@
 //! prove that W^X and the stack guard page work (see smoke-test.sh).
 
 use crate::executor::{self, Priority};
-use crate::psci::Conduit;
-use crate::{irq, println, timer};
+use crate::{irq, net, println, timer};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -37,7 +36,7 @@ pub fn fault_tests() {
     #[cfg(feature = "fault-wx")]
     {
         println!("fault-test: writing to .text (must be a permission fault)");
-        let p = crate::dtb::sym::text_start() as *mut u32;
+        let p = crate::mm::sym::text_start() as *mut u32;
         // SAFETY: deliberately invalid; this must fault.
         unsafe { core::ptr::write_volatile(p, 0) };
         println!("fault-test: FAILED, .text is writable");
@@ -57,7 +56,7 @@ pub fn fault_tests() {
     }
 }
 
-pub fn spawn(psci: Conduit) {
+pub fn spawn(has_net: bool) {
     // Spawned in "wrong" order on purpose: the datapath task must still run first.
     executor::spawn(Priority::Service, "selftest-a", async {
         let _ = FIRST.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
@@ -111,6 +110,27 @@ pub fn spawn(psci: Conduit) {
             1,
             "datapath task did not run first"
         );
+        if has_net {
+            // WAN must get a DHCP lease and the gateway must answer a ping.
+            let deadline = timer::Instant::now()
+                .checked_add(Duration::from_secs(10))
+                .unwrap();
+            while !(net::stack::DHCP_OK.load(Ordering::Acquire)
+                && net::stack::PING_OK.load(Ordering::Acquire))
+            {
+                assert!(
+                    timer::Instant::now() < deadline,
+                    "net: no DHCP lease / ping reply"
+                );
+                timer::sleep(Duration::from_millis(10)).await;
+            }
+            let (free, cap, fails) = net::packet::pool_stats();
+            println!(
+                "  net self-test   : ok (dhcp + ping; pool {free}/{cap} free, {fails} alloc failures, {} tx drops)",
+                net::device::tx_drops()
+            );
+        }
+
         let (polls, idles) = executor::stats();
         println!(
             "  executor        : ok (priorities, {} timer irqs, {} irqs, {} spurious, {} polls, {} idle waits)",
@@ -120,15 +140,20 @@ pub fn spawn(psci: Conduit) {
             polls,
             idles
         );
+        let (used, free) = crate::mm::heap::usage();
+        println!(
+            "  heap            : {} KiB used, {} MiB free",
+            used >> 10,
+            free >> 20
+        );
         println!("  uptime          : {} us", timer::uptime().as_micros());
         println!("rrouter: boot ok");
 
         #[cfg(feature = "smoke-test")]
-        crate::psci::system_off(psci);
+        crate::arch::power::off();
 
         #[cfg(not(feature = "smoke-test"))]
         {
-            let _ = psci;
             println!("idle (Ctrl-A X to quit QEMU)");
             loop {
                 timer::sleep(Duration::from_secs(60)).await;

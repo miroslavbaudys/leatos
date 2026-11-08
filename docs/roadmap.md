@@ -11,13 +11,14 @@ earlier milestones (marked 🎂), even though CAKE itself lands in M6. See
 |---|---|---|---|---|
 | M0 | Workspace scaffold: aarch64 boot, MMU identity map, PL011 console, DTB discovery, heap, generic timer, PSCI off, smoke test | `scripts/smoke-test.sh` passes under HVF and TCG | — | ✅ done |
 | M1 | Kernel core: 4 KiB page tables with W^X + WXN and guard pages, separate exception stack, GICv3 + IRQs, **tickless high-resolution timers** 🎂, async executor with **priority classes** 🎂, PCIe enumeration + BAR assignment | self-tests pass (sleep accuracy, priorities); W^X and guard-page faults caught; 2× virtio-net found | 3–4 wk | ✅ done (HVF `wfi` wake-up latency found, see qemu.md) |
-| M2 | virtio-net ×2, **pull-based TX with byte-limited rings** 🎂, packet buffer pools with **`PacketMeta`** 🎂, smoltcp, ping, DHCPv4 client on WAN | client VM can `ping` the router | 3–4 wk | ⏳ next |
-| M3 | DHCPv4 server + DNS forwarder/cache/`.lan` zone | client gets a lease; `dig nas.lan` works | 4–6 wk | |
+| M2 | virtio-net ×2 (INTx, NAPI-style), **pull-based TX with byte-limited rings** 🎂, bounded packet pool with **`PacketMeta`** 🎂, smoltcp, DHCPv4 client on WAN, static LAN; **arch-neutral restructure + unsafe confinement + x86_64 skeleton** | WAN gets a DHCP lease and the gateway answers ping (smoke test) | 3–4 wk | ✅ done (client-VM lab moved to M3; adaptive BQL to M6) |
+| M3 | QEMU lab (ISP VM + client VM over `-netdev dgram`), DHCPv4 server + DNS forwarder/cache/`.lan` zone | client gets a lease; `dig nas.lan` works | 4–6 wk | ⏳ next |
 | M4 | Forwarding plane + conntrack + NAPT + basic firewall; **pipeline with qdisc hook points** and **pre-NAT flow/host hashes from conntrack** 🎂 | client `curl`s through to the ISP VM | 8–12 wk | |
 | M5 | PPPoE WAN, reconnect, MSS clamp; **exposes encapsulation overhead** 🎂 | stable session against `pppoe-server`; survives a PADT | 4–6 wk | |
 | M6 | **Bufferbloat mitigation:** CoDel → FQ-CoDel → **CAKE** (shaper, overhead compensation, COBALT, host isolation, ingress mode, diffserv tins, ACK filter) in `crates/qdisc` | flent RRUL in the lab: < 10 ms added latency under load, fair per-host sharing | 6–10 wk | |
 | M7 | IPv6: DHCPv6-PD, RA/RDNSS, v6 firewall (CAKE handles v6 the same way) | client gets a global v6 address and reaches the ISP | 5–7 wk | |
 | M8 | Persistence (virtio-blk), SNTP, watchdog, panic → reboot, serial CLI, then HTTP UI | config survives a reboot | 4–6 wk | |
+| M9b | **x86_64 port**: Limine boot, ACPI (MADT/MCFG), LAPIC/IOAPIC, TSC-deadline timer, MSI-X, 16550 (see safety-and-portability.md §3) | same smoke tests pass on QEMU q35 | 4–6 wk | |
 | M9 | Hardening: fuzzing all parsers and qdisc, conntrack stress tests, 72 h soak test; CAKE **autorate** for variable-rate links | no leaks or panics over 72 h | ongoing | |
 
 The protocol and qdisc crates (`crates/*`) can be developed in parallel with

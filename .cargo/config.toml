@@ -5,6 +5,7 @@
 kbuild = "build -p rrouter-kernel --target aarch64-unknown-none"
 krun = "run -p rrouter-kernel --target aarch64-unknown-none"
 kclippy = "clippy -p rrouter-kernel --target aarch64-unknown-none"
+kcheck-x86 = "check -p rrouter-kernel --target x86_64-unknown-none"
 ksmoke = "run -p rrouter-kernel --target aarch64-unknown-none --features smoke-test"
 
 [target.aarch64-unknown-none]

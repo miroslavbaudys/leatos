@@ -17,7 +17,7 @@
 | `0x40_1000_0000` | PCIe ECAM (256 MiB) | Device |
 | `0x80_0000_0000` | PCIe 64-bit MMIO window: **not reachable** with a 39-bit VA; not used | — |
 
-Always take addresses from the DTB (`kernel/src/dtb.rs`) rather than
+Always take addresses from the DTB (`kernel/src/platform/dtb.rs`) rather than
 hard-coding them. The table above is for orientation only.
 
 ## Kernel image layout (`kernel/linker.ld`)
@@ -25,12 +25,12 @@ Every boundary is page-aligned so permissions can be applied per section:
 
 ```
 .text (RX) | .rodata (RO) | .data .bss boot-L1-table (RW)
-| guard | exception stack 16 KiB (SP_EL1) | guard | kernel stack 64 KiB (SP_EL0) |
+| guard | exception stack 16 KiB (SP_EL1) | guard | kernel stack 256 KiB (SP_EL0) |
 __kernel_end → heap
 ```
 
 ## Boot sequence
-`kernel/src/boot.S`:
+`kernel/src/arch/aarch64/boot.S`:
 1. QEMU jumps to `_start` on core 0 with the MMU off. Secondary cores stay
    off until PSCI `CPU_ON`.
 2. If running at EL2 (TCG with `virtualization=on`), drop to EL1. Under HVF
@@ -45,7 +45,7 @@ __kernel_end → heap
    so unaligned accesses and atomic exclusives can fault on real cores (HVF).
 6. Install `VBAR_EL1` and call `kernel_main(x0)`.
 
-`kernel/src/main.rs`:
+`kernel/src/main.rs` (`kmain`, called by `arch::aarch64::kernel_main`):
 7. Start the clock, discover hardware from the DTB (**no heap use before `heap::init`**), print the report.
 8. `heap::init`: the rest of RAM after the kernel.
 9. `mmu::init`: build **4 KiB-granular** tables from the heap and switch TTBR0
@@ -61,10 +61,11 @@ __kernel_end → heap
   IRQ path. Every other entry is fatal and goes to `rust_exception`, which decodes
   ESR (exception class, data/instruction abort status, read/write) and names
   guard-page hits.
-- **IRQ path:** `irq_entry` saves x0–x18, x29, x30, ELR, SPSR, FPCR, FPSR and
+- **IRQ path** (`arch/aarch64/boot.S` → `arch/aarch64/exceptions.rs` → `irq::dispatch`): `irq_entry` saves x0–x18, x29, x30, ELR, SPSR, FPCR, FPSR and
   **all q0–q31** (720-byte frame on SP_EL1), calls `rust_irq`, and restores.
-  `rust_irq` loops acknowledge (ICC_IAR1) → dispatch through `irq::HANDLERS` →
-  EOI until a spurious INTID is returned. An INTID with no handler is disabled.
+  `rust_irq` loops acknowledge (ICC_IAR1) → `irq::dispatch` (runs the
+  registered action, then signals its `IrqEvent`) → EOI, until a spurious
+  INTID is returned. An INTID with no handler is disabled.
 - **Handler rules:** acknowledge the device and set an atomic flag. No
   allocation, no printing, no locks shared with thread context.
 - **GICv3:** all interrupts are Group 1 NS at priority `0xa0`, PMR `0xff`,
@@ -87,4 +88,8 @@ it so automated runs exit.
   `-m` ≤ 3G. Moving to a 48-bit VA (start at L0) is a small change once it's needed.
 - Single core only. SMP needs PSCI `CPU_ON`, per-core stacks and redistributors, and an SMP-safe executor.
 - PCI: bus 0 only in practice (bridges are listed but not configured), no
-  I/O BARs, no MSI/MSI-X yet (M2 decides between INTx via `interrupt-map` and MSI-X through the GIC ITS).
+  I/O BARs. Device interrupts use legacy INTx routed through the DTB
+  `interrupt-map` (virtio-net: INTID 36/37). MSI-X arrives with the x86 port
+  or the GIC ITS.
+- The stack was 64 KiB until M2: NIC bring-up in debug builds overflowed it.
+  The guard page caught this cleanly.

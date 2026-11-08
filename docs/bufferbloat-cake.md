@@ -50,6 +50,12 @@ CAKE.
   ring and tune the limit from completion events. On virtio the ring drains
   almost instantly, but real NICs (M8+) need this.
 - **Drain RX promptly** so the RX ring doesn't become the hidden queue for ingress shaping.
+- **Status (M2):** implemented in `drivers/virtio_net.rs` + `net/device.rs`:
+  `can_transmit()` = free descriptor **and** in-flight bytes below
+  `tx_byte_limit` (fixed, 8 × 1514 B). smoltcp only gets a TX token when
+  there is room. Adaptive (BQL) limits follow in M6. The bounded packet pool
+  (`net/packet.rs`, 1024 × 2 KiB) carries `PacketMeta` and has 128 B of
+  headroom on every received packet, for re-encapsulation without a copy.
 
 ### 3.2 Timers and scheduling (M1, kernel core)
 - A 1500-byte packet at 50 Mbit/s takes 240 µs, and at 500 Mbit/s 24 µs. The shaper

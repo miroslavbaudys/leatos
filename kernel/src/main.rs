@@ -1,79 +1,82 @@
-//! rrouter — bare-metal aarch64 unikernel for SOHO routing.
+//! rrouter — bare-metal unikernel for SOHO routing (aarch64 today, x86_64 later).
 //!
-//! Single address space, everything runs at EL1 (on SP_EL0; exceptions use
-//! SP_EL1). Boot flow:
-//! `boot.S` (_start) → [`kernel_main`] → DTB discovery → heap → MMU (W^X) →
-//! GIC + timer IRQ → PCIe enumeration → executor.
+//! Single address space; everything runs in kernel mode. Boot order is
+//! arch-neutral (this file); the arch backend supplies entry, CPU, irqchip,
+//! timer and MMU hardware (`arch/`). See docs/architecture.md and
+//! docs/safety-and-portability.md.
 //!
-//! See `docs/architecture.md` and `docs/boot-and-memory.md`.
+//! `unsafe` is denied crate-wide. Only modules declared with
+//! `#[allow(unsafe_code)]` may use it: `grep -rn "allow(unsafe_code)"`
+//! lists the whole audit surface.
 
 #![no_std]
 #![no_main]
+#![deny(unsafe_code)]
+// The x86_64 backend is a compile-only skeleton (no IRQ entry yet).
+#![cfg_attr(target_arch = "x86_64", allow(dead_code))]
 
 extern crate alloc;
 
 mod arch;
 mod console;
-mod dtb;
-mod exceptions;
+mod drivers;
 mod executor;
-mod gic;
-mod heap;
 mod irq;
-mod mmu;
+mod mm;
+#[allow(unsafe_code)] // the one constructor that turns an address into a device region
+mod mmio;
+mod net;
+#[allow(unsafe_code)] // ECAM handle creation (2 operations)
 mod pci;
-mod psci;
+mod platform;
+#[allow(unsafe_code)] // feature-gated deliberate faults
 mod selftest;
 mod timer;
 
-core::arch::global_asm!(include_str!("boot.S"));
+use executor::Priority;
 
-/// Rust entry point, called from `boot.S` with the MMU on and a valid stack.
-///
-/// `x0_dtb` is whatever QEMU left in `x0` (the DTB address for Linux-style
-/// boots, usually 0 for bare-metal ELF boots).
-#[unsafe(no_mangle)]
-pub extern "C" fn kernel_main(x0_dtb: usize) -> ! {
+/// Arch-neutral kernel main, called by the arch entry point with the MMU on
+/// and a valid stack. `boot_arg` is the firmware hand-off (DTB address in x0).
+pub fn kmain(boot_arg: usize) -> ! {
     timer::init_clock();
     println!();
-    println!("rrouter {} — aarch64 bare-metal", env!("CARGO_PKG_VERSION"));
-    println!("  exception level : EL{}", arch::current_el());
+    println!("rrouter {} — bare metal", env!("CARGO_PKG_VERSION"));
+    println!("  privilege level : {}", arch::cpu::privilege_level());
 
-    // SAFETY: called once, early, before anything else reads the DTB.
-    let info = match unsafe { dtb::BootInfo::discover(x0_dtb) } {
-        Ok(info) => info,
-        Err(e) => panic!("device tree not found: {e}"),
-    };
-    if let Some(base) = info.uart_base {
-        console::set_base(base);
-    }
+    let info = arch::discover(boot_arg).unwrap_or_else(|e| panic!("platform discovery: {e}"));
+    arch::console::init(info.console_base);
+    arch::power::init(info.power);
     info.print();
 
-    heap::init(&info);
-    mmu::init(&info);
-
-    let gic = info.gic.expect("no GICv3 in device tree");
-    gic::init(&gic);
-    timer::init_irq(info.vtimer_intid);
+    mm::heap::init(&info);
+    mm::mmu::init(&info);
+    arch::irqchip::init(&info);
+    timer::init_irq(info.timer_intid);
     irq::enable();
     println!("  timer           : {} Hz, tickless", timer::frequency());
 
-    if let Some(pcie) = info.pcie {
-        let devices = pci::enumerate(&pcie);
-        pci::print(&devices);
+    net::packet::init_pool(net_pool_size());
+    let mut pci = info.pcie.map(|p| pci::init(&p));
+    if let Some(pci) = &pci {
+        pci::print(pci);
     }
+    let ifs = pci.as_mut().map(net::stack::bring_up).unwrap_or_default();
+    let has_net = !ifs.is_empty();
 
     selftest::fault_tests();
-    selftest::spawn(info.psci);
-
+    selftest::spawn(has_net);
+    executor::spawn(Priority::Datapath, "net", net::stack::run(ifs));
     executor::run()
+}
+
+/// Packet buffers to preallocate: 2 NICs × (RX ring + TX ring) plus room
+/// for queues. 1024 × 2 KiB = 2 MiB.
+fn net_pool_size() -> usize {
+    1024
 }
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // SAFETY: we are about to halt; taking the console from a holder that
-    // may have been interrupted is acceptable here.
-    unsafe { console::force_unlock() };
-    println!("\n!!! KERNEL PANIC: {info}");
-    arch::halt()
+    fatal_println!("\n!!! KERNEL PANIC: {info}");
+    arch::cpu::halt()
 }

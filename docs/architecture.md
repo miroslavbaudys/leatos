@@ -97,11 +97,18 @@ crates/proto-dns     forwarder, cache, local zone
 crates/fwd           LPM, neighbor cache, conntrack, NAT, firewall
 crates/qdisc         CoDel, FQ-CoDel, CAKE (simulation-tested with fake time)
 kernel/              bare-metal platform that drives the crates
+  arch/<target>/     all CPU-specific code (aarch64 today, x86_64 skeleton)
+  platform/          neutral BootInfo + firmware backends (DTB; ACPI later)
+  mm/ mmio.rs        memory, page tables, DMA; the safe MMIO abstraction
+  drivers/ net/      virtio-net, packet pool, smoltcp glue, network task
 (platform-host)      planned: TAP/pcap harness to run the crates on a dev machine
 ```
 
 The benefits: fast iteration and unit tests on the host, fuzzing with
 `cargo-fuzz`, and protocol code that doesn't depend on the kernel being finished.
+
+Kernel code layout and the unsafe policy are described in
+`docs/safety-and-portability.md`.
 
 ## Dependency constraints
 Only `no_std` crates may be used (std-only crates like tokio, hickory-dns
@@ -112,7 +119,9 @@ and dhcproto are out).
 | DTB parsing | `fdt` |
 | Heap | `linked_list_allocator` (bring-up); packet buffers come from dedicated pools |
 | Locks | `spin` |
-| virtio drivers | `virtio-drivers` (rcore-os), we implement its `Hal` trait |
+| virtio drivers + PCI config access | `virtio-drivers` (rcore-os), we implement its `Hal` trait |
+| MMIO | `safe-mmio` (via `mmio::Region`) |
+| aarch64 system registers | `aarch64-cpu` (arch backend only) |
 | TCP/IP for the router's own services | `smoltcp` |
 | DNS wire format | `simple-dns` or `domain` (check no_std support), or our own |
 | SSH / HTTP (later) | `sunset` / `picoserve` |

@@ -23,7 +23,8 @@ qdisc = { path = "crates/qdisc" }
 unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
-undocumented_unsafe_blocks = "warn"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "warn"
 
 [profile.release]
 debug = true      # keep symbols for gdb; they are not loaded into guest memory

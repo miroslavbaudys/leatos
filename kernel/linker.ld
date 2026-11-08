@@ -17,7 +17,7 @@
 ENTRY(_start)
 
 KERNEL_BASE    = 0x40200000;
-STACK_SIZE     = 0x10000; /* 64 KiB kernel (thread) stack, SP_EL0 */
+STACK_SIZE     = 0x40000; /* 256 KiB kernel (thread) stack, SP_EL0 */
 EXC_STACK_SIZE = 0x4000;  /* 16 KiB exception stack, SP_EL1     */
 PAGE           = 4096;
 

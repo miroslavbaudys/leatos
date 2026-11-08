@@ -24,7 +24,16 @@ fault-stack = ["smoke-test"]
 [dependencies]
 fdt = "0.1.5"
 linked_list_allocator = "0.10"
-spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex", "once"] }
+virtio-drivers = { version = "0.13", default-features = false }
+safe-mmio = "0.3"
+smoltcp = { version = "0.14", default-features = false, features = [
+    "alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6",
+    "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "socket-dns",
+] }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+aarch64-cpu = "11"
 
 [lints]
 workspace = true

@@ -1,64 +1,43 @@
-//! Tickless high-resolution timers on the ARM generic *virtual* timer.
+//! Tickless high-resolution timers (arch-neutral).
 //!
 //! There is no periodic tick (CAKE requirement, docs/bufferbloat-cake.md
-//! §3.2). The comparator `CNTV_CVAL_EL0` is always programmed to the
-//! earliest pending deadline, or the timer is switched off when nothing is
+//! §3.2). The hardware comparator (`CNTV_CVAL_EL0` on aarch64, TSC-deadline on
+//! x86_64) is always programmed to the earliest pending deadline, or the timer is switched off when nothing is
 //! waiting. Resolution is one counter tick (about 42 ns at 24 MHz under HVF).
 //!
-//! IRQ path: the handler only masks the timer and sets `FIRED`. Expired
-//! timers are processed and their wakers called by the executor in thread
-//! context ([`process`]).
+//! IRQ path: the handler only masks the timer, then `FIRED` is signalled.
+//! Expired timers are processed and their wakers called by the executor in
+//! thread context ([`process`]). The hardware side is `arch::timer`.
 
-use crate::{gic, irq};
+use crate::arch::timer as hw;
+use crate::irq::{self, IrqEvent, Trigger};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::arch::asm;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use spin::Mutex;
 
-const CTL_ENABLE: u64 = 1 << 0;
-const CTL_IMASK: u64 = 1 << 1;
-
 static BOOT_TICKS: AtomicU64 = AtomicU64::new(0);
 static FREQ: AtomicU64 = AtomicU64::new(1);
-static FIRED: AtomicBool = AtomicBool::new(false);
 static TIMER_IRQS: AtomicU64 = AtomicU64::new(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+static FIRED: IrqEvent = IrqEvent::new();
 
 /// Pending timers, keyed by (deadline in ticks, unique id). Thread context only.
 static TIMERS: Mutex<BTreeMap<(u64, u64), Waker>> = Mutex::new(BTreeMap::new());
 
-// ---- Raw counter access --------------------------------------------------------
-
-/// Counter frequency in Hz (CNTFRQ_EL0).
+/// Counter frequency in Hz.
 pub fn frequency() -> u64 {
-    let f: u64;
-    // SAFETY: reading CNTFRQ_EL0 has no side effects.
-    unsafe { asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack)) };
-    f
+    FREQ.load(Ordering::Relaxed)
 }
 
-/// Raw virtual counter value (CNTVCT_EL0).
+/// Raw counter value.
 #[inline]
 pub fn ticks() -> u64 {
-    let t: u64;
-    // SAFETY: `isb` + reading CNTVCT_EL0 has no side effects.
-    unsafe { asm!("isb", "mrs {}, cntvct_el0", out(reg) t, options(nomem, nostack)) };
-    t
-}
-
-fn write_ctl(v: u64) {
-    // SAFETY: CNTV_CTL_EL0 only controls the EL1 virtual timer.
-    unsafe { asm!("msr cntv_ctl_el0, {}", "isb", in(reg) v, options(nomem, nostack)) };
-}
-
-fn write_cval(v: u64) {
-    // SAFETY: CNTV_CVAL_EL0 only sets the virtual timer comparator.
-    unsafe { asm!("msr cntv_cval_el0, {}", in(reg) v, options(nomem, nostack)) };
+    hw::ticks()
 }
 
 // ---- Time types ----------------------------------------------------------------
@@ -73,6 +52,9 @@ impl Instant {
     }
     pub fn elapsed(self) -> Duration {
         ticks_to_duration(ticks().saturating_sub(self.0))
+    }
+    pub fn saturating_duration_since(self, earlier: Instant) -> Duration {
+        ticks_to_duration(self.0.saturating_sub(earlier.0))
     }
     pub fn checked_add(self, d: Duration) -> Option<Self> {
         self.0.checked_add(duration_to_ticks(d)).map(Instant)
@@ -101,46 +83,43 @@ pub fn irq_count() -> u64 {
 
 // ---- Setup and IRQ ---------------------------------------------------------------
 
-/// Start the monotonic clock. Works without the GIC.
+/// Start the monotonic clock. Works before the interrupt controller is up.
 pub fn init_clock() {
-    FREQ.store(frequency().max(1), Ordering::Relaxed);
+    FREQ.store(hw::frequency(), Ordering::Relaxed);
     BOOT_TICKS.store(ticks(), Ordering::Relaxed);
 }
 
-/// Hook the virtual timer interrupt up (requires the GIC).
+/// Hook the timer interrupt up (requires the interrupt controller).
 pub fn init_irq(intid: u32) {
-    write_ctl(0);
-    irq::register(intid, on_irq);
-    gic::enable_ppi(intid);
+    hw::stop();
+    irq::register(intid, on_irq, &FIRED);
+    crate::arch::irqchip::enable(intid, Trigger::Level);
 }
 
-/// IRQ context: mask the (level-sensitive) timer output and flag the executor.
+/// IRQ context: silence the level-sensitive timer output; `FIRED` is
+/// signalled by the dispatcher afterwards.
 fn on_irq(_intid: u32) {
-    write_ctl(CTL_ENABLE | CTL_IMASK);
+    hw::mask_from_irq();
     TIMER_IRQS.fetch_add(1, Ordering::Relaxed);
-    FIRED.store(true, Ordering::Release);
 }
 
 /// True if the timer fired and [`process`] has work to do.
 pub fn pending() -> bool {
-    FIRED.load(Ordering::Acquire)
+    FIRED.is_fired()
 }
 
 /// Program the comparator for the earliest deadline, or turn the timer off.
 fn program(timers: &BTreeMap<(u64, u64), Waker>) {
     match timers.keys().next() {
-        Some(&(deadline, _)) => {
-            write_cval(deadline);
-            write_ctl(CTL_ENABLE); // unmasked; fires immediately if already due
-        }
-        None => write_ctl(0),
+        Some(&(deadline, _)) => hw::set_deadline(deadline),
+        None => hw::stop(),
     }
 }
 
 /// Thread context: wake every expired timer and re-arm the comparator.
 /// Called by the executor on every loop iteration.
 pub fn process() {
-    if !FIRED.swap(false, Ordering::AcqRel) {
+    if !FIRED.take() {
         return;
     }
     let now = ticks();

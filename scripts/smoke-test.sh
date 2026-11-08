@@ -9,7 +9,7 @@
 #   SMOKE_VERBOSE=1 ...                   # print full console output
 #
 # Cases:
-#   boot         normal boot with 2 NICs: self-tests pass, PCI finds virtio-net
+#   boot         normal boot with 2 NICs: self-tests pass, WAN gets a DHCP lease, gateway answers ping
 #   fault-wx     writing to .text must raise a permission fault (W^X)
 #   fault-stack  unbounded recursion must hit the kernel stack guard page
 set -euo pipefail
@@ -51,9 +51,9 @@ for c in $CASES; do
     boot)
       boot smoke-test
       ok=0
-      if has "rrouter: boot ok" && has "virtio-net" && ! has "PANIC" && ! has "UNHANDLED"; then ok=1; fi
+      if has "rrouter: boot ok" && has "net self-test   : ok" && ! has "PANIC" && ! has "UNHANDLED"; then ok=1; fi
       result "boot" "$ok"
-      grep -E "sleep overshoot|executor  " "$LOG" | sed 's/^/        /' || true
+      grep -E "sleep overshoot|executor  |net ping|net self-test" "$LOG" | sed 's/^/        /' || true
       ;;
     fault-wx)
       boot fault-wx

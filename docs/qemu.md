@@ -14,6 +14,8 @@ Requirements: QEMU ≥ 8 (`brew install qemu`) and the Rust toolchain. The
 | `scripts/smoke-test.sh` | automated boot tests (cases `boot`, `fault-wx`, `fault-stack`); non-zero exit on failure |
 | `cargo test` | host unit tests for the `crates/*` protocol crates |
 | `cargo kclippy` | clippy for the kernel |
+| `cargo kcheck-x86` | type-check the kernel for x86_64 against the arch skeleton |
+| `scripts/unsafe-report.sh` | list modules allowed to use `unsafe` and count unsafe constructs |
 
 `scripts/qemu-run.sh` reads these environment variables:
 
@@ -28,7 +30,9 @@ Requirements: QEMU ≥ 8 (`brew install qemu`) and the Rust toolchain. The
 | `QEMU_EXTRA` | unset | extra arguments passed to QEMU |
 
 Run both `scripts/smoke-test.sh` and `QEMU_ACCEL=tcg scripts/smoke-test.sh`
-before committing boot, MMU, IRQ or timer changes. `SMOKE_CASES="boot"`
+before committing boot, MMU, IRQ, timer or driver changes. The smoke test
+uses `QEMU_NET=user` by default: QEMU's built-in "slirp" network gives the
+WAN a DHCP lease (10.0.2.15, gateway 10.0.2.2), and the boot test pings the gateway. `SMOKE_CASES="boot"`
 selects cases, and `SMOKE_VERBOSE=1` prints the full console output.
 
 ### Kernel features
