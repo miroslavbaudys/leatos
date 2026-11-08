@@ -92,6 +92,24 @@ blocklists, DNSSEC.
 Resolution order in the request handler: local zone → blocklist → cache →
 forward to the current upstream (the upstream list is swapped atomically on `WanUp`).
 
+## NAT and firewall
+**Status (M4): implemented** in `crates/fwd` (27 tests, including fuzzing) and
+`kernel/src/net/datapath.rs`, verified end to end in the lab:
+- NAPT/masquerade on the WAN with **endpoint-independent mapping**
+  (RFC 4787) and endpoint-dependent filtering. NAT ports 10000–39999
+  (router-local sockets use ≥ 40000). Port preservation when free.
+- Conntrack: TCP state (SYN → established → closing/closed) with
+  timeouts, UDP unreplied/assured, ICMP echo; bounded at 16384 entries;
+  all NAT state flushed when the WAN address changes.
+- ICMP errors: TTL-exceeded generated (rate-limited, 50/s), and errors
+  about NATed flows translated, including the embedded header.
+- Firewall: new flows only LAN→WAN; TCP must start with SYN; WAN→LAN only
+  for tracked connections; hairpin, fragments and unknown protocols dropped.
+- Open: **port forwarding (DNAT)**, hairpin NAT, IP fragment reassembly
+  (fragments are dropped today), ICMP unreachable for no-route, MSS
+  clamping + PMTU (M5, with PPPoE), UPnP/NAT-PMP, faster conntrack
+  structures (hash table + timer wheel instead of BTreeMap + O(n) expiry).
+
 ## Supporting pieces needed by all of the above
 - NAT (masquerade on the WAN) and a stateful firewall: LAN→WAN allowed,
   WAN→LAN only established or related, input protection, an IPv6 firewall

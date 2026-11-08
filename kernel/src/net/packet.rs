@@ -39,7 +39,9 @@ pub struct PacketMeta {
     /// Pre-NAT internal host hashes, for host isolation.
     pub src_host_hash: u16,
     pub dst_host_hash: u16,
-    /// DiffServ tin, from DSCP.
+    /// DiffServ code point (from the IP header).
+    pub dscp: u8,
+    /// DiffServ tin, mapped from DSCP by the qdisc.
     pub tin: u8,
     pub ecn_capable: bool,
     /// On-wire length after overhead compensation.
@@ -141,6 +143,13 @@ impl PacketBuf {
         self.len -= n;
     }
 
+    /// The packet plus all tailroom after it (for in-place rewrites that may
+    /// grow the packet, e.g. ICMP error generation).
+    pub fn data_with_tailroom_mut(&mut self) -> &mut [u8] {
+        let s = self.start;
+        &mut self.buf_mut()[s..]
+    }
+
     /// Receive area for DMA: the storage after [`HEADROOM`], so received
     /// packets keep headroom for re-encapsulation when forwarded. After the
     /// device fills it, call [`Self::set_rx_range`].
@@ -164,5 +173,11 @@ impl Drop for PacketBuf {
         if let Some(s) = self.storage.take() {
             POOL.lock().push(s);
         }
+    }
+}
+
+impl qdisc::Packet for PacketBuf {
+    fn len_bytes(&self) -> usize {
+        self.len
     }
 }

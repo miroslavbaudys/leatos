@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Build a lab VM initramfs: Alpine's initramfs-virt (kernel modules,
+# busybox) plus an overlay archive with lab/<role>/ and busybox-extras.
+# Linux unpacks concatenated cpio archives in order, so the overlay's
+# /init replaces Alpine's.   Usage: build-initrd.sh client|isp  (prints path)
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+
+ROLE="${1:?usage: build-initrd.sh client|isp}"
+[[ -d "lab/$ROLE" ]] || { echo "no lab/$ROLE" >&2; exit 1; }
+ALPINE_DIR=$(scripts/lab/fetch-alpine.sh | tail -1)
+OUT="lab/cache/$ROLE-initrd.img"
+STAGE=$(mktemp -d -t rrouter-initrd)
+trap 'rm -rf "$STAGE"' EXIT
+
+cp -R "lab/$ROLE/." "$STAGE/"
+mkdir -p "$STAGE/usr/bin"
+tar -xzf "$ALPINE_DIR"/busybox-extras-*.apk -C "$STAGE/usr" bin/busybox-extras 2>/dev/null
+chmod 0755 "$STAGE/init" "$STAGE/usr/bin/busybox-extras"
+( cd "$STAGE" && find . -mindepth 1 | sed 's|^\./||' | cpio -o -H newc 2>/dev/null | gzip -9 ) > "$STAGE.cpio.gz"
+cat "$ALPINE_DIR/initramfs-virt" "$STAGE.cpio.gz" > "$OUT"
+rm -f "$STAGE.cpio.gz"
+echo "$OUT"

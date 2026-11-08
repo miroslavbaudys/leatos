@@ -1,0 +1,13 @@
+#!/usr/bin/busybox sh
+# Firewall probe: route the LAN subnet via the caller (the router's WAN
+# address) and try to open a connection *into* the LAN host given in the
+# query string. Reports whether the route was installed (so "BLOCKED"
+# really means the router dropped it) and probes ourselves as a control.
+bb=/usr/bin/busybox
+addr=${REMOTE_ADDR#\[}; addr=${addr%\]}; addr=${addr#::ffff:}
+echo "Content-Type: text/plain"
+echo
+$bb route del -net 192.168.1.0 netmask 255.255.255.0 2>/dev/null
+if $bb route add -net 192.168.1.0 netmask 255.255.255.0 gw "$addr" 2>/dev/null; then echo "route=OK via $addr"; else echo "route=FAILED via $addr"; fi
+if $bb wget -q -T 2 -O /dev/null "http://127.0.0.1/" 2>/dev/null; then echo "control=OPEN"; else echo "control=BLOCKED"; fi
+if $bb wget -q -T 3 -O /dev/null "http://$QUERY_STRING:8080/" 2>/dev/null; then echo "target=OPEN"; else echo "target=BLOCKED"; fi

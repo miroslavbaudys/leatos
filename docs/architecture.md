@@ -42,7 +42,7 @@ we need a panic handler that reboots plus a watchdog (milestone M7).
 └───────────────────────────────────────────────────────────────┘
 ```
 
-### Packet path
+### Packet path (implemented in M4: `kernel/src/net/datapath.rs` + `crates/fwd`)
 1. A virtio-net RX interrupt wakes the network task, which drains the RX queue in batches.
 2. Classification: if the packet is addressed to the router (one of its IPs,
    ARP/NDP for its IPs, PPPoE discovery or control frames), hand it to the local
@@ -52,7 +52,10 @@ we need a panic handler that reboots plus a watchdog (milestone M7).
    flow and host hashes, tin, wire length), WAN-ingress CAKE (download
    shaping), route lookup (LPM), neighbor resolution (queue the packet if the
    neighbor is unresolved), TTL decrement and incremental checksum update.
-4. Egress: enqueue into the egress interface's qdisc (CAKE on the WAN). A TX
+   Packets *for* the router go into a small bounded per-port queue and
+   from there into smoltcp. The router's own transmissions also go through
+   the port's qdisc, so the qdisc sees all egress traffic.
+4. Egress: enqueue into the egress interface's qdisc (CAKE on the WAN; a bounded FIFO until M6). A TX
    task **pulls** from the qdisc when the driver has ring space and the
    shaper allows it, then encapsulates and transmits. The qdisc is the only
    place packets wait (no hidden queues).

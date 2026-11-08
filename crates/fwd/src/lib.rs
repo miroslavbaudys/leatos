@@ -1,22 +1,27 @@
-//! Forwarding plane: LPM routing table, neighbor cache, conntrack, NAPT, firewall, MSS clamping.
+//! IPv4 forwarding plane: routing, neighbor resolution, connection
+//! tracking with NAT (masquerade), a stateful firewall and per-packet
+//! classification for the qdisc (CAKE).
 //!
-//! Planned modules: `lpm`, `neigh` (ARP/NDP cache + pending-packet queue),
-//! `conntrack`, `nat`, `filter`, `pipeline` (per-packet run-to-completion).
-//! See `docs/architecture.md#forwarding-plane`.
+//! - [`wire`]: header access and incremental checksums
+//! - [`route`]: longest-prefix-match table
+//! - [`neigh`]: ARP cache with a tiny bounded pending queue
+//! - [`conntrack`]: connections, NAPT with endpoint-independent mapping
+//! - [`forwarder`]: the per-packet pipeline → [`forwarder::Verdict`]
 //!
-//! Design rules (see `docs/architecture.md`):
-//! - `#![no_std]` + `alloc`: the same code runs in the bare-metal kernel and
-//!   in host tests.
-//! - Sans-IO: no sockets, no clocks, no async runtime. Callers feed in bytes
-//!   and the current time, and get back bytes to send and events.
+//! Design rules (see `docs/architecture.md`): `#![no_std]` + `alloc`,
+//! sans-IO (frames and `now_ms` in, verdicts out), no allocation per
+//! forwarded packet, every input bounds-checked (fuzz-tested).
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds() {}
-}
+pub mod conntrack;
+pub mod forwarder;
+pub mod neigh;
+pub mod route;
+pub mod wire;
+
+/// Interface index, as assigned by [`forwarder::Forwarder::add_interface`].
+pub type IfIndex = u8;

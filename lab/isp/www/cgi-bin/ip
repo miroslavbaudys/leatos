@@ -1,0 +1,7 @@
+#!/usr/bin/busybox sh
+# Report the client address as seen by the ISP (i.e. after NAT).
+# httpd listens dual-stack, so IPv4 peers appear as [::ffff:a.b.c.d].
+addr=${REMOTE_ADDR#\[}; addr=${addr%\]}; addr=${addr#::ffff:}
+echo "Content-Type: text/plain"
+echo
+echo "$addr"

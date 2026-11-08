@@ -176,9 +176,11 @@ version = "0.1.0"
 dependencies = [
  "aarch64-cpu",
  "fdt",
+ "fwd",
  "linked_list_allocator",
  "proto-dhcp",
  "proto-dns",
+ "qdisc",
  "safe-mmio",
  "smoltcp",
  "spin",

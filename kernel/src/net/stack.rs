@@ -1,22 +1,25 @@
-//! The router's own IP stack (smoltcp) on the WAN and LAN interfaces.
+//! The network task: ports (NIC + qdisc + router stack), the forwarding
+//! datapath, and the router's own services.
 //!
-//! - WAN (first virtio-net): DHCPv4 client (smoltcp socket for now;
-//!   `crates/proto-dhcp` takes over later).
-//! - LAN (second virtio-net): static 192.168.1.1/24.
-//! - After a lease: ICMP echo to the gateway (proves RX + TX + IRQs).
+//! - WAN (first virtio-net): DHCPv4 client (smoltcp socket for now).
+//! - LAN (second virtio-net): static 192.168.1.1/24, DHCP server, DNS.
+//! - Every received frame goes through `net::datapath` first: frames for
+//!   the router reach smoltcp, everything else is forwarded (NAT, firewall).
+//! - After a WAN lease: ICMP echo to the gateway (boot self-test).
 //!
 //! Interrupts work NAPI-style: the IRQ action masks the INTx line; this task
 //! wakes, clears the device's interrupt status, polls until idle, and
 //! unmasks. The task runs at `Priority::Datapath`.
-//!
-//! The forwarding plane (M4) will sit beside this: packets *for* the router
-//! go to smoltcp, packets *through* it go to `crates/fwd`.
 
 use crate::drivers::virtio_net::VirtioNet;
 use crate::irq::{self, IrqEvent, Trigger};
+use crate::net::datapath::{self, Datapath};
+use crate::net::device::{PortDevice, PortQdisc};
+use crate::net::packet::PacketBuf;
 use crate::net::services::LanServices;
 use crate::pci::Pci;
 use crate::{arch, println, timer};
+use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -43,9 +46,17 @@ const PING_IDENT: u16 = 0x22b;
 const PING_COUNT: u16 = 3;
 const PING_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Egress qdisc limits per port (placeholder FIFO until CAKE).
+const QDISC_PACKETS: usize = 256;
+const QDISC_BYTES: usize = 128 * 1024;
+
 pub struct NetIf {
     pub name: &'static str,
     pub dev: VirtioNet,
+    /// Egress queue: forwarded traffic and the router's own traffic.
+    pub qdisc: PortQdisc,
+    /// Frames for the router stack (filled by the datapath, drained by smoltcp).
+    pub local_rx: VecDeque<PacketBuf>,
     iface: Interface,
     pub(crate) sockets: SocketSet<'static>,
     irq: Option<(u32, &'static IrqEvent)>,
@@ -73,7 +84,7 @@ pub fn bring_up(pci: &mut Pci) -> Vec<NetIf> {
     let mut ifs = Vec::new();
     for (i, d) in devs.iter().enumerate().take(2) {
         let name = if i == 0 { "wan0" } else { "lan0" };
-        let mut dev = match VirtioNet::new(pci, d) {
+        let dev = match VirtioNet::new(pci, d) {
             Ok(dev) => dev,
             Err(e) => {
                 println!("  net {name}: init failed: {e:?}");
@@ -83,7 +94,14 @@ pub fn bring_up(pci: &mut Pci) -> Vec<NetIf> {
         let mac = dev.mac();
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = timer::ticks();
-        let mut iface = Interface::new(config, &mut dev, now());
+        let mut qdisc = PortQdisc::new(QDISC_PACKETS, QDISC_BYTES);
+        let mut local_rx = VecDeque::with_capacity(datapath::LOCAL_RX_MAX);
+        let mut port = PortDevice {
+            local_rx: &mut local_rx,
+            qdisc: &mut qdisc,
+            now_ns: datapath::now_ns(),
+        };
+        let mut iface = Interface::new(config, &mut port, now());
         let mut sockets = SocketSet::new(Vec::new());
         if i == 0 {
             sockets.add(dhcpv4::Socket::new());
@@ -111,6 +129,8 @@ pub fn bring_up(pci: &mut Pci) -> Vec<NetIf> {
         ifs.push(NetIf {
             name,
             dev,
+            qdisc,
+            local_rx,
             iface,
             sockets,
             irq,
@@ -214,8 +234,14 @@ impl Pinger {
     }
 }
 
-/// Returns the new upstream DNS server list when the lease changed.
-fn handle_dhcp(nif: &mut NetIf, pinger: &mut Pinger) -> Option<Vec<Ipv4Address>> {
+/// A WAN lease change: (address/prefix, gateway, DNS servers); `None` fields = lost.
+struct LeaseChange {
+    addr: Option<(Ipv4Address, u8)>,
+    gateway: Option<Ipv4Address>,
+    dns: Vec<Ipv4Address>,
+}
+
+fn handle_dhcp(nif: &mut NetIf, pinger: &mut Pinger) -> Option<LeaseChange> {
     let (handle, _) = nif
         .sockets
         .iter()
@@ -254,7 +280,11 @@ fn handle_dhcp(nif: &mut NetIf, pinger: &mut Pinger) -> Option<Vec<Ipv4Address>>
             );
             DHCP_OK.store(true, Ordering::Release);
             pinger.target = cfg.router;
-            Some(cfg.dns_servers.iter().copied().collect())
+            Some(LeaseChange {
+                addr: Some((cfg.address.address(), cfg.address.prefix_len())),
+                gateway: cfg.router,
+                dns: cfg.dns_servers.iter().copied().collect(),
+            })
         }
         Some(dhcpv4::Event::Deconfigured) => {
             if DHCP_OK.load(Ordering::Acquire) {
@@ -264,9 +294,26 @@ fn handle_dhcp(nif: &mut NetIf, pinger: &mut Pinger) -> Option<Vec<Ipv4Address>>
             nif.iface.routes_mut().remove_default_ipv4_route();
             DHCP_OK.store(false, Ordering::Release);
             pinger.target = None;
-            Some(Vec::new())
+            Some(LeaseChange {
+                addr: None,
+                gateway: None,
+                dns: Vec::new(),
+            })
         }
         None => None,
+    }
+}
+
+fn poll_stacks(ifs: &mut [NetIf]) {
+    let t = now();
+    let now_ns = datapath::now_ns();
+    for nif in ifs.iter_mut() {
+        let mut port = PortDevice {
+            local_rx: &mut nif.local_rx,
+            qdisc: &mut nif.qdisc,
+            now_ns,
+        };
+        nif.iface.poll(t, &mut port, &mut nif.sockets);
     }
 }
 
@@ -275,6 +322,7 @@ pub async fn run(mut ifs: Vec<NetIf>) {
     if ifs.is_empty() {
         return;
     }
+    let mut dp = Datapath::new(&ifs);
     let mut pinger = Pinger::new(&mut ifs[0].sockets);
     let mut services = (ifs.len() >= 2).then(|| {
         let (wan, lan) = ifs.split_at_mut(1);
@@ -295,27 +343,29 @@ pub async fn run(mut ifs: Vec<NetIf>) {
             }
         }
 
-        // Step 2: process everything pending.
-        let t = now();
-        for nif in ifs.iter_mut() {
-            nif.iface.poll(t, &mut nif.dev, &mut nif.sockets);
-        }
-        if let Some(upstreams) = handle_dhcp(&mut ifs[0], &mut pinger)
-            && let Some(svc) = services.as_mut()
-        {
-            svc.set_upstreams(&upstreams);
+        // Step 2: received frames → forwarder (forward / local / drop).
+        dp.rx(&mut ifs);
+
+        // Step 3: the router's own stack and services.
+        poll_stacks(&mut ifs);
+        if let Some(change) = handle_dhcp(&mut ifs[0], &mut pinger) {
+            dp.set_wan(change.addr, change.gateway);
+            if let Some(svc) = services.as_mut() {
+                svc.set_upstreams(&change.dns);
+            }
         }
         pinger.step(&mut ifs[0].sockets);
         if let Some(svc) = services.as_mut() {
             let (wan, lan) = ifs.split_at_mut(1);
             svc.step(&mut lan[0].sockets, Some(&mut wan[0].sockets));
         }
-        let t = now();
-        for nif in ifs.iter_mut() {
-            nif.iface.poll(t, &mut nif.dev, &mut nif.sockets);
-        }
+        poll_stacks(&mut ifs);
+        dp.housekeeping(&mut ifs);
 
-        // Step 3: unmask lines we masked (a still-pending device re-fires).
+        // Step 4: qdiscs → NICs (pull, while the NIC has room).
+        let backlog = dp.flush_tx(&mut ifs);
+
+        // Step 5: unmask lines we masked (a still-pending device re-fires).
         for nif in ifs.iter_mut() {
             if nif.masked
                 && let Some((intid, _)) = nif.irq
@@ -325,7 +375,11 @@ pub async fn run(mut ifs: Vec<NetIf>) {
             }
         }
 
-        // Step 4: sleep until an IRQ or the next protocol deadline.
+        // Step 6: sleep until an IRQ or the next deadline.
+        if dp.more_rx {
+            crate::executor::yield_now().await;
+            continue;
+        }
         let t = now();
         let mut delay = ifs
             .iter_mut()
@@ -342,8 +396,13 @@ pub async fn run(mut ifs: Vec<NetIf>) {
         if let Some(at) = pinger.deadline() {
             delay = delay.min(at.saturating_duration_since(timer::Instant::now()));
         }
-        // Devices without an IRQ are polled at least every millisecond.
-        if ifs.iter().any(|n| n.irq.is_none()) {
+        let hk = dp
+            .next_housekeeping()
+            .saturating_sub(timer::uptime().as_millis() as u64);
+        delay = delay.min(Duration::from_millis(hk));
+        // TX completion normally raises an interrupt; poll as a fallback while
+        // a qdisc has a backlog, and for devices without an IRQ.
+        if backlog || ifs.iter().any(|n| n.irq.is_none()) {
             delay = delay.min(Duration::from_millis(1));
         }
         WaitAny {

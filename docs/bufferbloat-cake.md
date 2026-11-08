@@ -95,6 +95,15 @@ Pool size: the packet buffer pools must be able to hold CAKE's memory limit
 (several MB per instance) plus the rings.
 
 ### 3.4 Pipeline position (M4)
+**Status (M4):** the egress hook exists. `crates/qdisc` defines the `Qdisc`
+trait, with `BFifo` (bounded tail-drop) as the placeholder. Every port's
+egress, including the router's own smoltcp traffic, goes through it, and
+the NIC pulls from it (`Datapath::flush_tx`). `PacketMeta` is filled from
+conntrack: a keyed flow hash of the **pre-NAT** original tuple (identical
+in both directions), pre-NAT host hashes, DSCP, ECN and pure-ACK. The
+only other buffering is the neighbor table's ≤ 3 packets per unresolved
+next hop. Not done yet: the ingress hook (download shaping) and the DSCP→tin mapping.
+
 ```
 WAN RX ─► decap (VLAN/PPPoE) ─► conntrack/NAT ─► classify ─► [CAKE ingress] ─► forward ─► LAN TX
 LAN RX ─► conntrack/NAT ─► classify ─► forward ─► [CAKE egress on WAN] ─► encap ─► WAN TX (pull)
