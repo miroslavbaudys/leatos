@@ -7,7 +7,8 @@
 # rrouter's WAN is bridged at layer 2 onto a physical interface and gets its
 # own lease from your home router (double NAT). The Mac then sends all IPv4
 # traffic to rrouter via two /1 routes (more specific than the default route,
-# so macOS's own default route stays intact and untouched) and uses
+# so macOS's own default route stays intact and untouched; added in the
+# explicit -netmask form, then verified) and uses
 # 192.168.1.1 as DNS server.
 #
 # Usage (in Terminal; sudo asks for your password):
@@ -72,8 +73,9 @@ restore_network() {
   routes=$(sed -n 's/^ROUTES=//p' "$STATE")
   echo "== restoring network settings (from $STATE)"
   if [[ "$routes" == 1 ]]; then
-    sudo route -n delete -net 0.0.0.0/1 "$ROUTER_LAN" >/dev/null 2>&1 && echo "  removed route 0.0.0.0/1"
-    sudo route -n delete -net 128.0.0.0/1 "$ROUTER_LAN" >/dev/null 2>&1 && echo "  removed route 128.0.0.0/1"
+    # Explicit netmask form: macOS mis-parses "0.0.0.0/1" (see switch_routes).
+    sudo route -n delete -net 0.0.0.0 -netmask 128.0.0.0 "$ROUTER_LAN" >/dev/null 2>&1 && echo "  removed route 0.0.0.0/1"
+    sudo route -n delete -net 128.0.0.0 -netmask 128.0.0.0 "$ROUTER_LAN" >/dev/null 2>&1 && echo "  removed route 128.0.0.0/1"
   fi
   if [[ -n "$svc" && -n "$dns" ]]; then
     # shellcheck disable=SC2086 # intentional word splitting: list of servers
@@ -172,8 +174,23 @@ mkdir -p "$(dirname "$STATE")"
 printf 'SERVICE=%s\nDNS=%s\nIPV6=%s\nROUTES=1\n' "$SERVICE" "$orig_dns" "$v6_state" >"$STATE"
 
 echo "== switching this Mac to rrouter"
-sudo -n route -n add -net 0.0.0.0/1 "$ROUTER_LAN" >/dev/null
-sudo -n route -n add -net 128.0.0.0/1 "$ROUTER_LAN" >/dev/null
+# Explicit -netmask form (as OpenVPN uses on macOS): with the CIDR form
+# "0.0.0.0/1" macOS installed the low half as a gateway-less interface
+# route, so the Mac ARPed for every destination itself ("Host is down").
+sudo -n route -n add -net 0.0.0.0 -netmask 128.0.0.0 "$ROUTER_LAN" >/dev/null
+sudo -n route -n add -net 128.0.0.0 -netmask 128.0.0.0 "$ROUTER_LAN" >/dev/null
+# Verify both halves before going further; restore at once if either is wrong.
+for probe in 1.1.1.1 8.8.8.8 172.66.0.1 208.67.222.222; do
+  got_gw=$(route -n get "$probe" 2>/dev/null | awk '/gateway:/{print $2}')
+  got_if=$(route -n get "$probe" 2>/dev/null | awk '/interface:/{print $2}')
+  if [[ "$got_gw" != "$ROUTER_LAN" || "$got_if" != "$MAC_IF" ]]; then
+    echo "!! route check failed for $probe: gateway='$got_gw' interface='$got_if' (expected $ROUTER_LAN on $MAC_IF)"
+    route -n get "$probe" 2>&1 | sed 's/^/     /'
+    netstat -rn -f inet | grep -E "^(0|128)(\.0)*/1|^0/1|^128/1|$MAC_IF" | sed 's/^/     /' || true
+    echo "!! restoring network"; exit 1
+  fi
+done
+echo "  verified: both halves of IPv4 route via $ROUTER_LAN on $MAC_IF"
 sudo -n networksetup -setdnsservers "$SERVICE" "$ROUTER_LAN"
 [[ "$v6_state" == automatic ]] && sudo -n networksetup -setv6off "$SERVICE"
 sudo -n dscacheutil -flushcache 2>/dev/null || true
@@ -181,9 +198,11 @@ sudo -n killall -HUP mDNSResponder 2>/dev/null || true
 echo "  IPv4 via $ROUTER_LAN, DNS $ROUTER_LAN (was: $orig_dns)"
 
 # ---- checks ------------------------------------------------------------------------------------
-echo "== checks"
-gw=$(route -n get 1.1.1.1 2>/dev/null | awk '/gateway/{print $2}')
-[[ "$gw" == "$ROUTER_LAN" ]] && pass "route to 1.1.1.1 via $gw" || fail "route to 1.1.1.1 via '$gw'"
+echo "== checks (destinations in both halves: 1.1.1.1 low, example.com/9.9.9.9 high)"
+for probe in 1.1.1.1 9.9.9.9; do
+  gw=$(route -n get "$probe" 2>/dev/null | awk '/gateway:/{print $2}')
+  [[ "$gw" == "$ROUTER_LAN" ]] && pass "route to $probe via $gw" || fail "route to $probe via '$gw'"
+done
 tr_out=$(traceroute -n -m 2 -q 1 -w 2 1.1.1.1 2>/dev/null || true)
 h1=$(echo "$tr_out" | awk '$1=="1"{print $2}')
 h2=$(echo "$tr_out" | awk '$1=="2"{print $2}')
@@ -194,11 +213,13 @@ a=$(dig +short +time=2 +tries=1 @"$ROUTER_LAN" router.lan A 2>/dev/null | head -
 [[ "$a" == "$ROUTER_LAN" ]] && pass "dns: router.lan -> $a" || fail "dns: router.lan -> '$a'"
 code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 https://example.com/ || true)
 [[ "$code" == 200 ]] && pass "https://example.com/ -> HTTP $code" || fail "https://example.com/ -> '$code'"
-if ping -c 3 -t 5 1.1.1.1 >"$WORK/ping" 2>&1; then
-  pass "ping 1.1.1.1 ($(grep -o 'min/avg/max[^=]*= [^ ]*' "$WORK/ping" | sed 's/.*= //') ms)"
-else
-  fail "ping 1.1.1.1"
-fi
+for probe in 1.1.1.1 9.9.9.9; do
+  if ping -c 3 -t 5 "$probe" >"$WORK/ping-$probe" 2>&1; then
+    pass "ping $probe ($(grep -o 'min/avg/max[^=]*= [^ ]*' "$WORK/ping-$probe" | sed 's/.*= //') ms)"
+  else
+    fail "ping $probe: $(grep -m1 -E 'sendto|timeout' "$WORK/ping-$probe" || true)"
+  fi
+done
 if networksetup -getinfo "$SERVICE" | grep -q "^IPv6 IP address: [0-9a-f]"; then
   info "IPv6 is active on '$SERVICE': IPv6 traffic bypasses rrouter (use --ipv4-only)"
 fi

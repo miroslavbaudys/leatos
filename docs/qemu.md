@@ -152,7 +152,11 @@ scripts/mac-internet.sh --restore        # undo a previous run (after a crash, k
   network. A USB/Thunderbolt Ethernet adapter is the reliable option.
 - **Mac changes:** routes `0.0.0.0/1` + `128.0.0.0/1` via 192.168.1.1. These
   are more specific than the default route, so macOS's own default route is
-  never modified. DNS for the active network service is set to 192.168.1.1,
+  never modified. They're added in the explicit `-netmask 128.0.0.0` form:
+  with the CIDR form `0.0.0.0/1`, macOS installed the low half without a
+  gateway (first real run: 1.1.1.1 failed with "Host is down" while
+  172.x worked). After adding, test addresses in both halves are checked, and
+  the script restores at once if either half doesn't go via rrouter. DNS for the active network service is set to 192.168.1.1,
   and with `--ipv4-only`, IPv6 is turned off.
 - **Safety:**
   - it asks for confirmation;
