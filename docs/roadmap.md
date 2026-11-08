@@ -19,6 +19,7 @@ earlier milestones (marked 🎂), even though CAKE itself lands in M6. See
 | M7 | IPv6: DHCPv6-PD, RA/RDNSS, v6 firewall (CAKE handles v6 the same way) | client gets a global v6 address and reaches the ISP | 5–7 wk | |
 | M8 | Persistence (virtio-blk), SNTP, watchdog, panic → reboot, serial CLI, then HTTP UI | config survives a reboot | 4–6 wk | |
 | M9b | **x86_64 port**: Limine boot, ACPI (MADT/MCFG), LAPIC/IOAPIC, TSC-deadline timer, MSI-X, 16550 (see safety-and-portability.md §3) | same smoke tests pass on QEMU q35 | 4–6 wk | |
+| — | **Mac integration** (`scripts/mac-lab.sh`: Mac on rrouter's LAN; `scripts/mac-internet.sh`: Mac's real IPv4 internet through rrouter, WAN bridged on Wi-Fi) | both `--check` runs pass on the developer's MacBook | — | ✅ done |
 | M9 | Hardening: fuzzing all parsers and qdisc, conntrack stress tests, 72 h soak test; CAKE **autorate** for variable-rate links | no leaks or panics over 72 h | ongoing | |
 
 The protocol and qdisc crates (`crates/*`) can be developed in parallel with

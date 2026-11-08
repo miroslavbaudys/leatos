@@ -88,8 +88,11 @@ restore_network() {
       set -- $r
       sudo route -n delete -net "$1" -netmask "$2" "$ROUTER_LAN" >/dev/null 2>&1 && n=$((n + 1))
     done
-    # Routes from earlier versions of this script (0.0.0.0/1 form).
-    sudo route -n delete -net 0.0.0.0 -netmask 128.0.0.0 "$ROUTER_LAN" >/dev/null 2>&1 && n=$((n + 1))
+    # Only for state files from the old 0.0.0.0/1 version: otherwise this
+    # delete can match vmnet's own 0.0.0.0-keyed route on the LAN bridge.
+    if [[ "$routes" == 1 ]]; then
+      sudo route -n delete -net 0.0.0.0 -netmask 128.0.0.0 "$ROUTER_LAN" >/dev/null 2>&1 && n=$((n + 1))
+    fi
     echo "  removed $n routes via $ROUTER_LAN"
   fi
   if [[ -n "$svc" && -n "$dns" ]]; then
