@@ -26,7 +26,7 @@
 #     --shape U:D    shape rrouter's upload to U and download to D Mbit/s
 #                    (e.g. 42:50: slightly below the real line rate, so the
 #                    queue forms in rrouter where CoDel controls it)
-#     --kernel-args "a=b c=d"   extra rrouter boot arguments (e.g. "ecn=0")
+#     --kernel-args "a=b c=d"   extra rrouter boot arguments (e.g. "ecn_up=1")
 #     --yes          don't ask for confirmation
 #     --check        run the checks, then restore and exit (exit 1 on failure)
 #

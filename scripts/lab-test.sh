@@ -24,6 +24,11 @@
 #   LAB_ROUTER_ARGS="…"  extra router boot arguments, e.g. qdisc=codel (single
 #                        CoDel queue: the negative control for the flow-
 #                        isolation latency check)
+#   LAB_EXPECT_ECN=U:D   ECN the check expects per direction (1 = marks, 0 =
+#                        drops; default: derived from the router arguments,
+#                        i.e. 0:1). Set it against the router's real setting
+#                        as a negative control, e.g. LAB_ROUTER_ARGS=ecn=1
+#                        with the default expectation.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -66,6 +71,15 @@ echo "== start client"
 linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
+# The router prints qdisc counters every 10 s: wait for one more round so
+# they include the client's last (upload) phase.
+if [[ "$SHAPE_KBIT" != 0 ]]; then
+  n0=$(tr -d '\r' <"$WORK/router.log" | grep -c "qdisc wan0" || true)
+  for _ in $(seq 1 130); do
+    [[ $(tr -d '\r' <"$WORK/router.log" | grep -c "qdisc wan0" || true) -gt "$n0" ]] && break
+    sleep 0.1
+  done
+fi
 
 if [[ "${LAB_VERBOSE:-0}" == "1" ]]; then
   for vm in isp router client; do
@@ -78,7 +92,36 @@ tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|net wan0 .*lease|n
 echo "== results"
 tr -d '\r' <"$WORK/client.log" | grep -E "^LAB (PASS|FAIL|INFO|WARN)|^    \|" | sed 's/^/  /' || true
 
-if tr -d '\r' <"$WORK/client.log" | grep -q "LAB DONE fails=0" && ! tr -d '\r' <"$WORK/client.log" | grep -q "LAB FAIL"; then
+# Per-direction ECN (router side): with ECN on, the AQM marks the client's
+# ECN-capable traffic; with it off, it drops and never marks. Upload = WAN
+# egress, download = LAN egress.
+router_fails=0
+if [[ "$SHAPE_KBIT" != 0 ]]; then
+  bootarg() { echo " $ROUTER_ARGS " | sed -n "s/.* $1=\([0-9]*\) .*/\1/p"; }
+  all=$(bootarg ecn)
+  up=$(bootarg ecn_up); up=${up:-${all:-0}}
+  down=$(bootarg ecn_down); down=${down:-${all:-1}}
+  if [[ -n "${LAB_EXPECT_ECN:-}" ]]; then up=${LAB_EXPECT_ECN%%:*}; down=${LAB_EXPECT_ECN##*:}; fi
+  for pair in "wan0 upload $up" "lan0 download $down"; do
+    set -- $pair
+    line=$(tr -d '\r' <"$WORK/router.log" | grep "qdisc $1 " | tail -1)
+    drops=$(echo "$line" | sed -n 's/.*aqm drops \([0-9]*\).*/\1/p')
+    marks=$(echo "$line" | sed -n 's/.*ecn marks \([0-9]*\).*/\1/p')
+    what="$2 ($1): aqm drops ${drops:-?}, ecn marks ${marks:-?}"
+    if [[ -z "$drops" || -z "$marks" ]]; then
+      echo "  LAB FAIL: ecn $what (no router counters)"; router_fails=$((router_fails + 1))
+    elif [[ "$3" == 1 && "$marks" -gt 0 ]]; then
+      echo "  LAB PASS: ecn $2 on: $what"
+    elif [[ "$3" == 0 && "$marks" == 0 && "$drops" -gt 0 ]]; then
+      echo "  LAB PASS: ecn $2 off: $what"
+    else
+      echo "  LAB FAIL: ecn $2 expected $([[ "$3" == 1 ]] && echo marks || echo 'drops, no marks'): $what"
+      router_fails=$((router_fails + 1))
+    fi
+  done
+fi
+
+if [[ "$router_fails" == 0 ]] && tr -d '\r' <"$WORK/client.log" | grep -q "LAB DONE fails=0" && ! tr -d '\r' <"$WORK/client.log" | grep -q "LAB FAIL"; then
   echo "LAB TEST: PASS"
 else
   echo "LAB TEST: FAIL" >&2

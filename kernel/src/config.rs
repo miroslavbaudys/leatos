@@ -64,7 +64,8 @@ fn arg_u64(bootargs: &str, key: &str) -> Option<u64> {
 /// bottleneck so the queue forms in rrouter. Boot arguments, in kbit/s:
 /// `shape_up=42000` (WAN egress), `shape_down=50000` (LAN egress, i.e. the
 /// download direction), `shape_overhead=38` (bytes per packet, default 0),
-/// `ecn=0` (AQM drops instead of ECN-marking), `qdisc=cake|fq_codel|codel`
+/// `ecn_up=0|1` / `ecn_down=0|1` (ECN marking instead of dropping, per
+/// direction; default up off, down on; `ecn=` sets both), `qdisc=cake|fq_codel|codel`
 /// (egress AQM, default `cake`; `codel` = one queue, for A/B tests) and
 /// `isolation=triple-isolate|dual-srchost|dual-dsthost|flows` (CAKE's
 /// fairness, default `triple-isolate`).
@@ -81,8 +82,14 @@ pub struct Qos {
     pub up_kbit: Option<u64>,
     pub down_kbit: Option<u64>,
     pub overhead: u32,
-    /// ECN marking in the AQM (boot argument `ecn=0` disables: drop only).
-    pub ecn: bool,
+    /// ECN marking in the AQM, per direction. Default (as OpenWrt's SQM):
+    /// **off for upload** (WAN egress): the senders are local, a drop costs
+    /// one retransmission on a short path and works on every path, while
+    /// marks can be bleached on the way (seen on the developer's line,
+    /// docs/bufferbloat-cake.md); **on for download** (LAN egress), where a
+    /// mark saves data that already crossed the bottleneck.
+    pub ecn_up: bool,
+    pub ecn_down: bool,
     pub aqm: AqmKind,
     pub isolation: qdisc::cake::Isolation,
 }
@@ -92,7 +99,12 @@ pub fn qos(bootargs: &str) -> Qos {
         up_kbit: arg_u64(bootargs, "shape_up").filter(|&r| r > 0),
         down_kbit: arg_u64(bootargs, "shape_down").filter(|&r| r > 0),
         overhead: arg_u64(bootargs, "shape_overhead").unwrap_or(0) as u32,
-        ecn: arg_u64(bootargs, "ecn").is_none_or(|v| v != 0),
+        ecn_up: arg_u64(bootargs, "ecn_up")
+            .or(arg_u64(bootargs, "ecn"))
+            .is_some_and(|v| v != 0),
+        ecn_down: arg_u64(bootargs, "ecn_down")
+            .or(arg_u64(bootargs, "ecn"))
+            .is_none_or(|v| v != 0),
         aqm: match arg(bootargs, "qdisc") {
             Some("fq_codel") => AqmKind::FqCodel,
             Some("codel") => AqmKind::Codel,

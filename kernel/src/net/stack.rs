@@ -103,13 +103,15 @@ pub fn bring_up(pci: &mut Pci, qos: &crate::config::Qos) -> Vec<NetIf> {
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = timer::ticks();
         let rate = qos.rate(if i == 0 { qos.up_kbit } else { qos.down_kbit });
+        let ecn = if i == 0 { qos.ecn_up } else { qos.ecn_down };
         let aqm = Aqm::new(
             qos,
+            ecn,
             QDISC_PACKETS,
             QDISC_BYTES,
             timer::ticks() ^ mac_seed(&mac),
         );
-        let desc = aqm.describe(qos.ecn);
+        let desc = aqm.describe(ecn);
         let mut qdisc = PortQdisc::new(aqm, rate);
         match rate {
             Some(r) => println!(

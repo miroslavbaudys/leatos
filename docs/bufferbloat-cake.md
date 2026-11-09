@@ -359,6 +359,42 @@ only for now. A second LAN host in the lab is a follow-up.
     throughput 39.1 < 42 suggests the uplink also dips below its shaping
     rate at times.
 
+### Per-direction ECN (default: drop on upload, mark on download)
+The bleaching finding could have led to a "bleaching detector" (switch to
+drops when marks get no echo). We decided against it, because it would
+overfit one line and one server:
+- **Blind to QUIC:** QUIC's ECN feedback is encrypted.
+- **Misreads AccECN:** Accurate ECN (used by L4S) reports marks in a
+  counter, not with the classic ECE flag, so a detector would wrongly
+  call those flows bleached.
+- **CAKE already has a safety net:** BLUE, for flows that ignore marks.
+
+Instead rrouter follows common SQM practice (OpenWrt's sqm-scripts default
+to ECN on ingress, off on egress):
+- **`ecn_up` = 0 (upload, WAN egress: drop).** The senders are local, a drop
+  costs one retransmission over a short path, and it works on every path.
+  On the developer's line it cut upload added latency from +104 to +41 ms
+  (single-queue A/B above).
+- **`ecn_down` = 1 (download, LAN egress: mark).** A mark saves data that
+  already crossed the bottleneck, and the marks demonstrably reach the
+  receiver.
+- **`ecn=` sets both.** The boot log shows `(drop only)` or `+ ECN` per
+  port.
+
+**Lab check** (`scripts/lab-test.sh`):
+- **Setup:** the client enables `tcp_ecn=1` and adds one long 3 MB upload
+  (`nc` to a `tcpsvd` sink on the ISP), so CoDel acts on WAN egress.
+- **Check:** the router's final counters per port. Where ECN is on there
+  must be marks; where it is off, drops and no marks.
+
+| router args | upload (wan0) | download (lan0) | result |
+|---|---|---|---|
+| default | 29 drops, 0 marks | 0 drops, 52 marks | PASS |
+| `ecn=1` | 0 drops, 29 marks | 52 marks | PASS |
+| `ecn_up=1 ecn_down=0` | 29 marks | 52 drops, 0 marks | PASS |
+| `ecn=1` with the default expectation (`LAB_EXPECT_ECN=0:1`), the negative control | 29 marks | | **FAIL** (as it must) |
+| default, TCG | 29 drops | 52 marks | PASS |
+
 ## 5. Configuration UX
 ```toml
 [qos]

@@ -38,11 +38,11 @@ pub enum Aqm {
 }
 
 impl Aqm {
-    pub fn new(qos: &Qos, max_packets: usize, limit_bytes: usize, seed: u64) -> Self {
+    pub fn new(qos: &Qos, ecn: bool, max_packets: usize, limit_bytes: usize, seed: u64) -> Self {
         let codel = qdisc::codel::Params {
             max_packets,
             limit_bytes,
-            ecn: qos.ecn,
+            ecn,
             ..Default::default()
         };
         match qos.aqm {

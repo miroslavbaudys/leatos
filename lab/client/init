@@ -103,6 +103,10 @@ want=$($bb sed -n 's/.*lab_shape_kbit=\([0-9]*\).*/\1/p' /proc/cmdline)
 now_ms() { $bb awk '{printf "%d", $1 * 1000}' /proc/uptime; }
 if [ -n "$want" ] && [ "$want" != 0 ]; then
   lo=$((want * 80 / 100)); hi=$((want * 105 / 100))
+  # Request ECN on our connections (Linux only accepts it by default), so the
+  # router's per-direction ECN setting decides between marks and drops
+  # (scripts/lab-test.sh checks the router's counters).
+  echo 1 >/proc/sys/net/ipv4/tcp_ecn || echo "LAB WARN: cannot enable tcp_ecn"
   # Download 5 MB while pinging the router (latency under load).
   $bb ping -c 25 -i 0.2 192.168.1.1 >/tmp/ping-load 2>&1 &
   t0=$(now_ms)
@@ -130,6 +134,11 @@ if [ -n "$want" ] && [ "$want" != 0 ]; then
     fail "shaper up: only $okc/20 uploads arrived intact (last response: $(echo $resp | $bb head -c 80))"
   elif [ "$kbit" -ge "$lo" ] && [ "$kbit" -le "$hi" ]; then pass "shaper up: $kbit kbit/s over 20 x 120 KB (shaped $want)"
   else fail "shaper up: $kbit kbit/s, expected $lo..$hi"; fi
+  # One long upload connection (3 MB), so the AQM acts on the WAN egress
+  # queue (short POSTs end before CoDel's 100 ms interval). The router's
+  # marks/drops for it are checked by scripts/lab-test.sh.
+  got=$($bb head -c 3000000 /dev/zero | $bb nc -w 5 "$ISP" 5001 2>&1 | $bb tr -d ' ')
+  echo "LAB INFO: long upload: ISP sink reports '${got}' bytes"
   # Ping replies leave through the LAN egress shaper behind the download. With
   # flow isolation (CAKE, FQ-CoDel) they skip the download's queue: avg ~1 ms. One
   # CoDel queue (router arg qdisc=codel, the negative control) gives ~8 ms.
