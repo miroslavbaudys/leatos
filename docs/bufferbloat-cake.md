@@ -181,6 +181,29 @@ marking on a real packet buffer.
 show which case applies. The **shaper** (next step) makes rrouter the
 bottleneck on purpose, so that CoDel/CAKE control the queue.
 
+### Status: shaper (M6 step 3)
+`crates/qdisc/src/shaper.rs`: a rate shaper around any qdisc (CAKE-style:
+rate-based `next_tx` instead of a token bucket; 1 ms release window so the
+datapath wakes ~1×/ms; no credit after idle). In the kernel, each port is
+`Shaper<Codel>`: the **WAN egress** is shaped at the upload rate and the
+**LAN egress** at the download rate. With one LAN port, shaping LAN egress
+is equivalent to an ingress hook for download traffic. A true ingress stage
+(for several LAN ports, counting drops) comes with CAKE. The network task
+sleeps until the shaper's next release (`FlushResult::shaper_wake_ns`), and
+hybrid idle makes that wake-up µs-precise.
+
+Rates are **boot arguments**: `shape_up=` / `shape_down=` (kbit/s) and
+`shape_overhead=` (bytes per packet). Pass them with `QEMU_APPEND`, or with
+`scripts/mac-internet.sh --shape 42:50` (Mbit/s).
+
+| Evidence | Result |
+|---|---|
+| host simulation: rate accuracy (1–100 Mbit/s) | within 1 % |
+| host simulation: TCP-like flow, deep dumb downstream buffer at 48 Mbit/s | unshaped **434 ms** downstream queue (util 1.00); shaped at 43 Mbit/s + CoDel **0.10 ms** (util 0.78, single Reno flow) |
+| lab (`scripts/lab-test.sh`, shaped 10/10 Mbit/s), HVF | down 9.55 Mbit/s, up 9.50 Mbit/s, ping to router *during* the download avg 7.9 ms / max 19 ms |
+| lab, TCG | down 9.53, up 8.2 Mbit/s (TCG overhead on 20 short uploads; near the 8.0 bound) |
+| negative control: unshaped router, same client expectations | fails (221 / 137 Mbit/s) |
+
 ## 5. Configuration UX
 ```toml
 [qos]

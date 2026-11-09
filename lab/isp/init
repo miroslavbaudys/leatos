@@ -17,6 +17,7 @@ $bb hostname isp
 $bb ifconfig lo 127.0.0.1 up
 $bb ifconfig eth0 203.0.113.1 netmask 255.255.255.0 up || { echo "LAB FAIL: isp has no eth0"; $bb poweroff -f; }
 $bb touch /tmp/udhcpd.leases
+$bb dd if=/dev/zero of=/www/5mb bs=1024 count=5120 2>/dev/null   # shaper throughput test
 $bx udhcpd -S /etc/udhcpd.conf
 $bx httpd -p 80 -h /www
 $bx dnsd -c /etc/dnsd.conf -i 203.0.113.1 &

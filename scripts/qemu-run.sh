@@ -25,6 +25,8 @@
 #   MAC_LAN_RANGE=192.168.1.2,192.168.1.9   mac modes: vmnet's own address range
 #                        (its first address goes to the Mac's bridge interface)
 #   QEMU_PCAP_DIR=dir    with QEMU_NET=user: dump WAN/LAN traffic to pcap files
+#   QEMU_APPEND="..."    kernel command line (DTB /chosen/bootargs), e.g.
+#                        "shape_up=42000 shape_down=50000 idle_spin_us=0"
 #   QEMU_EXTRA="..."     extra QEMU arguments
 set -euo pipefail
 
@@ -95,6 +97,7 @@ fi
 
 # shellcheck disable=SC2206
 EXTRA=(${QEMU_EXTRA:-})
+if [[ -n "${QEMU_APPEND:-}" ]]; then EXTRA+=(-append "$QEMU_APPEND"); fi
 
 exec "${QEMU_BIN:-qemu-system-aarch64}" \
   -machine virt,gic-version=3 \

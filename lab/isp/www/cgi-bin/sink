@@ -1,0 +1,6 @@
+#!/usr/bin/busybox sh
+# Upload sink for the shaper test: count and discard the request body.
+n=$(/usr/bin/busybox cat | /usr/bin/busybox wc -c)
+echo "Content-Type: text/plain"
+echo
+echo "ok $n (content-length ${CONTENT_LENGTH:-?})"

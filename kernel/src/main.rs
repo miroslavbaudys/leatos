@@ -53,7 +53,10 @@ pub fn kmain(boot_arg: usize) -> ! {
     mm::mmu::init(&info);
     arch::irqchip::init(&info);
     timer::init_irq(info.timer_intid);
-    timer::set_spin_window(config::idle_spin_window(info.virtual_machine));
+    timer::set_spin_window(config::idle_spin_window(
+        info.virtual_machine,
+        info.bootargs,
+    ));
     irq::enable();
     println!(
         "  timer           : {} Hz, tickless, hybrid-idle spin window {} us",
@@ -66,7 +69,11 @@ pub fn kmain(boot_arg: usize) -> ! {
     if let Some(pci) = &pci {
         pci::print(pci);
     }
-    let ifs = pci.as_mut().map(net::stack::bring_up).unwrap_or_default();
+    let qos = config::qos(info.bootargs);
+    let ifs = pci
+        .as_mut()
+        .map(|p| net::stack::bring_up(p, &qos))
+        .unwrap_or_default();
     let has_net = !ifs.is_empty();
 
     selftest::fault_tests();

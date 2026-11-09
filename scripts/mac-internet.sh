@@ -12,7 +12,7 @@
 # 192.168.1.1 as DNS server.
 #
 # Usage (in Terminal; sudo asks for your password):
-#   scripts/mac-internet.sh [--wan-if enX] [--ipv4-only] [--release] [--yes] [--check]
+#   scripts/mac-internet.sh [--wan-if enX] [--ipv4-only] [--release] [--shape UP:DOWN] [--yes] [--check]
 #   scripts/mac-internet.sh --restore      undo everything from a previous run
 #                                          (after a crash, kill -9, reboot, …)
 #     --wan-if enX   physical interface to bridge the WAN onto (default: the
@@ -23,6 +23,9 @@
 #                    no IPv6 yet, so IPv6 traffic would bypass it); restored on exit
 #     --release      run an optimised (release) build of rrouter instead of
 #                    the debug build: much faster datapath (see bufferbloat.sh)
+#     --shape U:D    shape rrouter's upload to U and download to D Mbit/s
+#                    (e.g. 42:50: slightly below the real line rate, so the
+#                    queue forms in rrouter where CoDel controls it)
 #     --yes          don't ask for confirmation
 #     --check        run the checks, then restore and exit (exit 1 on failure)
 #
@@ -56,16 +59,25 @@ WAN_IF=""
 IPV4_ONLY=0
 ASSUME_YES=0
 PROFILE=debug
+SHAPE=""
+KERNEL_ARGS=""
 MODE=interactive
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --wan-if) WAN_IF="${2:?--wan-if needs an interface}"; shift 2 ;;
     --ipv4-only) IPV4_ONLY=1; shift ;;
     --release) PROFILE=release; shift ;;
+    --shape)
+      SHAPE="${2:?--shape needs UP:DOWN in Mbit/s, e.g. 42:50}"
+      [[ "$SHAPE" =~ ^[0-9]+(\.[0-9]+)?:[0-9]+(\.[0-9]+)?$ ]] || { echo "--shape expects UP:DOWN in Mbit/s, e.g. 42:50" >&2; exit 2; }
+      up_k=$(awk -v m="${SHAPE%%:*}" 'BEGIN{printf "%d", m * 1000}')
+      down_k=$(awk -v m="${SHAPE##*:}" 'BEGIN{printf "%d", m * 1000}')
+      KERNEL_ARGS="shape_up=$up_k shape_down=$down_k"
+      shift 2 ;;
     --yes) ASSUME_YES=1; shift ;;
     --check) MODE=check; shift ;;
     --restore) MODE=restore; shift ;;
-    -h | --help) sed -n '2,31p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,34p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -149,7 +161,7 @@ PORT=$(networksetup -listallhardwareports | awk -v dev="$WAN_IF" '/^Hardware Por
 check_no_subnet_conflict "192\\.168\\.1" || exit 1
 HOME_GW=$(route -n get default 2>/dev/null | awk '/gateway/{print $2}')
 
-echo "rrouter ($PROFILE build) will become this Mac's IPv4 router:"
+echo "rrouter ($PROFILE build${SHAPE:+, shaped ${SHAPE%%:*} up / ${SHAPE##*:} down Mbit/s}) will become this Mac's IPv4 router:"
 echo "  WAN bridged onto : $WAN_IF ($PORT, service '$SERVICE'); home gateway $HOME_GW"
 echo "  Mac changes      : routes for 1.0.0.0-255.255.255.255 (8 prefixes) via $ROUTER_LAN, DNS for '$SERVICE' -> $ROUTER_LAN$([[ $IPV4_ONLY == 1 ]] && echo ", IPv6 off")"
 echo "  undo             : automatic on exit/Ctrl-C/watchdog; manual: scripts/mac-internet.sh --restore"
@@ -175,7 +187,7 @@ BEFORE=$(ifconfig -l)
 
 echo "== start rrouter (WAN bridged on $WAN_IF, LAN on vmnet-host)"
 sudo -n env QEMU_BIN="$QEMU_BIN" QEMU_NET=mac-internet MAC_WAN_IF="$WAN_IF" QEMU_ACCEL="${QEMU_ACCEL:-hvf}" \
-  scripts/qemu-run.sh "$KERNEL" >"$WORK/router.log" 2>&1 &
+  QEMU_APPEND="$KERNEL_ARGS" scripts/qemu-run.sh "$KERNEL" >"$WORK/router.log" 2>&1 &
 ROUTER_PID=$!
 if ! wait_for "$WORK/router.log" "net wan0 .*dhcp lease" 30; then
   echo "rrouter got no WAN lease on $WAN_IF within 30 s."
@@ -199,7 +211,7 @@ v6_state=unchanged
 if [[ "$IPV4_ONLY" == 1 ]] && networksetup -getinfo "$SERVICE" | grep -q "^IPv6: Automatic"; then v6_state=automatic; fi
 mkdir -p "$(dirname "$STATE")"
 # BUILD= is informational (read by scripts/bufferbloat.sh to label results).
-printf 'SERVICE=%s\nDNS=%s\nIPV6=%s\nROUTES=split\nBUILD=%s\n' "$SERVICE" "$orig_dns" "$v6_state" "$PROFILE" >"$STATE"
+printf 'SERVICE=%s\nDNS=%s\nIPV6=%s\nROUTES=split\nBUILD=%s\nSHAPE=%s\n' "$SERVICE" "$orig_dns" "$v6_state" "$PROFILE" "$SHAPE" >"$STATE"
 
 echo "== switching this Mac to rrouter"
 for r in "${SPLIT_ROUTES[@]}"; do
@@ -263,7 +275,7 @@ cat <<EOT
 == This Mac now uses rrouter for IPv4 internet and DNS. Browse normally.
   WAN: $LEASE
   watch traffic : sudo tcpdump -ni $MAC_IF      (Wireshark on $MAC_IF)
-  router console: tail -f $WORK/router.log
+  router console: tail -f $WORK/router.log   (qdisc lines every 10 s under load)
   bufferbloat   : https://www.waveform.com/tools/bufferbloat  (CAKE arrives in M6)
 Ctrl-C restores your network. If anything goes wrong: scripts/mac-internet.sh --restore
 EOT

@@ -11,6 +11,7 @@ use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
 use qdisc::Qdisc;
 use qdisc::codel::Codel;
+use qdisc::shaper::Shaper;
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
@@ -21,8 +22,8 @@ pub fn tx_drops() -> u64 {
     TX_DROPS.load(Ordering::Relaxed)
 }
 
-/// Egress AQM on every port (CoDel until CAKE replaces it).
-pub type PortQdisc = Codel<PacketBuf>;
+/// Egress on every port: optional rate shaper around CoDel (CAKE later).
+pub type PortQdisc = Shaper<Codel<PacketBuf>>;
 
 pub struct PortDevice<'a> {
     pub local_rx: &'a mut VecDeque<PacketBuf>,

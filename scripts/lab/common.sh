@@ -20,10 +20,10 @@ lab_cpu_flags() {
 }
 
 # Start an Alpine lab VM with one NIC on a UDP socket link (background; PID appended to PIDS).
-linux_vm() { # initrd mac local_port remote_port log
+linux_vm() { # initrd mac local_port remote_port log [extra kernel args]
   qemu-system-aarch64 -machine virt "${CPU[@]}" -m 512M -nographic \
     -kernel "$ALPINE_DIR/vmlinuz-virt" -initrd "$1" \
-    -append "console=ttyAMA0 rdinit=/init quiet loglevel=3" \
+    -append "console=ttyAMA0 rdinit=/init quiet loglevel=3 ${6:-}" \
     -netdev "dgram,id=n0,local.type=inet,local.host=127.0.0.1,local.port=$3,remote.type=inet,remote.host=127.0.0.1,remote.port=$4" \
     -device "virtio-net-pci,netdev=n0,mac=$2" >"$5" 2>&1 &
   PIDS+=($!)

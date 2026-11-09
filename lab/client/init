@@ -98,5 +98,43 @@ else
   fail "firewall probe: $(echo $probe)"
 fi
 
+# --- shaping (M6): throughput ~ shaped rate, latency stays low under load ------------
+want=$($bb sed -n 's/.*lab_shape_kbit=\([0-9]*\).*/\1/p' /proc/cmdline)
+now_ms() { $bb awk '{printf "%d", $1 * 1000}' /proc/uptime; }
+if [ -n "$want" ] && [ "$want" != 0 ]; then
+  lo=$((want * 80 / 100)); hi=$((want * 105 / 100))
+  # Download 5 MB while pinging the router (latency under load).
+  $bb ping -c 25 -i 0.2 192.168.1.1 >/tmp/ping-load 2>&1 &
+  t0=$(now_ms)
+  $bb wget -q -T 30 -O /tmp/5mb "http://$ISP/5mb"
+  t1=$(now_ms)
+  wait
+  got=$($bb wc -c </tmp/5mb 2>/dev/null || echo 0); $bb rm -f /tmp/5mb
+  kbit=$(( 5242880 * 8 / (t1 - t0) ))
+  if [ "$got" != 5242880 ]; then fail "shaper down: got $got of 5242880 bytes"
+  elif [ "$kbit" -ge "$lo" ] && [ "$kbit" -le "$hi" ]; then pass "shaper down: $kbit kbit/s (shaped $want)"
+  else fail "shaper down: $kbit kbit/s, expected $lo..$hi"; fi
+  # Upload: 20 POSTs of 120 KB (this busybox's `wget --post-file` sends no
+  # body; --post-data is limited by the 128 KB argument limit). The sink
+  # reports the received byte count, which must match.
+  chunk=$($bb head -c 120000 /dev/zero | $bb tr '\0' 'a')
+  t0=$(now_ms)
+  okc=0
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    resp=$($bb wget -q -T 30 -O - --post-data="$chunk" "http://$ISP/cgi-bin/sink" 2>&1)
+    case "$resp" in "ok 120000 "*) okc=$((okc + 1)) ;; esac
+  done
+  t1=$(now_ms)
+  kbit=$(( 20 * 120000 * 8 / (t1 - t0) ))
+  if [ "$okc" != 20 ]; then
+    fail "shaper up: only $okc/20 uploads arrived intact (last response: $(echo $resp | $bb head -c 80))"
+  elif [ "$kbit" -ge "$lo" ] && [ "$kbit" -le "$hi" ]; then pass "shaper up: $kbit kbit/s over 20 x 120 KB (shaped $want)"
+  else fail "shaper up: $kbit kbit/s, expected $lo..$hi"; fi
+  # Pings to the router cross the LAN egress shaper behind the download: CoDel
+  # must keep that queue short (target 5 ms).
+  avg=$($bb awk -F'/' '/min\/avg\/max/{print int($4)}' /tmp/ping-load)
+  if [ -n "$avg" ] && [ "$avg" -lt 30 ]; then pass "latency under shaped load: avg ${avg} ms ($($bb grep -o 'min/avg/max = [^ ]*' /tmp/ping-load))"; else fail "latency under shaped load: avg '${avg}' ms"; $bb tail -2 /tmp/ping-load | $bb sed 's/^/    | /'; fi
+fi
+
 echo "LAB DONE fails=$fails"
 $bb poweroff -f

@@ -49,12 +49,54 @@ pub fn lan() -> Lan {
     }
 }
 
+/// `key=value` from the kernel command line.
+fn arg<'a>(bootargs: &'a str, key: &str) -> Option<&'a str> {
+    bootargs
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+}
+
+fn arg_u64(bootargs: &str, key: &str) -> Option<u64> {
+    arg(bootargs, key).and_then(|v| v.parse().ok())
+}
+
+/// Shaping (docs/bufferbloat-cake.md): set rates slightly below the real
+/// bottleneck so the queue forms in rrouter. Boot arguments, in kbit/s:
+/// `shape_up=42000` (WAN egress), `shape_down=50000` (LAN egress, i.e. the
+/// download direction), `shape_overhead=38` (bytes per packet, default 0).
+#[derive(Clone, Copy, Debug)]
+pub struct Qos {
+    pub up_kbit: Option<u64>,
+    pub down_kbit: Option<u64>,
+    pub overhead: u32,
+}
+
+pub fn qos(bootargs: &str) -> Qos {
+    Qos {
+        up_kbit: arg_u64(bootargs, "shape_up").filter(|&r| r > 0),
+        down_kbit: arg_u64(bootargs, "shape_down").filter(|&r| r > 0),
+        overhead: arg_u64(bootargs, "shape_overhead").unwrap_or(0) as u32,
+    }
+}
+
+impl Qos {
+    pub fn rate(&self, kbit: Option<u64>) -> Option<qdisc::shaper::Rate> {
+        kbit.map(|k| qdisc::shaper::Rate {
+            overhead: self.overhead,
+            ..qdisc::shaper::Rate::kbit(k)
+        })
+    }
+}
+
 /// Hybrid-idle spin window (docs/bufferbloat-cake.md §3.2). Under QEMU on
 /// macOS/HVF an idle vCPU wakes from `wfi` up to ~3 ms late (measured,
 /// roughly 25 % of the sleep, capped at ~3 ms), so deadlines closer than
 /// 4 ms are spun out and longer sleeps wake 4 ms early. Real hardware wakes
-/// in microseconds: no spinning.
-pub fn idle_spin_window(virtual_machine: bool) -> core::time::Duration {
+/// in microseconds: no spinning. Override: boot argument `idle_spin_us=N`.
+pub fn idle_spin_window(virtual_machine: bool, bootargs: &str) -> core::time::Duration {
+    if let Some(us) = arg_u64(bootargs, "idle_spin_us") {
+        return core::time::Duration::from_micros(us);
+    }
     if virtual_machine {
         core::time::Duration::from_micros(4_000)
     } else {

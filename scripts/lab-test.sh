@@ -16,10 +16,19 @@
 #   LAB_KEEP_LOGS=1      keep console logs (path printed)
 #   LAB_TIMEOUT=120      seconds before giving up
 #   QEMU_ACCEL=tcg       run without hardware acceleration
+#   LAB_SHAPE_KBIT=10000 router shapes both directions at this rate and the
+#                        client checks throughput + latency under load
+#                        (0 = unshaped router, shaping checks skipped)
+#   LAB_EXPECT_KBIT=N    what the client expects (default: LAB_SHAPE_KBIT);
+#                        set it with LAB_SHAPE_KBIT=0 as a negative control
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TIMEOUT="${LAB_TIMEOUT:-120}"
+SHAPE_KBIT="${LAB_SHAPE_KBIT:-10000}"
+EXPECT_KBIT="${LAB_EXPECT_KBIT:-$SHAPE_KBIT}"
+ROUTER_ARGS=""
+[[ "$SHAPE_KBIT" != 0 ]] && ROUTER_ARGS="shape_up=$SHAPE_KBIT shape_down=$SHAPE_KBIT"
 LAN_PORT="${LAB_LAN_PORT:-10003}"
 WAN_PORT="${LAB_WAN_PORT:-10005}"
 WORK=$(mktemp -d -t rrouter-lab)
@@ -43,14 +52,14 @@ CLIENT_INITRD=$(scripts/lab/build-initrd.sh client | tail -1)
 echo "== start ISP (203.0.113.1)"
 start_isp "$WAN_PORT" "$WORK/isp.log" || exit 1
 
-echo "== start rrouter"
-QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" QEMU_PCAP_DIR="${LAB_PCAP_DIR:-}" QEMU_ACCEL="$QEMU_ACCEL" \
+echo "== start rrouter${ROUTER_ARGS:+ ($ROUTER_ARGS)}"
+QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" QEMU_PCAP_DIR="${LAB_PCAP_DIR:-}" QEMU_ACCEL="$QEMU_ACCEL" QEMU_APPEND="$ROUTER_ARGS" \
   scripts/qemu-run.sh target/aarch64-unknown-none/debug/rrouter >"$WORK/router.log" 2>&1 &
 PIDS+=($!)
 wait_for "$WORK/router.log" "rrouter: boot ok" 40 || { echo "router did not boot:"; cat "$WORK/router.log"; exit 1; }
 
 echo "== start client"
-linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log"
+linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 
@@ -61,7 +70,7 @@ if [[ "${LAB_VERBOSE:-0}" == "1" ]]; then
 fi
 
 echo "== router"
-tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|net wan0 .*lease|net ping" | sed 's/^/  /' || true
+tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|net wan0 .*lease|net ping|qos |qdisc " | sed 's/^/  /' || true
 echo "== results"
 tr -d '\r' <"$WORK/client.log" | grep -E "^LAB (PASS|FAIL|INFO|WARN)|^    \|" | sed 's/^/  /' || true
 

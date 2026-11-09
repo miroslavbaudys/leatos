@@ -77,6 +77,10 @@ pub unsafe fn discover(x0: usize, kernel_start: usize) -> Result<BootInfo, &'sta
         .and_then(|n| n.compatible())
         .is_some_and(|c| c.all().any(|s| s == "linux,dummy-virt"));
 
+    // The DTB stays mapped for the kernel's lifetime (caller contract), so
+    // borrowing its strings as 'static is sound.
+    let bootargs: &'static str = fdt.chosen().bootargs().unwrap_or("");
+
     Ok(BootInfo {
         firmware: ("dtb", addr, fdt.total_size()),
         cpus: fdt.cpus().count(),
@@ -87,6 +91,7 @@ pub unsafe fn discover(x0: usize, kernel_start: usize) -> Result<BootInfo, &'sta
         timer_intid,
         pcie,
         virtual_machine,
+        bootargs,
     })
 }
 

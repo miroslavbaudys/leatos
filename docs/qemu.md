@@ -96,6 +96,7 @@ Checks run by the client (`lab/client/init`), each printed as `LAB PASS/FAIL`:
 | ICMP | ping through NAT (echo identifier translation) |
 | TTL / ICMP errors | `traceroute`: hop 1 = rrouter's time-exceeded; hop 2 = the ISP's port-unreachable, **NAT-translated back** |
 | Conntrack | 20 sequential TCP connections |
+| Shaper (M6) | router boots with `shape_up=shape_down=10000`. The client downloads 5 MB and uploads 20 × 120 KB (byte counts verified by the ISP's sink); both must land in 8.0–10.5 Mbit/s, and ping to the router *during* the download must average < 30 ms. `LAB_SHAPE_KBIT=0 LAB_EXPECT_KBIT=10000` is the negative control (must fail). This busybox's `wget --post-file` sends no body, hence `--post-data` chunks. |
 | Firewall | the ISP routes 192.168.1.0/24 via the router and connects *into* the client (`/cgi-bin/probe`); it must be blocked. The check requires `route=OK` and a working control connection, so "blocked" can't come from a broken probe. Verified once against a router with the WAN→LAN rule disabled: the check then fails with `target=OPEN`. |
 
 Options: `LAB_VERBOSE=1` (all consoles), `LAB_PCAP_DIR=dir` (router
@@ -146,6 +147,7 @@ scripts/mac-internet.sh --check --yes    # switch, run checks, restore, exit cod
 scripts/mac-internet.sh --wan-if en7     # bridge onto a specific interface (e.g. USB Ethernet)
 scripts/mac-internet.sh --ipv4-only      # turn IPv6 off while running (rrouter has no IPv6 yet)
 scripts/mac-internet.sh --release        # optimised rrouter build (faster datapath)
+scripts/mac-internet.sh --release --shape 42:50   # shape upload/download (Mbit/s) below the line rate
 scripts/mac-internet.sh --restore        # undo a previous run (after a crash, kill -9, reboot)
 ```
 - **WAN:** `vmnet-bridged` puts rrouter's WAN NIC (52:54:00:00:00:01) directly

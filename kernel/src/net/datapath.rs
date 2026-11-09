@@ -51,6 +51,14 @@ pub struct Datapath {
     last_dequeued: [u64; 2],
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FlushResult {
+    /// Earliest time (uptime ns) a shaper will release its next packet.
+    pub shaper_wake_ns: Option<u64>,
+    /// A qdisc has packets but the NIC ring is full (wait for TX completion).
+    pub ring_full_backlog: bool,
+}
+
 /// Print per-port qdisc statistics every this many ms (only if there was traffic).
 const STATS_MS: u64 = 10_000;
 
@@ -239,13 +247,14 @@ impl Datapath {
         }
     }
 
-    /// Move packets from each qdisc to its NIC while the NIC has room.
-    /// Returns true if any qdisc still has a backlog.
-    pub fn flush_tx(&mut self, ifs: &mut [NetIf]) -> bool {
+    /// Move packets from each qdisc to its NIC while the NIC has room and
+    /// the shaper allows.
+    pub fn flush_tx(&mut self, ifs: &mut [NetIf]) -> FlushResult {
         let now = now_ns();
-        let mut backlog = false;
+        let mut r = FlushResult::default();
         for nif in ifs.iter_mut() {
             nif.dev.reap_tx();
+            let mut shaper_wait = None;
             while nif.dev.can_transmit() {
                 match nif.qdisc.dequeue(now) {
                     Dequeue::Packet(p) => {
@@ -253,12 +262,20 @@ impl Datapath {
                             self.qdisc_drops += 1;
                         }
                     }
-                    Dequeue::WaitUntil(_) | Dequeue::Empty => break,
+                    Dequeue::WaitUntil(t) => {
+                        shaper_wait = Some(t);
+                        break;
+                    }
+                    Dequeue::Empty => break,
                 }
             }
-            backlog |= nif.qdisc.stats().backlog_packets > 0;
+            if let Some(t) = shaper_wait {
+                r.shaper_wake_ns = Some(r.shaper_wake_ns.map_or(t, |w: u64| w.min(t)));
+            } else if nif.qdisc.stats().backlog_packets > 0 {
+                r.ring_full_backlog = true;
+            }
         }
-        backlog
+        r
     }
 
     /// One console line per port that sent traffic since the last report.
@@ -269,9 +286,17 @@ impl Datapath {
                 continue;
             }
             self.last_dequeued[i] = s.dequeued;
-            let max_sojourn = nif.qdisc.take_max_sojourn_ns();
+            let max_sojourn = nif.qdisc.inner_mut().take_max_sojourn_ns();
+            let shaped = match nif.qdisc.rate() {
+                Some(r) => alloc::format!(
+                    "shaped {} kbit/s, throttled {}, ",
+                    r.bits_per_sec / 1000,
+                    nif.qdisc.throttled
+                ),
+                None => alloc::string::String::new(),
+            };
             crate::println!(
-                "  qdisc {}       : sent {}, aqm drops {}, ecn marks {}, overflow drops {}, backlog {} pkts, max sojourn {}.{:03} ms",
+                "  qdisc {}       : {shaped}sent {}, aqm drops {}, ecn marks {}, overflow drops {}, backlog {} pkts, max sojourn {}.{:03} ms",
                 nif.name,
                 s.dequeued,
                 s.aqm_actions - s.marked,

@@ -109,6 +109,8 @@ pub struct BootInfo {
     pub pcie: Option<PcieInfo>,
     /// Running under a hypervisor (QEMU `virt`): enables hybrid idle.
     pub virtual_machine: bool,
+    /// Kernel command line (DTB `/chosen/bootargs`; QEMU `-append`).
+    pub bootargs: &'static str,
 }
 
 impl BootInfo {
@@ -135,6 +137,9 @@ impl BootInfo {
                 "physical"
             }
         );
+        if !self.bootargs.is_empty() {
+            println!("  bootargs        : {}", self.bootargs);
+        }
         match self.irqchip {
             Some(IrqChipInfo::GicV3 { gicd, gicr, .. }) => {
                 println!("  irqchip         : GICv3, gicd {gicd:#x}, gicr {gicr:#x}")

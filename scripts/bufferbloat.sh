@@ -51,7 +51,8 @@ gw=$(route -n get "$PING_TARGET" 2>/dev/null | awk '/gateway:/{print $2}')
 if [[ -z "$LABEL" ]]; then
   if [[ "$gw" == 192.168.1.1 ]]; then
     build=$(sed -n 's/^BUILD=//p' lab/cache/mac-internet.state 2>/dev/null || true)
-    LABEL="rrouter-${build:-unknown}"
+    shape=$(sed -n 's/^SHAPE=//p' lab/cache/mac-internet.state 2>/dev/null || true)
+    LABEL="rrouter-${build:-unknown}${shape:+-shaped-${shape/:/-}}"
   else
     LABEL=direct
   fi

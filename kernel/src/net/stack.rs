@@ -76,7 +76,8 @@ fn mask_intx(intid: u32) {
 }
 
 /// Bring up every virtio-net device: first = WAN, second = LAN.
-pub fn bring_up(pci: &mut Pci) -> Vec<NetIf> {
+/// WAN egress is shaped at the upload rate, LAN egress at the download rate.
+pub fn bring_up(pci: &mut Pci, qos: &crate::config::Qos) -> Vec<NetIf> {
     let devs: Vec<_> = pci
         .devices
         .iter()
@@ -96,11 +97,22 @@ pub fn bring_up(pci: &mut Pci) -> Vec<NetIf> {
         let mac = dev.mac();
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = timer::ticks();
-        let mut qdisc = PortQdisc::new(qdisc::codel::Params {
+        let rate = qos.rate(if i == 0 { qos.up_kbit } else { qos.down_kbit });
+        let codel = qdisc::codel::Codel::new(qdisc::codel::Params {
             max_packets: QDISC_PACKETS,
             limit_bytes: QDISC_BYTES,
             ..Default::default()
         });
+        let mut qdisc = PortQdisc::new(codel, rate);
+        match rate {
+            Some(r) => println!(
+                "  qos {name}       : shaped {} kbit/s ({}), overhead {} B, CoDel",
+                r.bits_per_sec / 1000,
+                if i == 0 { "upload" } else { "download" },
+                r.overhead
+            ),
+            None => println!("  qos {name}       : unshaped, CoDel"),
+        }
         let mut local_rx = VecDeque::with_capacity(datapath::LOCAL_RX_MAX);
         let mut port = PortDevice {
             local_rx: &mut local_rx,
@@ -368,8 +380,8 @@ pub async fn run(mut ifs: Vec<NetIf>) {
         poll_stacks(&mut ifs);
         dp.housekeeping(&mut ifs);
 
-        // Step 4: qdiscs → NICs (pull, while the NIC has room).
-        let backlog = dp.flush_tx(&mut ifs);
+        // Step 4: qdiscs → NICs (pull, while the NIC has room and the shaper allows).
+        let tx = dp.flush_tx(&mut ifs);
 
         // Step 5: unmask lines we masked (a still-pending device re-fires).
         for nif in ifs.iter_mut() {
@@ -406,9 +418,13 @@ pub async fn run(mut ifs: Vec<NetIf>) {
             .next_housekeeping()
             .saturating_sub(timer::uptime().as_millis() as u64);
         delay = delay.min(Duration::from_millis(hk));
+        // A shaper holding packets: wake exactly when it releases the next one.
+        if let Some(at) = tx.shaper_wake_ns {
+            delay = delay.min(Duration::from_nanos(at.saturating_sub(datapath::now_ns())));
+        }
         // TX completion normally raises an interrupt; poll as a fallback while
-        // a qdisc has a backlog, and for devices without an IRQ.
-        if backlog || ifs.iter().any(|n| n.irq.is_none()) {
+        // a NIC ring is full with a backlog, and for devices without an IRQ.
+        if tx.ring_full_backlog || ifs.iter().any(|n| n.irq.is_none()) {
             delay = delay.min(Duration::from_millis(1));
         }
         WaitAny {

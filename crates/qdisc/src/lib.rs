@@ -17,6 +17,7 @@ extern crate alloc;
 
 pub mod codel;
 pub mod fifo;
+pub mod shaper;
 
 /// What a qdisc needs to know about a packet.
 pub trait Packet {
