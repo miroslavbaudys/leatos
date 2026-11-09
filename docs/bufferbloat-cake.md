@@ -222,19 +222,35 @@ loaded p90 minus idle p50. Only valid runs are shown (2026-11-08/09):
 | direct | 2 | 66.9, 47.5 ms (≈ 57) | **243.5, 241.7 ms** | 369–403 ms | 54–56 / 46 |
 | rrouter-release | 3 | 50.7, 58.6, 45.0 ms (≈ 51) | **52.0, 69.2, 100.1 ms (≈ 74)** | 172–206 ms | 54–55 / 38–48 |
 | rrouter-debug | 1 | 55.7 ms | 58.0 ms | 129 ms | 55 / 45 |
+| rrouter-release + hybrid idle + CoDel | 1 | 47.8 ms | **199.2 ms** | 323 ms | 53 / 47 |
 
 **Findings:**
 1. **Download is the same with or without rrouter** (≈ +50–57 ms at the
    same throughput). The queue builds upstream (home router / ISP), and
    rrouter adds nothing measurable. A fix needs **ingress shaping** in rrouter
    slightly below ~54 Mbit/s (§3.4), so the queue moves into rrouter.
-2. **Upload is ~3× better through rrouter** (≈ +74 ms vs ≈ +242 ms, same
-   throughput; the direct runs are very consistent). Hypothesis, not yet
-   proven: a direct upload fills a deep transmit queue (macOS, Wi-Fi driver
-   or upstream), while through rrouter every packet passes rrouter's small
-   bounded queues first. Their early tail drops slow TCP down before deep
-   queues fill. This is the first real-world evidence for the "no hidden
-   queues" design (§3.1), even before CAKE.
+2. ~~Upload is ~3× better through rrouter~~, **corrected 2026-11-09.**
+   The early rrouter runs (+52–100 ms vs direct +242 ms) were most likely an
+   *accident of rrouter being slow*: before hybrid idle it woke up to 3 ms
+   late, and its 128 KB FIFO tail-dropped. Both throttled the Mac's TCP and
+   kept the downstream queue short. With hybrid idle + CoDel (384-packet
+   hard limit), upload went to **+199 ms**, close to direct. The qdisc
+   statistics from that run show why:
+
+   ```
+   qdisc wan0 : aqm drops 0, ecn marks 0, overflow drops 2456, max sojourn 15.8–23.2 ms
+   ```
+   CoDel never acted, because rrouter's queue never *stood* above 5 ms. It
+   overflowed in **bursts** (the Mac pushes multi-Gbit/s through vmnet;
+   rrouter's TX drains at ~200 Mbit/s), so the standing queue lives
+   **downstream of rrouter**: the macOS Wi-Fi transmit path behind
+   vmnet-bridged, or the access point, at ~46 Mbit/s. That's a hidden queue
+   (§3.1) created by the host, invisible to rrouter.
+   **Consequence:** an AQM alone can't help. rrouter must **shape** below
+   the real bottleneck (≈ 42 Mbit/s up, ≈ 50 Mbit/s down) to become the
+   bottleneck itself; then the queue forms where CoDel/CAKE control it.
+   Hybrid idle vs. queue limit as the cause of the change wasn't separated
+   (no A/B); neither is a design property worth keeping.
 3. **Upload via rrouter still varies (52–100 ms):** the BFifo has no AQM and
    no flow isolation (a ping waits behind the upload). This is what COBALT
    + flow queueing address.
