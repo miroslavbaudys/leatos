@@ -5,6 +5,13 @@
 //! x86_64) is always programmed to the earliest pending deadline, or the timer is switched off when nothing is
 //! waiting. Resolution is one counter tick (about 42 ns at 24 MHz under HVF).
 //!
+//! **Hybrid idle** (docs/bufferbloat-cake.md §3.2): some hypervisors wake
+//! an idle vCPU late (macOS HVF: up to ~3 ms after `wfi`). With a non-zero
+//! spin window, the comparator is armed `spin_window` *early*; once the next
+//! deadline is within the window, the executor spins (IRQs enabled) instead
+//! of `wfi`, and the exact-deadline interrupt arrives in microseconds. On
+//! real hardware the window is 0: plain tickless `wfi`.
+//!
 //! IRQ path: the handler only masks the timer, then `FIRED` is signalled.
 //! Expired timers are processed and their wakers called by the executor in
 //! thread context ([`process`]). The hardware side is `arch::timer`.
@@ -25,6 +32,11 @@ static FREQ: AtomicU64 = AtomicU64::new(1);
 static TIMER_IRQS: AtomicU64 = AtomicU64::new(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 static FIRED: IrqEvent = IrqEvent::new();
+/// Earliest pending deadline (ticks), `u64::MAX` if none. Lock-free mirror
+/// of the `TIMERS` minimum for the executor's idle decisions.
+static NEXT_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Hybrid-idle spin window in ticks (0 = disabled).
+static SPIN_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Pending timers, keyed by (deadline in ticks, unique id). Thread context only.
 static TIMERS: Mutex<BTreeMap<(u64, u64), Waker>> = Mutex::new(BTreeMap::new());
@@ -103,23 +115,52 @@ fn on_irq(_intid: u32) {
     TIMER_IRQS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// True if the timer fired and [`process`] has work to do.
-pub fn pending() -> bool {
-    FIRED.is_fired()
+/// Set the hybrid-idle spin window (0 disables it). See the module docs.
+pub fn set_spin_window(d: Duration) {
+    SPIN_TICKS.store(duration_to_ticks(d), Ordering::Relaxed);
 }
 
-/// Program the comparator for the earliest deadline, or turn the timer off.
+pub fn spin_window() -> Duration {
+    ticks_to_duration(SPIN_TICKS.load(Ordering::Relaxed))
+}
+
+/// True if [`process`] has work: the timer fired, or the earliest deadline
+/// has passed (also covers an interrupt that is late or was missed).
+pub fn pending() -> bool {
+    FIRED.is_fired() || NEXT_DEADLINE.load(Ordering::Acquire) <= ticks()
+}
+
+/// If the next deadline is within the spin window, return it: the executor
+/// should spin until then instead of sleeping in `wfi`.
+pub fn spin_until() -> Option<u64> {
+    let d = NEXT_DEADLINE.load(Ordering::Acquire);
+    let w = SPIN_TICKS.load(Ordering::Relaxed);
+    (d != u64::MAX && w > 0 && d <= ticks().saturating_add(w)).then_some(d)
+}
+
+/// Program the comparator for the earliest deadline (early by the spin
+/// window if it is further away than that), or turn the timer off.
 fn program(timers: &BTreeMap<(u64, u64), Waker>) {
     match timers.keys().next() {
-        Some(&(deadline, _)) => hw::set_deadline(deadline),
-        None => hw::stop(),
+        Some(&(deadline, _)) => {
+            NEXT_DEADLINE.store(deadline, Ordering::Release);
+            let w = SPIN_TICKS.load(Ordering::Relaxed);
+            let early = deadline.saturating_sub(w);
+            // Far away: wake early, then spin the rest. Close: exact deadline.
+            hw::set_deadline(if early > ticks() { early } else { deadline });
+        }
+        None => {
+            NEXT_DEADLINE.store(u64::MAX, Ordering::Release);
+            hw::stop();
+        }
     }
 }
 
 /// Thread context: wake every expired timer and re-arm the comparator.
 /// Called by the executor on every loop iteration.
 pub fn process() {
-    if !FIRED.take() {
+    let fired = FIRED.take();
+    if !fired && NEXT_DEADLINE.load(Ordering::Acquire) > ticks() {
         return;
     }
     let now = ticks();

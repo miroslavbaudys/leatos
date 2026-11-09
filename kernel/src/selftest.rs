@@ -147,14 +147,21 @@ pub fn spawn(has_net: bool) {
             }
         }
 
-        let (polls, idles) = executor::stats();
+        let st = executor::stats();
         println!(
-            "  executor        : ok (priorities, {} timer irqs, {} irqs, {} spurious, {} polls, {} idle waits)",
+            "  executor        : ok (priorities, {} timer irqs, {} irqs, {} spurious, {} polls)",
             timer::irq_count(),
             irq::count(),
             irq::spurious(),
-            polls,
-            idles
+            st.polls
+        );
+        let up = timer::uptime();
+        println!(
+            "  idle            : {} wfi, {} spins ({} ms spinning = {:.1}% of uptime)",
+            st.idle_waits,
+            st.idle_spins,
+            st.spin_time.as_millis(),
+            st.spin_time.as_secs_f64() * 100.0 / up.as_secs_f64().max(1e-9)
         );
         let (used, free) = crate::mm::heap::usage();
         println!(

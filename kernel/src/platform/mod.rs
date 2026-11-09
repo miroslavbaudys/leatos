@@ -107,6 +107,8 @@ pub struct BootInfo {
     /// Interrupt ID of the per-CPU timer used for tickless deadlines.
     pub timer_intid: u32,
     pub pcie: Option<PcieInfo>,
+    /// Running under a hypervisor (QEMU `virt`): enables hybrid idle.
+    pub virtual_machine: bool,
 }
 
 impl BootInfo {
@@ -125,6 +127,14 @@ impl BootInfo {
             None => println!("  console         : default address"),
         }
         println!("  power           : {:?}", self.power);
+        println!(
+            "  machine         : {}",
+            if self.virtual_machine {
+                "virtual (QEMU virt)"
+            } else {
+                "physical"
+            }
+        );
         match self.irqchip {
             Some(IrqChipInfo::GicV3 { gicd, gicr, .. }) => {
                 println!("  irqchip         : GICv3, gicd {gicd:#x}, gicr {gicr:#x}")

@@ -63,13 +63,30 @@ CAKE.
   `CNTV_CVAL` to the next deadline. No periodic jiffies tick.
 - The generic timer runs at 24 MHz under HVF (about 42 ns resolution), which is good enough.
 - **Measured in M1:** tickless sleeps land within 0–6 µs while the CPU is
-  busy (`idle-poll`). When idle in `wfi`, the *host* (macOS HVF) adds 0.3–3 ms
-  of wake-up latency. This is a QEMU-on-macOS artifact, but it would ruin
-  shaping accuracy in lab tests. Plan for M6: **hybrid idle**. If the next
-  deadline is within a threshold (or the shaper has packets queued), arm the
-  comparator early and spin for the last stretch; otherwise `wfi`. Make the
-  threshold configurable (≈0 on real hardware). Until then, use the
-  `idle-poll` feature for QoS experiments (docs/qemu.md).
+  busy, but when idle in `wfi` the *host* (macOS HVF) adds 0.3–3 ms of wake-up
+  latency (roughly 25 % of the sleep, capped at ~3 ms).
+- **Hybrid idle (implemented, M6 step 1):** `timer::set_spin_window(w)`. The
+  comparator is armed `w` early; when the next deadline is within `w`, the
+  executor spins with IRQs enabled instead of `wfi`, and the exact-deadline
+  interrupt arrives in microseconds. `w` = 4 ms on QEMU `virt` (detected from
+  the DTB root `linux,dummy-virt`) and 0 on physical machines
+  (`config::idle_spin_window`). `timer::pending()` also checks the deadline
+  directly, so a late or lost interrupt cannot stall timers. Measured (HVF):
+
+  | sleep | wfi only (M1) | hybrid idle | idle-poll |
+  |---|---|---|---|
+  | 1 ms | +270 µs | **+1 µs** | +1 µs |
+  | 10 ms | +2.5 ms | **+1–4 µs** | +1 µs |
+  | 100 ms | +0.04–3 ms | **+1–2 µs** | +0–3 µs |
+  | idle host CPU | ~0 % | **~0 %** | 100 % |
+
+  TCG: +35–38 µs, previously 0.6–3 ms. The 100 µs sleep in the boot
+  self-test shows +220–350 µs **with NICs present, in every idle mode,
+  including pure polling** (+5 µs without NICs). That's CPU contention, not
+  timer slack: the Datapath-priority network task is busy with boot-time
+  DHCP/stack work, and the Service-priority self-test waits, as designed.
+  CAKE's datapath work runs at Datapath priority itself, but long datapath
+  polls still matter; keep them short.
 - **Executor priorities:** the datapath (RX → forward → qdisc → TX) must
   never wait behind a slow service task (DNS, CLI). M1's executor gets at
   least two priority classes, and the datapath work runs first on every loop

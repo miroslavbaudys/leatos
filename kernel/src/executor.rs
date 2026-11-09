@@ -9,7 +9,9 @@
 //!   handlers); handlers signal an `irq::IrqEvent`, which the executor loop
 //!   turns into a wakeup.
 //! - Idle: mask IRQs, re-check for work, `wfi`, unmask. A pending interrupt
-//!   always ends `wfi` even while masked, so no wakeup is lost.
+//!   always ends `wfi` even while masked, so no wakeup is lost. With a
+//!   hybrid-idle spin window (`timer::set_spin_window`), a deadline that is
+//!   close is spun out with IRQs enabled instead.
 
 use crate::{irq, timer};
 use alloc::boxed::Box;
@@ -46,6 +48,18 @@ static QUEUES: [Mutex<VecDeque<Arc<Task>>>; CLASSES] =
     [const { Mutex::new(VecDeque::new()) }; CLASSES];
 static POLLS: AtomicU64 = AtomicU64::new(0);
 static IDLE_WAITS: AtomicU64 = AtomicU64::new(0);
+static IDLE_SPINS: AtomicU64 = AtomicU64::new(0);
+static SPIN_TICKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug)]
+pub struct Stats {
+    pub polls: u64,
+    /// Idle periods spent in `wfi`.
+    pub idle_waits: u64,
+    /// Idle periods spun out (hybrid idle) and the total time spent spinning.
+    pub idle_spins: u64,
+    pub spin_time: core::time::Duration,
+}
 
 impl Wake for Task {
     fn wake(self: Arc<Self>) {
@@ -90,12 +104,14 @@ fn poll_task(task: Arc<Task>) {
     }
 }
 
-/// (polls, idle waits) for diagnostics.
-pub fn stats() -> (u64, u64) {
-    (
-        POLLS.load(Ordering::Relaxed),
-        IDLE_WAITS.load(Ordering::Relaxed),
-    )
+/// Counters for diagnostics.
+pub fn stats() -> Stats {
+    Stats {
+        polls: POLLS.load(Ordering::Relaxed),
+        idle_waits: IDLE_WAITS.load(Ordering::Relaxed),
+        idle_spins: IDLE_SPINS.load(Ordering::Relaxed),
+        spin_time: timer::ticks_to_duration(SPIN_TICKS_TOTAL.load(Ordering::Relaxed)),
+    }
 }
 
 /// Run forever.
@@ -112,6 +128,19 @@ pub fn run() -> ! {
 
         irq::disable();
         if !has_work() {
+            // Hybrid idle: a deadline within the spin window is waited for
+            // by spinning with IRQs enabled (precise), not by `wfi` (which
+            // some hypervisors end milliseconds late).
+            if let Some(deadline) = timer::spin_until() {
+                irq::enable();
+                let t0 = timer::ticks();
+                while !has_work() && timer::ticks() < deadline {
+                    core::hint::spin_loop();
+                }
+                IDLE_SPINS.fetch_add(1, Ordering::Relaxed);
+                SPIN_TICKS_TOTAL.fetch_add(timer::ticks() - t0, Ordering::Relaxed);
+                continue;
+            }
             IDLE_WAITS.fetch_add(1, Ordering::Relaxed);
             #[cfg(not(feature = "idle-poll"))]
             crate::arch::cpu::wait_for_interrupt();

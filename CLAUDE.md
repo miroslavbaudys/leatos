@@ -53,7 +53,7 @@ Goals: PPPoE, DHCP (v4 server/client, DHCPv6-PD, RA), a DNS forwarder, NAT, a fi
 - New lab checks need a **negative control** (show that the check fails when the feature is broken), as done for the firewall probe.
 - **Packet buffers** come only from `net::packet` (bounded pool, no allocation per packet). On pool exhaustion, drop; never grow.
 - **IRQ handlers** (`irq::register` actions) only acknowledge or mask hardware and touch atomics. No allocation, no `println!`, no locks except ones thread context takes with IRQs masked (the irqchip lock). Work runs in tasks awaiting an `IrqEvent`. Device interrupts follow NAPI: mask → poll until empty → unmask.
-- Under QEMU on macOS, `wfi` wake-up adds up to ~3 ms; don't "fix" timer code for it (use the `idle-poll` feature; see docs/qemu.md).
+- Timer precision under QEMU/HVF comes from **hybrid idle** (`timer::set_spin_window`, 4 ms on virtual machines, 0 on hardware). Don't add other workarounds for `wfi` latency; `idle-poll` is only for experiments.
 - Network changes on the developer's Mac: mac-lab only adds lab-scoped routes and resolvers. mac-internet may change routing and DNS, but only after confirmation, with the original state saved first, `/1` routes (never the default route), a watchdog, and `--restore`. Keep these guarantees in any new script.
 - Lab downloads are pinned by SHA-256 in `scripts/lab/fetch-alpine.sh`; never unpin. Update the hashes deliberately.
 - Shell scripts must run on macOS bash 3.2 (no associative arrays) and BSD tools (no `\s` in sed, no `timeout`).

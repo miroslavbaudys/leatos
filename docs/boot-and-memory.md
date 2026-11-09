@@ -77,6 +77,8 @@ The EL1 **virtual** timer (INTID 27, read from the DTB) runs **tickless**:
 `CNTV_CVAL_EL0` holds the earliest deadline from a `BTreeMap`, or the timer is
 off. The IRQ only masks the timer and sets `FIRED`; `timer::process()`
 (thread context) wakes expired `Sleep` futures and re-arms the comparator.
+On virtual machines, **hybrid idle** arms the comparator 4 ms early and
+spins out the rest of the wait (see bufferbloat-cake.md §3.2).
 
 ## Power off
 `psci::system_off()` uses PSCI `SYSTEM_OFF` (`0x8400_0008`) through the

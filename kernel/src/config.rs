@@ -49,6 +49,19 @@ pub fn lan() -> Lan {
     }
 }
 
+/// Hybrid-idle spin window (docs/bufferbloat-cake.md §3.2). Under QEMU on
+/// macOS/HVF an idle vCPU wakes from `wfi` up to ~3 ms late (measured,
+/// roughly 25 % of the sleep, capped at ~3 ms), so deadlines closer than
+/// 4 ms are spun out and longer sleeps wake 4 ms early. Real hardware wakes
+/// in microseconds: no spinning.
+pub fn idle_spin_window(virtual_machine: bool) -> core::time::Duration {
+    if virtual_machine {
+        core::time::Duration::from_micros(4_000)
+    } else {
+        core::time::Duration::ZERO
+    }
+}
+
 pub fn dns() -> Dns {
     Dns {
         cache_entries: 4096,

@@ -53,8 +53,13 @@ pub fn kmain(boot_arg: usize) -> ! {
     mm::mmu::init(&info);
     arch::irqchip::init(&info);
     timer::init_irq(info.timer_intid);
+    timer::set_spin_window(config::idle_spin_window(info.virtual_machine));
     irq::enable();
-    println!("  timer           : {} Hz, tickless", timer::frequency());
+    println!(
+        "  timer           : {} Hz, tickless, hybrid-idle spin window {} us",
+        timer::frequency(),
+        timer::spin_window().as_micros()
+    );
 
     net::packet::init_pool(net_pool_size());
     let mut pci = info.pcie.map(|p| pci::init(&p));

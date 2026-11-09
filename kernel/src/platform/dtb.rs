@@ -71,6 +71,12 @@ pub unsafe fn discover(x0: usize, kernel_start: usize) -> Result<BootInfo, &'sta
         .find_compatible(&["pci-host-ecam-generic"])
         .and_then(|n| pcie_info(n, gic_addr_cells as usize));
 
+    // QEMU's `virt` machine identifies itself in the root node.
+    let virtual_machine = fdt
+        .find_node("/")
+        .and_then(|n| n.compatible())
+        .is_some_and(|c| c.all().any(|s| s == "linux,dummy-virt"));
+
     Ok(BootInfo {
         firmware: ("dtb", addr, fdt.total_size()),
         cpus: fdt.cpus().count(),
@@ -80,6 +86,7 @@ pub unsafe fn discover(x0: usize, kernel_start: usize) -> Result<BootInfo, &'sta
         irqchip,
         timer_intid,
         pcie,
+        virtual_machine,
     })
 }
 

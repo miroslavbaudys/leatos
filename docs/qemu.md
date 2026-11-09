@@ -51,8 +51,13 @@ The boot self-test measures sleep overshoot. On an M4 Max with QEMU 11.1:
 | HVF, `wfi` idle (default) | +40 µs | +270 µs | +2.5 ms | +0.04–2.9 ms |
 | HVF, `idle-poll` | +4 µs | +1 µs | +1 µs | +0–3 µs |
 | TCG, `wfi` idle | +2.2 ms | +0.6 ms | +2.7 ms | +3.0 ms |
+| **HVF, hybrid idle (default since M6)** | (+5 µs without NICs) | +1 µs | +1–4 µs | +1–2 µs |
+| TCG, hybrid idle | | +35 µs | +36 µs | +38 µs |
 
-**Conclusion:** the timer and IRQ path are µs-precise. The millisecond slack
+Hybrid idle (spin only for the last ≤ 4 ms before a deadline) keeps idle
+host CPU at about 0 % (`idle-poll`: 100 %). See bufferbloat-cake.md §3.2.
+
+**Conclusion (M1):** the timer and IRQ path are µs-precise. The millisecond slack
 is the host waking an idle vCPU after `wfi` (it looks like macOS timer
 coalescing, roughly proportional to the sleep length). Real hardware wakes
 from `wfi` in microseconds. For latency and CAKE experiments in QEMU, build

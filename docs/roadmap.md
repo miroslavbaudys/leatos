@@ -4,8 +4,14 @@ The estimates assume one experienced developer. The whole QEMU-only feature
 set is about 14–20 months; real hardware adds 3–6+ months per NIC family.
 
 **Bufferbloat mitigation (CAKE) is a core feature.** Its constraints shape
-earlier milestones (marked 🎂), even though CAKE itself lands in M6. See
-`docs/bufferbloat-cake.md`.
+earlier milestones (marked 🎂). See `docs/bufferbloat-cake.md`.
+
+**Order (2026-11-09):** M6 (CAKE) is done **before** M5 (PPPoE). Milestone
+numbers are kept as stable references. Reason: rrouter already routes the
+developer's real internet behind the home router (`scripts/mac-internet.sh`),
+so CAKE can be measured on a real line immediately (`scripts/bufferbloat.sh`:
+baseline +51 ms download / +74 ms upload under load). PPPoE only matters once
+rrouter replaces the home router, which also needs real hardware.
 
 | # | Milestone | Done when | Est. | Status |
 |---|---|---|---|---|
@@ -14,8 +20,8 @@ earlier milestones (marked 🎂), even though CAKE itself lands in M6. See
 | M2 | virtio-net ×2 (INTx, NAPI-style), **pull-based TX with byte-limited rings** 🎂, bounded packet pool with **`PacketMeta`** 🎂, smoltcp, DHCPv4 client on WAN, static LAN; **arch-neutral restructure + unsafe confinement + x86_64 skeleton** | WAN gets a DHCP lease and the gateway answers ping (smoke test) | 3–4 wk | ✅ done (client-VM lab moved to M3; adaptive BQL to M6) |
 | M3 | QEMU lab (Alpine client VM over `-netdev dgram`), DHCPv4 server (`crates/proto-dhcp`), DNS forwarder/cache/`.lan` zone (`crates/proto-dns`) | `scripts/lab-test.sh`: client gets a lease; `nas.lan`, `router.lan`, the client's own name and reverse lookups resolve; NXDOMAIN; upstream forwarding; ping | 4–6 wk | ✅ done (ISP VM moved to M4; DNS-over-TCP open) |
 | M4 | ISP VM in the lab; forwarding plane (`crates/fwd`): LPM routes, ARP neighbor cache, conntrack, NAPT (EIM), stateful firewall, ICMP error generation and translation; **qdisc hook for all egress** + **pre-NAT flow/host hashes in `PacketMeta`** 🎂 | `scripts/lab-test.sh`: HTTP/ICMP through NAT, NATed source seen by the ISP, traceroute through NAT, 20 connections, firewall blocks WAN→LAN | 8–12 wk | ✅ done (DNAT/port forwarding, fragments, hairpin open) |
-| M5 | PPPoE WAN, reconnect, MSS clamp; **exposes encapsulation overhead** 🎂 | stable session against `pppoe-server`; survives a PADT | 4–6 wk | ⏳ next |
-| M6 | **Bufferbloat mitigation:** CoDel → FQ-CoDel → **CAKE** (shaper, overhead compensation, COBALT, host isolation, ingress mode, diffserv tins, ACK filter) in `crates/qdisc` | flent RRUL in the lab: < 10 ms added latency under load, fair per-host sharing | 6–10 wk | |
+| M6 | **Bufferbloat mitigation:** hybrid idle (timer precision under QEMU/HVF) → CoDel → FQ-CoDel → **CAKE** (shaper, overhead compensation, COBALT, host isolation, ingress mode, diffserv tins, ACK filter) in `crates/qdisc` | flent RRUL in the lab: < 10 ms added latency under load, fair per-host sharing | 6–10 wk | ⏳ in progress: hybrid idle ✅ (µs timers under HVF, ~0 % idle CPU); next CoDel (reordered before M5) |
+| M5 | PPPoE WAN, reconnect, MSS clamp; **exposes encapsulation overhead** 🎂 | stable session against `pppoe-server`; survives a PADT | 4–6 wk | after M6 (needs real hardware to matter: rrouter sits behind the home router today) |
 | M7 | IPv6: DHCPv6-PD, RA/RDNSS, v6 firewall (CAKE handles v6 the same way) | client gets a global v6 address and reaches the ISP | 5–7 wk | |
 | M8 | Persistence (virtio-blk), SNTP, watchdog, panic → reboot, serial CLI, then HTTP UI | config survives a reboot | 4–6 wk | |
 | M9b | **x86_64 port**: Limine boot, ACPI (MADT/MCFG), LAPIC/IOAPIC, TSC-deadline timer, MSI-X, 16550 (see safety-and-portability.md §3) | same smoke tests pass on QEMU q35 | 4–6 wk | |
