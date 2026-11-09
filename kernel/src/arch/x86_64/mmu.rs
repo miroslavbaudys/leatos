@@ -7,8 +7,11 @@ pub const LEVELS: usize = 4;
 pub const TOP_LEVEL_SHIFT: usize = 39;
 pub const VA_BITS: u32 = 48;
 
-/// Legacy MMIO below 4 GiB is described by ACPI/E820 on x86 (TODO).
-pub const PLATFORM_MMIO: &[(usize, usize)] = &[];
+/// Interrupt controllers at their architectural addresses: IOAPIC and local
+/// APIC (the ACPI MADT reports these; on PCs they never move). PCIe ECAM is
+/// mapped from `BootInfo`.
+pub const PLATFORM_MMIO: &[(usize, usize)] =
+    &[(0xfec0_0000, 0xfec0_1000), (0xfee0_0000, 0xfee0_1000)];
 
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
@@ -48,8 +51,13 @@ pub fn leaf_desc(pa: u64, perm: Perm, level: usize) -> u64 {
     pa | attrs(perm) | PRESENT | large
 }
 
+/// Switch to the page tables at `root` (EFER.NXE and CR0.WP were enabled
+/// in boot.S, so NX and read-only pages are enforced, also for the kernel).
+///
 /// # Safety
 /// `root` must be a complete identity map of everything in use.
-pub unsafe fn activate(_root: u64) {
-    todo!("x86_64: write CR3 (and enable EFER.NXE, CR0.WP)")
+pub unsafe fn activate(root: u64) {
+    // SAFETY: forwarded from the caller; writing CR3 also flushes the TLB
+    // (no global pages are used).
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
 }

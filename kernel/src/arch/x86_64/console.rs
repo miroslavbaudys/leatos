@@ -1,28 +1,30 @@
-//! 16550 UART on COM1 (I/O port 0x3f8).
+//! 16550 UART on COM1 (I/O port 0x3f8), 115200 8N1.
 
-use core::arch::asm;
+use super::port::{inb, outb};
 use spin::Mutex;
 
 const COM1: u16 = 0x3f8;
+const IER: u16 = 1;
+const FCR: u16 = 2;
+const LCR: u16 = 3;
+const MCR: u16 = 4;
 const LSR: u16 = 5;
 const LSR_THRE: u8 = 1 << 5;
 
 static LOCK: Mutex<()> = Mutex::new(());
 
-fn outb(port: u16, v: u8) {
-    // SAFETY: COM1 data port write; the UART is owned by this module.
-    unsafe { asm!("out dx, al", in("dx") port, in("al") v, options(nomem, nostack)) };
+/// Program 115200 8N1 with FIFOs (firmware usually did already). `base`
+/// (MMIO) is not used on x86.
+pub fn init(_base: Option<usize>) {
+    let _g = LOCK.lock();
+    outb(COM1 + IER, 0); // no UART interrupts (polled output)
+    outb(COM1 + LCR, 0x80); // DLAB: divisor follows
+    outb(COM1, 1); // divisor 1 = 115200 baud
+    outb(COM1 + IER, 0);
+    outb(COM1 + LCR, 0x03); // 8N1
+    outb(COM1 + FCR, 0xc7); // enable + clear FIFOs, 14-byte threshold
+    outb(COM1 + MCR, 0x03); // DTR + RTS
 }
-
-fn inb(port: u16) -> u8 {
-    let v: u8;
-    // SAFETY: COM1 status port read; no side effects beyond the device.
-    unsafe { asm!("in al, dx", in("dx") port, out("al") v, options(nomem, nostack)) };
-    v
-}
-
-/// Port I/O console: `base` (MMIO) is not used on x86.
-pub fn init(_base: Option<usize>) {}
 
 fn put(b: u8) {
     while inb(COM1 + LSR) & LSR_THRE == 0 {

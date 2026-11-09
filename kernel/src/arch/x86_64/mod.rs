@@ -1,22 +1,63 @@
-//! x86_64 backend: **compile-only skeleton**.
-//!
-//! Purpose today: `cargo kcheck-x86` type-checks all arch-neutral code
-//! against this API, so aarch64 assumptions cannot creep into neutral
-//! modules. Trivially correct pieces are real (CPU flags, 16550 console,
-//! page-table encoding, TSC read); the rest are `todo!()` with the plan in
-//! docs/safety-and-portability.md §3 (Limine boot, ACPI MADT/MCFG,
-//! LAPIC + IOAPIC, TSC-deadline timer, MSI-X).
+//! x86_64 backend: PVH entry, 16550 console, ACPI discovery, local APIC
+//! (timer + MSI-X vectors), TSC clock, ACPI S5 power-off
+//! (docs/safety-and-portability.md §3). Target: QEMU q35 now, the PC
+//! Engines apu4 (M10) next.
 
 pub mod console;
 pub mod cpu;
+mod exceptions;
 pub mod irqchip;
 pub mod mmu;
+mod port;
 pub mod power;
 pub mod timer;
 
-use crate::platform::BootInfo;
+use crate::platform::{BootInfo, IntxMap, IrqChipInfo, PcieInfo, PowerMethod, acpi, pvh};
 
-/// Discover the machine from ACPI tables (RSDP from the boot protocol).
-pub fn discover(_boot_arg: usize) -> Result<BootInfo, &'static str> {
-    Err("x86_64: ACPI discovery not implemented yet")
+core::arch::global_asm!(include_str!("boot.S"), options(att_syntax));
+
+/// Entry point called from `boot.S` in 64-bit mode with the boot page
+/// tables and the kernel stack; `start_info` is the PVH `hvm_start_info`.
+#[unsafe(no_mangle)]
+extern "C" fn kernel_main(start_info: usize) -> ! {
+    exceptions::init();
+    crate::kmain(start_info)
+}
+
+/// Discover the machine from the PVH start info and the ACPI tables.
+pub fn discover(start_info: usize) -> Result<BootInfo, &'static str> {
+    let si = pvh::parse(start_info, crate::mm::sym::kernel_start())?;
+    let a = acpi::parse(si.rsdp)?;
+    let (pm1a_cnt, slp) = match a.s5 {
+        Some(s5) => (a.pm1a_cnt, s5),
+        None => (0, (0, 0)), // power::off reports the failure
+    };
+    let pcie = a.mcfg.map(|(base, first, last)| PcieInfo {
+        ecam: base as usize + ((first as usize) << 20),
+        ecam_size: (last as usize - first as usize + 1) << 20,
+        bus_start: first,
+        bus_end: last,
+        mem32: None, // firmware (SeaBIOS/coreboot) assigned the BARs
+        intx: IntxMap::EMPTY,
+    });
+    Ok(BootInfo {
+        firmware: ("pvh start info + acpi", start_info, 56),
+        cpus: a.cpus.max(1),
+        ram: si.ram,
+        console_base: None,
+        power: PowerMethod::AcpiS5 {
+            pm1a_cnt,
+            pm1b_cnt: a.pm1b_cnt,
+            slp_typ_a: slp.0,
+            slp_typ_b: slp.1,
+        },
+        irqchip: Some(IrqChipInfo::Apic {
+            lapic: a.lapic,
+            ioapic: a.ioapic,
+        }),
+        timer_intid: exceptions::TIMER_VECTOR,
+        pcie,
+        virtual_machine: cpu::hypervisor(),
+        bootargs: si.cmdline,
+    })
 }

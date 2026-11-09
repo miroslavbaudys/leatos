@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Boot an rrouter kernel ELF in QEMU (aarch64 `virt`).
-# Used as the cargo runner for aarch64-unknown-none (`cargo krun`).
+# Boot an rrouter kernel ELF in QEMU: aarch64 `virt`, or x86_64 `q35` when
+# the ELF is an x86-64 build (PVH entry via -kernel; SeaBIOS assigns BARs).
+# Used as the cargo runner for both targets (`cargo krun`, `cargo krun-x86`).
 #
 # Environment:
 #   QEMU_ACCEL=hvf|tcg   default: hvf on Apple Silicon macOS, tcg elsewhere
+#                        (x86_64 guests on Apple Silicon: always tcg)
 #   QEMU_MEM=256M        guest RAM (max 3G: boot.S maps RAM in 1..4 GiB only)
 #   QEMU_SMP=1
 #   QEMU_GDB=1           start paused with a gdb stub on :1234
@@ -33,18 +35,33 @@ set -euo pipefail
 KERNEL="${1:?usage: qemu-run.sh <kernel-elf>}"
 shift || true
 
+# ELF e_machine (bytes 18-19): 0xb7 = aarch64, 0x3e = x86-64.
+ARCH=aarch64
+if [[ "$(od -An -tx1 -j18 -N1 "$KERNEL" | tr -d ' ')" == "3e" ]]; then ARCH=x86_64; fi
+
 if [[ -z "${QEMU_ACCEL:-}" ]]; then
-  if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
+  if [[ "$ARCH" == aarch64 && "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
     QEMU_ACCEL=hvf
+  elif [[ "$ARCH" == x86_64 && "$(uname -m)" == "x86_64" && -e /dev/kvm ]]; then
+    QEMU_ACCEL=kvm
   else
     QEMU_ACCEL=tcg
   fi
 fi
 
-if [[ "$QEMU_ACCEL" == "hvf" ]]; then
+if [[ "$ARCH" == x86_64 ]]; then
+  MACHINE=(-machine q35 -vga none)
+  # `max` gives TCG every feature it emulates (NX, x2APIC, invariant TSC).
+  if [[ "$QEMU_ACCEL" == tcg ]]; then CPU=(-accel tcg -cpu max); else CPU=(-accel "$QEMU_ACCEL" -cpu host); fi
+  DEFAULT_BIN=qemu-system-x86_64
+elif [[ "$QEMU_ACCEL" == "hvf" ]]; then
+  MACHINE=(-machine virt,gic-version=3)
   CPU=(-accel hvf -cpu host)
+  DEFAULT_BIN=qemu-system-aarch64
 else
+  MACHINE=(-machine virt,gic-version=3)
   CPU=(-accel tcg -cpu cortex-a76)
+  DEFAULT_BIN=qemu-system-aarch64
 fi
 
 NET=(-nic none)
@@ -99,8 +116,12 @@ fi
 EXTRA=(${QEMU_EXTRA:-})
 if [[ -n "${QEMU_APPEND:-}" ]]; then EXTRA+=(-append "$QEMU_APPEND"); fi
 
-exec "${QEMU_BIN:-qemu-system-aarch64}" \
-  -machine virt,gic-version=3 \
+# QEMU_BIN (sudo callers) names the aarch64 binary; derive the x86 one from it.
+BIN="${QEMU_BIN:-$DEFAULT_BIN}"
+if [[ "$ARCH" == x86_64 ]]; then BIN="${BIN%qemu-system-aarch64}"; [[ "$BIN" == */ || -z "$BIN" ]] && BIN="${BIN}qemu-system-x86_64"; fi
+
+exec "$BIN" \
+  "${MACHINE[@]}" \
   "${CPU[@]}" \
   -smp "${QEMU_SMP:-1}" \
   -m "${QEMU_MEM:-256M}" \

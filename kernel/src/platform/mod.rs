@@ -1,5 +1,5 @@
 //! Arch-neutral description of the machine, filled in by a firmware
-//! backend: DTB today (aarch64 QEMU virt), ACPI later (x86_64).
+//! backend: DTB (aarch64 QEMU virt) or PVH start info + ACPI (x86_64).
 //!
 //! Discovery runs **before the heap exists**, so these types are plain
 //! `Copy` data with fixed-size arrays and no allocation.
@@ -7,6 +7,14 @@
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)] // reads the firmware DTB blob through a raw pointer
 pub mod dtb;
+
+#[cfg(target_arch = "x86_64")]
+pub mod acpi;
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)] // the one constructor that views firmware memory as bytes
+pub mod phys;
+#[cfg(target_arch = "x86_64")]
+pub mod pvh;
 
 use crate::println;
 
@@ -18,7 +26,12 @@ pub enum IrqChipInfo {
         gicr: usize,
         gicr_size: usize,
     },
-    // x86_64 (future): Apic { lapic: usize, ioapic: usize, .. }
+    /// x86: local APIC (xAPIC MMIO) and the first IOAPIC.
+    #[allow(dead_code)] // fields are read by the x86_64 backend only
+    Apic {
+        lapic: usize,
+        ioapic: Option<(usize, u32)>,
+    },
 }
 
 /// How to power the machine off.
@@ -26,7 +39,15 @@ pub enum IrqChipInfo {
 pub enum PowerMethod {
     PsciHvc,
     PsciSmc,
-    // x86_64 (future): AcpiS5 { .. }
+    /// ACPI S5 (soft off): write `SLP_TYP | SLP_EN` to the PM1 control
+    /// register(s) (I/O ports from the FADT, `SLP_TYP` from the DSDT `\_S5`).
+    #[allow(dead_code)] // fields are read by the x86_64 backend only
+    AcpiS5 {
+        pm1a_cnt: u16,
+        pm1b_cnt: u16,
+        slp_typ_a: u16,
+        slp_typ_b: u16,
+    },
 }
 
 /// A CPU-visible window that the PCIe host bridge forwards to the bus.
@@ -132,7 +153,7 @@ impl BootInfo {
         println!(
             "  machine         : {}",
             if self.virtual_machine {
-                "virtual (QEMU virt)"
+                "virtual machine"
             } else {
                 "physical"
             }
@@ -144,6 +165,12 @@ impl BootInfo {
             Some(IrqChipInfo::GicV3 { gicd, gicr, .. }) => {
                 println!("  irqchip         : GICv3, gicd {gicd:#x}, gicr {gicr:#x}")
             }
+            Some(IrqChipInfo::Apic { lapic, ioapic }) => match ioapic {
+                Some((io, gsi)) => println!(
+                    "  irqchip         : local APIC {lapic:#x}, IOAPIC {io:#x} (GSI {gsi}..)"
+                ),
+                None => println!("  irqchip         : local APIC {lapic:#x}"),
+            },
             None => println!("  irqchip         : none"),
         }
         println!("  timer intid     : {}", self.timer_intid);
