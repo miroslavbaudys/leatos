@@ -13,6 +13,10 @@ so CAKE can be measured on a real line immediately (`scripts/bufferbloat.sh`:
 baseline +51 ms download / +74 ms upload under load). PPPoE only matters once
 rrouter replaces the home router, which also needs real hardware.
 
+**Hardware target:** a PC Engines **APU2** (developer-owned). Path after M6:
+M9b (x86_64 on QEMU q35) → M10 (APU2 bare metal, igb driver) → M5 (PPPoE,
+with rrouter replacing the home router).
+
 | # | Milestone | Done when | Est. | Status |
 |---|---|---|---|---|
 | M0 | Workspace scaffold: aarch64 boot, MMU identity map, PL011 console, DTB discovery, heap, generic timer, PSCI off, smoke test | `scripts/smoke-test.sh` passes under HVF and TCG | — | ✅ done |
@@ -25,6 +29,7 @@ rrouter replaces the home router, which also needs real hardware.
 | M7 | IPv6: DHCPv6-PD, RA/RDNSS, v6 firewall (CAKE handles v6 the same way) | client gets a global v6 address and reaches the ISP | 5–7 wk | |
 | M8 | Persistence (virtio-blk), SNTP, watchdog, panic → reboot, serial CLI, then HTTP UI | config survives a reboot | 4–6 wk | |
 | M9b | **x86_64 port**: Limine boot, ACPI (MADT/MCFG), LAPIC/IOAPIC, TSC-deadline timer, MSI-X, 16550 (see safety-and-portability.md §3) | same smoke tests pass on QEMU q35 | 4–6 wk | |
+| M10 | **PC Engines APU2 bare metal** (AMD GX-412TC, 4× Jaguar 1 GHz, 3× Intel GbE i210AT/i211AT depending on variant, coreboot + SeaBIOS, serial console only): Limine BIOS boot from USB/SD/mSATA, **`igb` NIC driver** from the Intel datasheet (descriptor rings, MSI-X, **BQL-style TX limit** 🎂, unsafe confined to the driver module), hybrid idle off (spin window 0), per-packet CPU cost measured | rrouter routes on the APU2 between modem and LAN: smoke and lab checks on hardware, real-line `bufferbloat.sh` with CAKE at the line rate, no hidden NIC queue (ring bytes bounded), 72 h soak | 5–8 wk | after M9b |
 | — | **Mac integration** (`scripts/mac-lab.sh`: Mac on rrouter's LAN; `scripts/mac-internet.sh`: Mac's real IPv4 internet through rrouter, WAN bridged on Wi-Fi) | both `--check` runs pass on the developer's MacBook | — | ✅ done |
 | M9 | Hardening: fuzzing all parsers and qdisc, conntrack stress tests, 72 h soak test; CAKE **autorate** for variable-rate links | no leaks or panics over 72 h | ongoing | |
 
@@ -42,5 +47,5 @@ can start early using simulated time.
 4. **No std ecosystem:** DNS, TLS and SSH crates need no_std alternatives.
 5. **No isolation:** one panic stops routing. Mitigate with watchdog + reboot,
    and keep `unsafe` confined to drivers and arch code.
-6. **Real hardware:** NIC drivers (Intel igc/ixgbe) must be written from datasheets, with BQL-style TX limits.
+6. **Real hardware:** NIC drivers must be written from datasheets, with BQL-style TX limits. First: Intel `igb` (i210/i211) for the APU2 (M10); the 1 GHz Jaguar CPU makes per-packet cost visible early.
 7. **Security:** a new network stack facing the internet. Fuzzing is mandatory.
