@@ -130,10 +130,11 @@ if [ -n "$want" ] && [ "$want" != 0 ]; then
     fail "shaper up: only $okc/20 uploads arrived intact (last response: $(echo $resp | $bb head -c 80))"
   elif [ "$kbit" -ge "$lo" ] && [ "$kbit" -le "$hi" ]; then pass "shaper up: $kbit kbit/s over 20 x 120 KB (shaped $want)"
   else fail "shaper up: $kbit kbit/s, expected $lo..$hi"; fi
-  # Pings to the router cross the LAN egress shaper behind the download: CoDel
-  # must keep that queue short (target 5 ms).
+  # Ping replies leave through the LAN egress shaper behind the download. With
+  # flow isolation (FQ-CoDel) they skip the download's queue: avg ~1 ms. One
+  # CoDel queue (router arg fq_flows=1, the negative control) gives ~8 ms.
   avg=$($bb awk -F'/' '/min\/avg\/max/{print int($4)}' /tmp/ping-load)
-  if [ -n "$avg" ] && [ "$avg" -lt 30 ]; then pass "latency under shaped load: avg ${avg} ms ($($bb grep -o 'min/avg/max = [^ ]*' /tmp/ping-load))"; else fail "latency under shaped load: avg '${avg}' ms"; $bb tail -2 /tmp/ping-load | $bb sed 's/^/    | /'; fi
+  if [ -n "$avg" ] && [ "$avg" -lt 3 ]; then pass "latency under shaped load: avg ${avg} ms ($($bb grep -o 'min/avg/max = [^ ]*' /tmp/ping-load))"; else fail "latency under shaped load: avg '${avg}' ms"; $bb tail -2 /tmp/ping-load | $bb sed 's/^/    | /'; fi
 fi
 
 echo "LAB DONE fails=$fails"

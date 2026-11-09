@@ -19,7 +19,7 @@ use alloc::collections::VecDeque;
 pub const DEFAULT_TARGET_NS: u64 = 5_000_000;
 pub const DEFAULT_INTERVAL_NS: u64 = 100_000_000;
 /// "Don't drop if less than one MTU is queued" (RFC 8289 §5.5).
-const MAX_PACKET: usize = 1514;
+pub(crate) const MAX_PACKET: usize = 1514;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Params {
@@ -67,21 +67,174 @@ fn control_law(t: u64, interval: u64, count: u32) -> u64 {
         .unwrap_or(0) as u64
 }
 
-pub struct Codel<P> {
-    q: VecDeque<(P, u64)>,
-    p: Params,
-    bytes: usize,
-    // CoDel state (RFC 8289 names)
+/// Per-queue CoDel state (RFC 8289 variable names). [`Codel`] has one;
+/// FQ-CoDel keeps one per flow queue.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Vars {
     first_above_time: u64,
     drop_next: u64,
     count: u32,
     lastcount: u32,
     dropping: bool,
+}
+
+/// Sojourn-time diagnostics.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Sojourn {
+    pub last_ns: u64,
+    pub max_ns: u64,
+}
+
+/// The queue CoDel pulls packets from.
+pub(crate) trait Source<P> {
+    /// Pop the head packet with its enqueue time (ns).
+    fn pop(&mut self) -> Option<(P, u64)>;
+    /// Bytes still queued after the pop, for the "at least one MTU
+    /// queued" rule (RFC 8289 §5.5; FQ-CoDel uses the total backlog).
+    fn backlog_bytes(&self) -> usize;
+}
+
+impl Vars {
+    /// RFC 8289 `dodequeue`: pop one packet and decide whether CoDel is in
+    /// the "persistently above target" state where dropping is allowed.
+    fn do_dequeue<P: Packet>(
+        &mut self,
+        src: &mut impl Source<P>,
+        params: &Params,
+        soj: &mut Sojourn,
+        now: u64,
+    ) -> Option<(P, bool)> {
+        let Some((p, ts)) = src.pop() else {
+            self.first_above_time = 0;
+            return None;
+        };
+        let sojourn = now.saturating_sub(ts);
+        soj.last_ns = sojourn;
+        soj.max_ns = soj.max_ns.max(sojourn);
+        let ok_to_drop = if sojourn < params.target_ns || src.backlog_bytes() <= MAX_PACKET {
+            self.first_above_time = 0;
+            false
+        } else if self.first_above_time == 0 {
+            self.first_above_time = now + params.interval_ns;
+            false
+        } else {
+            now >= self.first_above_time
+        };
+        Some((p, ok_to_drop))
+    }
+
+    /// RFC 8289 dequeue: returns the packet to send, after dropping (or
+    /// ECN-marking) as the control law demands. Drops are counted in
+    /// `stats`; `dequeued` is left to the caller.
+    pub(crate) fn dequeue<P: Packet>(
+        &mut self,
+        src: &mut impl Source<P>,
+        params: &Params,
+        stats: &mut Stats,
+        soj: &mut Sojourn,
+        now: u64,
+    ) -> Option<P> {
+        let Some((mut p, ok_to_drop)) = self.do_dequeue(src, params, soj, now) else {
+            self.dropping = false;
+            return None;
+        };
+        if self.dropping {
+            if !ok_to_drop {
+                self.dropping = false; // sojourn back below target: leave the dropping state
+            }
+            while self.dropping && now >= self.drop_next {
+                if let Some(kept) = congestion_signal(p, params, stats) {
+                    // ECN-marked: deliver it, schedule the next signal.
+                    self.count += 1;
+                    self.drop_next = control_law(self.drop_next, params.interval_ns, self.count);
+                    p = kept;
+                    break;
+                }
+                self.count += 1;
+                match self.do_dequeue(src, params, soj, now) {
+                    None => {
+                        self.dropping = false;
+                        return None;
+                    }
+                    Some((next, ok)) => {
+                        p = next;
+                        if ok {
+                            self.drop_next =
+                                control_law(self.drop_next, params.interval_ns, self.count);
+                        } else {
+                            self.dropping = false;
+                        }
+                    }
+                }
+            }
+        } else if ok_to_drop {
+            // Enter the dropping state: signal congestion on this packet. If
+            // it was dropped, deliver the next one (RFC 8289 delivers it
+            // regardless of its own sojourn; the next signal is scheduled).
+            if let Some(kept) = congestion_signal(p, params, stats) {
+                p = kept;
+            } else if let Some((next, _)) = self.do_dequeue(src, params, soj, now) {
+                p = next;
+            } else {
+                self.enter_dropping(params, now); // the drop emptied the queue
+                return None;
+            }
+            self.enter_dropping(params, now);
+        }
+        Some(p)
+    }
+
+    /// RFC 8289: when re-entering the dropping state soon after leaving it,
+    /// resume from the previous drop rate instead of starting at 1.
+    fn enter_dropping(&mut self, params: &Params, now: u64) {
+        self.dropping = true;
+        let delta = self.count.wrapping_sub(self.lastcount);
+        self.count = if delta > 1 && now.saturating_sub(self.drop_next) < 16 * params.interval_ns {
+            delta
+        } else {
+            1
+        };
+        self.drop_next = control_law(now, params.interval_ns, self.count);
+        self.lastcount = self.count;
+    }
+}
+
+/// Drop or ECN-mark `p`. Returns the packet if it was marked (keep it).
+fn congestion_signal<P: Packet>(mut p: P, params: &Params, stats: &mut Stats) -> Option<P> {
+    stats.aqm_actions += 1;
+    if params.ecn && p.mark_ce() {
+        stats.marked += 1;
+        Some(p)
+    } else {
+        stats.dropped += 1;
+        None
+    }
+}
+
+/// Single-queue CoDel.
+pub struct Codel<P> {
+    q: VecDeque<(P, u64)>,
+    p: Params,
+    bytes: usize,
+    vars: Vars,
     stats: Stats,
-    /// Sojourn time of the last dequeued packet (diagnostics).
-    pub last_sojourn_ns: u64,
-    /// Largest sojourn seen since the last `take_max_sojourn`.
-    max_sojourn_ns: u64,
+    soj: Sojourn,
+}
+
+struct Fifo<'a, P> {
+    q: &'a mut VecDeque<(P, u64)>,
+    bytes: &'a mut usize,
+}
+
+impl<P: Packet> Source<P> for Fifo<'_, P> {
+    fn pop(&mut self) -> Option<(P, u64)> {
+        let (p, ts) = self.q.pop_front()?;
+        *self.bytes -= p.len_bytes();
+        Some((p, ts))
+    }
+    fn backlog_bytes(&self) -> usize {
+        *self.bytes
+    }
 }
 
 impl<P: Packet> Codel<P> {
@@ -90,55 +243,20 @@ impl<P: Packet> Codel<P> {
             q: VecDeque::with_capacity(p.max_packets),
             p,
             bytes: 0,
-            first_above_time: 0,
-            drop_next: 0,
-            count: 0,
-            lastcount: 0,
-            dropping: false,
+            vars: Vars::default(),
             stats: Stats::default(),
-            last_sojourn_ns: 0,
-            max_sojourn_ns: 0,
+            soj: Sojourn::default(),
         }
+    }
+
+    /// Sojourn time of the last dequeued packet (diagnostics).
+    pub fn last_sojourn_ns(&self) -> u64 {
+        self.soj.last_ns
     }
 
     /// Largest sojourn time since the previous call (resets it).
     pub fn take_max_sojourn_ns(&mut self) -> u64 {
-        core::mem::take(&mut self.max_sojourn_ns)
-    }
-
-    /// RFC 8289 `dodequeue`: pop one packet and decide whether CoDel is in
-    /// the "persistently above target" state where dropping is allowed.
-    fn do_dequeue(&mut self, now: u64) -> Option<(P, bool)> {
-        let Some((p, ts)) = self.q.pop_front() else {
-            self.first_above_time = 0;
-            return None;
-        };
-        self.bytes -= p.len_bytes();
-        let sojourn = now.saturating_sub(ts);
-        self.last_sojourn_ns = sojourn;
-        self.max_sojourn_ns = self.max_sojourn_ns.max(sojourn);
-        let ok_to_drop = if sojourn < self.p.target_ns || self.bytes <= MAX_PACKET {
-            self.first_above_time = 0;
-            false
-        } else if self.first_above_time == 0 {
-            self.first_above_time = now + self.p.interval_ns;
-            false
-        } else {
-            now >= self.first_above_time
-        };
-        Some((p, ok_to_drop))
-    }
-
-    /// Drop or ECN-mark `p`. Returns the packet if it was marked (keep it).
-    fn congestion_signal(&mut self, mut p: P) -> Option<P> {
-        self.stats.aqm_actions += 1;
-        if self.p.ecn && p.mark_ce() {
-            self.stats.marked += 1;
-            Some(p)
-        } else {
-            self.stats.dropped += 1;
-            None
-        }
+        core::mem::take(&mut self.soj.max_ns)
     }
 }
 
@@ -156,55 +274,20 @@ impl<P: Packet> Qdisc<P> for Codel<P> {
     }
 
     fn dequeue(&mut self, now: u64) -> Dequeue<P> {
-        let Some((mut p, ok_to_drop)) = self.do_dequeue(now) else {
-            self.dropping = false;
-            return Dequeue::Empty;
+        let mut src = Fifo {
+            q: &mut self.q,
+            bytes: &mut self.bytes,
         };
-        if self.dropping {
-            if !ok_to_drop {
-                self.dropping = false; // sojourn back below target: leave the dropping state
+        match self
+            .vars
+            .dequeue(&mut src, &self.p, &mut self.stats, &mut self.soj, now)
+        {
+            Some(p) => {
+                self.stats.dequeued += 1;
+                Dequeue::Packet(p)
             }
-            while self.dropping && now >= self.drop_next {
-                if let Some(kept) = self.congestion_signal(p) {
-                    // ECN-marked: deliver it, schedule the next signal.
-                    self.count += 1;
-                    self.drop_next = control_law(self.drop_next, self.p.interval_ns, self.count);
-                    p = kept;
-                    break;
-                }
-                self.count += 1;
-                match self.do_dequeue(now) {
-                    None => {
-                        self.dropping = false;
-                        return Dequeue::Empty;
-                    }
-                    Some((next, ok)) => {
-                        p = next;
-                        if ok {
-                            self.drop_next =
-                                control_law(self.drop_next, self.p.interval_ns, self.count);
-                        } else {
-                            self.dropping = false;
-                        }
-                    }
-                }
-            }
-        } else if ok_to_drop {
-            // Enter the dropping state: signal congestion on this packet. If
-            // it was dropped, deliver the next one (RFC 8289 delivers it
-            // regardless of its own sojourn; the next signal is scheduled).
-            if let Some(kept) = self.congestion_signal(p) {
-                p = kept;
-            } else if let Some((next, _)) = self.do_dequeue(now) {
-                p = next;
-            } else {
-                self.enter_dropping(now); // the drop emptied the queue
-                return Dequeue::Empty;
-            }
-            self.enter_dropping(now);
+            None => Dequeue::Empty,
         }
-        self.stats.dequeued += 1;
-        Dequeue::Packet(p)
     }
 
     fn has_room(&self) -> bool {
@@ -217,22 +300,6 @@ impl<P: Packet> Qdisc<P> for Codel<P> {
             backlog_bytes: self.bytes,
             ..self.stats
         }
-    }
-}
-
-impl<P: Packet> Codel<P> {
-    /// RFC 8289: when re-entering the dropping state soon after leaving it,
-    /// resume from the previous drop rate instead of starting at 1.
-    fn enter_dropping(&mut self, now: u64) {
-        self.dropping = true;
-        let delta = self.count.wrapping_sub(self.lastcount);
-        self.count = if delta > 1 && now.saturating_sub(self.drop_next) < 16 * self.p.interval_ns {
-            delta
-        } else {
-            1
-        };
-        self.drop_next = control_law(now, self.p.interval_ns, self.count);
-        self.lastcount = self.count;
     }
 }
 
@@ -413,7 +480,7 @@ mod tests {
             ecn: false,
             ..Params::default()
         });
-        let (med, p99, util) = simulate(&mut q, false, |q| q.last_sojourn_ns);
+        let (med, p99, util) = simulate(&mut q, false, |q| q.last_sojourn_ns());
         std::eprintln!(
             "codel drop: median {:.1} ms, p99 {:.1} ms, util {util:.3}, signals {}",
             med as f64 / 1e6,
@@ -463,7 +530,7 @@ mod tests {
             ecn: false,
             ..Params::default()
         });
-        let (cmed, _, _) = simulate(&mut codel, false, |q| q.last_sojourn_ns);
+        let (cmed, _, _) = simulate(&mut codel, false, |q| q.last_sojourn_ns());
         std::eprintln!(
             "fifo: median {:.1} ms vs codel {:.1} ms",
             med as f64 / 1e6,
@@ -480,7 +547,7 @@ mod tests {
     #[test]
     fn ecn_marks_instead_of_dropping() {
         let mut q = Codel::new(Params::default());
-        let (med, _, util) = simulate(&mut q, true, |q| q.last_sojourn_ns);
+        let (med, _, util) = simulate(&mut q, true, |q| q.last_sojourn_ns());
         let s = q.stats();
         std::eprintln!(
             "codel ecn: median {:.1} ms, util {util:.3}, marked {}",

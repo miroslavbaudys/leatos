@@ -10,7 +10,7 @@ use crate::net::packet::PacketBuf;
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
 use qdisc::Qdisc;
-use qdisc::codel::Codel;
+use qdisc::fq_codel::FqCodel;
 use qdisc::shaper::Shaper;
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
@@ -22,8 +22,8 @@ pub fn tx_drops() -> u64 {
     TX_DROPS.load(Ordering::Relaxed)
 }
 
-/// Egress on every port: optional rate shaper around CoDel (CAKE later).
-pub type PortQdisc = Shaper<Codel<PacketBuf>>;
+/// Egress on every port: optional rate shaper around FQ-CoDel (CAKE later).
+pub type PortQdisc = Shaper<FqCodel<PacketBuf>>;
 
 pub struct PortDevice<'a> {
     pub local_rx: &'a mut VecDeque<PacketBuf>,

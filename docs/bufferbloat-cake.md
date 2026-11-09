@@ -185,7 +185,7 @@ bottleneck on purpose, so that CoDel/CAKE control the queue.
 `crates/qdisc/src/shaper.rs`: a rate shaper around any qdisc (CAKE-style:
 rate-based `next_tx` instead of a token bucket; 1 ms release window so the
 datapath wakes ~1×/ms; no credit after idle). In the kernel, each port is
-`Shaper<Codel>`: the **WAN egress** is shaped at the upload rate and the
+`Shaper<Codel>` (now `Shaper<FqCodel>`, see below): the **WAN egress** is shaped at the upload rate and the
 **LAN egress** at the download rate. With one LAN port, shaping LAN egress
 is equivalent to an ingress hook for download traffic. A true ingress stage
 (for several LAN ports, counting drops) comes with CAKE. The network task
@@ -242,6 +242,39 @@ fallback sources were added.
 - Download throughput (44.5 Mbit/s) was below the 50 Mbit/s shaping rate,
   so at times the real downlink was the bottleneck. Ingress shaping needs
   more margin (CAKE recommends ~85–90 % for ingress).
+
+### Status: FQ-CoDel (M6 step 4)
+`crates/qdisc/src/fq_codel.rs` implements RFC 8290. Packets are hashed by
+`PacketMeta::flow_hash` (keyed, pre-NAT 5-tuple from conntrack) into 1024
+flow queues, each with its own CoDel state. The CoDel control law was
+factored out of `codel.rs` (`Vars`, `Source`) for this, so both qdiscs share
+one implementation.
+
+- **DRR:** deficit round robin, quantum 1514 B, so sharing is byte-fair
+  whatever the packet size.
+- **New-flows list:** flows that become active are served first. Sparse
+  flows (ping, DNS, games, VoIP, TCP handshakes) always arrive to an empty
+  queue, so they always take this fast path.
+- **Overflow:** head-drops from the *fattest* flow, never the arriving
+  packet.
+- **Memory:** a preallocated slab of `max_packets` slots with linked lists
+  per flow, so nothing is allocated per packet.
+- **Kernel:** each port is `Shaper<FqCodel>`. Router-local frames (smoltcp:
+  DNS, DHCP, ping replies) have `flow_hash` 0 and share one sparse queue.
+- **A/B:** boot argument `fq_flows=N`; `fq_flows=1` is a single CoDel queue.
+- **Stats:** the `qdisc` console line shows active flows and activations.
+
+| Evidence | single CoDel | FQ-CoDel |
+|---|---|---|
+| sim: sender ignoring drops at 125 % of the link + ping every 20 ms | ping p50 **81 ms** | ping p99 **< 0.01 ms**, no ping loss |
+| sim: 4 Reno flows, RTT 10/20/40/80 ms + ping (drops) | ping p99 73 ms, Jain fairness 0.64, util 0.95 | ping p99 **0.7 ms**, fairness **0.99**, util 0.98 |
+| same with ECN | ping p99 93 ms, fairness 0.59 | ping p99 0.7 ms, fairness 0.99, util 0.97, 0 drops |
+| lab, 10/10 Mbit/s, ping to router during the download, HVF | avg 8 ms, max 21 ms (`LAB_ROUTER_ARGS=fq_flows=1`: check **fails**, the negative control) | avg **0.7 ms**, max 1.4 ms |
+| lab, TCG | | avg 1.6 ms, max 5.6 ms |
+
+The lab check now requires an average below 3 ms, so it fails without flow
+isolation. The simulated single-queue result (ping p99 73–93 ms behind
+competing flows) matches the ~85 ms seen on the real line.
 
 ## 5. Configuration UX
 ```toml

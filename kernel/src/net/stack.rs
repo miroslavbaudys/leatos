@@ -98,25 +98,34 @@ pub fn bring_up(pci: &mut Pci, qos: &crate::config::Qos) -> Vec<NetIf> {
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = timer::ticks();
         let rate = qos.rate(if i == 0 { qos.up_kbit } else { qos.down_kbit });
-        let codel = qdisc::codel::Codel::new(qdisc::codel::Params {
-            max_packets: QDISC_PACKETS,
-            limit_bytes: QDISC_BYTES,
-            ecn: qos.ecn,
+        let fq = qdisc::fq_codel::FqCodel::new(qdisc::fq_codel::FqParams {
+            codel: qdisc::codel::Params {
+                max_packets: QDISC_PACKETS,
+                limit_bytes: QDISC_BYTES,
+                ecn: qos.ecn,
+                ..Default::default()
+            },
+            flows: qos.flows,
             ..Default::default()
         });
-        let mut qdisc = PortQdisc::new(codel, rate);
+        let mut qdisc = PortQdisc::new(fq, rate);
+        let aqm = alloc::format!(
+            "{}{}",
+            if qos.flows > 1 {
+                alloc::format!("FQ-CoDel ({} flows)", qos.flows)
+            } else {
+                alloc::string::String::from("CoDel (single queue)")
+            },
+            if qos.ecn { " + ECN" } else { " (drop only)" }
+        );
         match rate {
             Some(r) => println!(
-                "  qos {name}       : shaped {} kbit/s ({}), overhead {} B, CoDel{}",
+                "  qos {name}       : shaped {} kbit/s ({}), overhead {} B, {aqm}",
                 r.bits_per_sec / 1000,
                 if i == 0 { "upload" } else { "download" },
                 r.overhead,
-                if qos.ecn { " + ECN" } else { " (drop only)" }
             ),
-            None => println!(
-                "  qos {name}       : unshaped, CoDel{}",
-                if qos.ecn { " + ECN" } else { " (drop only)" }
-            ),
+            None => println!("  qos {name}       : unshaped, {aqm}"),
         }
         let mut local_rx = VecDeque::with_capacity(datapath::LOCAL_RX_MAX);
         let mut port = PortDevice {

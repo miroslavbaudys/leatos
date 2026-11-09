@@ -337,7 +337,15 @@ impl Datapath {
                 continue;
             }
             self.last_dequeued[i] = s.dequeued;
-            let max_sojourn = nif.qdisc.inner_mut().take_max_sojourn_ns();
+            let fq = nif.qdisc.inner_mut();
+            let max_sojourn = fq.take_max_sojourn_ns();
+            let (new_flows, old_flows) = fq.active_flows();
+            let flows = alloc::format!(
+                "flows {} new + {} old (activations {}), ",
+                new_flows,
+                old_flows,
+                fq.new_flow_count
+            );
             let shaped = match nif.qdisc.rate() {
                 Some(r) => alloc::format!(
                     "shaped {} kbit/s, throttled {}, ",
@@ -347,7 +355,7 @@ impl Datapath {
                 None => alloc::string::String::new(),
             };
             crate::println!(
-                "  qdisc {}       : {shaped}sent {}, aqm drops {}, ecn marks {}, overflow drops {}, backlog {} pkts, max sojourn {}.{:03} ms",
+                "  qdisc {}       : {shaped}{flows}sent {}, aqm drops {}, ecn marks {}, overflow drops {}, backlog {} pkts, max sojourn {}.{:03} ms",
                 nif.name,
                 s.dequeued,
                 s.aqm_actions - s.marked,

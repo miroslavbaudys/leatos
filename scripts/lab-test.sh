@@ -21,6 +21,9 @@
 #                        (0 = unshaped router, shaping checks skipped)
 #   LAB_EXPECT_KBIT=N    what the client expects (default: LAB_SHAPE_KBIT);
 #                        set it with LAB_SHAPE_KBIT=0 as a negative control
+#   LAB_ROUTER_ARGS="…"  extra router boot arguments, e.g. fq_flows=1 (single
+#                        CoDel queue: the negative control for the flow-
+#                        isolation latency check)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -29,6 +32,7 @@ SHAPE_KBIT="${LAB_SHAPE_KBIT:-10000}"
 EXPECT_KBIT="${LAB_EXPECT_KBIT:-$SHAPE_KBIT}"
 ROUTER_ARGS=""
 [[ "$SHAPE_KBIT" != 0 ]] && ROUTER_ARGS="shape_up=$SHAPE_KBIT shape_down=$SHAPE_KBIT"
+ROUTER_ARGS="$ROUTER_ARGS ${LAB_ROUTER_ARGS:-}"
 LAN_PORT="${LAB_LAN_PORT:-10003}"
 WAN_PORT="${LAB_WAN_PORT:-10005}"
 WORK=$(mktemp -d -t rrouter-lab)

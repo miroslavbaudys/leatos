@@ -1,6 +1,7 @@
 //! Queue management for bufferbloat mitigation: the [`Qdisc`] interface,
 //! [`fifo::BFifo`] (bounded tail-drop FIFO), [`codel::Codel`] (RFC 8289
-//! AQM), and later FQ-CoDel and CAKE (docs/bufferbloat-cake.md).
+//! AQM), [`fq_codel::FqCodel`] (RFC 8290 flow queueing), [`shaper::Shaper`],
+//! and later CAKE (docs/bufferbloat-cake.md).
 //!
 //! The qdisc is the **only** place packets wait in rrouter. Egress is
 //! pull-based: the datapath dequeues only when the driver has room, so a
@@ -17,6 +18,7 @@ extern crate alloc;
 
 pub mod codel;
 pub mod fifo;
+pub mod fq_codel;
 pub mod shaper;
 
 /// What a qdisc needs to know about a packet.
@@ -28,6 +30,12 @@ pub trait Packet {
     /// dropping it. The default (not ECN-capable) makes the AQM drop.
     fn mark_ce(&mut self) -> bool {
         false
+    }
+    /// Flow identity for flow queueing (FQ-CoDel): packets of one flow must
+    /// get the same hash. Should be keyed, so outsiders cannot aim for
+    /// collisions. Default: everything is one flow.
+    fn flow_hash(&self) -> u32 {
+        0
     }
 }
 

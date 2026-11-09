@@ -184,6 +184,12 @@ impl qdisc::Packet for PacketBuf {
     /// ECN: turn ECT(0)/ECT(1) into CE in an IPv4 frame (incremental header
     /// checksum update). Non-IPv4 and Not-ECT packets are left alone (the AQM
     /// drops them instead).
+    /// Keyed hash of the pre-NAT 5-tuple (conntrack); 0 for router-local
+    /// frames, which then share one (sparse) flow queue.
+    fn flow_hash(&self) -> u32 {
+        self.meta.flow_hash
+    }
+
     fn mark_ce(&mut self) -> bool {
         use fwd::wire;
         let f = self.data_mut();
