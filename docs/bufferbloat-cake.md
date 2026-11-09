@@ -320,6 +320,36 @@ variant (RFC 8289 CoDel is used).
 The lab has a single client, so host isolation is tested in simulation
 only for now. A second LAN host in the lab is a follow-up.
 
+**Real line, CAKE vs single queue (2026-11-09, shaped 42/45, one run each):**
+
+| run | download Mbit/s | download added p90 | upload Mbit/s | upload added p90 |
+|---|---|---|---|---|
+| CAKE (default) | 41.9 | **+46 ms** (p50 only +4 ms) | 39.4 | **+14 ms** (grade A) |
+| `qdisc=codel` | 35.5 | +73 ms | 40.5 | +102 ms |
+
+- **Upload is solved for latency-sensitive traffic:** the ping bypasses the
+  bulk uploads.
+  - The bulk flows' own queues still reach the hard limit (WAN max sojourn
+    166–238 ms, 383 overflow drops, only 91 BLUE drops).
+- **ECN marks on upload are lost on the path (confirmed).** During the
+  upload rrouter set ~7,700 CE marks on WAN egress. The Mac's upload data
+  was ECT(0), so ECN was negotiated. Yet ACKs arriving from the WAN carried
+  ECE only 7 more times (17 → 24). Something between rrouter and the
+  server clears the CE bits (*ECN bleaching*: the home router at
+  192.168.8.1 or the ISP). The single-queue run shows the same (5,484 marks,
+  ECE 13 → 17).
+- **ECN works on download.** rrouter's CE marks on LAN egress reach the
+  Mac. The Mac echoes ECE (18.5k → 35.5k ACKs), and the servers answer
+  with CWR (279 → 526).
+- **The remaining download latency is upstream of rrouter.**
+  - The ping's own queue in rrouter is the sparse fast path.
+  - Download throughput (41.9) stayed below the 45 Mbit/s shaping rate, so
+    the real downlink was at times the bottleneck and queued in front of
+    rrouter.
+  - Idle latency already varies (p50 8 ms, max 26 ms): the line's rate
+    varies. A lower download rate, or later CAKE autorate (M9), addresses
+    this.
+
 ## 5. Configuration UX
 ```toml
 [qos]
