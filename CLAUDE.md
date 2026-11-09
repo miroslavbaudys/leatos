@@ -25,7 +25,7 @@ Goals: PPPoE, DHCP (v4 server/client, DHCPv6-PD, RA), a DNS forwarder, NAT, a fi
 - `cargo kbuild [--release]`: build the kernel. `cargo krun` boots it (`Ctrl-A X` quits; `QEMU_NET=user` adds 2 NICs)
 - `scripts/smoke-test.sh`: cases boot (DHCP + ping), fault-wx, fault-stack. Also run `QEMU_ACCEL=tcg scripts/smoke-test.sh` after boot, MMU, IRQ, timer or driver changes
 - `scripts/lab-test.sh`: client VM + router + ISP VM; DHCP, DNS, NAT, ICMP, traceroute, firewall end to end (`LAB_VERBOSE=1` for consoles). Run it after any network change, also with `QEMU_ACCEL=tcg`
-- `scripts/mac-internet.sh [--check] [--wan-if enX] [--ipv4-only] [--release] [--shape U:D] | --restore`: route the Mac's real IPv4 internet + DNS through rrouter (WAN vmnet-bridged); state saved before changes, watchdog + `--restore` undo
+- `scripts/mac-internet.sh [--check] [--wan-if enX] [--ipv4-only] [--release] [--shape U:D] [--kernel-args "..."] | --restore`: route the Mac's real IPv4 internet + DNS through rrouter (WAN vmnet-bridged); state saved before changes, watchdog + `--restore` undo
 - `scripts/bufferbloat.sh [--label X]`: latency idle vs. under download/upload load, throughput and grade. Runs are marked INVALID if the load failed; results go to `lab/cache/bufferbloat.csv`
 - `scripts/mac-lab.sh [--check]`: put the developer's Mac on rrouter's LAN (vmnet-host, needs sudo, so run it in Terminal); only 203.0.113.0/24 and `*.lan`/`*.example` DNS go via rrouter; cleans up on exit
 - `cargo test`: host tests for `crates/*`; `cargo clippy --all-targets` for the crates
@@ -44,7 +44,7 @@ Goals: PPPoE, DHCP (v4 server/client, DHCPv6-PD, RA), a DNS forwarder, NAT, a fi
 - `crates/*` are `#![no_std]` + `alloc` and **sans-IO** (pass bytes and `now` in; return bytes and events). Protocol logic goes there, not in the kernel.
 - Dependencies must be `no_std`. Prefer audited crates (virtio-drivers, safe-mmio, smoltcp, aarch64-cpu) over hand-written unsafe.
 - Edition 2024: `#[unsafe(no_mangle)]`, `unsafe extern "C"`, `&raw const`.
-- Kernel runtime options are **boot arguments** (DTB `/chosen/bootargs`, QEMU `-append` via `QEMU_APPEND`), parsed in `config.rs`: `shape_up`, `shape_down`, `shape_overhead`, `idle_spin_us`.
+- Kernel runtime options are **boot arguments** (DTB `/chosen/bootargs`, QEMU `-append` via `QEMU_APPEND`), parsed in `config.rs`: `shape_up`, `shape_down`, `shape_overhead`, `ecn`, `idle_spin_us`.
 - No heap use before `heap::init` (platform discovery runs before it).
 - New MMIO must be mapped in `mm::mmu::init` (or `arch::mmu::PLATFORM_MMIO`). Writable memory is never executable.
 - **Latency-first datapath (CAKE):** the qdisc is the only place packets may wait (no other FIFOs). TX is pull-based (`can_transmit` before `transmit`). Timers are tickless, so no periodic tick. Datapath tasks run at `Priority::Datapath`.

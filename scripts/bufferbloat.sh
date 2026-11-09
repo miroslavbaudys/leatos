@@ -23,7 +23,15 @@ PING_TARGET=1.1.1.1
 # Cloudflare refuses single downloads above ~50 MB (HTTP 403), so each stream
 # fetches 25 MB chunks back to back until the phase ends.
 CHUNK=25000000
-DL_URL="https://speed.cloudflare.com/__down?bytes=$CHUNK"
+# Download sources, in order. A stream that gets rate-limited (429) or a
+# server error moves on to the next source (Cloudflare rate-limits an IP
+# after many runs). The fallbacks are large static files, read with a byte
+# range of $CHUNK.
+DL_URLS=(
+  "https://speed.cloudflare.com/__down?bytes=$CHUNK"
+  "https://proof.ovh.net/files/1Gb.dat"
+  "https://nbg1-speed.hetzner.com/1GB.bin"
+)
 UL_URL='https://speed.cloudflare.com/__up'
 STREAMS=4
 DURATION=15
@@ -52,7 +60,8 @@ if [[ -z "$LABEL" ]]; then
   if [[ "$gw" == 192.168.1.1 ]]; then
     build=$(sed -n 's/^BUILD=//p' lab/cache/mac-internet.state 2>/dev/null || true)
     shape=$(sed -n 's/^SHAPE=//p' lab/cache/mac-internet.state 2>/dev/null || true)
-    LABEL="rrouter-${build:-unknown}${shape:+-shaped-${shape/:/-}}"
+    xargs_=$(sed -n 's/^ARGS=//p' lab/cache/mac-internet.state 2>/dev/null | tr ' =' '_-' || true)
+    LABEL="rrouter-${build:-unknown}${shape:+-shaped-${shape/:/-}}${xargs_:+-$xargs_}"
   else
     LABEL=direct
   fi
@@ -97,11 +106,12 @@ load() { # download|upload
   for i in $(seq 1 "$STREAMS"); do
     (
       total=0
+      src=0
       while :; do
         left=$(( end - $(date +%s) ))
         [[ $left -gt 0 ]] || break
         if [[ "$1" == download ]]; then
-          out=$(curl -s -o /dev/null -m "$left" -w '%{http_code} %{size_download}' "$DL_URL" 2>/dev/null || true)
+          out=$(curl -s -o /dev/null -m "$left" -r "0-$((CHUNK - 1))" -w '%{http_code} %{size_download}' "${DL_URLS[$src]}" 2>/dev/null || true)
         else
           out=$(curl -s -o /dev/null -m "$left" -X POST -H 'Content-Type: application/octet-stream' \
             --data-binary @"$WORK/chunk" -w '%{http_code} %{size_upload}' "$UL_URL" 2>/dev/null || true)
@@ -110,8 +120,14 @@ load() { # download|upload
         bytes=${out##* }
         total=$(( total + ${bytes:-0} ))
         case "$code" in
-          200 | 000 | 100) ;; # 000/100: cut off by the phase deadline mid-transfer
-          429 | 5??) echo "HTTP $code" >>"$WORK/retry.$i"; sleep 1 ;;
+          200 | 206 | 000 | 100) ;; # 206: ranged fallback; 000/100: cut off by the deadline
+          429 | 5??)
+            echo "HTTP $code" >>"$WORK/retry.$i"
+            if [[ "$1" == download && $((src + 1)) -lt ${#DL_URLS[@]} ]]; then
+              src=$((src + 1)) # rate-limited: switch to the next download source
+            else
+              sleep 1
+            fi ;;
           *) echo "HTTP $code" >>"$WORK/fatal.$i"; break ;;
         esac
       done
@@ -168,7 +184,7 @@ for n in download upload; do
   [[ "$m" == "-" ]] && continue
   if awk -v m="$m" 'BEGIN{exit !(m < 1.0)}'; then valid=0; reasons+=" $n: only $m Mbit/s of load;"; fi
   if [[ -n "$f" ]]; then valid=0; reasons+=" $n: streams failed ($f);"; fi
-  if [[ "$r" -gt 0 ]]; then echo "  note: $n phase retried $r rate-limited/5xx requests (1 s backoff each)"; fi
+  if [[ "$r" -gt 0 ]]; then echo "  note: $n phase hit $r rate-limited/5xx responses (switched download source, or retried after 1 s)"; fi
 done
 
 added() { awk -v a="$1" -v b="$2" 'BEGIN{ if(a=="nan"||b=="nan") print "nan"; else printf "%.1f", a-b }'; }

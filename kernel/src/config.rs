@@ -63,12 +63,15 @@ fn arg_u64(bootargs: &str, key: &str) -> Option<u64> {
 /// Shaping (docs/bufferbloat-cake.md): set rates slightly below the real
 /// bottleneck so the queue forms in rrouter. Boot arguments, in kbit/s:
 /// `shape_up=42000` (WAN egress), `shape_down=50000` (LAN egress, i.e. the
-/// download direction), `shape_overhead=38` (bytes per packet, default 0).
+/// download direction), `shape_overhead=38` (bytes per packet, default 0),
+/// `ecn=0` (AQM drops instead of ECN-marking).
 #[derive(Clone, Copy, Debug)]
 pub struct Qos {
     pub up_kbit: Option<u64>,
     pub down_kbit: Option<u64>,
     pub overhead: u32,
+    /// ECN marking in the AQM (boot argument `ecn=0` disables: drop only).
+    pub ecn: bool,
 }
 
 pub fn qos(bootargs: &str) -> Qos {
@@ -76,6 +79,7 @@ pub fn qos(bootargs: &str) -> Qos {
         up_kbit: arg_u64(bootargs, "shape_up").filter(|&r| r > 0),
         down_kbit: arg_u64(bootargs, "shape_down").filter(|&r| r > 0),
         overhead: arg_u64(bootargs, "shape_overhead").unwrap_or(0) as u32,
+        ecn: arg_u64(bootargs, "ecn").is_none_or(|v| v != 0),
     }
 }
 

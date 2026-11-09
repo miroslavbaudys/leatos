@@ -204,6 +204,25 @@ Rates are **boot arguments**: `shape_up=` / `shape_down=` (kbit/s) and
 | lab, TCG | down 9.53, up 8.2 Mbit/s (TCG overhead on 20 short uploads; near the 8.0 bound) |
 | negative control: unshaped router, same client expectations | fails (221 / 137 Mbit/s) |
 
+### First real-line run with shaping (42/50 Mbit/s)
+The queue **moved into rrouter**: the WAN shaper throttled 113k times, and
+the macOS Wi-Fi path no longer holds the standing queue. But CoDel's
+signals barely slowed the senders:
+
+```
+qdisc wan0 : shaped 42000 kbit/s, … aqm drops 16, ecn marks 5673, overflow drops 842, backlog 363 pkts, max sojourn 106 ms
+```
+Upload: 40.4 Mbit/s with **+106 ms** added (p90), down from +199 ms
+unshaped. That's exactly the ~105 ms that 363 packets take at 42 Mbit/s: the
+queue sat at the hard limit despite ~380 ECN marks per second. Hypotheses:
+macOS TCP reacting weakly to ECN (or disabling it per connection), ECN
+feedback lost on the path, or a marking problem visible only end to end.
+**Diagnostic:** the same run with `ecn=0` (CoDel drops instead). Also,
+the ping waits behind the upload because CoDel is a single FIFO: flow
+isolation (FQ-CoDel/CAKE) would remove that wait entirely. The download
+phase was invalid (Cloudflare rate limit), so the download fallback
+sources were added.
+
 ## 5. Configuration UX
 ```toml
 [qos]

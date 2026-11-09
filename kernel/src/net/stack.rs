@@ -101,17 +101,22 @@ pub fn bring_up(pci: &mut Pci, qos: &crate::config::Qos) -> Vec<NetIf> {
         let codel = qdisc::codel::Codel::new(qdisc::codel::Params {
             max_packets: QDISC_PACKETS,
             limit_bytes: QDISC_BYTES,
+            ecn: qos.ecn,
             ..Default::default()
         });
         let mut qdisc = PortQdisc::new(codel, rate);
         match rate {
             Some(r) => println!(
-                "  qos {name}       : shaped {} kbit/s ({}), overhead {} B, CoDel",
+                "  qos {name}       : shaped {} kbit/s ({}), overhead {} B, CoDel{}",
                 r.bits_per_sec / 1000,
                 if i == 0 { "upload" } else { "download" },
-                r.overhead
+                r.overhead,
+                if qos.ecn { " + ECN" } else { " (drop only)" }
             ),
-            None => println!("  qos {name}       : unshaped, CoDel"),
+            None => println!(
+                "  qos {name}       : unshaped, CoDel{}",
+                if qos.ecn { " + ECN" } else { " (drop only)" }
+            ),
         }
         let mut local_rx = VecDeque::with_capacity(datapath::LOCAL_RX_MAX);
         let mut port = PortDevice {

@@ -26,6 +26,7 @@
 #     --shape U:D    shape rrouter's upload to U and download to D Mbit/s
 #                    (e.g. 42:50: slightly below the real line rate, so the
 #                    queue forms in rrouter where CoDel controls it)
+#     --kernel-args "a=b c=d"   extra rrouter boot arguments (e.g. "ecn=0")
 #     --yes          don't ask for confirmation
 #     --check        run the checks, then restore and exit (exit 1 on failure)
 #
@@ -61,6 +62,7 @@ ASSUME_YES=0
 PROFILE=debug
 SHAPE=""
 KERNEL_ARGS=""
+EXTRA_ARGS=""
 MODE=interactive
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -74,10 +76,11 @@ while [[ $# -gt 0 ]]; do
       down_k=$(awk -v m="${SHAPE##*:}" 'BEGIN{printf "%d", m * 1000}')
       KERNEL_ARGS="shape_up=$up_k shape_down=$down_k"
       shift 2 ;;
+    --kernel-args) EXTRA_ARGS="${2:?--kernel-args needs a string}"; shift 2 ;;
     --yes) ASSUME_YES=1; shift ;;
     --check) MODE=check; shift ;;
     --restore) MODE=restore; shift ;;
-    -h | --help) sed -n '2,34p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,35p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -187,7 +190,7 @@ BEFORE=$(ifconfig -l)
 
 echo "== start rrouter (WAN bridged on $WAN_IF, LAN on vmnet-host)"
 sudo -n env QEMU_BIN="$QEMU_BIN" QEMU_NET=mac-internet MAC_WAN_IF="$WAN_IF" QEMU_ACCEL="${QEMU_ACCEL:-hvf}" \
-  QEMU_APPEND="$KERNEL_ARGS" scripts/qemu-run.sh "$KERNEL" >"$WORK/router.log" 2>&1 &
+  QEMU_APPEND="$KERNEL_ARGS${EXTRA_ARGS:+ $EXTRA_ARGS}" scripts/qemu-run.sh "$KERNEL" >"$WORK/router.log" 2>&1 &
 ROUTER_PID=$!
 if ! wait_for "$WORK/router.log" "net wan0 .*dhcp lease" 30; then
   echo "rrouter got no WAN lease on $WAN_IF within 30 s."
@@ -211,7 +214,7 @@ v6_state=unchanged
 if [[ "$IPV4_ONLY" == 1 ]] && networksetup -getinfo "$SERVICE" | grep -q "^IPv6: Automatic"; then v6_state=automatic; fi
 mkdir -p "$(dirname "$STATE")"
 # BUILD= is informational (read by scripts/bufferbloat.sh to label results).
-printf 'SERVICE=%s\nDNS=%s\nIPV6=%s\nROUTES=split\nBUILD=%s\nSHAPE=%s\n' "$SERVICE" "$orig_dns" "$v6_state" "$PROFILE" "$SHAPE" >"$STATE"
+printf 'SERVICE=%s\nDNS=%s\nIPV6=%s\nROUTES=split\nBUILD=%s\nSHAPE=%s\nARGS=%s\n' "$SERVICE" "$orig_dns" "$v6_state" "$PROFILE" "$SHAPE" "$EXTRA_ARGS" >"$STATE"
 
 echo "== switching this Mac to rrouter"
 for r in "${SPLIT_ROUTES[@]}"; do
