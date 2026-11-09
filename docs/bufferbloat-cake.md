@@ -395,6 +395,20 @@ to ECN on ingress, off on egress):
 | `ecn=1` with the default expectation (`LAB_EXPECT_ECN=0:1`), the negative control | 29 marks | | **FAIL** (as it must) |
 | default, TCG | 29 drops | 52 marks | PASS |
 
+**Real line with the new defaults (2026-11-09 22:32, shaped 38/36, one run):**
+- **Upload:** 28.8 Mbit/s, +35.7 ms. rrouter's upload queue now drops
+  instead of marking (141 drops, 0 marks). The bulk uploads' own max
+  sojourn fell to **41 ms** after the start (121 ms in the first interval),
+  against 123–130 ms with marks.
+- **Download:** 33.1 Mbit/s, +39.4 ms, against +9.6 ms at the same 36 Mbit/s
+  earlier. ECN marks only (3,252); LAN max sojourn 127 → 89 → 48 ms.
+- **The line was noisier this time:** idle ping max 134 ms, p99 28 ms.
+  The ping bypasses rrouter's bulk queues, so its remaining variation
+  comes from the line.
+- **Conclusion:** single runs on this line can't separate configurations
+  that differ by less than ~30 ms. Comparisons need repeated, interleaved
+  runs, and a variable-rate line ultimately needs autorate.
+
 ## 5. Configuration UX
 ```toml
 [qos]
