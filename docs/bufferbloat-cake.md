@@ -217,11 +217,31 @@ unshaped. That's exactly the ~105 ms that 363 packets take at 42 Mbit/s: the
 queue sat at the hard limit despite ~380 ECN marks per second. Hypotheses:
 macOS TCP reacting weakly to ECN (or disabling it per connection), ECN
 feedback lost on the path, or a marking problem visible only end to end.
-**Diagnostic:** the same run with `ecn=0` (CoDel drops instead). Also,
-the ping waits behind the upload because CoDel is a single FIFO: flow
-isolation (FQ-CoDel/CAKE) would remove that wait entirely. The download
-phase was invalid (Cloudflare rate limit), so the download fallback
-sources were added.
+The download phase was invalid (Cloudflare rate limit), so the download
+fallback sources were added.
+
+**A/B, ECN on vs off (2026-11-09, shaped 42/50, one run each):**
+
+| run | upload Mbit/s | upload added p90 | WAN max sojourn | download Mbit/s | download added p90 | LAN max sojourn |
+|---|---|---|---|---|---|---|
+| ECN on | 40.3 | **+104 ms** | 106 ms (4842 marks, queue at limit) | 44.3 | +83 ms | 90 ms (702 marks) |
+| ECN off (`ecn=0`) | 37.6 | **+41 ms** | 41–45 ms (163 drops) | 44.7 | +85 ms | 89 ms (545 drops) |
+
+- **Upload: drops work, CE marks mostly don't.** macOS has classic ECN on
+  (`net.inet.tcp.ecn=1`, L4S off), so L4S isn't the explanation. Leading
+  hypothesis: **ECN bleaching** upstream (the home router or ISP clears the
+  ECN bits after rrouter marks them), so the receiver never echoes ECE.
+  Diagnostic added: per-port counters of ECN codepoints and TCP ECE/CWR
+  flags on forwarded packets (`ecn rx …` console lines). ECE on ACKs
+  arriving from the WAN would show that the marks survived.
+- **Download: even drops don't contain the queue** (545 drops, still ~89 ms).
+  Likely the senders (CDNs, often BBR) barely react to loss. A single-queue
+  AQM can't fix that. **Flow isolation** (FQ-CoDel / CAKE: per-flow queues,
+  sparse flows first) is the fix: a bulk flow then only delays itself, and
+  the ping (or a game, a call, DNS) bypasses it.
+- Download throughput (44.5 Mbit/s) was below the 50 Mbit/s shaping rate,
+  so at times the real downlink was the bottleneck. Ingress shaping needs
+  more margin (CAKE recommends ~85–90 % for ingress).
 
 ## 5. Configuration UX
 ```toml

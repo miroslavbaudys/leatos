@@ -49,6 +49,12 @@ pub struct Datapath {
     pub qdisc_drops: u64,
     next_stats: u64,
     last_dequeued: [u64; 2],
+    /// Per ingress port: forwarded IPv4 packets by ECN codepoint
+    /// [Not-ECT, ECT(1), ECT(0), CE], and TCP packets with ECE / CWR set.
+    ecn_seen: [[u64; 4]; 2],
+    tcp_ece: [u64; 2],
+    tcp_cwr: [u64; 2],
+    ecn_reported: [u64; 2],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -111,6 +117,10 @@ impl Datapath {
             qdisc_drops: 0,
             next_stats: STATS_MS,
             last_dequeued: [0; 2],
+            ecn_seen: [[0; 4]; 2],
+            tcp_ece: [0; 2],
+            tcp_cwr: [0; 2],
+            ecn_reported: [0; 2],
         }
     }
 
@@ -151,6 +161,28 @@ impl Datapath {
         pkt.data_mut().fill(0);
         wire::build_arp_request(pkt.data_mut(), iface.mac, my_ip, target);
         self.enqueue(ifs, ifx, pkt);
+    }
+
+    /// ECN diagnostics on a forwarded frame (before NAT/egress): codepoint
+    /// counts, and the TCP ECE (receiver saw CE) / CWR (sender reacted) flags.
+    fn observe_ecn(&mut self, ingress: IfIndex, frame: &[u8]) {
+        let i = ingress as usize;
+        if i >= 2 {
+            return;
+        }
+        let Some(v) = wire::Ipv4View::parse(frame, wire::ETH_HDR) else {
+            return;
+        };
+        self.ecn_seen[i][(v.tos(frame) & 3) as usize] += 1;
+        if v.proto == wire::PROTO_TCP && v.l4_len >= 14 {
+            let flags = frame[v.l4 + 13];
+            if flags & 0x40 != 0 {
+                self.tcp_ece[i] += 1;
+            }
+            if flags & 0x80 != 0 {
+                self.tcp_cwr[i] += 1;
+            }
+        }
     }
 
     /// Learn neighbors from ARP and release packets waiting for them.
@@ -212,6 +244,7 @@ impl Datapath {
                         class,
                     } => {
                         pkt.set_len(len);
+                        self.observe_ecn(ifx, pkt.data());
                         pkt.meta = meta_from(&class, ifx, len, now_ns());
                         FORWARDED.fetch_add(1, Ordering::Relaxed);
                         match self.neigh.resolve(egress, next_hop, pkt, now) {
@@ -280,6 +313,24 @@ impl Datapath {
 
     /// One console line per port that sent traffic since the last report.
     fn print_qdisc_stats(&mut self, ifs: &mut [NetIf]) {
+        for (i, nif) in ifs.iter().enumerate().take(2) {
+            let total: u64 = self.ecn_seen[i].iter().sum();
+            if total == self.ecn_reported[i] {
+                continue;
+            }
+            self.ecn_reported[i] = total;
+            let e = self.ecn_seen[i];
+            crate::println!(
+                "  ecn rx {}      : not-ect {}, ect0 {}, ect1 {}, ce {} | tcp ece {}, cwr {}",
+                nif.name,
+                e[0],
+                e[2],
+                e[1],
+                e[3],
+                self.tcp_ece[i],
+                self.tcp_cwr[i]
+            );
+        }
         for (i, nif) in ifs.iter_mut().enumerate().take(2) {
             let s = nif.qdisc.stats();
             if s.dequeued == self.last_dequeued[i] {
