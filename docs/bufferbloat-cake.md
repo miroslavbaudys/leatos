@@ -169,30 +169,40 @@ ecn = true
 - **Real line:** the Waveform bufferbloat test, and flent against a remote netserver.
 
 ## 6b. Baseline measurements (before CAKE)
-Measured with `scripts/bufferbloat.sh` on the developer's MacBook (Wi-Fi to the
-home router, rrouter in QEMU/HVF via `scripts/mac-internet.sh`, debug
-build, BFifo qdisc):
+Measured with `scripts/bufferbloat.sh` on the developer's MacBook: Wi-Fi to
+the home router (192.168.8.1), line ≈ 55 Mbit/s down / 46 Mbit/s up.
+rrouter runs in QEMU/HVF via `scripts/mac-internet.sh` with a BFifo qdisc
+(128 KB tail drop) and NIC rings limited to 8 frames in flight. "Added" is
+loaded p90 minus idle p50. Only valid runs are shown (2026-11-08/09):
 
-| Date | Path | Idle p50 | Download | Added (p90) | Upload | Added (p90) |
-|---|---|---|---|---|---|---|
-| 2026-11-08 | rrouter-debug | 7.8 ms | 55.3 Mbit/s | +55.7 ms (B); p99 117 ms | 45.2 Mbit/s | +58.0 ms (B) |
-| 2026-11-08 | rrouter-release | 9.6 ms | 55.0 Mbit/s | +50.7 ms (B); p99 117 ms | 38.0 Mbit/s | +52.0 ms (B) |
+| Path | Runs | Download added (p90) | Upload added (p90) | Upload max | ↓ / ↑ Mbit/s |
+|---|---|---|---|---|---|
+| direct | 2 | 66.9, 47.5 ms (≈ 57) | **243.5, 241.7 ms** | 369–403 ms | 54–56 / 46 |
+| rrouter-release | 3 | 50.7, 58.6, 45.0 ms (≈ 51) | **52.0, 69.2, 100.1 ms (≈ 74)** | 172–206 ms | 54–55 / 38–48 |
+| rrouter-debug | 1 | 55.7 ms | 58.0 ms | 129 ms | 55 / 45 |
 
-**Interpretation (single runs, so treat ±10 % as noise):**
-- The release build is several times faster per packet but gives the same throughput, so
-  **rrouter is not the bottleneck**. About 55 Mbit/s is the real line or Wi-Fi limit.
-- The ~50 ms of added latency therefore most likely builds **upstream**
-  (home router, ISP or Wi-Fi), in front of that bottleneck. This is the case CAKE
-  addresses: shape slightly below the bottleneck (~50 Mbit/s here) so the
-  queue moves into rrouter, where COBALT and flow queueing keep it short.
-- First `direct` run (without rrouter; **degraded**: 2 requests rate-limited,
-  so it's marked invalid): download +67 ms (p90), similar to rrouter, which is
-  consistent with an upstream queue. Upload **+299 ms p90, 600 ms max**, much
-  worse than through rrouter (+52–58 ms). A plausible cause: sending directly
-  fills macOS's deep Wi-Fi transmit queue, while through rrouter packets pass
-  its small bounded queues first (≤ 8 frames in flight, 128 KB FIFO). That
-  would be early evidence for the "no hidden queues" design. **Needs clean
-  repeats** before drawing conclusions.
+**Findings:**
+1. **Download is the same with or without rrouter** (≈ +50–57 ms at the
+   same throughput). The queue builds upstream (home router / ISP), and
+   rrouter adds nothing measurable. A fix needs **ingress shaping** in rrouter
+   slightly below ~54 Mbit/s (§3.4), so the queue moves into rrouter.
+2. **Upload is ~3× better through rrouter** (≈ +74 ms vs ≈ +242 ms, same
+   throughput; the direct runs are very consistent). Hypothesis, not yet
+   proven: a direct upload fills a deep transmit queue (macOS, Wi-Fi driver
+   or upstream), while through rrouter every packet passes rrouter's small
+   bounded queues first. Their early tail drops slow TCP down before deep
+   queues fill. This is the first real-world evidence for the "no hidden
+   queues" design (§3.1), even before CAKE.
+3. **Upload via rrouter still varies (52–100 ms):** the BFifo has no AQM and
+   no flow isolation (a ping waits behind the upload). This is what COBALT
+   + flow queueing address.
+4. **The build type doesn't matter at this rate** (debug ≈ release), so CPU
+   is not the limit.
+
+**Implications for M6:** shaping must be accurate at sub-millisecond
+granularity (1500 B at 50 Mbit/s = 240 µs), but QEMU-on-macOS `wfi` wake-up
+adds up to ~3 ms (§3.2). The **hybrid idle** (early wake + spin) is
+therefore a prerequisite for meaningful CAKE results in this setup.
 
 ## 7. Performance
 CAKE costs more CPU than fq_codel. On Linux, low-end ARM routers saturate at a
