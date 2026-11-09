@@ -6,17 +6,17 @@
 //! maintenance in `share` / `unshare`.
 
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
+use alloc::vec::Vec;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use spin::Mutex;
 use virtio_drivers::{BufferDirection, Hal, PAGE_SIZE, PhysAddr};
 
-/// MMIO range that BAR addresses may fall into (set by `pci`).
-static MMIO_START: AtomicUsize = AtomicUsize::new(0);
-static MMIO_END: AtomicUsize = AtomicUsize::new(0);
+/// MMIO ranges that BAR addresses may fall into: every memory BAR that
+/// `pci` found and mapped as device memory.
+static MMIO: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
-pub fn set_mmio_window(start: usize, end: usize) {
-    MMIO_START.store(start, Ordering::Relaxed);
-    MMIO_END.store(end, Ordering::Relaxed);
+pub fn add_mmio_range(start: usize, end: usize) {
+    MMIO.lock().push((start, end));
 }
 
 fn layout(pages: usize) -> Layout {
@@ -42,14 +42,11 @@ unsafe impl Hal for DmaHal {
     }
 
     unsafe fn mmio_phys_to_virt(paddr: PhysAddr, size: usize) -> NonNull<u8> {
-        let (start, end) = (
-            MMIO_START.load(Ordering::Relaxed),
-            MMIO_END.load(Ordering::Relaxed),
-        );
         let p = paddr as usize;
+        let end = p.checked_add(size).expect("dma: MMIO range overflows");
         assert!(
-            p >= start && p.checked_add(size).is_some_and(|e| e <= end),
-            "dma: BAR {p:#x}+{size:#x} outside MMIO window {start:#x}..{end:#x}"
+            MMIO.lock().iter().any(|&(s, e)| p >= s && end <= e),
+            "dma: {p:#x}+{size:#x} is not inside a mapped PCI BAR"
         );
         NonNull::new(p as *mut u8).expect("dma: null MMIO address")
     }

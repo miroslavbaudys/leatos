@@ -57,20 +57,27 @@ Every dependency is reviewed for `no_std` support and its own unsafe surface bef
 
 ## 3. x86_64 portability
 
+**Status (M9b, 2026-11-09): x86_64 runs.** On QEMU q35 (TCG on Apple
+Silicon), the x86_64 kernel passes the same smoke tests (boot with DHCP and
+ping, fault-wx, fault-stack) and the full lab (`RROUTER_ARCH=x86_64
+scripts/lab-test.sh`: DHCP, DNS, NAT, firewall, shaping, CAKE, ECN). The
+next target is the PC Engines apu4 (M10).
+
 ### 3.1 What's the same, and what differs
-| Area | aarch64 (now) | x86_64 (future) | Portable? |
+| Area | aarch64 | x86_64 | Portable? |
 |---|---|---|---|
-| Boot | QEMU `-kernel` ELF, DTB at RAM start | Limine (or PVH) boot protocol, ACPI RSDP | arch + platform backend |
-| HW discovery | DTB | ACPI: MADT (APIC), MCFG (ECAM) | neutral `BootInfo`, two backends |
+| Boot | QEMU `-kernel` ELF, DTB at RAM start | **PVH** (`XEN_ELFNOTE_PHYS32_ENTRY`): QEMU `-kernel`, 32-bit entry stub in `boot.S` → long mode; multiboot2 header for GRUB/Limine on hardware in M10 | arch + platform backend |
+| HW discovery | DTB | PVH start info (memory map, command line) + ACPI: MADT (LAPIC/IOAPIC), MCFG (ECAM), FADT + DSDT `\_S5` | neutral `BootInfo`, two backends |
 | Console | PL011 MMIO | 16550 UART (port I/O `0x3f8`) | `arch::console` |
-| Interrupt controller | GICv3 | Local APIC + IOAPIC; **MSI/MSI-X preferred** | `arch::irqchip` API |
-| Timer (tickless) | generic timer, CNTV_CVAL | **TSC-deadline** LAPIC timer (calibrate the TSC via CPUID 0x15 / HPET) | `arch::timer` API |
-| Page tables | 4 KiB granule, 512-entry levels | 4-level, also 4 KiB × 512 | **neutral builder** + per-arch descriptor bits |
-| Exceptions | vector table, ESR decode | IDT, error codes, CR2 | `arch::exceptions` → neutral `FaultInfo` |
+| Interrupt controller | GICv3, INTx from the DTB `interrupt-map` | local APIC, 8259 PICs masked; devices via **MSI-X** | `arch::irqchip` API |
+| Timer (tickless) | generic timer, CNTV_CVAL | TSC clock (calibrated on the 8254 PIT), **LAPIC one-shot** deadlines. TSC-deadline mode isn't used: the apu4's AMD GX-412TC lacks it | `arch::timer` API |
+| Page tables | 4 KiB granule, 512-entry levels | 4-level, 4 KiB × 512; NX via EFER.NXE, W^X enforced for ring 0 by CR0.WP | **neutral builder** + per-arch descriptor bits |
+| Exceptions | vector table, ESR decode | IDT, TSS with IST1 (exception stack) for #PF/#DF/NMI/#MC, error codes, CR2 | arch |
+| Power off | PSCI | ACPI S5 (PM1 control ports, `\_S5` SLP_TYP) | `arch::power` |
 | Memory ordering for DMA | weak (`dmb`/`dsb`) | strong (TSO) | handled inside virtio-drivers / fences |
-| PCIe | ECAM, we assign BARs | ECAM via MCFG; firmware already assigned BARs | **neutral** (keep BARs that are already assigned) |
+| PCIe | ECAM, we assign BARs | ECAM via MCFG; firmware assigned the BARs; every BAR is mapped at runtime (`mm::mmu::map_device`) | **neutral** |
 | virtio-net (PCI) | ✔ | ✔ | **neutral**. This is why we use virtio-**pci**, not virtio-mmio |
-| Real NICs | — | Intel i225/i226 (igc), common in x86 mini-PCs | neutral driver over `mmio` + `dma` |
+| Real NICs | — | Intel i211 (igb), apu4 (M10) | neutral driver over `mmio` + `dma` |
 
 ### 3.2 Code layout that keeps the port cheap
 ```
@@ -78,8 +85,9 @@ kernel/src/
   main.rs            arch-neutral boot order
   arch/mod.rs        selects the backend; documents the arch API contract
   arch/aarch64/      boot.S, cpu, exceptions, gic (irqchip), timer, mmu bits, psci, pl011
-  arch/x86_64/       compile-only stubs today (`cargo kcheck-x86`)
-  platform/          neutral BootInfo + dtb backend (later: acpi backend)
+  arch/x86_64/       boot.S (PVH entry), isr.S, cpu, exceptions (IDT/TSS), irqchip (LAPIC,
+                     MSI-X), timer (TSC + LAPIC), mmu bits, power (ACPI S5), console, port
+  platform/          neutral BootInfo; dtb (aarch64); pvh + acpi + phys (x86_64)
   mm/                heap, page-table builder, dma
   irq.rs timer.rs executor.rs console.rs pci.rs mmio.rs   (neutral)
   drivers/           virtio_net (neutral)
@@ -88,22 +96,46 @@ kernel/src/
 **Rule:** nothing outside `arch/` may use `core::arch`, `asm!` or arch-specific
 crates. Neutral code calls only the `arch::` API.
 
-**CI guard:** `cargo kcheck-x86` type-checks the kernel for
-`x86_64-unknown-none` against stub implementations. If neutral code starts
-depending on aarch64, this check fails long before a real port begins.
+**Guards:**
+- `cargo kcheck-x86`: type-checks neutral code for x86_64.
+- `cargo kclippy-x86`: lints the x86 kernel, with every feature like `kclippy`.
+- `RROUTER_ARCH=x86_64` on `scripts/smoke-test.sh` and `scripts/lab-test.sh`
+  boots the x86 kernel.
+
+**Unsafe on x86_64** (`scripts/unsafe-report.sh`):
+- **Arch backend:** port I/O (one instruction per function), control
+  registers, CPUID, `lidt`/`ltr`, the extern statics of `isr.S`/`boot.S`.
+- **`platform::phys`:** one constructor that views firmware memory as a
+  byte slice. The ACPI and PVH parsers are safe, bounds-checked code over
+  those slices.
 
 ### 3.3 Device interrupts: the main design fork
 - aarch64 QEMU virt: legacy INTx through the DTB `interrupt-map` is simple.
   MSI-X needs the GICv3 ITS (complex).
 - x86: MSI-X is simple (write the LAPIC address/data), while INTx needs ACPI
   `_PRT`, which means AML interpretation (complex).
-- **Decision:** drivers see an abstract `IrqLine` (enable, disable, and an `IrqEvent` to
-  wait on). M2 implements INTx for aarch64. The x86 port implements MSI-X
-  behind the same interface. Drivers use a NAPI-style pattern either way:
-  interrupt → mask → poll until empty → unmask.
+- **Decision (implemented):** drivers see an interrupt ID plus an
+  `IrqEvent` either way.
+  - **INTx where the platform routes it:** aarch64.
+  - **Otherwise MSI-X:** `pci::Pci::enable_msix` programs table entry 0 with
+    `arch::irqchip::msi_message`. `arch::irqchip::enable` and `disable`
+    unmask and mask that entry. Device vectors are 48–63; a message raised
+    while masked stays pending in the device, so NAPI-style masking loses
+    nothing.
+- **virtio caveat:** `virtio-drivers` 0.13 doesn't assign MSI-X vectors to
+  the queues. `VirtioNet::route_msix` writes `msix_config` and
+  `queue_msix_vector` once, after init. This is documented in
+  `drivers/virtio_net.rs` as the one place where rrouter touches
+  registers the crate also maps. Remove it once `virtio-drivers` supports
+  MSI-X.
 
-### 3.4 Effort estimate for the x86_64 port (after M2)
-Boot via Limine, plus a 16550 console, ACPI (MADT/MCFG, via the `acpi`
-crate), LAPIC + IOAPIC, TSC-deadline timer, IDT/exceptions, x86 page-table
-bits and MSI-X: **about 4–6 weeks**, if the seams above are kept clean. Testing
-on Apple Silicon runs under TCG emulation only (functional, not performance).
+### 3.4 Effort, as it turned out
+The seams held: the port needed no changes to neutral code beyond three
+small API additions:
+- `mm::mmu::map_device`, because x86 firmware places BARs anywhere in the
+  PCI hole;
+- MSI-X in `pci` and `arch::irqchip`;
+- `mmio::Region16`, for virtio's 16-bit registers.
+
+Testing on Apple Silicon runs under TCG emulation only: functional, not
+performance. Performance is measured on the apu4 (M10).

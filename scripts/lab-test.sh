@@ -16,6 +16,8 @@
 #   LAB_KEEP_LOGS=1      keep console logs (path printed)
 #   LAB_TIMEOUT=120      seconds before giving up
 #   QEMU_ACCEL=tcg       run without hardware acceleration
+#   RROUTER_ARCH=x86_64  run the x86_64 router kernel (QEMU q35, TCG); the
+#                        client and ISP VMs stay aarch64
 #   LAB_SHAPE_KBIT=10000 router shapes both directions at this rate and the
 #                        client checks throughput + latency under load
 #                        (0 = unshaped router, shaping checks skipped)
@@ -53,7 +55,8 @@ source scripts/lab/common.sh
 lab_cpu_flags
 
 echo "== build"
-cargo build -q -p rrouter-kernel --target aarch64-unknown-none
+ARCH="${RROUTER_ARCH:-aarch64}"
+cargo build -q -p rrouter-kernel --target "$ARCH-unknown-none"
 ALPINE_DIR=$(scripts/lab/fetch-alpine.sh | tail -1)
 ISP_INITRD=$(scripts/lab/build-initrd.sh isp | tail -1)
 CLIENT_INITRD=$(scripts/lab/build-initrd.sh client | tail -1)
@@ -63,7 +66,7 @@ start_isp "$WAN_PORT" "$WORK/isp.log" || exit 1
 
 echo "== start rrouter${ROUTER_ARGS:+ ($ROUTER_ARGS)}"
 QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" QEMU_PCAP_DIR="${LAB_PCAP_DIR:-}" QEMU_ACCEL="$QEMU_ACCEL" QEMU_APPEND="$ROUTER_ARGS" \
-  scripts/qemu-run.sh target/aarch64-unknown-none/debug/rrouter >"$WORK/router.log" 2>&1 &
+  scripts/qemu-run.sh "target/$ARCH-unknown-none/debug/rrouter" >"$WORK/router.log" 2>&1 &
 PIDS+=($!)
 wait_for "$WORK/router.log" "rrouter: boot ok" 40 || { echo "router did not boot:"; cat "$WORK/router.log"; exit 1; }
 

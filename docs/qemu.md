@@ -14,11 +14,18 @@ Requirements: QEMU ≥ 8 (`brew install qemu`) and the Rust toolchain. The
 | `scripts/smoke-test.sh` | automated boot tests (cases `boot`, `fault-wx`, `fault-stack`); non-zero exit on failure |
 | `cargo test` | host unit tests for the `crates/*` protocol crates |
 | `cargo kclippy` | clippy for the kernel |
-| `cargo kcheck-x86` | type-check the kernel for x86_64 against the arch skeleton |
+| `cargo kcheck-x86` | type-check the kernel for x86_64 |
+| `cargo kbuild-x86` / `cargo krun-x86` / `cargo kclippy-x86` | build / boot (QEMU q35, TCG) / lint the x86_64 kernel |
+| `RROUTER_ARCH=x86_64 scripts/smoke-test.sh` | the smoke tests with the x86_64 kernel |
+| `RROUTER_ARCH=x86_64 scripts/lab-test.sh` | the lab with an x86_64 router (client and ISP VMs stay aarch64) |
 | `scripts/unsafe-report.sh` | list modules allowed to use `unsafe` and count unsafe constructs |
 | `scripts/lab-test.sh` | end-to-end test with client + ISP VMs: DHCP, DNS, NAT, firewall (see below) |
 
-`scripts/qemu-run.sh` reads these environment variables:
+`scripts/qemu-run.sh` boots either architecture. It reads the ELF's
+machine type: x86-64 kernels boot on `-machine q35` through PVH (`-kernel`),
+with SeaBIOS assigning the PCI BARs. On Apple Silicon x86 guests always use
+TCG, the full lab included (functional, not performance). It reads these
+environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|

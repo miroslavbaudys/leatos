@@ -26,6 +26,11 @@ use crate::platform::BootInfo;
 use crate::println;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use spin::Mutex;
+
+/// The active address space, kept so device MMIO found later (PCI BARs that
+/// firmware placed anywhere in the PCI hole) can be mapped: [`map_device`].
+static LIVE: Mutex<Option<AddressSpace>> = Mutex::new(None);
 
 pub const PAGE: usize = 4096;
 const ENTRIES: usize = 512;
@@ -114,8 +119,25 @@ impl AddressSpace {
         }
     }
 
+    /// Is the page at `addr` mapped (by a page or a larger block)?
+    fn is_mapped(&self, addr: usize) -> bool {
+        let mut t = 0;
+        for level in 0..hw::LEVELS {
+            let shift = hw::TOP_LEVEL_SHIFT - 9 * level;
+            let entry = self.tables[t].0[(addr >> shift) & (ENTRIES - 1)];
+            if !hw::is_valid(entry) {
+                return false;
+            }
+            if !hw::is_table(entry, level) {
+                return true;
+            }
+            t = self.index_of(hw::desc_addr(entry));
+        }
+        true
+    }
+
     /// Switch the CPU to this address space and return the table count.
-    /// The tables are leaked: the MMU uses them for the rest of the kernel's life.
+    /// The tables then live in [`LIVE`] for the rest of the kernel's life.
     ///
     /// # Safety
     /// The tree must identity-map everything the kernel touches from now on
@@ -123,8 +145,11 @@ impl AddressSpace {
     pub unsafe fn activate(self) -> usize {
         let n = self.tables.len();
         let root = table_addr(&self.tables[0]);
-        Vec::leak(self.tables);
-        // SAFETY: forwarded from the caller's contract; tables are leaked (live forever).
+        let mut live = LIVE.lock();
+        assert!(live.is_none(), "mmu: address space activated twice");
+        *live = Some(self); // boxes don't move: the root stays at `root`
+        // SAFETY: forwarded from the caller's contract; the tables are kept
+        // in LIVE, never freed.
         unsafe { hw::activate(root) };
         n
     }
@@ -169,6 +194,26 @@ pub fn init(info: &BootInfo) {
     // SAFETY: code, data, stacks, heap and all MMIO in use are mapped above.
     let tables = unsafe { space.activate() };
     println!("  mmu             : 4 KiB pages, W^X, guard pages ({tables} tables)");
+}
+
+/// Map `[start, end)` as device memory in the live address space, page by
+/// page, skipping pages that are already mapped (e.g. inside a platform
+/// MMIO window). For PCI BARs, which on PCs firmware places anywhere in the
+/// PCI hole. Only adds mappings: nothing in use changes.
+pub fn map_device(start: usize, end: usize) {
+    let (start, end) = (align_down(start), align_up(end));
+    let mut live = LIVE.lock();
+    let space = live.as_mut().expect("mmu: map_device before mmu::init");
+    let mut added = false;
+    for page in (start..end).step_by(PAGE) {
+        if !space.is_mapped(page) {
+            space.map(page, page + PAGE, Perm::Device);
+            added = true;
+        }
+    }
+    if added {
+        hw::sync_tables();
+    }
 }
 
 /// Is `addr` inside one of the unmapped stack guard pages?

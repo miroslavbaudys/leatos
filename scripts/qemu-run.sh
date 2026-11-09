@@ -49,6 +49,9 @@ if [[ -z "${QEMU_ACCEL:-}" ]]; then
   fi
 fi
 
+# An x86_64 guest can only use hardware acceleration on an x86_64 host.
+if [[ "$ARCH" == x86_64 && "$(uname -m)" != x86_64 && "$QEMU_ACCEL" != tcg ]]; then QEMU_ACCEL=tcg; fi
+
 if [[ "$ARCH" == x86_64 ]]; then
   MACHINE=(-machine q35 -vga none)
   # `max` gives TCG every feature it emulates (NX, x2APIC, invariant TSC).

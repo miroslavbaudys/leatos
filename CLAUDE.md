@@ -1,21 +1,21 @@
 # CLAUDE.md
 
-rrouter is a SOHO router OS in Rust: a **bare-metal unikernel**, running on aarch64 QEMU `virt` today (HVF on Apple Silicon), with x86_64 planned.
+rrouter is a SOHO router OS in Rust: a **bare-metal unikernel** for aarch64 (QEMU `virt`, HVF on Apple Silicon) and x86_64 (QEMU q35 via PVH, TCG; target hardware: PC Engines apu4, M10).
 Goals: PPPoE, DHCP (v4 server/client, DHCPv6-PD, RA), a DNS forwarder, NAT, a firewall, IPv4 + IPv6, and
 **bufferbloat mitigation with CAKE**, which is a core design driver (`docs/bufferbloat-cake.md`).
 
 ## Layout
 - `kernel/` (`rrouter-kernel`, binary `rrouter`)
   - `src/main.rs`: arch-neutral boot order (`kmain`). `#![deny(unsafe_code)]` applies crate-wide
-  - `src/arch/`: **all** CPU-specific code. `aarch64/` (boot.S, cpu, exceptions + IRQ entry, irqchip = GICv3, timer, mmu descriptors, power = PSCI, console = PL011) and `x86_64/` (compile-only skeleton). `arch/mod.rs` documents the API every backend provides
-  - `src/platform/`: neutral `BootInfo` (no allocation) + `dtb.rs` backend (later `acpi`)
+  - `src/arch/`: **all** CPU-specific code. `aarch64/` (boot.S, cpu, exceptions + IRQ entry, irqchip = GICv3, timer, mmu descriptors, power = PSCI, console = PL011) and `x86_64/` (boot.S = PVH entry → long mode, isr.S, exceptions = IDT/TSS/IST, irqchip = local APIC + MSI-X, timer = TSC + LAPIC one-shot, power = ACPI S5, console = 16550, port I/O). `arch/mod.rs` documents the API every backend provides
+  - `src/platform/`: neutral `BootInfo` (no allocation); `dtb.rs` (aarch64); `pvh.rs` + `acpi.rs` over `phys.rs` (x86_64: one unsafe byte-view constructor, safe parsers)
   - `src/mm/`: `heap`, `mmu` (neutral page-table builder; arch supplies the encoding), `dma` (virtio `Hal`), `sym` (linker symbols)
   - `src/mmio.rs`: `Region` = safe, bounds-checked MMIO over `safe-mmio`
   - `src/irq.rs` (dispatch + `IrqEvent`), `timer.rs` (tickless, `sleep`), `executor.rs` (priority async), `console.rs` (`println!`, `fatal_println!`), `pci.rs` (via `virtio-drivers` `PciRoot`), `selftest.rs`
   - `src/drivers/virtio_net.rs`: slot-owned DMA buffers, pull-based TX with a byte limit
   - `src/net/`: `packet.rs` (bounded pool, headroom, `PacketMeta`), `datapath.rs` (NIC RX → `fwd::Forwarder` → neighbor → qdisc → NIC TX), `device.rs` (smoltcp `Device` behind the datapath: RX from `local_rx`, TX into the qdisc), `stack.rs` (ports, WAN DHCP client, NAPI-style IRQ loop), `services.rs` (LAN DHCP server + DNS forwarder: smoltcp UDP sockets ↔ sans-IO crates)
   - `src/config.rs`: compiled-in defaults (LAN 192.168.1.1/24, DHCP range, statics, DNS) until the config store exists
-  - `linker.ld`: kernel at `0x4020_0000`, page-aligned sections, guard pages, 16 KiB exception stack + 256 KiB kernel stack
+  - `linker.ld` (aarch64, kernel at `0x4020_0000`) / `linker-x86_64.ld` (at 1 MiB, keeps the PVH note): page-aligned sections, guard pages, 16 KiB exception stack + 256 KiB kernel stack
 - Implemented and tested: `crates/proto-dhcp` (DHCPv4 server), `crates/proto-dns` (forwarder), `crates/fwd` (`wire`, `route`, `neigh`, `conntrack` with NAPT, `forwarder` pipeline), and `crates/qdisc` (`Qdisc` trait, `BFifo`, `codel` = RFC 8289 with ECN, `fq_codel` = RFC 8290 flow queueing (DRR, new-flows list, fattest-flow overflow drop, slab storage), `cake` = CAKE core on top (8-way set-associative hashing, host isolation from pre-NAT host hashes, COBALT = CoDel + BLUE); `testutil` = shared simulation with Reno-like, unresponsive and sparse senders). CAKE is the default egress qdisc on both ports (`net/device.rs` `Aqm`), wrapped in `shaper::Shaper` (WAN = upload rate, LAN = download rate; boot args `shape_up=`/`shape_down=` kbit/s, `shape_overhead=`). Skeleton: `proto-pppoe`
 - `lab/client/`, `lab/isp/`: overlays for the Alpine lab VMs (`/init`, configs, web/CGI); `lab/cache/` (gitignored) holds downloads
 - `scripts/qemu-run.sh` (cargo runner), `scripts/smoke-test.sh`, `scripts/lab-test.sh`, `scripts/mac-lab.sh` (+ `scripts/lab/`: fetch, initrd build, `common.sh`), `scripts/unsafe-report.sh`
@@ -30,7 +30,8 @@ Goals: PPPoE, DHCP (v4 server/client, DHCPv6-PD, RA), a DNS forwarder, NAT, a fi
 - `scripts/mac-lab.sh [--check]`: put the developer's Mac on rrouter's LAN (vmnet-host, needs sudo, so run it in Terminal); only 203.0.113.0/24 and `*.lan`/`*.example` DNS go via rrouter; cleans up on exit
 - `cargo test`: host tests for `crates/*`; `cargo clippy --all-targets` for the crates
 - `cargo kclippy [--features <f>]`: run for each of `smoke-test`, `idle-poll`, `fault-wx`, `fault-stack`
-- `cargo kcheck-x86`: type-check neutral code against the x86_64 skeleton (**must stay green**)
+- `cargo kcheck-x86`: type-check neutral code for x86_64 (**must stay green**); `cargo kbuild-x86` / `krun-x86` / `kclippy-x86 [--features <f>]` for the x86_64 kernel (run kclippy-x86 for the same features as kclippy)
+- `RROUTER_ARCH=x86_64 scripts/smoke-test.sh` / `scripts/lab-test.sh`: the same tests with the x86_64 kernel (TCG; client/ISP VMs stay aarch64). Run them after arch, boot, IRQ, timer, PCI or driver changes
 - `scripts/unsafe-report.sh`: the unsafe audit surface
 
 ## Rules
@@ -45,8 +46,9 @@ Goals: PPPoE, DHCP (v4 server/client, DHCPv6-PD, RA), a DNS forwarder, NAT, a fi
 - Dependencies must be `no_std`. Prefer audited crates (virtio-drivers, safe-mmio, smoltcp, aarch64-cpu) over hand-written unsafe.
 - Edition 2024: `#[unsafe(no_mangle)]`, `unsafe extern "C"`, `&raw const`.
 - Kernel runtime options are **boot arguments** (DTB `/chosen/bootargs`, QEMU `-append` via `QEMU_APPEND`), parsed in `config.rs`: `shape_up`, `shape_down`, `shape_overhead`, `ecn_up` (default 0: drop on upload), `ecn_down` (default 1: mark on download), `ecn` (sets both), `qdisc` (`cake` default, `fq_codel`, `codel` = single queue), `isolation` (`triple-isolate` default, `dual-srchost`, `dual-dsthost`, `flows`), `idle_spin_us`. `scripts/lab-test.sh` passes extra ones via `LAB_ROUTER_ARGS` and checks per-direction ECN from the router's counters (`LAB_EXPECT_ECN=U:D` for the negative control).
-- No heap use before `heap::init` (platform discovery runs before it).
-- New MMIO must be mapped in `mm::mmu::init` (or `arch::mmu::PLATFORM_MMIO`). Writable memory is never executable.
+- No heap use before `heap::init` (platform discovery runs before it). On x86_64, firmware memory (`platform::phys` views) is only valid during discovery: copy what you need into `BootInfo` or statics.
+- New MMIO must be mapped in `mm::mmu::init` (or `arch::mmu::PLATFORM_MMIO`), or at runtime with `mm::mmu::map_device` (PCI BARs). Writable memory is never executable.
+- Device interrupts: INTx where the platform routes it (aarch64), else MSI-X (`Pci::enable_msix`, vectors from `arch::irqchip::msi_vector`). Never add IOAPIC/INTx routing that needs ACPI AML.
 - **Latency-first datapath (CAKE):** the qdisc is the only place packets may wait (no other FIFOs). TX is pull-based (`can_transmit` before `transmit`). Timers are tickless, so no periodic tick. Datapath tasks run at `Priority::Datapath`.
 - **Ports:** NAT uses 10000–39999; router-local sockets (DNS upstream, future services) must bind ≥ 40000 so replies are never mistaken for NAT traffic.
 - Never edit a script in place while it may be running (bash reads scripts incrementally): write a temp file and rename it over the original.

@@ -216,6 +216,20 @@ pub fn init(info: &BootInfo) {
 }
 
 /// Enable an interrupt. SPIs (>= 32) are routed to this core with `trigger`.
+/// MSI-X isn't used on aarch64 (QEMU virt routes INTx through the GIC;
+/// MSI would need the GICv3 ITS).
+pub fn msi_vector(_n: usize) -> Option<u32> {
+    None
+}
+
+pub fn msi_message(_vector: u32) -> Option<(u64, u32)> {
+    None
+}
+
+pub fn attach_msix(_vector: u32, _entry: crate::mmio::Region) {
+    unreachable!("aarch64: msi_message() is None, so MSI-X is never attached")
+}
+
 pub fn enable(intid: u32, trigger: Trigger) {
     assert!((intid as usize) < MAX_INTID);
     with_gic(|g| {

@@ -92,7 +92,7 @@ pub fn bring_up(pci: &mut Pci, qos: &crate::config::Qos) -> Vec<NetIf> {
     let mut ifs = Vec::new();
     for (i, d) in devs.iter().enumerate().take(2) {
         let name = if i == 0 { "wan0" } else { "lan0" };
-        let dev = match VirtioNet::new(pci, d) {
+        let mut dev = match VirtioNet::new(pci, d) {
             Ok(dev) => dev,
             Err(e) => {
                 println!("  net {name}: init failed: {e:?}");
@@ -135,18 +135,26 @@ pub fn bring_up(pci: &mut Pci, qos: &crate::config::Qos) -> Vec<NetIf> {
         } else {
             iface.update_ip_addrs(|a| a.push(IpCidr::Ipv4(LAN_ADDR)).expect("lan addr"));
         }
-        let irq = d.intx.map(|intid| {
+        // Legacy INTx where the platform routes it (aarch64 DTB), otherwise
+        // MSI-X (x86_64: INTx routing would need ACPI AML).
+        let line = d.intx.map(|intid| (intid, Trigger::Level, "")).or_else(|| {
+            let vector = arch::irqchip::msi_vector(i)?;
+            dev.route_msix(pci, d, 0).ok()?;
+            pci.enable_msix(d, vector)?;
+            Some((vector, Trigger::Edge, " (MSI-X)"))
+        });
+        let irq = line.map(|(intid, trigger, kind)| {
             let ev = irq::new_event();
             irq::register(intid, mask_intx, ev);
-            arch::irqchip::enable(intid, Trigger::Level);
-            (intid, ev)
+            arch::irqchip::enable(intid, trigger);
+            (intid, ev, kind)
         });
         println!(
             "  net {name}       : virtio-net {} mac {} {}",
             d.df,
             EthernetAddress(mac),
             match irq {
-                Some((intid, _)) => alloc::format!("intid {intid}"),
+                Some((intid, _, kind)) => alloc::format!("intid {intid}{kind}"),
                 None => alloc::string::String::from("(no irq: polling)"),
             }
         );
@@ -160,7 +168,7 @@ pub fn bring_up(pci: &mut Pci, qos: &crate::config::Qos) -> Vec<NetIf> {
             local_rx,
             iface,
             sockets,
-            irq,
+            irq: irq.map(|(intid, ev, _)| (intid, ev)),
             masked: false,
         });
     }

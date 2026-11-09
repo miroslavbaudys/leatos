@@ -51,6 +51,10 @@ pub fn leaf_desc(pa: u64, perm: Perm, level: usize) -> u64 {
     pa | attrs(perm) | PRESENT | large
 }
 
+/// New entries were written into the live tables (only previously
+/// unmapped slots): x86 caches no not-present entries, nothing to flush.
+pub fn sync_tables() {}
+
 /// Switch to the page tables at `root` (EFER.NXE and CR0.WP were enabled
 /// in boot.S, so NX and read-only pages are enforced, also for the kernel).
 ///

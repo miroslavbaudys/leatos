@@ -54,6 +54,14 @@ pub fn leaf_desc(pa: u64, perm: Perm, level: usize) -> u64 {
     pa | attrs(perm) | VALID | kind
 }
 
+/// New entries were written into the live tables (only previously invalid
+/// slots, which the TLB never caches): make the stores visible to the
+/// table walker before the next access through them.
+pub fn sync_tables() {
+    // SAFETY: barriers only; no memory or register state changes.
+    unsafe { asm!("dsb ishst", "isb", options(nostack, preserves_flags)) };
+}
+
 /// Switch TTBR0 to `root` and enable WXN.
 ///
 /// # Safety

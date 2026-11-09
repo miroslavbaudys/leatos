@@ -1,17 +1,27 @@
 //! PCIe enumeration and BAR assignment over ECAM (arch-neutral).
 //!
-//! Config-space access goes through `virtio-drivers`' `PciRoot`, so this
-//! module only has two `unsafe` operations: creating the ECAM handle, and one
-//! read-only clone used to read the (read-only) Interrupt Pin register.
+//! Config-space access goes through `virtio-drivers`' `PciRoot`. The
+//! `unsafe` here: creating the ECAM handle; two clones of it, one read-only
+//! (Interrupt Pin) and one for the MSI-X capability, which `PciRoot` never
+//! touches; and the MSI-X table entry region.
+//!
+//! Every memory BAR is mapped as device memory when found
+//! (`mm::mmu::map_device`): on PCs, firmware may put BARs anywhere in the
+//! PCI hole.
+//!
+//! **MSI-X** ([`Pci::enable_msix`]): one table entry per device, pointing
+//! at a local-APIC vector (`arch::irqchip`). Used where legacy INTx routing
+//! would need ACPI AML (`_PRT`): x86_64.
 //!
 //! With `-kernel` on QEMU aarch64 no firmware assigns BARs, so we size every
 //! memory BAR and place it in the host bridge's 32-bit MMIO window. BARs that
 //! firmware already assigned (x86 with SeaBIOS/OVMF) are kept. I/O BARs are
 //! skipped: virtio "modern" devices and real NICs use memory BARs.
 
-use crate::mm::dma;
+use crate::mm::{dma, mmu};
+use crate::mmio::Region;
 use crate::platform::{PciWindow, PcieInfo};
-use crate::println;
+use crate::{arch, println};
 use alloc::vec::Vec;
 use virtio_drivers::transport::pci::bus::{
     BarInfo, Cam, Command, ConfigurationAccess, DeviceFunction, DeviceFunctionInfo, HeaderType,
@@ -63,7 +73,54 @@ impl PciDevice {
 
 pub struct Pci {
     pub root: PciRoot<MmioCam<'static>>,
+    /// Config access for registers `PciRoot` doesn't handle (capabilities).
+    cfg: MmioCam<'static>,
     pub devices: Vec<PciDevice>,
+}
+
+const CAP_MSIX: u8 = 0x11;
+const MSIX_ENABLE: u32 = 1 << 15;
+const MSIX_FUNCTION_MASK: u32 = 1 << 14;
+
+impl Pci {
+    pub fn config_read(&self, df: DeviceFunction, offset: u8) -> u32 {
+        self.cfg.read_word(df, offset)
+    }
+
+    /// Offset of the first capability with `id`.
+    pub fn capability(&self, df: DeviceFunction, id: u8) -> Option<u8> {
+        self.root
+            .capabilities(df)
+            .find(|c| c.id == id)
+            .map(|c| c.offset)
+    }
+
+    /// Route the device's MSI-X entry 0 to `vector` (masked until
+    /// `arch::irqchip::enable`) and switch the function from INTx to MSI-X.
+    /// `None` if the device or the platform lacks MSI-X.
+    pub fn enable_msix(&mut self, dev: &PciDevice, vector: u32) -> Option<()> {
+        let (addr, data) = arch::irqchip::msi_message(vector)?;
+        let cap = self.capability(dev.df, CAP_MSIX)?;
+        let header = self.cfg.read_word(dev.df, cap);
+        let table = self.cfg.read_word(dev.df, cap + 4);
+        let bar = dev.bars.get((table & 7) as usize).copied().flatten()?;
+        let entry_addr = bar.addr + (table & !7) as u64;
+        if entry_addr + 16 > bar.addr + bar.size {
+            return None;
+        }
+        // SAFETY: MSI-X table entry 0 inside a memory BAR that init()
+        // mapped as device memory; nothing else accesses the MSI-X table.
+        let mut entry = unsafe { Region::new(entry_addr as usize, 16) };
+        entry.write32(12, 1); // vector control: masked
+        entry.write32(0, addr as u32);
+        entry.write32(4, (addr >> 32) as u32);
+        entry.write32(8, data);
+        arch::irqchip::attach_msix(vector, entry);
+        let ctrl = (header >> 16 | MSIX_ENABLE) & !MSIX_FUNCTION_MASK;
+        self.cfg
+            .write_word(dev.df, cap, ctrl << 16 | (header & 0xffff));
+        Some(())
+    }
 }
 
 /// Bump allocator over the 32-bit MMIO window.
@@ -122,6 +179,8 @@ fn assign_bars(
             }
             pci
         };
+        mmu::map_device(addr as usize, (addr + size) as usize);
+        dma::add_mmio_range(addr as usize, (addr + size) as usize);
         bars[i] = Some(Bar {
             addr,
             size,
@@ -143,6 +202,9 @@ pub fn init(info: &PcieInfo) -> Pci {
     let cam = unsafe { MmioCam::new(info.ecam as *mut u8, Cam::Ecam) };
     // SAFETY: `ro` is used only to read the read-only Interrupt Pin register.
     let ro = unsafe { cam.unsafe_clone() };
+    // SAFETY: `cfg` only accesses capability registers (MSI-X), which
+    // PciRoot never reads or writes.
+    let cfg = unsafe { cam.unsafe_clone() };
     let mut root = PciRoot::new(cam);
 
     let mut mmio = info.mem32.map(|w| {
@@ -151,7 +213,6 @@ pub fn init(info: &PcieInfo) -> Pci {
             w.pci_addr, w.cpu_addr,
             "pci: non-identity MMIO window unsupported"
         );
-        dma::set_mmio_window(w.cpu_addr as usize, (w.cpu_addr + w.size) as usize);
         MmioAlloc {
             window: w,
             next: w.pci_addr,
@@ -179,7 +240,7 @@ pub fn init(info: &PcieInfo) -> Pci {
             });
         }
     }
-    Pci { root, devices }
+    Pci { root, cfg, devices }
 }
 
 pub fn print(pci: &Pci) {

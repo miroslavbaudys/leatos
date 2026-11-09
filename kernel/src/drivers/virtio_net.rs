@@ -14,8 +14,19 @@
 //!   adaptive BQL is planned with CAKE (M6).
 //! - Interrupts work NAPI-style: IRQ → line masked → task polls RX/TX until
 //!   empty → line unmasked (see `net::stack`).
+//!
+//! **MSI-X** (x86_64): `virtio-drivers` 0.13 doesn't assign MSI-X vectors
+//! to the queues, and a device with MSI-X enabled but no vector raises no
+//! interrupts at all. [`VirtioNet::route_msix`] therefore writes the two
+//! vector registers of the virtio common configuration itself, once, after
+//! `VirtIONetRaw::new` finished. That is the one place where rrouter
+//! touches registers that `virtio-drivers` also maps: its transport uses
+//! the common configuration only during init (and when queues are set up),
+//! never afterwards, so the accesses never interleave. Remove this when
+//! `virtio-drivers` supports MSI-X.
 
 use crate::mm::dma::DmaHal;
+use crate::mmio::Region16;
 use crate::net::packet::PacketBuf;
 use crate::pci::{Pci, PciDevice};
 use alloc::boxed::Box;
@@ -79,6 +90,47 @@ impl VirtioNet {
             nic.post_rx(buf)?;
         }
         Ok(nic)
+    }
+
+    /// Point the RX and TX queues at MSI-X table entry `entry` and disable
+    /// configuration-change interrupts (see the module docs).
+    pub fn route_msix(&mut self, pci: &Pci, dev: &PciDevice, entry: u16) -> Result<(), Error> {
+        const CAP_VENDOR: u8 = 0x09;
+        const COMMON_CFG: u32 = 1;
+        const MSIX_CONFIG: usize = 0x10;
+        const QUEUE_SELECT: usize = 0x16;
+        const QUEUE_MSIX_VECTOR: usize = 0x1a;
+        const NO_VECTOR: u16 = 0xffff;
+        let cap = pci
+            .root
+            .capabilities(dev.df)
+            .find(|c| c.id == CAP_VENDOR && c.private_header >> 8 == COMMON_CFG as u16)
+            .ok_or(Error::Transport)?;
+        let bar_index = (pci.config_read(dev.df, cap.offset + 4) & 0xff) as usize;
+        let offset = pci.config_read(dev.df, cap.offset + 8) as u64;
+        let bar = dev
+            .bars
+            .get(bar_index)
+            .copied()
+            .flatten()
+            .ok_or(Error::Transport)?;
+        if offset + 0x38 > bar.size {
+            return Err(Error::Transport);
+        }
+        // SAFETY: the virtio common configuration inside a memory BAR that
+        // pci::init mapped as device memory. `virtio-drivers` accesses it
+        // only during init, which has finished (`self.raw` exists), and the
+        // driver is single-threaded: no interleaving accesses (module docs).
+        let mut common = unsafe { Region16::new((bar.addr + offset) as usize, 0x38) };
+        common.write16(MSIX_CONFIG, NO_VECTOR);
+        for queue in 0..2 {
+            common.write16(QUEUE_SELECT, queue);
+            common.write16(QUEUE_MSIX_VECTOR, entry);
+            if common.read16(QUEUE_MSIX_VECTOR) != entry {
+                return Err(Error::Device); // the device couldn't allocate the vector
+            }
+        }
+        Ok(())
     }
 
     pub fn mac(&self) -> [u8; 6] {

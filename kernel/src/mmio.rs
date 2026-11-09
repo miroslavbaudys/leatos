@@ -70,3 +70,43 @@ impl Region {
         self.write32(offset + 4, (value >> 32) as u32);
     }
 }
+
+/// Like [`Region`], for devices whose registers must be accessed 16 bits at
+/// a time (virtio PCI common configuration: a 32-bit write there would also
+/// hit the neighbouring field).
+pub struct Region16 {
+    regs: UniqueMmioPointer<'static, [ReadWrite<u16>]>,
+    base: usize,
+}
+
+impl Region16 {
+    /// # Safety
+    /// As [`Region::new`]: device MMIO, mapped as device memory, valid for
+    /// the kernel's lifetime, not accessed concurrently through any other
+    /// pointer.
+    pub unsafe fn new(base: usize, len: usize) -> Self {
+        assert!(base.is_multiple_of(2) && len.is_multiple_of(2) && len > 0);
+        let ptr = NonNull::new(base as *mut ReadWrite<u16>).expect("mmio: null base");
+        // SAFETY: forwarded from the caller's contract.
+        let regs = unsafe { UniqueMmioPointer::new(NonNull::slice_from_raw_parts(ptr, len / 2)) };
+        Self { regs, base }
+    }
+
+    fn reg(&mut self, offset: usize) -> UniqueMmioPointer<'_, ReadWrite<u16>> {
+        assert!(
+            offset.is_multiple_of(2),
+            "mmio: unaligned offset {offset:#x}"
+        );
+        self.regs
+            .get(offset / 2)
+            .unwrap_or_else(|| panic!("mmio: offset {offset:#x} out of range at {:#x}", self.base))
+    }
+
+    pub fn read16(&mut self, offset: usize) -> u16 {
+        self.reg(offset).read()
+    }
+
+    pub fn write16(&mut self, offset: usize, value: u16) {
+        self.reg(offset).write(value);
+    }
+}
