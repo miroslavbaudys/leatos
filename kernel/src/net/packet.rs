@@ -190,6 +190,14 @@ impl qdisc::Packet for PacketBuf {
         self.meta.flow_hash
     }
 
+    /// Keyed hashes of the internal (pre-NAT) source and destination hosts.
+    fn host_hashes(&self) -> (u32, u32) {
+        (
+            self.meta.src_host_hash as u32,
+            self.meta.dst_host_hash as u32,
+        )
+    }
+
     fn mark_ce(&mut self) -> bool {
         use fwd::wire;
         let f = self.data_mut();

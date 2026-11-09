@@ -6,12 +6,17 @@
 //!   the same queue as forwarded traffic, so CAKE sees all egress traffic.
 //!   smoltcp only gets a TX token while the qdisc has room.
 
+use crate::config::{AqmKind, Qos};
 use crate::net::packet::PacketBuf;
 use alloc::collections::VecDeque;
+use alloc::format;
+use alloc::string::String;
 use core::sync::atomic::{AtomicU64, Ordering};
 use qdisc::Qdisc;
-use qdisc::fq_codel::FqCodel;
+use qdisc::cake::{Cake, CakeParams};
+use qdisc::fq_codel::{FqCodel, FqParams};
 use qdisc::shaper::Shaper;
+use qdisc::{Dequeue, Stats};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
@@ -22,8 +27,110 @@ pub fn tx_drops() -> u64 {
     TX_DROPS.load(Ordering::Relaxed)
 }
 
-/// Egress on every port: optional rate shaper around FQ-CoDel (CAKE later).
-pub type PortQdisc = Shaper<FqCodel<PacketBuf>>;
+/// Egress on every port: optional rate shaper around the AQM.
+pub type PortQdisc = Shaper<Aqm>;
+
+/// The egress AQM, chosen by boot argument (`qdisc=`) for A/B tests.
+pub enum Aqm {
+    Cake(Cake<PacketBuf>),
+    /// FQ-CoDel; with one flow queue it is plain CoDel.
+    FqCodel(FqCodel<PacketBuf>),
+}
+
+impl Aqm {
+    pub fn new(qos: &Qos, max_packets: usize, limit_bytes: usize, seed: u64) -> Self {
+        let codel = qdisc::codel::Params {
+            max_packets,
+            limit_bytes,
+            ecn: qos.ecn,
+            ..Default::default()
+        };
+        match qos.aqm {
+            AqmKind::Cake => Self::Cake(Cake::new(CakeParams {
+                codel,
+                isolation: qos.isolation,
+                seed,
+                ..Default::default()
+            })),
+            AqmKind::FqCodel | AqmKind::Codel => Self::FqCodel(FqCodel::new(FqParams {
+                codel,
+                flows: if qos.aqm == AqmKind::Codel { 1 } else { 1024 },
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// For the boot log, e.g. "CAKE (Triple, 1024 flows, 8-way, COBALT) + ECN".
+    pub fn describe(&self, ecn: bool) -> String {
+        let kind = match self {
+            Self::Cake(c) => {
+                let p = c.params();
+                format!(
+                    "CAKE ({:?}, {} flows, {}-way, COBALT)",
+                    p.isolation, p.flows, p.ways
+                )
+            }
+            Self::FqCodel(f) if f.flows() == 1 => String::from("CoDel (single queue)"),
+            Self::FqCodel(f) => format!("FQ-CoDel ({} flows)", f.flows()),
+        };
+        format!("{kind}{}", if ecn { " + ECN" } else { " (drop only)" })
+    }
+
+    pub fn take_max_sojourn_ns(&mut self) -> u64 {
+        match self {
+            Self::Cake(c) => c.take_max_sojourn_ns(),
+            Self::FqCodel(f) => f.take_max_sojourn_ns(),
+        }
+    }
+
+    /// AQM-specific part of the periodic stats line.
+    pub fn diag(&self) -> String {
+        match self {
+            Self::Cake(c) => {
+                let (n, o) = c.active_flows();
+                let (sh, dh) = c.active_hosts();
+                format!(
+                    "flows {n} new + {o} old (activations {}, collisions {}), hosts {sh} src / {dh} dst, blue drops {}, ",
+                    c.new_flow_count, c.way_collisions, c.blue_drops
+                )
+            }
+            Self::FqCodel(f) => {
+                let (n, o) = f.active_flows();
+                format!(
+                    "flows {n} new + {o} old (activations {}), ",
+                    f.new_flow_count
+                )
+            }
+        }
+    }
+}
+
+impl Qdisc<PacketBuf> for Aqm {
+    fn enqueue(&mut self, p: PacketBuf, now_ns: u64) -> Result<(), PacketBuf> {
+        match self {
+            Self::Cake(c) => c.enqueue(p, now_ns),
+            Self::FqCodel(f) => f.enqueue(p, now_ns),
+        }
+    }
+    fn dequeue(&mut self, now_ns: u64) -> Dequeue<PacketBuf> {
+        match self {
+            Self::Cake(c) => c.dequeue(now_ns),
+            Self::FqCodel(f) => f.dequeue(now_ns),
+        }
+    }
+    fn has_room(&self) -> bool {
+        match self {
+            Self::Cake(c) => c.has_room(),
+            Self::FqCodel(f) => f.has_room(),
+        }
+    }
+    fn stats(&self) -> Stats {
+        match self {
+            Self::Cake(c) => c.stats(),
+            Self::FqCodel(f) => f.stats(),
+        }
+    }
+}
 
 pub struct PortDevice<'a> {
     pub local_rx: &'a mut VecDeque<PacketBuf>,

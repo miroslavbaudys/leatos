@@ -64,8 +64,18 @@ fn arg_u64(bootargs: &str, key: &str) -> Option<u64> {
 /// bottleneck so the queue forms in rrouter. Boot arguments, in kbit/s:
 /// `shape_up=42000` (WAN egress), `shape_down=50000` (LAN egress, i.e. the
 /// download direction), `shape_overhead=38` (bytes per packet, default 0),
-/// `ecn=0` (AQM drops instead of ECN-marking), `fq_flows=1024` (flow queues;
-/// `fq_flows=1` = a single CoDel queue, for A/B tests).
+/// `ecn=0` (AQM drops instead of ECN-marking), `qdisc=cake|fq_codel|codel`
+/// (egress AQM, default `cake`; `codel` = one queue, for A/B tests) and
+/// `isolation=triple-isolate|dual-srchost|dual-dsthost|flows` (CAKE's
+/// fairness, default `triple-isolate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AqmKind {
+    Cake,
+    FqCodel,
+    /// FQ-CoDel with one queue: plain CoDel.
+    Codel,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Qos {
     pub up_kbit: Option<u64>,
@@ -73,8 +83,8 @@ pub struct Qos {
     pub overhead: u32,
     /// ECN marking in the AQM (boot argument `ecn=0` disables: drop only).
     pub ecn: bool,
-    /// FQ-CoDel flow queues per port.
-    pub flows: usize,
+    pub aqm: AqmKind,
+    pub isolation: qdisc::cake::Isolation,
 }
 
 pub fn qos(bootargs: &str) -> Qos {
@@ -83,9 +93,17 @@ pub fn qos(bootargs: &str) -> Qos {
         down_kbit: arg_u64(bootargs, "shape_down").filter(|&r| r > 0),
         overhead: arg_u64(bootargs, "shape_overhead").unwrap_or(0) as u32,
         ecn: arg_u64(bootargs, "ecn").is_none_or(|v| v != 0),
-        flows: arg_u64(bootargs, "fq_flows")
-            .filter(|&n| (1..=65536).contains(&n))
-            .unwrap_or(1024) as usize,
+        aqm: match arg(bootargs, "qdisc") {
+            Some("fq_codel") => AqmKind::FqCodel,
+            Some("codel") => AqmKind::Codel,
+            _ => AqmKind::Cake,
+        },
+        isolation: match arg(bootargs, "isolation") {
+            Some("flows") => qdisc::cake::Isolation::Flows,
+            Some("dual-srchost") => qdisc::cake::Isolation::DualSrcHost,
+            Some("dual-dsthost") => qdisc::cake::Isolation::DualDstHost,
+            _ => qdisc::cake::Isolation::Triple,
+        },
     }
 }
 

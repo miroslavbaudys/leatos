@@ -27,7 +27,7 @@ use crate::{Dequeue, Packet, Qdisc, Stats};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-const NIL: u32 = u32::MAX;
+pub(crate) const NIL: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FqParams {
@@ -59,10 +59,10 @@ enum List {
 
 /// A flow's packets: a linked list through the slab.
 #[derive(Clone, Copy, Debug)]
-struct FlowQueue {
+pub(crate) struct FlowQueue {
     head: u32,
     tail: u32,
-    bytes: usize,
+    pub(crate) bytes: usize,
 }
 
 struct Flow {
@@ -72,19 +72,19 @@ struct Flow {
     vars: Vars,
 }
 
-struct Slot<P> {
+pub(crate) struct Slot<P> {
     pkt: Option<(P, u64)>,
     next: u32,
 }
 
 /// Fixed pool of packet slots with a free list.
-struct Slab<P> {
+pub(crate) struct Slab<P> {
     slots: Vec<Slot<P>>,
     free: u32,
 }
 
 impl<P> Slab<P> {
-    fn new(cap: usize) -> Self {
+    pub(crate) fn new(cap: usize) -> Self {
         let slots = (0..cap)
             .map(|i| Slot {
                 pkt: None,
@@ -97,7 +97,7 @@ impl<P> Slab<P> {
         }
     }
 
-    fn alloc(&mut self, p: P, ts: u64) -> Result<u32, P> {
+    pub(crate) fn alloc(&mut self, p: P, ts: u64) -> Result<u32, P> {
         let i = self.free;
         let Some(slot) = self.slots.get_mut(i as usize) else {
             return Err(p);
@@ -110,13 +110,13 @@ impl<P> Slab<P> {
 }
 
 impl FlowQueue {
-    const EMPTY: Self = Self {
+    pub(crate) const EMPTY: Self = Self {
         head: NIL,
         tail: NIL,
         bytes: 0,
     };
 
-    fn push<P>(&mut self, slab: &mut Slab<P>, i: u32, len: usize) {
+    pub(crate) fn push<P>(&mut self, slab: &mut Slab<P>, i: u32, len: usize) {
         match slab.slots.get_mut(self.tail as usize) {
             Some(tail) => tail.next = i,
             None => self.head = i,
@@ -125,7 +125,7 @@ impl FlowQueue {
         self.bytes += len;
     }
 
-    fn pop<P: Packet>(&mut self, slab: &mut Slab<P>) -> Option<(P, u64)> {
+    pub(crate) fn pop<P: Packet>(&mut self, slab: &mut Slab<P>) -> Option<(P, u64)> {
         let i = self.head;
         let slot = slab.slots.get_mut(i as usize)?;
         let (p, ts) = slot.pkt.take()?;
@@ -141,11 +141,11 @@ impl FlowQueue {
 }
 
 /// One flow's queue as CoDel's packet source; keeps the totals in step.
-struct FlowSource<'a, P> {
-    slab: &'a mut Slab<P>,
-    q: &'a mut FlowQueue,
-    packets: &'a mut usize,
-    bytes: &'a mut usize,
+pub(crate) struct FlowSource<'a, P> {
+    pub(crate) slab: &'a mut Slab<P>,
+    pub(crate) q: &'a mut FlowQueue,
+    pub(crate) packets: &'a mut usize,
+    pub(crate) bytes: &'a mut usize,
 }
 
 impl<P: Packet> Source<P> for FlowSource<'_, P> {
@@ -215,6 +215,11 @@ impl<P: Packet> FqCodel<P> {
     /// Largest sojourn time since the previous call (resets it).
     pub fn take_max_sojourn_ns(&mut self) -> u64 {
         core::mem::take(&mut self.soj.max_ns)
+    }
+
+    /// Number of flow queues.
+    pub fn flows(&self) -> usize {
+        self.flows.len()
     }
 
     /// Flows currently on the (new, old) lists.
@@ -352,81 +357,8 @@ mod tests {
     extern crate std;
     use super::*;
     use crate::codel::Codel;
-    use core::cell::RefCell;
-    use std::vec;
-
-    const MS: u64 = 1_000_000;
-
-    std::thread_local! {
-        /// Packets dropped inside the qdisc, per flow (set by `Pkt::drop`).
-        static DROPS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
-    }
-
-    fn drops(flow: usize) -> u64 {
-        DROPS.with(|d| d.borrow().get(flow).copied().unwrap_or(0))
-    }
-
-    #[derive(Debug)]
-    struct Pkt {
-        len: usize,
-        flow: u32,
-        seq: u64,
-        sent: u64,
-        ect: bool,
-        ce: bool,
-        delivered: bool,
-    }
-
-    impl Drop for Pkt {
-        fn drop(&mut self) {
-            if !self.delivered {
-                DROPS.with(|d| {
-                    let mut d = d.borrow_mut();
-                    let f = self.flow as usize;
-                    if d.len() <= f {
-                        d.resize(f + 1, 0);
-                    }
-                    d[f] += 1;
-                });
-            }
-        }
-    }
-
-    impl Packet for Pkt {
-        fn len_bytes(&self) -> usize {
-            self.len
-        }
-        fn mark_ce(&mut self) -> bool {
-            self.ce |= self.ect;
-            self.ect
-        }
-        /// Spread small flow ids over the hash space, as a keyed hash would.
-        fn flow_hash(&self) -> u32 {
-            self.flow.wrapping_mul(0x9e37_79b9)
-        }
-    }
-
-    fn pkt(flow: u32, len: usize, seq: u64) -> Pkt {
-        Pkt {
-            len,
-            flow,
-            seq,
-            sent: 0,
-            ect: false,
-            ce: false,
-            delivered: false,
-        }
-    }
-
-    fn take(q: &mut impl Qdisc<Pkt>, now: u64) -> Option<Pkt> {
-        match q.dequeue(now) {
-            Dequeue::Packet(mut p) => {
-                p.delivered = true;
-                Some(p)
-            }
-            _ => None,
-        }
-    }
+    use crate::testutil::*;
+    use alloc::vec;
 
     #[test]
     fn distinct_flows_get_distinct_queues() {
@@ -547,129 +479,6 @@ mod tests {
         assert_eq!(q.stats().dropped, 0);
     }
 
-    // ---- simulation ---------------------------------------------------------------
-
-    enum Source {
-        /// Reno-like: +1 packet per RTT, halve on a drop or CE mark (once per RTT).
-        Reno {
-            rtt_ms: f64,
-            cwnd: f64,
-            last_signal: u64,
-        },
-        /// Sends at a fixed rate whatever happens (a loss-insensitive sender
-        /// such as a UDP flood, or BBR before it measures the bottleneck).
-        Fixed { pkts_per_ms: f64 },
-        /// One small packet every `every_ms` (ping, game, VoIP).
-        Sparse { every_ms: f64 },
-    }
-
-    struct Result {
-        /// Sojourn of each sparse-flow packet (ns, sorted).
-        sparse_sojourn: Vec<u64>,
-        /// Delivered bytes per flow in the measured half.
-        delivered: Vec<u64>,
-        utilisation: f64,
-    }
-
-    /// 20 s at 0.1 ms steps over a 4 packets/ms link (≈ 48 Mbit/s at 1500 B);
-    /// the second half is measured. Flow `i` is `sources[i]`.
-    fn simulate(q: &mut impl Qdisc<Pkt>, sources: &mut [Source], ecn: bool) -> Result {
-        DROPS.with(|d| d.borrow_mut().clear());
-        let link = 4.0;
-        let total = 200_000u64;
-        let mut acc = vec![0.0f64; sources.len()];
-        let mut seen_drops = vec![0u64; sources.len()];
-        let mut res = Result {
-            sparse_sojourn: Vec::new(),
-            delivered: vec![0; sources.len()],
-            utilisation: 0.0,
-        };
-        let (mut credit, mut busy, mut slots) = (0.0, 0u64, 0.0);
-        let mut seq = 0;
-        for t in 0..total {
-            let now = t * MS / 10;
-            let measuring = t > total / 2;
-            for (f, s) in sources.iter_mut().enumerate() {
-                let (rate, len) = match s {
-                    Source::Reno { rtt_ms, cwnd, .. } => {
-                        *cwnd += 0.1 / *rtt_ms; // +1 per RTT
-                        (*cwnd / *rtt_ms, 1500)
-                    }
-                    Source::Fixed { pkts_per_ms } => (*pkts_per_ms, 1500),
-                    Source::Sparse { every_ms } => (1.0 / *every_ms, 100),
-                };
-                acc[f] += rate / 10.0;
-                while acc[f] >= 1.0 {
-                    acc[f] -= 1.0;
-                    seq += 1;
-                    // (Not `..pkt()`: dropping that temporary would count as a drop.)
-                    let mut p = pkt(f as u32, len, seq);
-                    p.sent = now;
-                    p.ect = ecn;
-                    let _ = q.enqueue(p, now); // a rejected packet is dropped (counted)
-                }
-            }
-            credit += link / 10.0;
-            if measuring {
-                slots += link / 10.0;
-            }
-            while credit >= 1.0 {
-                let Some(p) = take(q, now) else {
-                    credit = 0.0;
-                    break;
-                };
-                credit -= 1.0;
-                let f = p.flow as usize;
-                if measuring {
-                    busy += 1;
-                    res.delivered[f] += p.len as u64;
-                    if matches!(sources[f], Source::Sparse { .. }) {
-                        res.sparse_sojourn.push(now - p.sent);
-                    }
-                }
-                if p.ce {
-                    signal(&mut sources[f], now);
-                }
-            }
-            for (f, s) in sources.iter_mut().enumerate() {
-                let d = drops(f);
-                if d > seen_drops[f] {
-                    seen_drops[f] = d;
-                    signal(s, now);
-                }
-            }
-        }
-        res.sparse_sojourn.sort_unstable();
-        res.utilisation = busy as f64 / slots;
-        res
-    }
-
-    fn signal(s: &mut Source, now: u64) {
-        if let Source::Reno {
-            rtt_ms,
-            cwnd,
-            last_signal,
-        } = s
-            && now - *last_signal > (*rtt_ms * MS as f64) as u64
-        {
-            *cwnd = (*cwnd / 2.0).max(2.0);
-            *last_signal = now;
-        }
-    }
-
-    fn pct(v: &[u64], p: usize) -> u64 {
-        v[(v.len() - 1) * p / 100]
-    }
-
-    fn params(ecn: bool) -> Params {
-        Params {
-            max_packets: 384,
-            limit_bytes: 384 * 1514,
-            ecn,
-            ..Params::default()
-        }
-    }
-
     /// The real-line download case (docs/bufferbloat-cake.md §6b): a
     /// sender that ignores drops, at 125 % of the link, plus a ping. With
     /// one CoDel queue the ping waits behind the flood; with flow queueing
@@ -678,8 +487,8 @@ mod tests {
     fn unresponsive_flood_does_not_delay_a_sparse_flow() {
         let mk = || {
             [
-                Source::Fixed { pkts_per_ms: 5.0 },
-                Source::Sparse { every_ms: 20.0 },
+                Sender::Fixed { pkts_per_ms: 5.0 },
+                Sender::Sparse { every_ms: 20.0 },
             ]
         };
         let mut codel = Codel::new(params(false));
@@ -715,13 +524,13 @@ mod tests {
     fn mixed_flows(ecn: bool) {
         let mk = || {
             [10.0, 20.0, 40.0, 80.0]
-                .map(|rtt_ms| Source::Reno {
+                .map(|rtt_ms| Sender::Reno {
                     rtt_ms,
                     cwnd: 4.0,
                     last_signal: 0,
                 })
                 .into_iter()
-                .chain([Source::Sparse { every_ms: 20.0 }])
+                .chain([Sender::Sparse { every_ms: 20.0 }])
                 .collect::<Vec<_>>()
         };
         let mut fq = FqCodel::new(FqParams {

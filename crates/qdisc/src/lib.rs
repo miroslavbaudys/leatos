@@ -16,10 +16,13 @@
 
 extern crate alloc;
 
+pub mod cake;
 pub mod codel;
 pub mod fifo;
 pub mod fq_codel;
 pub mod shaper;
+#[cfg(test)]
+mod testutil;
 
 /// What a qdisc needs to know about a packet.
 pub trait Packet {
@@ -36,6 +39,11 @@ pub trait Packet {
     /// collisions. Default: everything is one flow.
     fn flow_hash(&self) -> u32 {
         0
+    }
+    /// (source, destination) host identity for host isolation (CAKE), from
+    /// the **internal** (pre-NAT) addresses. Default: one host.
+    fn host_hashes(&self) -> (u32, u32) {
+        (0, 0)
     }
 }
 

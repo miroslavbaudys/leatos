@@ -14,7 +14,7 @@
 use crate::drivers::virtio_net::VirtioNet;
 use crate::irq::{self, IrqEvent, Trigger};
 use crate::net::datapath::{self, Datapath};
-use crate::net::device::{PortDevice, PortQdisc};
+use crate::net::device::{Aqm, PortDevice, PortQdisc};
 use crate::net::packet::PacketBuf;
 use crate::net::services::LanServices;
 use crate::pci::Pci;
@@ -46,11 +46,16 @@ const PING_IDENT: u16 = 0x22b;
 const PING_COUNT: u16 = 3;
 const PING_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Egress qdisc hard limits per port. CoDel keeps the standing queue near
-/// 5 ms; the limits only bound bursts. Two full queues plus both RX rings
+/// Egress qdisc hard limits per port (shared by all flows). The AQM keeps
+/// standing queues near 5 ms; the limits only bound bursts. Two full queues plus both RX rings
 /// (2 × 384 + 128 = 896) stay within the 1024-buffer packet pool.
 const QDISC_PACKETS: usize = 384;
 const QDISC_BYTES: usize = 384 * 1514;
+
+/// Per-port variation for the AQM's random seed.
+fn mac_seed(mac: &[u8; 6]) -> u64 {
+    mac.iter().fold(0, |a, &b| a << 8 | b as u64)
+}
 
 pub struct NetIf {
     pub name: &'static str,
@@ -98,34 +103,22 @@ pub fn bring_up(pci: &mut Pci, qos: &crate::config::Qos) -> Vec<NetIf> {
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = timer::ticks();
         let rate = qos.rate(if i == 0 { qos.up_kbit } else { qos.down_kbit });
-        let fq = qdisc::fq_codel::FqCodel::new(qdisc::fq_codel::FqParams {
-            codel: qdisc::codel::Params {
-                max_packets: QDISC_PACKETS,
-                limit_bytes: QDISC_BYTES,
-                ecn: qos.ecn,
-                ..Default::default()
-            },
-            flows: qos.flows,
-            ..Default::default()
-        });
-        let mut qdisc = PortQdisc::new(fq, rate);
-        let aqm = alloc::format!(
-            "{}{}",
-            if qos.flows > 1 {
-                alloc::format!("FQ-CoDel ({} flows)", qos.flows)
-            } else {
-                alloc::string::String::from("CoDel (single queue)")
-            },
-            if qos.ecn { " + ECN" } else { " (drop only)" }
+        let aqm = Aqm::new(
+            qos,
+            QDISC_PACKETS,
+            QDISC_BYTES,
+            timer::ticks() ^ mac_seed(&mac),
         );
+        let desc = aqm.describe(qos.ecn);
+        let mut qdisc = PortQdisc::new(aqm, rate);
         match rate {
             Some(r) => println!(
-                "  qos {name}       : shaped {} kbit/s ({}), overhead {} B, {aqm}",
+                "  qos {name}       : shaped {} kbit/s ({}), overhead {} B, {desc}",
                 r.bits_per_sec / 1000,
                 if i == 0 { "upload" } else { "download" },
                 r.overhead,
             ),
-            None => println!("  qos {name}       : unshaped, {aqm}"),
+            None => println!("  qos {name}       : unshaped, {desc}"),
         }
         let mut local_rx = VecDeque::with_capacity(datapath::LOCAL_RX_MAX);
         let mut port = PortDevice {

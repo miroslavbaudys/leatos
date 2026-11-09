@@ -21,7 +21,7 @@
 #                        (0 = unshaped router, shaping checks skipped)
 #   LAB_EXPECT_KBIT=N    what the client expects (default: LAB_SHAPE_KBIT);
 #                        set it with LAB_SHAPE_KBIT=0 as a negative control
-#   LAB_ROUTER_ARGS="…"  extra router boot arguments, e.g. fq_flows=1 (single
+#   LAB_ROUTER_ARGS="…"  extra router boot arguments, e.g. qdisc=codel (single
 #                        CoDel queue: the negative control for the flow-
 #                        isolation latency check)
 set -euo pipefail

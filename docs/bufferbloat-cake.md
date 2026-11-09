@@ -261,7 +261,7 @@ one implementation.
   per flow, so nothing is allocated per packet.
 - **Kernel:** each port is `Shaper<FqCodel>`. Router-local frames (smoltcp:
   DNS, DHCP, ping replies) have `flow_hash` 0 and share one sparse queue.
-- **A/B:** boot argument `fq_flows=N`; `fq_flows=1` is a single CoDel queue.
+- **A/B:** boot argument `qdisc=fq_codel`; `qdisc=codel` is a single CoDel queue (was `fq_flows=1`).
 - **Stats:** the `qdisc` console line shows active flows and activations.
 
 | Evidence | single CoDel | FQ-CoDel |
@@ -269,12 +269,56 @@ one implementation.
 | sim: sender ignoring drops at 125 % of the link + ping every 20 ms | ping p50 **81 ms** | ping p99 **< 0.01 ms**, no ping loss |
 | sim: 4 Reno flows, RTT 10/20/40/80 ms + ping (drops) | ping p99 73 ms, Jain fairness 0.64, util 0.95 | ping p99 **0.7 ms**, fairness **0.99**, util 0.98 |
 | same with ECN | ping p99 93 ms, fairness 0.59 | ping p99 0.7 ms, fairness 0.99, util 0.97, 0 drops |
-| lab, 10/10 Mbit/s, ping to router during the download, HVF | avg 8 ms, max 21 ms (`LAB_ROUTER_ARGS=fq_flows=1`: check **fails**, the negative control) | avg **0.7 ms**, max 1.4 ms |
+| lab, 10/10 Mbit/s, ping to router during the download, HVF | avg 8 ms, max 21 ms (`LAB_ROUTER_ARGS=qdisc=codel`: check **fails**, the negative control) | avg **0.7 ms**, max 1.4 ms |
 | lab, TCG | | avg 1.6 ms, max 5.6 ms |
 
 The lab check now requires an average below 3 ms, so it fails without flow
 isolation. The simulated single-queue result (ping p99 73–93 ms behind
 competing flows) matches the ~85 ms seen on the real line.
+
+### Status: CAKE core (M6 step 5)
+`crates/qdisc/src/cake.rs` builds on FQ-CoDel's lists, DRR, overflow drop
+and slab, and adds three CAKE features:
+
+- **Set-associative hashing (8 ways):** a flow whose bucket is taken uses a
+  free queue in the same set. Only a ninth simultaneous flow in one set
+  shares a queue, counted as `collisions`. A queue that changes owner starts
+  with fresh AQM state.
+- **Host isolation** (`Isolation::{Flows, DualSrcHost, DualDstHost, Triple}`,
+  CAKE's names). Each host counts its bulk flows, and a flow's DRR quantum is
+  `quantum / bulk flows of its busier host`. Host identities are the keyed
+  **pre-NAT** host hashes from conntrack. That makes isolation work per LAN
+  host on WAN egress (upload, by source) and on LAN egress (download, by
+  destination).
+  - `Triple` uses the busier of a flow's two hosts. Many flows to one
+    remote server are therefore only flow-fair, which is also how CAKE
+    behaves.
+- **COBALT = CoDel + BLUE per flow.** BLUE's drop probability rises by 1/256
+  each time a flow overflows (at most once per `target`) and falls by 1/4096
+  while its queue runs empty. Like CAKE, BLUE drops ECN-capable packets too.
+  It therefore contains senders that ignore marks, or whose marks are
+  bleached on the path, which was the real-line upload symptom.
+
+Not yet implemented: DiffServ tins, the ACK filter, a rate-aware target,
+ingress mode (counting drops against the shaper), and COBALT's own CoDel
+variant (RFC 8289 CoDel is used).
+
+**Kernel:** CAKE is the default egress AQM on both ports.
+- Boot args `qdisc=cake|fq_codel|codel` for A/B tests, and
+  `isolation=triple-isolate|dual-srchost|dual-dsthost|flows`.
+- The `qdisc` stats line adds collisions, active hosts and BLUE drops.
+
+| Evidence | Control | CAKE |
+|---|---|---|
+| sim: host A 1 flow vs host B 8 flows, backlogged, all 4 isolation modes in their direction | `Flows` or the wrong side isolated: A/B ≈ 0.125 | A/B within 0.8–1.25 |
+| sim: host A 1 Reno flow vs host B 4 Reno flows | FQ-CoDel: A gets **0.20** | A gets **0.42** (one Reno flow can't fill its half; B takes the slack), util 0.95 |
+| sim: sender ignoring ECN at 125 % of the link + ping | FQ-CoDel: flood's own sojourn p50 **77 ms** (queue at the limit), 20.6k overflow drops | p50 **12 ms**, 245 overflow drops, BLUE contains it; ping p99 0.1 ms |
+| sim: 4 responsive Reno flows + ping (drops and ECN) | | BLUE drops **0**; util 0.97–0.98, fairness 0.99, ping p99 0.7 ms (as FQ-CoDel) |
+| lab 10/10 Mbit/s, ping during the download, HVF | `qdisc=codel`: avg 7 ms, check **fails** | avg 0.8 ms (FQ-CoDel 0.8 ms) |
+| lab, TCG | | avg 1.7 ms |
+
+The lab has a single client, so host isolation is tested in simulation
+only for now. A second LAN host in the lab is a follow-up.
 
 ## 5. Configuration UX
 ```toml
