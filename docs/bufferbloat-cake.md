@@ -326,6 +326,7 @@ only for now. A second LAN host in the lab is a follow-up.
 |---|---|---|---|---|
 | CAKE (default) | 41.9 | **+46 ms** (p50 only +4 ms) | 39.4 | **+14 ms** (grade A) |
 | `qdisc=codel` | 35.5 | +73 ms | 40.5 | +102 ms |
+| CAKE, download shaped at **36** | 29.1 | **+9.6 ms** (grade A) | 39.1 | +37 ms |
 
 - **Upload is solved for latency-sensitive traffic:** the ping bypasses the
   bulk uploads.
@@ -349,6 +350,14 @@ only for now. A second LAN host in the lab is a follow-up.
   - Idle latency already varies (p50 8 ms, max 26 ms): the line's rate
     varies. A lower download rate, or later CAKE autorate (M9), addresses
     this.
+  - **Confirmed** with the download shaped at 36 Mbit/s: added latency fell
+    from +46 to **+9.6 ms**, and the LAN queue's max sojourn from 119–152 ms
+    to 40 ms. CAKE got there with ECN marks only (2,303 marks, no BLUE or
+    overflow drops).
+  - Upload in the same run: +37 ms (vs +14 ms before, same 42 Mbit/s
+    setting). ECN bleaching again (2,616 marks, ECE 33 → 40). Upload
+    throughput 39.1 < 42 suggests the uplink also dips below its shaping
+    rate at times.
 
 ## 5. Configuration UX
 ```toml
