@@ -156,6 +156,31 @@ behaviour without any VM.
 7. **Autorate** (later): adjust the shaper rate for variable links (LTE,
    cable) from latency probes, like `cake-autorate`. This is easy to integrate natively.
 
+### Status: CoDel (M6 step 2)
+`crates/qdisc/src/codel.rs`: RFC 8289 CoDel (target 5 ms, interval 100 ms,
+integer control law, ECN marking via `Packet::mark_ce`, resume-count
+logic, hard limits with tail drop). It is the egress qdisc on both ports
+(384 packets / 384 × 1514 B hard limit). Host simulation with one
+Reno-like flow (48 Mbit/s, RTT 20 ms):
+
+| queue | median sojourn | p99 | utilisation |
+|---|---|---|---|
+| deep FIFO | 250 ms | – | ~100 % |
+| CoDel, drop | 0.2 ms | 15.6 ms | 0.86 |
+| CoDel, ECN | 0.2 ms | – | 0.86 (21 marks, 0 drops) |
+
+The utilisation follows single-flow Reno theory (≈ 0.89 with a queue of
+≈ 0.25 BDP); more flows fill the gaps. The kernel prints per-port qdisc
+statistics every 10 s while there's traffic (sent, AQM drops, ECN marks,
+overflow drops, backlog, max sojourn), and a boot self-test checks ECN
+marking on a real packet buffer.
+
+**Expected effect on the real line:** CoDel only acts where rrouter's
+*own* queue builds. If the bottleneck is upstream (home router/ISP/Wi-Fi,
+§6b), rrouter's queue stays short and nothing changes. The qdisc stats
+show which case applies. The **shaper** (next step) makes rrouter the
+bottleneck on purpose, so that CoDel/CAKE control the queue.
+
 ## 5. Configuration UX
 ```toml
 [qos]

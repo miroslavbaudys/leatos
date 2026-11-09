@@ -29,9 +29,44 @@ fn heap_self_test() {
     println!("  heap self-test  : ok");
 }
 
+/// ECN marking on a real packet buffer: ECT(0) → CE with a valid header
+/// checksum; Not-ECT is refused (the AQM drops those instead).
+fn ecn_self_test() {
+    use fwd::wire;
+    use qdisc::Packet as _;
+    let frame = |tos: u8| {
+        let mut p = crate::net::packet::PacketBuf::alloc().expect("pool");
+        p.set_len(wire::ETH_HDR + 20);
+        let f = p.data_mut();
+        f.fill(0);
+        wire::put16(f, 12, wire::ETHERTYPE_IPV4);
+        let ip = &mut f[wire::ETH_HDR..];
+        ip[0] = 0x45;
+        ip[1] = tos;
+        wire::put16(ip, 2, 20);
+        ip[8] = 64;
+        ip[9] = wire::PROTO_UDP;
+        let c = wire::checksum(&ip[..20]);
+        wire::put16(ip, 10, c);
+        p
+    };
+    let mut ect = frame(0xb8 | 0b10); // DSCP EF + ECT(0)
+    assert!(ect.mark_ce(), "ECT packet must be markable");
+    let f = ect.data();
+    assert_eq!(f[wire::ETH_HDR + 1], 0xb8 | 0b11, "CE set, DSCP preserved");
+    assert!(
+        wire::Ipv4View::parse(f, wire::ETH_HDR).is_some(),
+        "header checksum still valid"
+    );
+    let mut not_ect = frame(0xb8);
+    assert!(!not_ect.mark_ce(), "Not-ECT must not be marked");
+    println!("  ecn self-test   : ok (ECT(0) -> CE, checksum valid; Not-ECT refused)");
+}
+
 /// Deliberate faults, compiled in only with the matching feature.
 pub fn fault_tests() {
     heap_self_test();
+    ecn_self_test();
 
     #[cfg(feature = "fault-wx")]
     {

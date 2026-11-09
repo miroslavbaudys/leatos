@@ -46,9 +46,11 @@ const PING_IDENT: u16 = 0x22b;
 const PING_COUNT: u16 = 3;
 const PING_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Egress qdisc limits per port (placeholder FIFO until CAKE).
-const QDISC_PACKETS: usize = 256;
-const QDISC_BYTES: usize = 128 * 1024;
+/// Egress qdisc hard limits per port. CoDel keeps the standing queue near
+/// 5 ms; the limits only bound bursts. Two full queues plus both RX rings
+/// (2 × 384 + 128 = 896) stay within the 1024-buffer packet pool.
+const QDISC_PACKETS: usize = 384;
+const QDISC_BYTES: usize = 384 * 1514;
 
 pub struct NetIf {
     pub name: &'static str,
@@ -94,7 +96,11 @@ pub fn bring_up(pci: &mut Pci) -> Vec<NetIf> {
         let mac = dev.mac();
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = timer::ticks();
-        let mut qdisc = PortQdisc::new(QDISC_PACKETS, QDISC_BYTES);
+        let mut qdisc = PortQdisc::new(qdisc::codel::Params {
+            max_packets: QDISC_PACKETS,
+            limit_bytes: QDISC_BYTES,
+            ..Default::default()
+        });
         let mut local_rx = VecDeque::with_capacity(datapath::LOCAL_RX_MAX);
         let mut port = PortDevice {
             local_rx: &mut local_rx,

@@ -47,7 +47,12 @@ pub struct Datapath {
     pub more_rx: bool,
     pub local_rx_drops: u64,
     pub qdisc_drops: u64,
+    next_stats: u64,
+    last_dequeued: [u64; 2],
 }
+
+/// Print per-port qdisc statistics every this many ms (only if there was traffic).
+const STATS_MS: u64 = 10_000;
 
 fn now_ms() -> u64 {
     timer::uptime().as_millis() as u64
@@ -96,6 +101,8 @@ impl Datapath {
             more_rx: false,
             local_rx_drops: 0,
             qdisc_drops: 0,
+            next_stats: STATS_MS,
+            last_dequeued: [0; 2],
         }
     }
 
@@ -223,6 +230,10 @@ impl Datapath {
         }
         self.next_housekeeping = now + HOUSEKEEPING_MS;
         self.fwd.expire(now);
+        if now >= self.next_stats {
+            self.next_stats = now + STATS_MS;
+            self.print_qdisc_stats(ifs);
+        }
         for (ifx, ip) in self.neigh.poll(now) {
             self.send_arp_request(ifs, ifx, ip);
         }
@@ -248,6 +259,29 @@ impl Datapath {
             backlog |= nif.qdisc.stats().backlog_packets > 0;
         }
         backlog
+    }
+
+    /// One console line per port that sent traffic since the last report.
+    fn print_qdisc_stats(&mut self, ifs: &mut [NetIf]) {
+        for (i, nif) in ifs.iter_mut().enumerate().take(2) {
+            let s = nif.qdisc.stats();
+            if s.dequeued == self.last_dequeued[i] {
+                continue;
+            }
+            self.last_dequeued[i] = s.dequeued;
+            let max_sojourn = nif.qdisc.take_max_sojourn_ns();
+            crate::println!(
+                "  qdisc {}       : sent {}, aqm drops {}, ecn marks {}, overflow drops {}, backlog {} pkts, max sojourn {}.{:03} ms",
+                nif.name,
+                s.dequeued,
+                s.aqm_actions - s.marked,
+                s.marked,
+                s.dropped - (s.aqm_actions - s.marked),
+                s.backlog_packets,
+                max_sojourn / 1_000_000,
+                (max_sojourn / 1_000) % 1_000
+            );
+        }
     }
 
     pub fn next_housekeeping(&self) -> u64 {

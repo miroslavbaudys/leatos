@@ -180,4 +180,27 @@ impl qdisc::Packet for PacketBuf {
     fn len_bytes(&self) -> usize {
         self.len
     }
+
+    /// ECN: turn ECT(0)/ECT(1) into CE in an IPv4 frame (incremental header
+    /// checksum update). Non-IPv4 and Not-ECT packets are left alone (the AQM
+    /// drops them instead).
+    fn mark_ce(&mut self) -> bool {
+        use fwd::wire;
+        let f = self.data_mut();
+        if wire::ethertype(f) != Some(wire::ETHERTYPE_IPV4)
+            || wire::Ipv4View::parse(f, wire::ETH_HDR).is_none()
+        {
+            return false;
+        }
+        let ip = wire::ETH_HDR;
+        let old = wire::get16(f, ip);
+        if f[ip + 1] & 0b11 == 0 {
+            return false; // Not-ECT
+        }
+        f[ip + 1] |= 0b11; // CE
+        let new = wire::get16(f, ip);
+        let c = wire::csum_update16(wire::get16(f, ip + 10), old, new);
+        wire::put16(f, ip + 10, c);
+        true
+    }
 }
