@@ -203,10 +203,16 @@ fn from_store(store: Option<&mut Store>, v: &str) {
         return set_source(format!("unknown (image={v})"));
     };
     let h = store.and_then(|st| block_on(st.header(AREA, slot)).ok().flatten());
+    // The source stays true for the whole boot; whether it is still a
+    // trial is `trial()` (cleared by a confirm), not part of this text.
     let what = match h {
         Some(h) if h.seq == seq && h.is_trial() => {
             TRIAL.call_once(|| (slot, h));
-            ", trial: confirm or it is rolled back"
+            println!(
+                "  image           : trial kernel: confirm within {} s or it is rolled back",
+                config::trial_secs()
+            );
+            ""
         }
         Some(h) if h.seq == seq => "",
         _ => ", record no longer in the store",
