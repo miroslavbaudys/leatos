@@ -76,9 +76,14 @@ trial is marked booted only by the kernel that will run it.
    a banner with a countdown (`trial_secs`, default 120 s).
 3. `POST /api/upgrade/confirm` clears the flags: from now on the loader
    enters this kernel at every boot. `scripts/apu-upload.sh --persist`
-   confirms only after the router answers again **and reports the
-   uploaded build** as the trial: the kernel booted, has a network and
-   serves the web interface.
+   confirms only once the router runs **the record it just stored** (the
+   trial's seq matches the upload's answer) **and that trial has stayed
+   up for `--stable-secs`** (default 30 s) with no reboot in between: the
+   kernel booted, has a network, serves the web interface and did not
+   crash right after. Answering once is not enough: a kernel that
+   crashes a few seconds after its web interface comes up (a
+   `fault-panic` test kernel does) would otherwise be confirmed and then
+   reboot forever, until the Limine `image=golden` entry is chosen.
 4. `POST /api/upgrade/revert`, or no confirm within `trial_secs`: the
    trial is erased and the router reboots into the previous kernel.
 

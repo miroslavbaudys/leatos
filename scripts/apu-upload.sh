@@ -4,12 +4,14 @@
 # /api/upgrade): nothing is written to the SD card, a power cycle boots its
 # kernel again. With --persist the kernel is stored on the SD card (POST
 # /api/upgrade/persist) and the router reboots into it as a trial; once it
-# answers with the new build, this script confirms it. A kernel that
+# answers with the new build and has stayed up for --stable-secs (default
+# 30, without a reboot in between), this script confirms it. A kernel that
 # panics, hangs or is not confirmed within the trial window is rolled back.
 #
 #   scripts/apu-upload.sh                      # release kernel -> $RROUTER_HOST, in RAM
 #   scripts/apu-upload.sh --persist            # store it on the SD card, reboot, confirm
 #   scripts/apu-upload.sh --persist --no-confirm   # leave the trial unconfirmed (rolls back)
+#   scripts/apu-upload.sh --persist --stable-secs 60   # longer stability window before confirming
 #   scripts/apu-upload.sh --confirm | --revert # confirm / roll back the running trial kernel
 #   scripts/apu-upload.sh --host 192.168.1.156 --cmdline "mgmt=wan mgmt_pass=... shape_up=20000"
 #   scripts/apu-upload.sh --debug              # debug kernel (bigger, slower)
@@ -31,6 +33,7 @@ FEATURES=
 REBOOT=0
 PERSIST=0
 CONFIRM=1
+STABLE=30
 TRIAL_OP=
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -42,9 +45,10 @@ while [[ $# -gt 0 ]]; do
     --reboot) REBOOT=1 ;;
     --persist) PERSIST=1 ;;
     --no-confirm) CONFIRM=0 ;;
+    --stable-secs) STABLE="$2"; shift ;;
     --confirm) TRIAL_OP=confirm ;;
     --revert) TRIAL_OP=revert ;;
-    -h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -62,6 +66,10 @@ status_line() { # prints "version uptime_s" or nothing
 image_line() { # prints "build|trial seq or -|source" or nothing
   curl -s -m 3 "$URL/api/status" 2>/dev/null |
     python3 -I -c 'import json,sys; d=json.load(sys.stdin); i=d.get("image") or {}; t=i.get("trial"); print("%s|%s|%s" % (d.get("build","?"), t["seq"] if t else "-", i.get("source","?")))' 2>/dev/null || true
+}
+trial_state() { # prints "uptime_s trial_seq remaining_s" ("-" for no trial), or nothing
+  curl -s -m 3 "$URL/api/status" 2>/dev/null |
+    python3 -I -c 'import json,sys; d=json.load(sys.stdin); t=(d.get("image") or {}).get("trial"); print(d["uptime_s"], t["seq"] if t else "-", t["remaining_s"] if t else "-")' 2>/dev/null || true
 }
 trial_op() { # confirm | revert
   local out code
@@ -98,7 +106,8 @@ if [[ -x "$OBJCOPY" ]]; then "$OBJCOPY" --strip-debug "$ELF" "$UPLOAD"; else cp 
 CRC="$(python3 -I -c 'import sys,zlib; print("%08x" % zlib.crc32(open(sys.argv[1],"rb").read()))' "$UPLOAD")"
 SIZE="$(wc -c <"$UPLOAD" | tr -d ' ')"
 
-# The id the kernel embeds (kernel/build.rs): the router must report it.
+# The id the kernel embeds (kernel/build.rs), for the log only: build.rs
+# runs only when kernel sources change, so it can differ from the tree.
 BUILD="$(git describe --always --dirty --abbrev=10 2>/dev/null || echo unknown)"
 
 hdr=(-H "X-Image-CRC32: $CRC")
@@ -111,6 +120,9 @@ out="$(curl -s -m 180 -u "admin:$PASS" "${hdr[@]}" -X POST --data-binary @"$UPLO
 code="${out##*$'\n'}"
 echo "router: ${out%$'\n'*} (HTTP $code)"
 [[ "$code" == 200 ]] || exit 1
+# The record the router stored ("... (slot A, seq 3, ...)"): the trial that
+# boots must be exactly this one.
+STORED_SEQ="$(printf '%s' "$out" | sed -n 's/.*, seq \([0-9]*\),.*/\1/p' | head -1)"
 
 # The new kernel needs a few seconds (NIC reset, link, DHCP), a persistent
 # upgrade a whole firmware boot too. It is back once the router was
@@ -143,12 +155,50 @@ if [[ "${rest%%|*}" == - ]]; then
   echo "the router does not run a trial kernel: the stored kernel was rolled back (see the serial console)" >&2
   exit 1
 fi
-if [[ "${img%%|*}" != "$BUILD" ]]; then
-  echo "the trial kernel reports build ${img%%|*}, uploaded $BUILD: not confirming" >&2
+if [[ -z "$STORED_SEQ" || "${rest%%|*}" != "$STORED_SEQ" ]]; then
+  echo "the trial is seq ${rest%%|*}, the upload was stored as seq ${STORED_SEQ:-?}: not confirming" >&2
   exit 1
 fi
 if [[ "$CONFIRM" == 0 ]]; then
   echo "not confirmed (--no-confirm): the router rolls back when the trial window ends"
   exit 0
 fi
+
+# Answering once is not enough: a kernel that crashes a few seconds after
+# its web interface comes up would be confirmed and then reboot forever.
+# Confirm only once the same trial has stayed up for $STABLE s.
+read -r up0 seq0 left0 <<<"$(trial_state)"
+if [[ -z "${up0:-}" || "$seq0" == - ]]; then
+  echo "the trial kernel is gone before the stability wait: not confirming" >&2
+  exit 1
+fi
+if [[ "$left0" != - && "$left0" -le $((STABLE - up0 + 5)) ]]; then
+  echo "trial window ($left0 s left) too short for --stable-secs $STABLE: not confirming (it rolls back)" >&2
+  exit 1
+fi
+echo "stability check: waiting until the trial kernel (seq $seq0) has been up for $STABLE s"
+last="$up0"
+miss=0
+while :; do
+  read -r up seq left <<<"$(trial_state)"
+  if [[ -z "${up:-}" ]]; then
+    # One lost poll (Wi-Fi) is not a crash; three in a row are.
+    miss=$((miss + 1))
+    if [[ "$miss" -ge 3 ]]; then
+      echo "the trial kernel stopped answering at uptime ~$last s: not confirming (it is rolled back)" >&2
+      exit 1
+    fi
+    sleep 1
+    continue
+  fi
+  miss=0
+  if [[ "$up" -lt "$last" || "$seq" != "$seq0" ]]; then
+    echo "the router rebooted during the stability wait (uptime $last -> $up s, trial $seq0 -> $seq): not confirming" >&2
+    exit 1
+  fi
+  last="$up"
+  [[ "$up" -ge "$STABLE" ]] && break
+  sleep 1
+done
+echo "stable: up $last s, trial seq $seq0 still pending"
 trial_op confirm
