@@ -17,10 +17,12 @@
 //! stack reads `local_rx` and puts its own frames into the qdiscs.
 
 use crate::config;
+use crate::drivers::Nic;
 use crate::net::packet::{PacketBuf, PacketMeta};
+use crate::net::shared::PortShared;
 use crate::net::shared::{LOCAL_RX_MAX, Shared};
-use crate::net::stack::Port;
 use crate::timer;
+use alloc::vec::Vec;
 use core::net::Ipv4Addr;
 use core::sync::atomic::{AtomicU64, Ordering};
 use fwd::forwarder::{Classification, Forwarder, Interface, Role, Verdict};
@@ -29,7 +31,7 @@ use fwd::{IfIndex, wire};
 use qdisc::{Dequeue, Qdisc};
 
 /// Frames handled per port per loop iteration.
-const RX_BUDGET: usize = 64;
+pub const RX_BUDGET: usize = 64;
 const MAX_CONNS: usize = 16_384;
 const HOUSEKEEPING_MS: u64 = 1_000;
 
@@ -46,8 +48,8 @@ pub struct Datapath {
     pub fwd: Forwarder,
     neigh: NeighTable<PacketBuf>,
     next_housekeeping: u64,
-    /// RX budget was exhausted: more frames are waiting.
-    pub more_rx: bool,
+    /// Egress ports whose qdisc got packets ([`Datapath::take_touched`]).
+    touched: [bool; 2],
     pub local_rx_drops: u64,
     pub qdisc_drops: u64,
     next_stats: u64,
@@ -116,7 +118,7 @@ impl Datapath {
             fwd,
             neigh: NeighTable::new(),
             next_housekeeping: 0,
-            more_rx: false,
+            touched: [false; 2],
             local_rx_drops: 0,
             qdisc_drops: 0,
             next_stats: STATS_MS,
@@ -137,6 +139,9 @@ impl Datapath {
 
     fn enqueue(&mut self, egress: IfIndex, pkt: PacketBuf) {
         let now = now_ns();
+        if let Some(t) = self.touched.get_mut(egress as usize) {
+            *t = true;
+        }
         if self.sh.ports[egress as usize]
             .qdisc
             .lock()
@@ -210,59 +215,49 @@ impl Datapath {
         }
     }
 
-    /// Drain every NIC's RX ring (up to the budget) through the forwarder.
-    pub fn rx(&mut self, ports: &mut [Port]) {
+    /// Run one port's received frames (taken from its NIC by the caller,
+    /// at most [`RX_BUDGET`]) through the forwarder. Drains `batch`.
+    pub fn rx_batch(&mut self, ifx: IfIndex, batch: &mut Vec<PacketBuf>) {
         let now = now_ms();
-        self.more_rx = false;
         let mut local = false;
-        for (i, port) in ports.iter_mut().enumerate() {
-            let ifx = i as IfIndex;
-            for n in 0.. {
-                if n == RX_BUDGET {
-                    self.more_rx = true;
-                    break;
+        for mut pkt in batch.drain(..) {
+            if wire::ethertype(pkt.data()) == Some(wire::ETHERTYPE_ARP) {
+                self.snoop_arp(ifx, pkt.data(), now);
+            }
+            let len = pkt.len();
+            match self
+                .fwd
+                .process(now, ifx, pkt.data_with_tailroom_mut(), len)
+            {
+                Verdict::Local => {
+                    let mut q = self.sh.ports[ifx as usize].local_rx.lock();
+                    if q.len() < LOCAL_RX_MAX {
+                        q.push_back(pkt);
+                        local = true;
+                    } else {
+                        self.local_rx_drops += 1;
+                    }
                 }
-                let Some(mut pkt) = port.dev.receive() else {
-                    break;
-                };
-                if wire::ethertype(pkt.data()) == Some(wire::ETHERTYPE_ARP) {
-                    self.snoop_arp(ifx, pkt.data(), now);
+                Verdict::Forward {
+                    egress,
+                    next_hop,
+                    len,
+                    class,
+                } => {
+                    pkt.set_len(len);
+                    self.observe_ecn(ifx, pkt.data());
+                    pkt.meta = meta_from(&class, ifx, len, now_ns());
+                    FORWARDED.fetch_add(1, Ordering::Relaxed);
+                    match self.neigh.resolve(egress, next_hop, pkt, now) {
+                        Resolve::Ready(mac, pkt) => self.send_resolved(egress, mac, pkt),
+                        Resolve::Queued { send_arp: true } => {
+                            self.send_arp_request(egress, next_hop)
+                        }
+                        Resolve::Queued { send_arp: false } => {}
+                    }
                 }
-                let len = pkt.len();
-                match self
-                    .fwd
-                    .process(now, ifx, pkt.data_with_tailroom_mut(), len)
-                {
-                    Verdict::Local => {
-                        let mut q = self.sh.ports[i].local_rx.lock();
-                        if q.len() < LOCAL_RX_MAX {
-                            q.push_back(pkt);
-                            local = true;
-                        } else {
-                            self.local_rx_drops += 1;
-                        }
-                    }
-                    Verdict::Forward {
-                        egress,
-                        next_hop,
-                        len,
-                        class,
-                    } => {
-                        pkt.set_len(len);
-                        self.observe_ecn(ifx, pkt.data());
-                        pkt.meta = meta_from(&class, ifx, len, now_ns());
-                        FORWARDED.fetch_add(1, Ordering::Relaxed);
-                        match self.neigh.resolve(egress, next_hop, pkt, now) {
-                            Resolve::Ready(mac, pkt) => self.send_resolved(egress, mac, pkt),
-                            Resolve::Queued { send_arp: true } => {
-                                self.send_arp_request(egress, next_hop)
-                            }
-                            Resolve::Queued { send_arp: false } => {}
-                        }
-                    }
-                    Verdict::Drop(_) => {
-                        DROPPED.fetch_add(1, Ordering::Relaxed);
-                    }
+                Verdict::Drop(_) => {
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -271,77 +266,27 @@ impl Datapath {
         }
     }
 
-    /// Once a second: expire connections, retry ARP.
-    pub fn housekeeping(&mut self, ports: &mut [Port]) {
+    /// Ports whose qdisc received packets since the last call: their TX
+    /// task must run (it may be another direction's task).
+    pub fn take_touched(&mut self) -> [bool; 2] {
+        core::mem::take(&mut self.touched)
+    }
+
+    /// Once a second: expire connections, retry ARP, print statistics.
+    /// No NIC access (the caller checks link state without this lock held).
+    pub fn housekeeping(&mut self) {
         let now = now_ms();
         if now < self.next_housekeeping {
             return;
         }
         self.next_housekeeping = now + HOUSEKEEPING_MS;
         self.fwd.expire(now);
-        for nif in ports.iter_mut() {
-            let changed = nif.dev.link_changed();
-            if changed.is_some() {
-                nif.link = changed;
-            }
-            match changed {
-                Some((true, speed, fd)) => crate::println!(
-                    "  net {}       : link up, {speed} Mbit/s {} duplex",
-                    nif.name,
-                    if fd { "full" } else { "half" }
-                ),
-                Some((false, ..)) => crate::println!("  net {}       : link down", nif.name),
-                None => {}
-            }
-        }
         if now >= self.next_stats {
             self.next_stats = now + STATS_MS;
-            self.print_qdisc_stats(ports);
+            self.print_qdisc_stats();
         }
         for (ifx, ip) in self.neigh.poll(now) {
             self.send_arp_request(ifx, ip);
-        }
-    }
-
-    /// Move packets from each qdisc to its NIC while the NIC has room and
-    /// the shaper allows.
-    pub fn flush_tx(&mut self, ports: &mut [Port]) -> FlushResult {
-        let now = now_ns();
-        let mut r = FlushResult::default();
-        for (nif, sp) in ports.iter_mut().zip(&self.sh.ports) {
-            nif.dev.reap_tx();
-            let mut shaper_wait = None;
-            let mut qdisc = sp.qdisc.lock();
-            while nif.dev.can_transmit() {
-                match qdisc.dequeue(now) {
-                    Dequeue::Packet(p) => {
-                        if nif.dev.transmit(p).is_err() {
-                            self.qdisc_drops += 1;
-                        }
-                    }
-                    Dequeue::WaitUntil(t) => {
-                        shaper_wait = Some(t);
-                        break;
-                    }
-                    Dequeue::Empty => break,
-                }
-            }
-            if let Some(t) = shaper_wait {
-                r.shaper_wake_ns = Some(r.shaper_wake_ns.map_or(t, |w: u64| w.min(t)));
-            } else if qdisc.stats().backlog_packets > 0 {
-                r.ring_full_backlog = true;
-            }
-        }
-        r
-    }
-
-    /// Publish port counters and the connection count for the status page.
-    pub fn publish(&self, ports: &[Port]) {
-        for (nif, sp) in ports.iter().zip(&self.sh.ports) {
-            *sp.snap.lock() = crate::net::shared::PortSnap {
-                stats: nif.dev.stats(),
-                link: nif.link,
-            };
         }
         self.sh
             .conntrack
@@ -349,9 +294,9 @@ impl Datapath {
     }
 
     /// One console line per port that sent traffic since the last report.
-    fn print_qdisc_stats(&mut self, ports: &mut [Port]) {
+    fn print_qdisc_stats(&mut self) {
         let mut printed = false;
-        for (i, nif) in ports.iter().enumerate().take(2) {
+        for (i, nif) in self.sh.ports.iter().enumerate().take(2) {
             let total: u64 = self.ecn_seen[i].iter().sum();
             if total == self.ecn_reported[i] {
                 continue;
@@ -369,8 +314,9 @@ impl Datapath {
                 self.tcp_cwr[i]
             );
         }
-        for (i, nif) in ports.iter().enumerate().take(2) {
-            let mut qdisc = self.sh.ports[i].qdisc.lock();
+        for i in 0..self.sh.ports.len().min(2) {
+            let nif = &self.sh.ports[i];
+            let mut qdisc = nif.qdisc.lock();
             let s = qdisc.stats();
             if s.dequeued == self.last_dequeued[i] {
                 continue;
@@ -424,4 +370,29 @@ impl Datapath {
     pub fn next_housekeeping(&self) -> u64 {
         self.next_housekeeping
     }
+}
+
+/// Move packets from a port's qdisc to its NIC while the NIC has room and
+/// the shaper allows (the port's TX task, with the NIC locked).
+pub fn flush_port(port: &PortShared, dev: &mut Nic) -> FlushResult {
+    let now = now_ns();
+    let mut r = FlushResult::default();
+    dev.reap_tx();
+    let mut qdisc = port.qdisc.lock();
+    while dev.can_transmit() {
+        match qdisc.dequeue(now) {
+            Dequeue::Packet(p) => {
+                if dev.transmit(p).is_err() {
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Dequeue::WaitUntil(t) => {
+                r.shaper_wake_ns = Some(t);
+                return r;
+            }
+            Dequeue::Empty => break,
+        }
+    }
+    r.ring_full_backlog = qdisc.stats().backlog_packets > 0;
+    r
 }

@@ -83,12 +83,41 @@ pub fn kmain(boot_arg: usize) -> ! {
     selftest::spawn(has_net);
     cpuload::spawn();
     if let Some((ports, hosts, shared)) = net {
-        executor::spawn(Priority::Datapath, "net", net::stack::run(ports, shared));
-        // Services on their own core when there is one (M11).
-        let svc_core = if smp::online() > 1 { 1 } else { 0 };
-        executor::spawn_on(svc_core, Priority::Service, "svc", net::svc::run(hosts, shared));
+        spawn_net(ports, hosts, shared);
     }
     executor::run()
+}
+
+/// Place the network tasks (docs/smp.md): with two ports, one datapath task
+/// per direction (download = WAN RX → LAN TX, upload = LAN RX → WAN TX);
+/// with 3+ cores each on its own core and the services on a third, with 2
+/// cores both directions on core 0 and the services on core 1.
+fn spawn_net(
+    ports: &'static [net::stack::Port],
+    hosts: alloc::vec::Vec<net::svc::HostIf>,
+    shared: &'static net::shared::Shared,
+) {
+    use net::stack::{Dir, run_dir};
+    let cores = smp::online();
+    let dp = net::stack::new_datapath(shared);
+    let svc_core = if ports.len() >= 2 {
+        let up_core = if cores >= 3 { 1 } else { 0 };
+        let down = Dir { rx: 0, tx: 1, primary: true };
+        let up = Dir { rx: 1, tx: 0, primary: false };
+        executor::spawn_on(0, Priority::Datapath, "dp_down", run_dir(down, ports, shared, dp));
+        executor::spawn_on(up_core, Priority::Datapath, "dp_up", run_dir(up, ports, shared, dp));
+        println!("  datapath        : download on core 0, upload on core {up_core}");
+        match cores {
+            1 => 0,
+            2 => 1,
+            _ => 2,
+        }
+    } else {
+        let one = Dir { rx: 0, tx: 0, primary: true };
+        executor::spawn_on(0, Priority::Datapath, "dp", run_dir(one, ports, shared, dp));
+        if cores > 1 { 1 } else { 0 }
+    };
+    executor::spawn_on(svc_core, Priority::Service, "svc", net::svc::run(hosts, shared));
 }
 
 /// Packet buffers to preallocate: 2 NICs × (RX ring + TX ring) plus room

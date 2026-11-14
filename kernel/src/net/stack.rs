@@ -51,14 +51,16 @@ fn mac_seed(mac: &[u8; 6]) -> u64 {
     mac.iter().fold(0, |a, &b| a << 8 | b as u64)
 }
 
-/// The datapath's half of a port: the NIC and its interrupt.
+/// The datapath's half of a port: the NIC and its interrupt. Shared by the
+/// two direction tasks (one receives on it, the other transmits), so the
+/// NIC is locked; `None` once the NICs were stopped for a reboot/upgrade.
+/// Lock order: NIC, then the datapath, then a qdisc (never the reverse).
 pub struct Port {
     pub name: &'static str,
-    pub dev: Nic,
+    pub dev: Mutex<Option<Nic>>,
     /// Last known link state (up, Mbit/s, full duplex), if the NIC reports one.
-    pub link: Option<(bool, u32, bool)>,
+    pub link: Mutex<Option<(bool, u32, bool)>>,
     irq: Option<(u32, &'static IrqEvent)>,
-    masked: bool,
 }
 
 pub fn now() -> NetInstant {
@@ -78,7 +80,7 @@ fn mask_intx(intid: u32) {
 pub fn bring_up(
     pci: &mut Pci,
     qos: &crate::config::Qos,
-) -> Option<(Vec<Port>, Vec<HostIf>, &'static Shared)> {
+) -> Option<(&'static [Port], Vec<HostIf>, &'static Shared)> {
     let devs: Vec<_> = pci
         .devices
         .iter()
@@ -171,10 +173,9 @@ pub fn bring_up(
         }
         ports.push(Port {
             name,
-            dev,
+            dev: Mutex::new(Some(dev)),
             irq: irq.map(|(intid, ev, _)| (intid, ev)),
-            masked: false,
-            link: None,
+            link: Mutex::new(None),
         });
         shared_ports.push(port);
         hosts.push(HostIf { iface, sockets });
@@ -182,7 +183,11 @@ pub fn bring_up(
     if ports.is_empty() {
         return None;
     }
-    Some((ports, hosts, shared::init(shared_ports)))
+    Some((
+        alloc::boxed::Box::leak(ports.into_boxed_slice()),
+        hosts,
+        shared::init(shared_ports),
+    ))
 }
 
 /// Wait until any of `events` fires or the sleep ends.
@@ -208,79 +213,186 @@ impl Future for WaitAny<'_> {
     }
 }
 
-/// The datapath task: never returns (except into a reboot or a new kernel).
-pub async fn run(mut ports: Vec<Port>, sh: &'static Shared) {
-    let mut dp = Datapath::new(sh);
-    let mut events: Vec<&'static IrqEvent> =
-        ports.iter().filter_map(|n| n.irq.map(|(_, e)| e)).collect();
-    events.push(sh.dp_kick);
+/// One direction of the datapath: receive on port `rx`, forward, transmit
+/// the queue of port `tx` (download = WAN → LAN, upload = LAN → WAN; one
+/// task for both when there is a single port). The `primary` direction
+/// also handles control messages, housekeeping and the status snapshot.
+#[derive(Clone, Copy)]
+pub struct Dir {
+    pub rx: usize,
+    pub tx: usize,
+    pub primary: bool,
+}
 
+/// The forwarding state both directions share.
+pub type SharedDatapath = &'static Mutex<Datapath>;
+
+pub fn new_datapath(sh: &'static Shared) -> SharedDatapath {
+    alloc::boxed::Box::leak(alloc::boxed::Box::new(Mutex::new(Datapath::new(sh))))
+}
+
+/// Wait forever (the NICs were stopped; the primary task is rebooting).
+async fn park() -> ! {
     loop {
-        sh.dp_kick.take();
-        // NAPI step 1: IRQ fired → clear device interrupt status.
-        for nif in ports.iter_mut() {
-            if let Some((_, ev)) = nif.irq
-                && ev.take()
-            {
-                nif.masked = true;
-            }
-            if nif.masked {
-                nif.dev.ack_interrupt();
+        timer::sleep(Duration::from_secs(3600)).await;
+    }
+}
+
+/// Primary only: link state and counters of every port, once a second.
+fn poll_links(ports: &[Port], sh: &Shared) {
+    for (port, sp) in ports.iter().zip(&sh.ports) {
+        let mut g = port.dev.lock();
+        let Some(dev) = g.as_mut() else { continue };
+        let changed = dev.link_changed();
+        let stats = dev.stats();
+        drop(g);
+        let mut link = port.link.lock();
+        if changed.is_some() {
+            *link = changed;
+        }
+        match changed {
+            Some((true, speed, fd)) => println!(
+                "  net {}       : link up, {speed} Mbit/s {} duplex",
+                port.name,
+                if fd { "full" } else { "half" }
+            ),
+            Some((false, ..)) => println!("  net {}       : link down", port.name),
+            None => {}
+        }
+        *sp.snap.lock() = PortSnap { stats, link: *link };
+    }
+}
+
+/// A datapath direction task: never returns (except into a reboot or a
+/// new kernel, from the primary task).
+pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: SharedDatapath) {
+    let rx = &ports[d.rx];
+    let mut events: Vec<&'static IrqEvent> = rx.irq.map(|(_, e)| e).into_iter().collect();
+    events.push(sh.tx_kick[d.tx]);
+    if d.primary {
+        events.push(sh.dp_kick);
+    }
+    let mut batch = Vec::with_capacity(datapath::RX_BUDGET);
+    let mut masked = false;
+    let mut next_links = 0u64;
+    loop {
+        sh.tx_kick[d.tx].take();
+        if d.primary {
+            sh.dp_kick.take();
+        }
+        // NAPI step 1: IRQ fired → clear device interrupt status. The TX
+        // side of this NIC (the other direction) may have completions.
+        if let Some((_, ev)) = rx.irq
+            && ev.take()
+        {
+            masked = true;
+            if d.rx != d.tx {
+                sh.tx_kick[d.rx].signal();
             }
         }
-
-        // Step 2: received frames → forwarder (forward / local / drop).
-        dp.rx(&mut ports);
-
-        // Step 3: messages from the services task.
-        let (wan, action) = {
-            let mut c = sh.control.lock();
-            (c.wan.take(), c.action.take())
-        };
-        if let Some(w) = wan {
-            dp.set_wan(w.addr, w.gateway);
-        }
-        if let Some(action) = action {
-            // Quiesce: dropping the ports resets the NICs (no more DMA).
-            drop(ports);
-            match action {
-                Action::Reboot => arch::power::reset(),
-                Action::Exec(staging, prepared, cmdline) => {
-                    crate::upgrade::exec(staging, prepared, &cmdline)
+        // Step 2: take a batch off the NIC (short lock), then forward it.
+        let more = {
+            let mut g = rx.dev.lock();
+            let Some(dev) = g.as_mut() else {
+                drop(g);
+                park().await
+            };
+            if masked {
+                dev.ack_interrupt();
+            }
+            while batch.len() < datapath::RX_BUDGET {
+                match dev.receive() {
+                    Some(p) => batch.push(p),
+                    None => break,
                 }
             }
+            batch.len() == datapath::RX_BUDGET
+        };
+        let mut touched = [false; 2];
+        if !batch.is_empty() {
+            let mut g = dp.lock();
+            g.rx_batch(d.rx as fwd::IfIndex, &mut batch);
+            touched = g.take_touched();
         }
-        dp.housekeeping(&mut ports);
 
-        // Step 4: qdiscs → NICs (pull, while the NIC has room and the shaper allows).
-        let tx = dp.flush_tx(&mut ports);
-        dp.publish(&ports);
-
-        // Step 5: unmask lines we masked (a still-pending device re-fires).
-        for nif in ports.iter_mut() {
-            if nif.masked
-                && let Some((intid, _)) = nif.irq
+        // Step 3 (primary): control messages, housekeeping, status.
+        let mut next_hk = u64::MAX;
+        if d.primary {
+            let (wan, action) = {
+                let mut c = sh.control.lock();
+                (c.wan.take(), c.action.take())
+            };
+            if let Some(action) = action {
+                // Quiesce: dropping the NICs resets them (no more DMA); the
+                // other direction then parks.
+                for port in ports {
+                    drop(port.dev.lock().take());
+                }
+                match action {
+                    Action::Reboot => arch::power::reset(),
+                    Action::Exec(staging, prepared, cmdline) => {
+                        crate::upgrade::exec(staging, prepared, &cmdline)
+                    }
+                }
+            }
             {
-                nif.masked = false;
-                arch::irqchip::enable(intid, Trigger::Level);
+                let mut g = dp.lock();
+                if let Some(w) = wan {
+                    g.set_wan(w.addr, w.gateway);
+                }
+                g.housekeeping();
+                let t = g.take_touched();
+                touched = [touched[0] | t[0], touched[1] | t[1]];
+                next_hk = g.next_housekeeping();
+            }
+            let now = timer::uptime().as_millis() as u64;
+            if now >= next_links {
+                next_links = now + 1000;
+                poll_links(ports, sh);
+            }
+        }
+        for (p, &t) in touched.iter().enumerate() {
+            if t && p != d.tx && p < sh.tx_kick.len() {
+                sh.tx_kick[p].signal();
             }
         }
 
-        // Step 6: sleep until an IRQ, a kick from the services or the next deadline.
-        if dp.more_rx {
+        // Step 4: this direction's qdisc → NIC.
+        let tx = {
+            let mut g = ports[d.tx].dev.lock();
+            let Some(dev) = g.as_mut() else {
+                drop(g);
+                park().await
+            };
+            datapath::flush_port(&sh.ports[d.tx], dev)
+        };
+
+        // Step 5: unmask (a still-pending device re-fires). On aarch64 this
+        // also routes the line to this core.
+        if masked && let Some((intid, _)) = rx.irq {
+            masked = false;
+            arch::irqchip::enable(intid, Trigger::Level);
+        }
+
+        // Step 6: sleep until an IRQ, a kick or the next deadline.
+        if more {
             crate::executor::yield_now().await;
             continue;
         }
-        let hk = dp
-            .next_housekeeping()
-            .saturating_sub(timer::uptime().as_millis() as u64);
-        let mut delay = Duration::from_millis(hk);
-        // A shaper holding packets: wake exactly when it releases the next one.
+        // Primary: next housekeeping / link poll; otherwise only events.
+        let now_ms = timer::uptime().as_millis() as u64;
+        let due = if d.primary {
+            next_hk.min(next_links)
+        } else {
+            u64::MAX
+        };
+        let mut delay = Duration::from_millis(due.saturating_sub(now_ms).min(1000));
         if let Some(at) = tx.shaper_wake_ns {
             delay = delay.min(Duration::from_nanos(at.saturating_sub(datapath::now_ns())));
         }
-        // TX completion normally raises an interrupt; poll as a fallback while
-        // a NIC ring is full with a backlog, and for devices without an IRQ.
+        // TX completion normally raises an interrupt (handled by the other
+        // direction, which kicks us); poll as a fallback while the ring is
+        // full with a backlog, and for devices without an IRQ.
         if tx.ring_full_backlog || ports.iter().any(|n| n.irq.is_none()) {
             delay = delay.min(Duration::from_millis(1));
         }

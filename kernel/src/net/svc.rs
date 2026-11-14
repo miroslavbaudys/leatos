@@ -215,20 +215,23 @@ fn lease_json(c: &LeaseChange) -> alloc::string::String {
     )
 }
 
-/// Poll every router-stack interface. Returns how many frames went into qdiscs.
-fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) -> u32 {
+/// Poll every router-stack interface; wake the TX task of each port that
+/// got frames in its qdisc.
+fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
     let t = stack::now();
     let now_ns = datapath::now_ns();
-    let mut queued = 0;
-    for (host, port) in hosts.iter_mut().zip(&sh.ports) {
+    for (i, (host, port)) in hosts.iter_mut().zip(&sh.ports).enumerate() {
+        let mut queued = 0;
         let mut dev = PortDevice {
             port,
             now_ns,
             queued: &mut queued,
         };
         host.iface.poll(t, &mut dev, &mut host.sockets);
+        if queued > 0 {
+            sh.tx_kick[i].signal();
+        }
     }
-    queued
 }
 
 /// The services task: never returns.
@@ -243,7 +246,7 @@ pub async fn run(mut hosts: Vec<HostIf>, sh: &'static Shared) {
 
     loop {
         sh.svc_kick.take();
-        let mut queued = poll_stacks(&mut hosts, sh);
+        poll_stacks(&mut hosts, sh);
         if let Some(change) = handle_dhcp(sh.ports[0].name, &mut hosts[0], &mut pinger) {
             sh.post_wan(WanChange {
                 addr: change.addr,
@@ -266,10 +269,7 @@ pub async fn run(mut hosts: Vec<HostIf>, sh: &'static Shared) {
                 timer::sleep(Duration::from_secs(3600)).await;
             }
         }
-        queued += poll_stacks(&mut hosts, sh);
-        if queued > 0 {
-            sh.dp_kick.signal();
-        }
+        poll_stacks(&mut hosts, sh);
 
         // More frames arrived while we worked: go round again, after
         // letting the datapath run.

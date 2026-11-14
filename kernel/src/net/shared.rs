@@ -62,8 +62,11 @@ pub struct Control {
 pub struct Shared {
     /// `ports[0]` = WAN, `ports[1]` = LAN.
     pub ports: Vec<PortShared>,
-    /// Services → datapath: frames queued for TX, or a control message.
+    /// Services → the primary datapath task: a control message.
     pub dp_kick: &'static IrqEvent,
+    /// Per port: frames were queued for TX (wakes the task that transmits
+    /// on that port).
+    pub tx_kick: Vec<&'static IrqEvent>,
     /// Datapath → services: frames in a `local_rx`.
     pub svc_kick: &'static IrqEvent,
     pub control: Mutex<Control>,
@@ -76,8 +79,10 @@ static SHARED: Once<&'static Shared> = Once::new();
 /// Create the shared state once (at bring-up).
 pub fn init(ports: Vec<PortShared>) -> &'static Shared {
     SHARED.call_once(|| {
+        let tx_kick = ports.iter().map(|_| irq::new_event()).collect();
         Box::leak(Box::new(Shared {
             ports,
+            tx_kick,
             dp_kick: irq::new_event(),
             svc_kick: irq::new_event(),
             control: Mutex::new(Control::default()),

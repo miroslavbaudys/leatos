@@ -74,7 +74,7 @@ the project (it effectively replaces netfilter), and it must be fuzzed.
 ### Tasks (M11 step 1)
 | Task | Priority | Owns | Does |
 |---|---|---|---|
-| `net` (`net::stack::run`) | Datapath | NICs (`Port`), `Datapath` (forwarder, neighbor table) | RX → forward → qdisc → TX, NAPI, housekeeping |
+| `dp_down` / `dp_up` (`net::stack::run_dir`) | Datapath | one direction each: RX on one port, TX on the other; share the locked NICs and `Datapath` (forwarder, neighbor table) | RX → forward → qdisc → TX, NAPI; `dp_down` also housekeeping and control |
 | `svc` (`net::svc::run`) | Service | smoltcp interfaces and sockets (`HostIf`), DHCP client, LAN DHCP server, DNS, mgmt | the router's own traffic |
 
 They share only `net::shared`: per port a locked qdisc and `local_rx`

@@ -124,21 +124,34 @@ if [[ "$SHAPE_KBIT" != 0 ]]; then
   done
 fi
 
-# CPU time per task (services split, M11): forwarding runs in the `net`
-# (datapath) task, DHCP/DNS/web in the `svc` task. After the client's run
-# `svc` must have done work and `net` (which forwarded the shaped
-# transfers) more of it. Negative control: a kernel without the split (one
-# `net` task doing everything, e.g. commit bdcf72e) has no `svc` task and fails.
+# CPU time per task (M11). Forwarding runs in the datapath tasks: dp_down
+# (WAN RX -> LAN TX) and dp_up (LAN RX -> WAN TX); DHCP/DNS/web in svc.
+# 1. split: svc did work, and each direction's task (loaded by the client's
+#    download resp. upload phase) more of it. Negative control: a kernel
+#    with one task doing everything (bdcf72e) has no svc/dp_* tasks.
+# 2. placement: with QEMU_SMP >= 3 dp_up runs on core 1, else on core 0
+#    (LAB_EXPECT_UP_CORE overrides). Negative control: QEMU_SMP=4 with
+#    LAB_ROUTER_ARGS=cores=2 keeps dp_up on core 0 and fails.
 line=$(tr -d '\r' <"$WORK/router.log" | grep "  cpu  " | tail -1 || true)
-net_ms=$(echo "$line" | sed -n 's/.*, net@[0-9]* \([0-9]*\) ms.*/\1/p')
-svc_ms=$(echo "$line" | sed -n 's/.*, svc@[0-9]* \([0-9]*\) ms.*/\1/p')
-what="net (datapath) ${net_ms:-?} ms, svc (services) ${svc_ms:-?} ms"
-if [[ -z "$net_ms" || -z "$svc_ms" ]]; then
+task_ms() { echo "$line" | sed -n "s/.*, $1@[0-9]* \([0-9]*\) ms.*/\1/p"; }
+task_core() { echo "$line" | sed -n "s/.*, $1@\([0-9]*\) .*/\1/p"; }
+down_ms=$(task_ms dp_down); up_ms=$(task_ms dp_up); svc_ms=$(task_ms svc)
+what="dp_down ${down_ms:-?} ms, dp_up ${up_ms:-?} ms, svc ${svc_ms:-?} ms"
+if [[ -z "$down_ms" || -z "$up_ms" || -z "$svc_ms" ]]; then
   echo "  LAB FAIL: cpu split: $what (no per-task counters)"; router_fails=$((router_fails + 1))
-elif [[ "$svc_ms" -gt 0 && "$net_ms" -gt "$svc_ms" ]]; then
+elif [[ "$svc_ms" -gt 0 && "$down_ms" -gt "$svc_ms" && "$up_ms" -gt "$svc_ms" ]]; then
   echo "  LAB PASS: cpu split: $what"
 else
-  echo "  LAB FAIL: cpu split: expected svc > 0 and net > svc: $what"; router_fails=$((router_fails + 1))
+  echo "  LAB FAIL: cpu split: expected svc > 0 and each direction > svc: $what"; router_fails=$((router_fails + 1))
+fi
+smp="${QEMU_SMP:-1}"
+want_up=${LAB_EXPECT_UP_CORE:-$([[ "$smp" -ge 3 ]] && echo 1 || echo 0)}
+up_core=$(task_core dp_up); down_core=$(task_core dp_down)
+if [[ "$up_core" == "$want_up" && "$down_core" == 0 ]]; then
+  echo "  LAB PASS: cpu placement: dp_down on core ${down_core}, dp_up on core ${up_core} (QEMU_SMP=$smp)"
+else
+  echo "  LAB FAIL: cpu placement: expected dp_down on core 0, dp_up on core $want_up, got ${down_core:-?}/${up_core:-?}"
+  router_fails=$((router_fails + 1))
 fi
 
 if [[ "$router_fails" == 0 ]] && tr -d '\r' <"$WORK/client.log" | grep -q "LAB DONE fails=0" && ! tr -d '\r' <"$WORK/client.log" | grep -q "LAB FAIL"; then

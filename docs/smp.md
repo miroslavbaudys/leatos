@@ -90,14 +90,34 @@ does one 64-bit access. TCG answered either way.
 - `QEMU_SMP=4 scripts/lab-test.sh`: the full lab, with `svc` on core 1
   (the per-task CPU line shows `svc@1`).
 
-## Step 3: one datapath core per direction (next)
+## Step 3: one datapath core per direction ✅
 - **Tasks:** `dp_down` (WAN RX → forwarder → LAN qdisc → LAN TX) and
-  `dp_up` (LAN RX → forwarder → WAN qdisc → WAN TX) on their own cores.
-  Each NIC's interrupt goes to its RX core.
+  `dp_up` (LAN RX → forwarder → WAN qdisc → WAN TX), `net::stack::run_dir`.
+  With 3+ cores they run on cores 0 and 1 and the services on core 2;
+  with 2 cores both directions are on core 0 and the services on core 1.
+  `dp_down` is the primary: it also handles control messages,
+  housekeeping and the status snapshot.
 - **Shared between the two:**
-  - `Mutex<Forwarder>` (conntrack/NAT), locked per RX batch
-  - `Mutex<NeighTable>`: ARP replies arrive on the other direction's RX
-  - `Mutex<Nic>` per port: RX by one core, TX by the other
-- **If the forwarder lock limits the gain:** shard conntrack. NAT
-  allocates external ports so that `port % shards` is the connection's
-  shard, so WAN ingress finds the shard from the destination port.
+  - `Mutex<Datapath>` (forwarder: conntrack/NAT/routes; neighbor table:
+    ARP replies arrive on the other direction's RX), locked per RX batch
+  - per port `Mutex<Option<Nic>>`: RX by one direction, TX by the other.
+    A batch is taken off the NIC under a short lock, then forwarded
+    without it.
+  - **Lock order:** NIC, then datapath, then qdisc; never the reverse.
+- **Wakeups:**
+  - Per port `tx_kick` wakes whoever transmits on that port: the other
+    direction (ARP-released packets), `svc` (router-local frames), or the
+    RX task after its NIC's interrupt (TX completions share the NIC's
+    vector).
+  - aarch64 routes each NIC's interrupt to the core that unmasks it,
+    which is its RX task's core. x86_64 MSI-X still targets core 0; the
+    event wakes the RX task by IPI.
+- **Checks (lab):**
+  - `cpu split`: each direction's task did more work than `svc` (the
+    client's download and upload phases load them).
+  - `cpu placement`: `dp_up` on core 1 with `QEMU_SMP` ≥ 3, else core 0.
+    Negative control: `QEMU_SMP=4 LAB_ROUTER_ARGS=cores=2` fails it.
+- **Later, if `Mutex<Datapath>` contention limits the gain on the
+  apu4:** shard conntrack (NAT external port % shards = the connection's
+  shard), route x86 MSI-X to the RX core, and give igb separate RX/TX
+  vectors.
