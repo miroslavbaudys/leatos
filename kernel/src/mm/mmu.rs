@@ -188,6 +188,11 @@ pub fn init(info: &BootInfo) {
     // Stacks. The guard pages below each stack are deliberately left unmapped.
     space.map(sym::exc_stack_bottom(), sym::exc_stack_top(), Perm::Rw);
     space.map(sym::stack_bottom(), sym::stack_top(), Perm::Rw);
+    crate::mm::stacks::check_layout();
+    for s in crate::mm::stacks::all_secondary() {
+        space.map(s.exc.0, s.exc.1, Perm::Rw);
+        space.map(s.stack.0, s.stack.1, Perm::Rw);
+    }
     // Heap: rest of RAM.
     space.map(sym::kernel_end(), align_down(ram_end), Perm::Rw);
 
@@ -224,6 +229,13 @@ pub fn guard_page_name(addr: usize) -> Option<&'static str> {
     } else if in_page(sym::exc_stack_guard()) {
         Some("exception stack overflow (guard page)")
     } else {
-        None
+        crate::mm::stacks::guard_name(addr)
     }
+}
+
+/// Physical address of the live root translation table (for secondary
+/// cores, which switch to the same address space).
+pub fn root() -> u64 {
+    let live = LIVE.lock();
+    table_addr(&live.as_ref().expect("mmu: root before mmu::init").tables[0])
 }

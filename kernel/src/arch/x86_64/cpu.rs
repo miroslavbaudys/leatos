@@ -40,6 +40,13 @@ pub fn dma_barrier() {
 /// is atomic: the interrupt shadow of `sti` covers `hlt`, so an IRQ that
 /// arrives in between still wakes the CPU. Interrupts stay enabled after.
 #[cfg_attr(feature = "idle-poll", allow(dead_code))]
+/// This core's index (`smp`). Single core until the x86_64 SMP backend
+/// lands (M11 step 2b).
+#[inline]
+pub fn core_id() -> usize {
+    0
+}
+
 pub fn wait_for_interrupt() {
     // SAFETY: `sti; hlt` enables interrupts and halts until one arrives.
     unsafe { asm!("sti", "hlt", options(nomem, nostack)) };

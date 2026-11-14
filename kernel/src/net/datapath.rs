@@ -406,15 +406,15 @@ impl Datapath {
         // Cumulative CPU time by task class (scripts/lab-test.sh checks
         // that forwarding lands in the datapath and DHCP/DNS in services).
         if printed {
-            let t = crate::executor::cpu_ticks();
+            let t = crate::executor::cpu_ticks(0);
             let ms = |ticks: u64| timer::ticks_to_duration(ticks).as_millis();
             let mut tasks = alloc::string::String::new();
-            crate::executor::task_ticks(|name, ticks| {
+            crate::executor::task_ticks(|name, core, ticks| {
                 use core::fmt::Write;
-                let _ = write!(tasks, ", {name} {} ms", ms(ticks));
+                let _ = write!(tasks, ", {name}@{core} {} ms", ms(ticks));
             });
             crate::println!(
-                "  cpu             : idle {} ms, uptime {} ms{tasks}",
+                "  cpu             : core 0 idle {} ms, uptime {} ms{tasks}",
                 ms(t.idle),
                 timer::uptime().as_millis()
             );

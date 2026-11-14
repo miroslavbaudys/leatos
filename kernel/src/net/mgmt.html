@@ -49,10 +49,9 @@
 <body>
 <header><h1>rrouter</h1><span id="ver">…</span><span id="up"></span><span id="wanwarn" class="warn"></span></header>
 <main>
-  <section class="wide"><h2>CPU load (core 0, the only core in use)</h2>
-    <div class="stat"><div><b id="cpunow">–</b> <span>last second</span></div><div><b id="cpuavg">–</b> <span id="cpuavgl">average</span></div>
-      <div class="legend"><span><i style="background:var(--s1)"></i>Datapath (forwarding, CAKE)</span><span><i style="background:var(--s2)"></i>Services (DHCP, DNS, web)</span><span><i style="background:var(--s3)"></i>Other (IRQs, timers)</span></div></div>
-    <div class="chart"><svg id="cpu" role="img" aria-label="CPU load over the last 5 minutes"></svg><div id="cputip" class="tip" hidden></div></div>
+  <section class="wide"><h2>CPU load per core</h2>
+    <div class="legend"><span><i style="background:var(--s1)"></i>Datapath (forwarding, CAKE)</span><span><i style="background:var(--s2)"></i>Services (DHCP, DNS, web)</span><span><i style="background:var(--s3)"></i>Other (IRQs, timers)</span></div>
+    <div id="cpucharts"></div>
     <details><summary>Last 10 seconds as a table</summary><table id="cputab"></table></details>
   </section>
   <section class="wide"><h2>Interfaces</h2><table id="ifs"></table></section>
@@ -73,15 +72,32 @@ const n = (x) => Number(x).toLocaleString();
 const rows = (pairs) => pairs.map(([k, v]) => `<tr><th>${esc(k)}</th><td>${v}</td></tr>`).join("");
 const dur = (s) => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + "d " : "") + h + "h " + m + "m " + (s % 60) + "s"; };
 
-// CPU load: samples are [busy, datapath, service] in permille, oldest first,
-// one per second. Stacked from the bottom: datapath (the forwarding task),
-// services (router stack, DHCP, DNS, this web server), other (the rest of
-// busy: IRQs, timers, the executor).
-let cpuS = [], cpuEv = null;
+// CPU load per core: cpu.cores[c] = samples [busy, datapath, service] in
+// permille, oldest first, one per second. Stacked from the bottom: datapath
+// (forwarding tasks), services (router stack, DHCP, DNS, this web server),
+// other (the rest of busy: IRQs, timers, the executor). One chart per core
+// (small multiples, same scale).
+let cpuCores = [], cpuEv = [], cpuInterval = 1;
 const pct = (p) => (p / 10).toFixed(1) + " %";
-function drawCpu() {
-  const svg = $("cpu"), s = cpuS, N = 300;
-  const W = Math.max(svg.clientWidth, 200), H = 170, L = 40, R = 6, T = 8, B = 20;
+function cpuChart(c) {
+  if (!$("cpu" + c)) {
+    const box = document.createElement("div");
+    box.innerHTML = `<div class="stat"><div><b>Core ${c}</b></div><div><b id="cpunow${c}">–</b> <span>last second</span></div>` +
+      `<div><b id="cpuavg${c}">–</b> <span id="cpuavgl${c}">average</span></div></div>` +
+      `<div class="chart"><svg id="cpu${c}" role="img" aria-label="CPU load of core ${c} over the last 5 minutes"></svg><div id="cputip${c}" class="tip" hidden></div></div>`;
+    $("cpucharts").append(box);
+    $("cpu" + c).addEventListener("pointermove", (ev) => cpuHover(c, ev));
+    $("cpu" + c).addEventListener("pointerleave", () => {
+      cpuEv[c] = null; $("cputip" + c).hidden = true;
+      const h = $("hair" + c); if (h) h.setAttribute("visibility", "hidden");
+    });
+  }
+  return $("cpu" + c);
+}
+function drawCpu(c) {
+  const svg = cpuChart(c), s = cpuCores[c] || [], N = 300;
+  const W = Math.max(svg.clientWidth, 200), H = cpuCores.length > 1 ? 120 : 170, L = 40, R = 6, T = 8, B = 20;
+  svg.style.height = H + "px";
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   const x = (i) => L + (W - L - R) * (N - s.length + i) / (N - 1);
   const y = (v) => T + (H - T - B) * (1 - Math.min(v, 1000) / 1000);
@@ -98,51 +114,57 @@ function drawCpu() {
     g += `<path d="M${x0},${y0}L${dp.join("L")}L${xn},${y0}Z" fill="var(--s1)" fill-opacity=".16"/>`;
     g += `<path d="${band(sv, dp)}" fill="var(--s2)" fill-opacity=".16"/>`;
     g += `<path d="${band(tot, sv)}" fill="var(--s3)" fill-opacity=".16"/>`;
-    for (const [p, c] of [[tot, "--s3"], [sv, "--s2"], [dp, "--s1"]]) {
-      g += `<polyline points="${p.join(" ")}" fill="none" stroke="var(${c})" stroke-width="2" stroke-linejoin="round"/>`;
+    for (const [p, col] of [[tot, "--s3"], [sv, "--s2"], [dp, "--s1"]]) {
+      g += `<polyline points="${p.join(" ")}" fill="none" stroke="var(${col})" stroke-width="2" stroke-linejoin="round"/>`;
     }
   } else {
     g += `<text x="${(L + W) / 2}" y="${H / 2}" text-anchor="middle">collecting…</text>`;
   }
-  g += `<line id="hair" class="hair" y1="${T}" y2="${H - B}" visibility="hidden"/>`;
+  g += `<line id="hair${c}" class="hair" y1="${T}" y2="${H - B}" visibility="hidden"/>`;
   svg.innerHTML = g;
   svg.cpuMap = { x, L, R, W, N };
-  if (cpuEv) cpuHover(cpuEv);
+  if (cpuEv[c]) cpuHover(c, cpuEv[c]);
 }
-function cpuHover(ev) {
-  cpuEv = ev;
-  const svg = $("cpu"), m = svg.cpuMap, s = cpuS;
+function cpuHover(c, ev) {
+  cpuEv[c] = ev;
+  const svg = $("cpu" + c), m = svg.cpuMap, s = cpuCores[c] || [];
   if (!m || !s.length) return;
   const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) * m.W / r.width;
   const i = Math.max(0, Math.min(s.length - 1, Math.round((px - m.L) / (m.W - m.L - m.R) * (m.N - 1)) - (m.N - s.length)));
   const [busy, dp, sv] = s[i], hx = m.x(i), ago = s.length - 1 - i;
-  const h = $("hair");
+  const h = $("hair" + c);
   h.setAttribute("x1", hx); h.setAttribute("x2", hx); h.setAttribute("visibility", "visible");
-  const tip = $("cputip"), line = (color, label, v) => {
+  const tip = $("cputip" + c), line = (color, label, v) => {
     const d = document.createElement("div");
     if (color) { const k = document.createElement("i"); k.style.background = color; d.append(k); }
     d.append(label + (v === undefined ? "" : ": " + pct(v)));
     return d;
   };
-  tip.replaceChildren(line(null, ago ? `${ago} s ago` : "last second"),
+  tip.replaceChildren(line(null, `core ${c}, ` + (ago ? `${ago} s ago` : "last second")),
     line("var(--s1)", "Datapath", dp), line("var(--s2)", "Services", sv), line("var(--s3)", "Other", Math.max(busy - dp - sv, 0)), line(null, "Total", busy));
   tip.hidden = false;
   const left = hx * r.width / m.W;
   tip.style.left = (left + 12 + tip.offsetWidth > r.width ? left - 12 - tip.offsetWidth : left + 12) + "px";
 }
-$("cpu").addEventListener("pointermove", cpuHover);
-$("cpu").addEventListener("pointerleave", () => { cpuEv = null; $("cputip").hidden = true; const h = $("hair"); if (h) h.setAttribute("visibility", "hidden"); });
-window.addEventListener("resize", drawCpu);
+window.addEventListener("resize", () => cpuCores.forEach((_, c) => drawCpu(c)));
 function showCpu(cpu) {
-  cpuS = cpu.samples;
-  const last = cpuS[cpuS.length - 1];
-  $("cpunow").textContent = last ? pct(last[0]) : "–";
-  $("cpuavg").textContent = cpuS.length ? pct(cpuS.reduce((a, d) => a + d[0], 0) / cpuS.length) : "–";
-  const secs = cpuS.length * cpu.interval_s;
-  $("cpuavgl").textContent = secs >= 60 ? `average, last ${Math.round(secs / 60)} min` : `average, last ${secs} s`;
-  $("cputab").innerHTML = "<tr><th>Seconds ago</th><th>Total</th><th>Datapath</th><th>Services</th><th>Other</th></tr>" +
-    cpuS.slice(-10).reverse().map((d, i) => `<tr><td>${i}</td><td>${pct(d[0])}</td><td>${pct(d[1])}</td><td>${pct(d[2])}</td><td>${pct(Math.max(d[0] - d[1] - d[2], 0))}</td></tr>`).join("");
-  drawCpu();
+  cpuCores = cpu.cores; cpuInterval = cpu.interval_s;
+  cpuCores.forEach((s, c) => {
+    cpuChart(c);
+    const last = s[s.length - 1];
+    $("cpunow" + c).textContent = last ? pct(last[0]) : "–";
+    $("cpuavg" + c).textContent = s.length ? pct(s.reduce((a, d) => a + d[0], 0) / s.length) : "–";
+    const secs = s.length * cpuInterval;
+    $("cpuavgl" + c).textContent = secs >= 60 ? `average, last ${Math.round(secs / 60)} min` : `average, last ${secs} s`;
+    drawCpu(c);
+  });
+  const head = cpuCores.map((_, c) => `<th>Core ${c}: total / datapath / services</th>`).join("");
+  const rows10 = [];
+  for (let i = 0; i < 10; i++) {
+    const cells = cpuCores.map((s) => { const d = s[s.length - 1 - i]; return `<td>${d ? `${pct(d[0])} / ${pct(d[1])} / ${pct(d[2])}` : "–"}</td>`; }).join("");
+    rows10.push(`<tr><td>${i}</td>${cells}</tr>`);
+  }
+  $("cputab").innerHTML = `<tr><th>Seconds ago</th>${head}</tr>` + rows10.join("");
 }
 
 async function refresh() {

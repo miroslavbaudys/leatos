@@ -55,11 +55,15 @@ pub const MAX_INTID: usize = 1020;
 
 struct Gic {
     gicd: Region,
-    /// Covers the whole redistributor area; `rd` is this core's frame offset.
+    /// Covers the whole redistributor area; `rd[core]` is that core's frame offset.
     gicr: Region,
-    rd: usize,
+    gicr_size: usize,
+    rd: [usize; crate::smp::MAX_CORES],
     lines: usize,
 }
+
+/// The wake/stop IPI (`smp`): SGI 0.
+pub const IPI_INTID: u32 = 0;
 
 static GIC: Mutex<Option<Gic>> = Mutex::new(None);
 
@@ -88,7 +92,7 @@ impl Gic {
     }
 
     fn wait_rwp_r(&mut self) {
-        while self.gicr.read32(self.rd + GICR_CTLR) & GICR_RWP != 0 {
+        while self.gicr.read32(self.rd[super::cpu::core_id()] + GICR_CTLR) & GICR_RWP != 0 {
             core::hint::spin_loop();
         }
     }
@@ -98,7 +102,7 @@ impl Gic {
         let me = affinity();
         let mut off = 0;
         while off + GICR_FRAME <= size {
-            let typer = gicr.read64_split(off + GICR_TYPER);
+            let typer = gicr.read64(off + GICR_TYPER);
             if typer >> 32 == me {
                 return Some(off);
             }
@@ -135,7 +139,7 @@ impl Gic {
     }
 
     fn init_redistributor(&mut self) {
-        let rd = self.rd;
+        let rd = self.rd[super::cpu::core_id()];
         self.gicr
             .modify32(rd + GICR_WAKER, |v| v & !WAKER_PROCESSOR_SLEEP);
         while self.gicr.read32(rd + GICR_WAKER) & WAKER_CHILDREN_ASLEEP != 0 {
@@ -154,7 +158,8 @@ impl Gic {
         let i = intid as usize;
         if i < 32 {
             let reg = if on { GICR_ISENABLER0 } else { GICR_ICENABLER0 };
-            self.gicr.write32(self.rd + reg, 1 << i);
+            self.gicr
+                .write32(self.rd[super::cpu::core_id()] + reg, 1 << i);
         } else {
             let reg = if on { GICD_ISENABLER } else { GICD_ICENABLER };
             self.gicd.write32(reg + (i / 32) * 4, 1 << (i % 32));
@@ -199,10 +204,14 @@ pub fn init(info: &BootInfo) {
     let mut r = unsafe { Region::new(gicr, gicr_size) };
     let lines = (((d.read32(GICD_TYPER) & 0x1f) as usize + 1) * 32).min(MAX_INTID);
     let rd = Gic::find_rd(&mut r, gicr_size).expect("gic: no redistributor for this core");
+    let mut rds = [0; crate::smp::MAX_CORES];
+    rds[0] = rd;
+    super::smp::set_boot_mpidr(super::cpu::hw_core_id());
     let mut gic = Gic {
         gicd: d,
         gicr: r,
-        rd,
+        gicr_size,
+        rd: rds,
         lines,
     };
     gic.init_distributor();
@@ -213,6 +222,38 @@ pub fn init(info: &BootInfo) {
         "  irqchip         : GICv3 up, {lines} lines, redistributor {:#x}",
         gicr + rd
     );
+}
+
+/// Bring up this (secondary) core's redistributor and CPU interface.
+pub fn init_secondary() {
+    let core = super::cpu::core_id();
+    with_gic(|g| {
+        let size = g.gicr_size;
+        let Some(rd) = Gic::find_rd(&mut g.gicr, size) else {
+            panic!(
+                "gic: no redistributor for affinity {:#x} in {size:#x} bytes",
+                affinity()
+            );
+        };
+        g.rd[core] = rd;
+        g.init_redistributor();
+    });
+    init_cpu_interface();
+}
+
+/// Send the wake/stop IPI (SGI 0) to `core`.
+pub fn send_ipi(core: usize) {
+    let id = super::smp::mpidr(core);
+    let (aff0, aff1, aff2, aff3) = (
+        id & 0xff,
+        (id >> 8) & 0xff,
+        (id >> 16) & 0xff,
+        (id >> 32) & 0xff,
+    );
+    debug_assert!(aff0 < 16, "SGI target list covers Aff0 0..15");
+    let v = aff3 << 48 | aff2 << 32 | (IPI_INTID as u64) << 24 | aff1 << 16 | 1 << aff0;
+    // SAFETY: writing ICC_SGI1R_EL1 sends a software interrupt; no memory effects.
+    unsafe { asm!("msr icc_sgi1r_el1, {}", "isb", in(reg) v, options(nostack, preserves_flags)) };
 }
 
 /// Enable an interrupt. SPIs (>= 32) are routed to this core with `trigger`.

@@ -81,9 +81,22 @@ pub unsafe fn discover(x0: usize, kernel_start: usize) -> Result<BootInfo, &'sta
     // borrowing its strings as 'static is sound.
     let bootargs: &'static str = fdt.chosen().bootargs().unwrap_or("");
 
+    // Core IDs (MPIDR affinity, `reg`), the boot core (ours) first.
+    let mut cpu_ids = [0u64; crate::smp::MAX_CORES];
+    let boot = crate::arch::cpu::hw_core_id();
+    let mut n = 1;
+    cpu_ids[0] = boot;
+    for c in fdt.cpus() {
+        let id = c.ids().first() as u64;
+        if id != boot && n < cpu_ids.len() {
+            cpu_ids[n] = id;
+            n += 1;
+        }
+    }
     Ok(BootInfo {
         firmware: ("dtb", addr, fdt.total_size()),
         cpus: fdt.cpus().count(),
+        cpu_ids,
         ram,
         console_base,
         power,

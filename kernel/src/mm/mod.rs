@@ -6,5 +6,6 @@ pub mod dma;
 pub mod heap;
 #[allow(unsafe_code)] // one call: activating the finished page tables
 pub mod mmu;
+pub mod stacks;
 #[allow(unsafe_code)] // `unsafe extern` declarations of linker symbols (addresses only)
 pub mod sym;

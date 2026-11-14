@@ -9,13 +9,18 @@ use crate::executor::{self, Priority};
 use crate::{irq, net, println, timer};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 
 static A_TICKS: AtomicU32 = AtomicU32::new(0);
 static B_TICKS: AtomicU32 = AtomicU32::new(0);
 /// Which class was polled first: 1 = datapath, 2 = service.
 static FIRST: AtomicU32 = AtomicU32::new(0);
+/// SMP self-test: when core 0 signalled, when the task on core 1 ran, and
+/// how late a 10 ms sleep on core 1 ended (ticks / µs).
+static SMP_SIGNALLED: AtomicU64 = AtomicU64::new(0);
+static SMP_WOKEN: AtomicU64 = AtomicU64::new(0);
+static SMP_SLEEP_OVER_US: AtomicU64 = AtomicU64::new(u64::MAX);
 
 fn heap_self_test() {
     let v: Vec<u64> = (0..1024).collect();
@@ -108,6 +113,23 @@ pub fn spawn(has_net: bool) {
         }
     });
 
+    // SMP: a task pinned to core 1 waits for an event that core 0 signals
+    // (cross-core wake + IPI), then sleeps on core 1 (its own timer queue
+    // and comparator).
+    let smp_event = (crate::smp::online() > 1).then(|| {
+        let ev = irq::new_event();
+        executor::spawn_on(1, Priority::Service, "selftest-smp", async move {
+            ev.wait().await;
+            SMP_WOKEN.store(timer::ticks(), Ordering::Release);
+            let want = Duration::from_millis(10);
+            let t0 = timer::Instant::now();
+            timer::sleep(want).await;
+            let over = t0.elapsed().saturating_sub(want).as_micros() as u64;
+            SMP_SLEEP_OVER_US.store(over, Ordering::Release);
+        });
+        ev
+    });
+
     executor::spawn(Priority::Service, "selftest", async move {
         // Sleep accuracy: tickless timers should land close to the deadline.
         // The overshoot is dominated by how fast the host wakes the vCPU.
@@ -180,6 +202,31 @@ pub fn spawn(has_net: bool) {
                     net::device::tx_drops()
                 );
             }
+        }
+
+        if let Some(ev) = smp_event {
+            SMP_SIGNALLED.store(timer::ticks(), Ordering::Release);
+            ev.signal();
+            let deadline = timer::Instant::now()
+                .checked_add(Duration::from_secs(2))
+                .unwrap();
+            while SMP_SLEEP_OVER_US.load(Ordering::Acquire) == u64::MAX {
+                assert!(
+                    timer::Instant::now() < deadline,
+                    "smp self-test: task on core 1 did not run (woken: {})",
+                    SMP_WOKEN.load(Ordering::Acquire) != 0
+                );
+                timer::sleep(Duration::from_millis(1)).await;
+            }
+            let wake = SMP_WOKEN
+                .load(Ordering::Acquire)
+                .saturating_sub(SMP_SIGNALLED.load(Ordering::Acquire));
+            println!(
+                "  smp self-test   : ok ({} cores; core 1 woken in {} us, 10 ms sleep on core 1 +{} us)",
+                crate::smp::online(),
+                timer::ticks_to_duration(wake).as_micros(),
+                SMP_SLEEP_OVER_US.load(Ordering::Acquire)
+            );
         }
 
         let st = executor::stats();

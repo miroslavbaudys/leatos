@@ -1,4 +1,5 @@
-//! Single-core async executor with strict priority classes.
+//! Async executor with strict priority classes, one run loop per core
+//! (tasks are pinned: `spawn_on`; a wakeup from another core sends a wake IPI).
 //!
 //! - [`Priority::Datapath`] tasks (RX → forward → qdisc → TX) always run
 //!   before [`Priority::Service`] tasks (DNS, DHCP, CLI…). After every poll
@@ -39,28 +40,48 @@ type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 struct Task {
     name: &'static str,
     prio: Priority,
+    /// The core whose executor polls this task (`spawn_on`).
+    core: usize,
     /// Timer ticks spent in this task's polls.
     busy: AtomicU64,
     queued: AtomicBool,
     future: Mutex<Option<BoxFuture>>,
 }
 
+const CORES: usize = crate::smp::MAX_CORES;
+
 /// Every task ever spawned (for per-task CPU time).
 static TASKS: Mutex<alloc::vec::Vec<Arc<Task>>> = Mutex::new(alloc::vec::Vec::new());
-static QUEUES: [Mutex<VecDeque<Arc<Task>>>; CLASSES] =
-    [const { Mutex::new(VecDeque::new()) }; CLASSES];
-static POLLS: AtomicU64 = AtomicU64::new(0);
-static IDLE_WAITS: AtomicU64 = AtomicU64::new(0);
-static IDLE_SPINS: AtomicU64 = AtomicU64::new(0);
-static SPIN_TICKS_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// Timer ticks spent in `wfi`/`hlt` (on x86_64 including the IRQ
-/// handlers, which run inside `sti; hlt`; on aarch64 they run after it).
-static WAIT_TICKS_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// Timer ticks spent polling tasks, per priority class.
-static POLL_TICKS: [AtomicU64; CLASSES] = [const { AtomicU64::new(0) }; CLASSES];
+/// Run queues per core and priority class.
+static QUEUES: [[Mutex<VecDeque<Arc<Task>>>; CLASSES]; CORES] =
+    [const { [const { Mutex::new(VecDeque::new()) }; CLASSES] }; CORES];
 
-/// Cumulative CPU time accounting in timer ticks (`cpuload` takes the
-/// differences).
+/// Per-core counters.
+struct CoreStats {
+    polls: AtomicU64,
+    idle_waits: AtomicU64,
+    idle_spins: AtomicU64,
+    spin_ticks: AtomicU64,
+    /// Timer ticks spent in `wfi`/`hlt` (on x86_64 including the IRQ
+    /// handlers, which run inside `sti; hlt`; on aarch64 they run after it).
+    wait_ticks: AtomicU64,
+    /// Timer ticks spent polling tasks, per priority class.
+    poll_ticks: [AtomicU64; CLASSES],
+}
+
+static STATS: [CoreStats; CORES] = [const {
+    CoreStats {
+        polls: AtomicU64::new(0),
+        idle_waits: AtomicU64::new(0),
+        idle_spins: AtomicU64::new(0),
+        spin_ticks: AtomicU64::new(0),
+        wait_ticks: AtomicU64::new(0),
+        poll_ticks: [const { AtomicU64::new(0) }; CLASSES],
+    }
+}; CORES];
+
+/// Cumulative CPU time accounting of one core in timer ticks (`cpuload`
+/// takes the differences).
 #[derive(Clone, Copy, Debug)]
 pub struct CpuTicks {
     /// When the snapshot was taken.
@@ -71,19 +92,21 @@ pub struct CpuTicks {
     pub service: u64,
 }
 
-/// Each task's name and the timer ticks its polls took so far.
-pub fn task_ticks(mut f: impl FnMut(&'static str, u64)) {
+/// Each task's name, core and the timer ticks its polls took so far.
+pub fn task_ticks(mut f: impl FnMut(&'static str, usize, u64)) {
     for t in TASKS.lock().iter() {
-        f(t.name, t.busy.load(Ordering::Relaxed));
+        f(t.name, t.core, t.busy.load(Ordering::Relaxed));
     }
 }
 
-pub fn cpu_ticks() -> CpuTicks {
+/// CPU time of `core`.
+pub fn cpu_ticks(core: usize) -> CpuTicks {
+    let s = &STATS[core];
     CpuTicks {
         at: timer::ticks(),
-        idle: WAIT_TICKS_TOTAL.load(Ordering::Relaxed) + SPIN_TICKS_TOTAL.load(Ordering::Relaxed),
-        datapath: POLL_TICKS[Priority::Datapath as usize].load(Ordering::Relaxed),
-        service: POLL_TICKS[Priority::Service as usize].load(Ordering::Relaxed),
+        idle: s.wait_ticks.load(Ordering::Relaxed) + s.spin_ticks.load(Ordering::Relaxed),
+        datapath: s.poll_ticks[Priority::Datapath as usize].load(Ordering::Relaxed),
+        service: s.poll_ticks[Priority::Service as usize].load(Ordering::Relaxed),
     }
 }
 
@@ -103,43 +126,67 @@ impl Wake for Task {
     }
     fn wake_by_ref(self: &Arc<Self>) {
         if !self.queued.swap(true, Ordering::AcqRel) {
-            QUEUES[self.prio as usize].lock().push_back(self.clone());
+            QUEUES[self.core][self.prio as usize]
+                .lock()
+                .push_back(self.clone());
+            // Another core may sit in `wfi`: the IPI ends it.
+            crate::smp::wake(self.core);
         }
     }
 }
 
-/// Spawn a task. It will be polled the next time the executor runs.
+/// Spawn a task on the boot core. It is polled the next time that core's
+/// executor runs.
 pub fn spawn(prio: Priority, name: &'static str, fut: impl Future<Output = ()> + Send + 'static) {
+    spawn_on(0, prio, name, fut);
+}
+
+/// Spawn a task pinned to `core` (must be online, or 0).
+pub fn spawn_on(
+    core: usize,
+    prio: Priority,
+    name: &'static str,
+    fut: impl Future<Output = ()> + Send + 'static,
+) {
+    assert!(
+        core < crate::smp::online(),
+        "spawn_on: core {core} is not online"
+    );
     let task = Arc::new(Task {
         name,
         prio,
+        core,
         busy: AtomicU64::new(0),
         queued: AtomicBool::new(true),
         future: Mutex::new(Some(Box::pin(fut))),
     });
     TASKS.lock().push(task.clone());
-    QUEUES[prio as usize].lock().push_back(task);
+    QUEUES[core][prio as usize].lock().push_back(task);
+    crate::smp::wake(core);
 }
 
-fn pop() -> Option<Arc<Task>> {
-    QUEUES.iter().find_map(|q| q.lock().pop_front())
+fn pop(core: usize) -> Option<Arc<Task>> {
+    QUEUES[core].iter().find_map(|q| q.lock().pop_front())
 }
 
-fn has_work() -> bool {
-    timer::pending() || irq::has_pending_wakeups() || QUEUES.iter().any(|q| !q.lock().is_empty())
+fn has_work(core: usize) -> bool {
+    timer::pending()
+        || irq::has_pending_wakeups()
+        || QUEUES[core].iter().any(|q| !q.lock().is_empty())
 }
 
-fn poll_task(task: Arc<Task>) {
+fn poll_task(core: usize, task: Arc<Task>) {
     task.queued.store(false, Ordering::Release);
     let waker = Waker::from(task.clone());
     let mut cx = Context::from_waker(&waker);
     let mut slot = task.future.lock();
     if let Some(fut) = slot.as_mut() {
-        POLLS.fetch_add(1, Ordering::Relaxed);
+        let s = &STATS[core];
+        s.polls.fetch_add(1, Ordering::Relaxed);
         let t0 = timer::ticks();
         let done = fut.as_mut().poll(&mut cx).is_ready();
         let dt = timer::ticks() - t0;
-        POLL_TICKS[task.prio as usize].fetch_add(dt, Ordering::Relaxed);
+        s.poll_ticks[task.prio as usize].fetch_add(dt, Ordering::Relaxed);
         task.busy.fetch_add(dt, Ordering::Relaxed);
         if done {
             *slot = None; // completed; drop the future now
@@ -147,49 +194,56 @@ fn poll_task(task: Arc<Task>) {
     }
 }
 
-/// Counters for diagnostics.
+/// Counters for diagnostics (all cores).
 pub fn stats() -> Stats {
+    let sum = |f: fn(&CoreStats) -> &AtomicU64| -> u64 {
+        STATS.iter().map(|s| f(s).load(Ordering::Relaxed)).sum()
+    };
     Stats {
-        polls: POLLS.load(Ordering::Relaxed),
-        idle_waits: IDLE_WAITS.load(Ordering::Relaxed),
-        idle_spins: IDLE_SPINS.load(Ordering::Relaxed),
-        spin_time: timer::ticks_to_duration(SPIN_TICKS_TOTAL.load(Ordering::Relaxed)),
+        polls: sum(|s| &s.polls),
+        idle_waits: sum(|s| &s.idle_waits),
+        idle_spins: sum(|s| &s.idle_spins),
+        spin_time: timer::ticks_to_duration(sum(|s| &s.spin_ticks)),
     }
 }
 
-/// Run forever.
+/// Run this core's tasks forever.
 pub fn run() -> ! {
+    let core = crate::smp::current();
+    let s = &STATS[core];
     loop {
         // Deferred interrupt work first: timer expiries and device events → wakeups.
         timer::process();
         irq::wake_fired();
 
-        if let Some(task) = pop() {
-            poll_task(task);
+        if let Some(task) = pop(core) {
+            poll_task(core, task);
             continue;
         }
 
         irq::disable();
-        if !has_work() {
+        if !has_work(core) {
             // Hybrid idle: a deadline within the spin window is waited for
             // by spinning with IRQs enabled (precise), not by `wfi` (which
             // some hypervisors end milliseconds late).
             if let Some(deadline) = timer::spin_until() {
                 irq::enable();
                 let t0 = timer::ticks();
-                while !has_work() && timer::ticks() < deadline {
+                while !has_work(core) && timer::ticks() < deadline {
                     core::hint::spin_loop();
                 }
-                IDLE_SPINS.fetch_add(1, Ordering::Relaxed);
-                SPIN_TICKS_TOTAL.fetch_add(timer::ticks() - t0, Ordering::Relaxed);
+                s.idle_spins.fetch_add(1, Ordering::Relaxed);
+                s.spin_ticks
+                    .fetch_add(timer::ticks() - t0, Ordering::Relaxed);
                 continue;
             }
-            IDLE_WAITS.fetch_add(1, Ordering::Relaxed);
+            s.idle_waits.fetch_add(1, Ordering::Relaxed);
             #[cfg(not(feature = "idle-poll"))]
             {
                 let t0 = timer::ticks();
                 crate::arch::cpu::wait_for_interrupt();
-                WAIT_TICKS_TOTAL.fetch_add(timer::ticks() - t0, Ordering::Relaxed);
+                s.wait_ticks
+                    .fetch_add(timer::ticks() - t0, Ordering::Relaxed);
             }
         }
         irq::enable(); // pending IRQs are taken here

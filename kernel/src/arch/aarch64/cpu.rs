@@ -8,6 +8,25 @@ pub fn privilege_level() -> u8 {
     CurrentEL.read(CurrentEL::EL) as u8
 }
 
+/// This core's index (`smp`), kept in `TPIDR_EL1` (set by `boot.S`: 0 on
+/// the boot core, the index passed to `CPU_ON` on the others).
+#[inline]
+pub fn core_id() -> usize {
+    let v: u64;
+    // SAFETY: reads a system register; no side effects.
+    unsafe { asm!("mrs {}, tpidr_el1", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v as usize
+}
+
+/// This core's hardware ID: MPIDR affinity in the device tree's `reg`
+/// layout (Aff2.Aff1.Aff0 in bits 0..24, Aff3 in bits 32..40).
+pub fn hw_core_id() -> u64 {
+    let m: u64;
+    // SAFETY: reads a system register; no side effects.
+    unsafe { asm!("mrs {}, mpidr_el1", out(reg) m, options(nomem, nostack, preserves_flags)) };
+    m & 0xff_00ff_ffff
+}
+
 /// Unmask IRQs on this core.
 #[inline]
 pub fn irq_enable() {

@@ -84,7 +84,11 @@ fn remap_and_mask_pics() {
 /// takes one from the master: the cascade IRQ 2 was acknowledged). Called
 /// from the trap handler.
 pub(super) fn legacy_pic_ack(irq: u8) {
-    let (port, bit) = if irq < 8 { (PIC1, irq) } else { (PIC2, irq - 8) };
+    let (port, bit) = if irq < 8 {
+        (PIC1, irq)
+    } else {
+        (PIC2, irq - 8)
+    };
     outb(port, 0x0b); // OCW3: next read returns the in-service register
     let in_service = inb(port) & (1 << bit) != 0;
     if in_service {
@@ -184,6 +188,16 @@ pub fn disable(intid: u32) {
         set_msix_mask(intid, true);
     }
 }
+
+/// The wake/stop IPI vector (`smp`). Nothing sends it until the x86_64
+/// SMP backend exists (M11 step 2b); `enable` ignores it.
+pub const IPI_INTID: u32 = 33;
+
+/// Secondary cores' local APIC setup (M11 step 2b).
+pub fn init_secondary() {}
+
+/// Send the wake/stop IPI to `core` (M11 step 2b: no other cores yet).
+pub fn send_ipi(_core: usize) {}
 
 /// End of interrupt (IRQ context).
 pub(super) fn eoi() {

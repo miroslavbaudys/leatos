@@ -21,12 +21,12 @@ page-table *construction*, PCI enumeration logic, driver state machines) can be 
 - `kernel` crate root: `#![deny(unsafe_code)]`.
 - Only these modules may opt out, with `#[allow(unsafe_code)]` on the `mod`
   declaration, so `grep allow(unsafe_code)` lists the whole audit surface:
-  - `arch::<target>`: CPU, vectors, IRQ entry, sysregs, MMU activation, power
+  - `arch::<target>`: CPU, vectors, IRQ entry, sysregs, MMU activation, power, SMP (aarch64 `smp.rs`: PSCI `CPU_ON`, one cache-line clean; `irqchip::send_ipi`: `ICC_SGI1R_EL1`)
   - `mm::heap`: allocator init; `take_staging` (the upgrade staging area as one `&'static mut [u8]`, handed out once)
   - `mm::dma`: the `virtio_drivers::Hal` implementation; `DmaRegion`
     (descriptor rings: volatile access, and `unsafe fn write_buffer_addr`,
     the hand-off)
-  - `mmio`: one constructor that turns an address into an MMIO region
+  - `mmio`: one constructor that turns an address into an MMIO region, plus `Region::read64` (one 64-bit access inside a region it owns; GICv3 `GICR_TYPER` under HVF)
   - `platform::dtb`: DTB blob pointer
   - `drivers::virtio_net`: the DMA buffer hand-off (begin/complete pairs)
   - `drivers::igb`: the register window (`Region::new` over BAR0) and the

@@ -71,8 +71,13 @@ for c in $CASES; do
       boot smoke-test
       ok=0
       if has "rrouter: boot ok" && has "net self-test   : ok" && ! has "PANIC" && ! has "UNHANDLED"; then ok=1; fi
+      # With QEMU_SMP=N (N > 1, up to 4): every core online and the
+      # cross-core wake works. Negative control: QEMU_APPEND=cores=1 with
+      # QEMU_SMP=4 must fail this case.
+      smp="${QEMU_SMP:-1}"; [[ "$smp" -gt 4 ]] && smp=4
+      if [[ "$smp" -gt 1 ]] && ! { has "smp             : $smp of" && has "smp self-test   : ok"; }; then ok=0; fi
       result "boot" "$ok"
-      grep -E "sleep overshoot|executor  |net ping|net self-test" "$LOG" | sed 's/^/        /' || true
+      grep -E "sleep overshoot|executor  |net ping|net self-test|smp  " "$LOG" | sed 's/^/        /' || true
       ;;
     fault-wx)
       boot fault-wx

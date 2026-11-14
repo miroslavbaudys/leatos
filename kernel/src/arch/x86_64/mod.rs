@@ -11,6 +11,7 @@ pub mod kexec;
 pub mod mmu;
 mod port;
 pub mod power;
+pub mod smp;
 pub mod timer;
 
 use crate::platform::{BootInfo, IntxMap, IrqChipInfo, PcieInfo, PowerMethod, acpi, multiboot2, pvh};
@@ -67,6 +68,8 @@ pub fn discover(start_info: usize) -> Result<BootInfo, &'static str> {
             ("pvh start info + acpi", start_info, 56)
         },
         cpus: a.cpus.max(1),
+        // MADT order; the x86_64 SMP backend puts the boot core first.
+        cpu_ids: a.apic_ids,
         ram: si.ram,
         console_base: None,
         power: PowerMethod::AcpiS5 {

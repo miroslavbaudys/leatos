@@ -232,6 +232,14 @@ pub fn mgmt() -> Mgmt {
     }
 }
 
+/// Boot argument `cores=N`: use at most N cores (default: all, up to
+/// `smp::MAX_CORES`). `cores=1` runs everything on the boot core (A/B tests).
+pub fn cores() -> Option<usize> {
+    arg_u64(bootargs(), "cores")
+        .map(|c| c as usize)
+        .filter(|&c| c >= 1)
+}
+
 /// `key=value` from the kernel command line.
 fn arg<'a>(bootargs: &'a str, key: &str) -> Option<&'a str> {
     // `key=value` only: `lan=` must not match `lan_x=`.

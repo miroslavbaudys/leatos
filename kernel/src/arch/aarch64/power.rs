@@ -13,6 +13,11 @@ pub fn init(method: PowerMethod) {
     USE_SMC.store(matches!(method, PowerMethod::PsciSmc), Ordering::Relaxed);
 }
 
+/// PSCI conduit: SMC (secure monitor) or HVC (hypervisor).
+pub(super) fn uses_smc() -> bool {
+    USE_SMC.load(Ordering::Relaxed)
+}
+
 /// Reset the machine (PSCI SYSTEM_RESET).
 pub fn reset() -> ! {
     if USE_SMC.load(Ordering::Relaxed) {

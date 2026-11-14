@@ -1,5 +1,5 @@
-//! CPU load history for the management page: once a second, how much of
-//! the last second core 0 was busy, split into datapath polls, service
+//! CPU load history for the management page: once a second, per core, how
+//! much of the last second the core was busy, split into datapath polls, service
 //! polls and the rest (IRQ handling, timers, the executor itself).
 //!
 //! "Datapath" is the `net` task (forwarding, CAKE); "service" is the
@@ -11,6 +11,7 @@
 //! the core never idles, so it shows as fully busy (by design).
 
 use crate::executor::{self, CpuTicks, Priority};
+use crate::smp::{self, MAX_CORES};
 use crate::timer;
 use core::time::Duration;
 use spin::Mutex;
@@ -35,15 +36,18 @@ struct History {
     len: usize,
 }
 
-static HIST: Mutex<History> = Mutex::new(History {
-    buf: [Sample {
-        busy: 0,
-        datapath: 0,
-        service: 0,
-    }; HISTORY],
-    head: 0,
-    len: 0,
-});
+/// One history per core.
+static HIST: [Mutex<History>; MAX_CORES] = [const {
+    Mutex::new(History {
+        buf: [Sample {
+            busy: 0,
+            datapath: 0,
+            service: 0,
+        }; HISTORY],
+        head: 0,
+        len: 0,
+    })
+}; MAX_CORES];
 
 fn permille(part: u64, whole: u64) -> u16 {
     (part.min(whole) * 1000).checked_div(whole).unwrap_or(0) as u16
@@ -60,9 +64,9 @@ fn sample(a: &CpuTicks, b: &CpuTicks) -> Sample {
     }
 }
 
-/// Oldest first.
-pub fn history(mut f: impl FnMut(Sample)) {
-    let h = HIST.lock();
+/// `core`'s samples, oldest first.
+pub fn history(core: usize, mut f: impl FnMut(Sample)) {
+    let h = HIST[core].lock();
     let start = (h.head + HISTORY - h.len) % HISTORY;
     for i in 0..h.len {
         f(h.buf[(start + i) % HISTORY]);
@@ -71,17 +75,19 @@ pub fn history(mut f: impl FnMut(Sample)) {
 
 /// The sampling task (service priority; it only takes a snapshot).
 pub async fn sampler() {
-    let mut last = executor::cpu_ticks();
+    let mut last: [CpuTicks; MAX_CORES] = core::array::from_fn(executor::cpu_ticks);
     loop {
         timer::sleep(INTERVAL).await;
-        let now = executor::cpu_ticks();
-        let s = sample(&last, &now);
-        last = now;
-        let mut h = HIST.lock();
-        let head = h.head;
-        h.buf[head] = s;
-        h.head = (head + 1) % HISTORY;
-        h.len = (h.len + 1).min(HISTORY);
+        for (core, prev) in last.iter_mut().enumerate().take(smp::online()) {
+            let now = executor::cpu_ticks(core);
+            let s = sample(prev, &now);
+            *prev = now;
+            let mut h = HIST[core].lock();
+            let head = h.head;
+            h.buf[head] = s;
+            h.head = (head + 1) % HISTORY;
+            h.len = (h.len + 1).min(HISTORY);
+        }
     }
 }
 

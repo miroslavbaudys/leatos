@@ -29,4 +29,6 @@ linker_symbols! {
     stack_guard => __stack_guard,
     stack_bottom => __stack_bottom,
     stack_top => __stack_top,
+    ap_stacks => __ap_stacks,
+    ap_stacks_end => __ap_stacks_end,
 }

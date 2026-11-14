@@ -17,6 +17,8 @@ pub struct Acpi {
     /// (MMIO address, first GSI) of the first IOAPIC.
     pub ioapic: Option<(usize, u32)>,
     pub cpus: usize,
+    /// Local APIC IDs of the enabled cores, in MADT order (first `cpus.min(MAX_CORES)`).
+    pub apic_ids: [u64; crate::smp::MAX_CORES],
     /// (ECAM base for bus 0 of segment 0, first bus, last bus).
     pub mcfg: Option<(u64, u8, u8)>,
     pub pm1a_cnt: u16,
@@ -123,7 +125,12 @@ fn madt(t: &[u8], acpi: &mut Acpi) {
         let e = &t[off..off + len];
         match kind {
             // Processor local APIC: flags bit 0 = enabled, bit 1 = online capable.
-            0 if u32_at(e, 4).is_some_and(|f| f & 3 != 0) => acpi.cpus += 1,
+            0 if u32_at(e, 4).is_some_and(|f| f & 3 != 0) => {
+                if acpi.cpus < acpi.apic_ids.len() {
+                    acpi.apic_ids[acpi.cpus] = e[3] as u64;
+                }
+                acpi.cpus += 1;
+            }
             1 if acpi.ioapic.is_none() => {
                 if let (Some(addr), Some(gsi)) = (u32_at(e, 4), u32_at(e, 8)) {
                     acpi.ioapic = Some((addr as usize, gsi));

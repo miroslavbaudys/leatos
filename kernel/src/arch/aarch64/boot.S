@@ -113,8 +113,70 @@ l1_store:
     msr     vbar_el1, x1
     isb
 
+    msr     tpidr_el1, xzr          // smp::current() = 0 on the boot core
     mov     x0, x19
     bl      kernel_main             // never returns
+
+// ---- Secondary cores ---------------------------------------------------------
+// Entered from PSCI CPU_ON with the MMU off, x0 = core index (context ID).
+// Turns on the MMU with the kernel's final tables (secondary_ttbr, cleaned
+// to the point of coherency by the boot core: with the MMU off this load
+// bypasses the caches), then takes this core's stacks from secondary_stacks
+// (cacheable from here on), sets the vectors and calls secondary_rust.
+.global _secondary_start
+_secondary_start:
+    mov     x19, x0
+    mrs     x1, CurrentEL
+    lsr     x1, x1, #2
+    cmp     x1, #2
+    b.ne    2f
+    mov     x1, #3
+    msr     cnthctl_el2, x1
+    msr     cntvoff_el2, xzr
+    mov     x1, #(1 << 31)
+    msr     hcr_el2, x1
+    mov     x1, #0x3c5
+    msr     spsr_el2, x1
+    adr     x1, 2f
+    msr     elr_el2, x1
+    eret
+2:
+    mov     x1, #(3 << 20)          // FP/SIMD on
+    msr     cpacr_el1, x1
+    ldr     x1, =0x30d00800
+    msr     sctlr_el1, x1
+    isb
+    mov     x2, #0xff00             // MAIR and TCR as on the boot core
+    msr     mair_el1, x2
+    ldr     x2, =0x200803519
+    msr     tcr_el1, x2
+    ldr     x1, =secondary_ttbr
+    ldr     x1, [x1]
+    msr     ttbr0_el1, x1
+    dsb     ish
+    isb
+    tlbi    vmalle1
+    dsb     ish
+    isb
+    mrs     x2, sctlr_el1
+    orr     x2, x2, #(1 << 0)       // M
+    orr     x2, x2, #(1 << 2)       // C
+    orr     x2, x2, #(1 << 12)      // I
+    orr     x2, x2, #(1 << 19)      // WXN, as mmu::activate sets it
+    msr     sctlr_el1, x2
+    isb
+    ldr     x1, =secondary_stacks   // [exception stack top, kernel stack top] per core
+    add     x1, x1, x19, lsl #4
+    ldp     x2, x3, [x1]
+    mov     sp, x2                  // SPSel=1: SP_EL1 = exception stack
+    msr     spsel, #0
+    mov     sp, x3                  // SP_EL0 = kernel stack
+    ldr     x1, =exception_vectors
+    msr     vbar_el1, x1
+    isb
+    msr     tpidr_el1, x19
+    mov     x0, x19
+    bl      secondary_rust          // never returns
 
 park:
     wfe

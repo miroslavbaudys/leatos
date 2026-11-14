@@ -459,23 +459,28 @@ fn status_json(
     let mut s = String::with_capacity(2048);
     let (pool_free, pool_cap, pool_fail) = crate::net::packet::pool_stats();
     let (heap_used, heap_free) = crate::mm::heap::usage();
-    // CPU load history: [busy, datapath, service] in permille, oldest first.
+    // CPU load history per core: [busy, datapath, service] in permille,
+    // oldest first.
     let mut cpu = format!(
-        "{{\"interval_s\":{},\"samples\":[",
+        "{{\"interval_s\":{},\"cores\":[",
         crate::cpuload::INTERVAL.as_secs()
     );
-    let mut first = true;
-    crate::cpuload::history(|x| {
-        let _ = write!(
-            cpu,
-            "{}[{},{},{}]",
-            if first { "" } else { "," },
-            x.busy,
-            x.datapath,
-            x.service
-        );
-        first = false;
-    });
+    for core in 0..crate::smp::online() {
+        cpu.push_str(if core > 0 { ",[" } else { "[" });
+        let mut first = true;
+        crate::cpuload::history(core, |x| {
+            let _ = write!(
+                cpu,
+                "{}[{},{},{}]",
+                if first { "" } else { "," },
+                x.busy,
+                x.datapath,
+                x.service
+            );
+            first = false;
+        });
+        cpu.push(']');
+    }
     cpu.push_str("]}");
     let _ = write!(
         s,

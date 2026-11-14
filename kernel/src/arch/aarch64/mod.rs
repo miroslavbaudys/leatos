@@ -7,6 +7,7 @@ pub mod irqchip;
 pub mod kexec;
 pub mod mmu;
 pub mod power;
+pub mod smp;
 pub mod timer;
 
 use crate::platform::BootInfo;

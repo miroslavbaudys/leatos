@@ -31,15 +31,25 @@ static BOOT_TICKS: AtomicU64 = AtomicU64::new(0);
 static FREQ: AtomicU64 = AtomicU64::new(1);
 static TIMER_IRQS: AtomicU64 = AtomicU64::new(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-static FIRED: IrqEvent = IrqEvent::new();
-/// Earliest pending deadline (ticks), `u64::MAX` if none. Lock-free mirror
-/// of the `TIMERS` minimum for the executor's idle decisions.
-static NEXT_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+const CORES: usize = crate::smp::MAX_CORES;
+/// Per core: the timer interrupt fired (signalled by [`on_irq`]).
+static FIRED: [IrqEvent; CORES] = [const { IrqEvent::new() }; CORES];
+/// Per core: earliest pending deadline (ticks), `u64::MAX` if none.
+/// Lock-free mirror of the `TIMERS` minimum for the executor's idle decisions.
+static NEXT_DEADLINE: [AtomicU64; CORES] = [const { AtomicU64::new(u64::MAX) }; CORES];
+static TIMER_INTID: AtomicU64 = AtomicU64::new(0);
 /// Hybrid-idle spin window in ticks (0 = disabled).
 static SPIN_TICKS: AtomicU64 = AtomicU64::new(0);
 
-/// Pending timers, keyed by (deadline in ticks, unique id). Thread context only.
-static TIMERS: Mutex<BTreeMap<(u64, u64), Waker>> = Mutex::new(BTreeMap::new());
+/// Pending timers per core, keyed by (deadline in ticks, unique id). A
+/// sleep registers on the core that polls it (tasks are pinned), and that
+/// core's comparator fires for it. Thread context only.
+static TIMERS: [Mutex<BTreeMap<(u64, u64), Waker>>; CORES] =
+    [const { Mutex::new(BTreeMap::new()) }; CORES];
+
+fn core() -> usize {
+    crate::smp::current()
+}
 
 /// Counter frequency in Hz.
 pub fn frequency() -> u64 {
@@ -104,15 +114,24 @@ pub fn init_clock() {
 /// Hook the timer interrupt up (requires the interrupt controller).
 pub fn init_irq(intid: u32) {
     hw::stop();
-    irq::register(intid, on_irq, &FIRED);
+    TIMER_INTID.store(intid as u64, Ordering::Relaxed);
+    // The per-core `FIRED` flag is raised by `on_irq` itself; the event the
+    // dispatcher signals is unused.
+    irq::register(intid, on_irq, irq::new_event());
     crate::arch::irqchip::enable(intid, Trigger::Level);
 }
 
-/// IRQ context: silence the level-sensitive timer output; `FIRED` is
-/// signalled by the dispatcher afterwards.
+/// The same on a secondary core (its own comparator and interrupt).
+pub fn init_secondary() {
+    hw::stop();
+    crate::arch::irqchip::enable(TIMER_INTID.load(Ordering::Relaxed) as u32, Trigger::Level);
+}
+
+/// IRQ context: silence this core's level-sensitive timer output.
 fn on_irq(_intid: u32) {
     hw::mask_from_irq();
     TIMER_IRQS.fetch_add(1, Ordering::Relaxed);
+    FIRED[core()].signal();
 }
 
 /// Set the hybrid-idle spin window (0 disables it). See the module docs.
@@ -127,30 +146,32 @@ pub fn spin_window() -> Duration {
 /// True if [`process`] has work: the timer fired, or the earliest deadline
 /// has passed (also covers an interrupt that is late or was missed).
 pub fn pending() -> bool {
-    FIRED.is_fired() || NEXT_DEADLINE.load(Ordering::Acquire) <= ticks()
+    let c = core();
+    FIRED[c].is_fired() || NEXT_DEADLINE[c].load(Ordering::Acquire) <= ticks()
 }
 
 /// If the next deadline is within the spin window, return it: the executor
 /// should spin until then instead of sleeping in `wfi`.
 pub fn spin_until() -> Option<u64> {
-    let d = NEXT_DEADLINE.load(Ordering::Acquire);
+    let d = NEXT_DEADLINE[core()].load(Ordering::Acquire);
     let w = SPIN_TICKS.load(Ordering::Relaxed);
     (d != u64::MAX && w > 0 && d <= ticks().saturating_add(w)).then_some(d)
 }
 
-/// Program the comparator for the earliest deadline (early by the spin
-/// window if it is further away than that), or turn the timer off.
-fn program(timers: &BTreeMap<(u64, u64), Waker>) {
+/// Program this core's comparator for the earliest deadline of `c`'s
+/// timers (`c` is this core; early by the spin window if it is further
+/// away than that), or turn the timer off.
+fn program(c: usize, timers: &BTreeMap<(u64, u64), Waker>) {
     match timers.keys().next() {
         Some(&(deadline, _)) => {
-            NEXT_DEADLINE.store(deadline, Ordering::Release);
+            NEXT_DEADLINE[c].store(deadline, Ordering::Release);
             let w = SPIN_TICKS.load(Ordering::Relaxed);
             let early = deadline.saturating_sub(w);
             // Far away: wake early, then spin the rest. Close: exact deadline.
             hw::set_deadline(if early > ticks() { early } else { deadline });
         }
         None => {
-            NEXT_DEADLINE.store(u64::MAX, Ordering::Release);
+            NEXT_DEADLINE[c].store(u64::MAX, Ordering::Release);
             hw::stop();
         }
     }
@@ -159,21 +180,22 @@ fn program(timers: &BTreeMap<(u64, u64), Waker>) {
 /// Thread context: wake every expired timer and re-arm the comparator.
 /// Called by the executor on every loop iteration.
 pub fn process() {
-    let fired = FIRED.take();
-    if !fired && NEXT_DEADLINE.load(Ordering::Acquire) > ticks() {
+    let c = core();
+    let fired = FIRED[c].take();
+    if !fired && NEXT_DEADLINE[c].load(Ordering::Acquire) > ticks() {
         return;
     }
     let now = ticks();
     let mut expired: Vec<Waker> = Vec::new();
     {
-        let mut timers = TIMERS.lock();
+        let mut timers = TIMERS[c].lock();
         while let Some(entry) = timers.first_entry() {
             if entry.key().0 > now {
                 break;
             }
             expired.push(entry.remove());
         }
-        program(&timers);
+        program(c, &timers);
     }
     // Wake outside the lock.
     for w in expired {
@@ -186,7 +208,8 @@ pub fn process() {
 /// Future returned by [`sleep`] / [`sleep_until`].
 pub struct Sleep {
     deadline: u64,
-    key: Option<(u64, u64)>,
+    /// (core whose timer list holds it, key) once registered.
+    key: Option<(usize, (u64, u64))>,
 }
 
 pub fn sleep(d: Duration) -> Sleep {
@@ -205,28 +228,32 @@ impl Future for Sleep {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         if ticks() >= self.deadline {
-            if let Some(k) = self.key.take() {
-                TIMERS.lock().remove(&k);
+            if let Some((c, k)) = self.key.take() {
+                TIMERS[c].lock().remove(&k);
             }
             return Poll::Ready(());
         }
         let deadline = self.deadline;
-        let key = *self
+        let c = core();
+        let (kc, key) = *self
             .key
-            .get_or_insert_with(|| (deadline, NEXT_ID.fetch_add(1, Ordering::Relaxed)));
-        let mut timers = TIMERS.lock();
+            .get_or_insert_with(|| (c, (deadline, NEXT_ID.fetch_add(1, Ordering::Relaxed))));
+        debug_assert_eq!(kc, c, "sleep polled on another core than it registered on");
+        let mut timers = TIMERS[kc].lock();
         timers.insert(key, cx.waker().clone());
-        program(&timers);
+        program(kc, &timers);
         Poll::Pending
     }
 }
 
 impl Drop for Sleep {
     fn drop(&mut self) {
-        if let Some(k) = self.key.take() {
-            let mut timers = TIMERS.lock();
-            if timers.remove(&k).is_some() {
-                program(&timers);
+        if let Some((c, k)) = self.key.take() {
+            let mut timers = TIMERS[c].lock();
+            // Only this core's comparator can be reprogrammed from here; a
+            // stale deadline elsewhere just causes one early wakeup.
+            if timers.remove(&k).is_some() && c == core() {
+                program(c, &timers);
             }
         }
     }

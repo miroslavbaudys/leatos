@@ -33,6 +33,7 @@ mod pci;
 mod platform;
 #[allow(unsafe_code)] // feature-gated deliberate faults
 mod selftest;
+mod smp;
 mod timer;
 mod upgrade;
 
@@ -67,6 +68,7 @@ pub fn kmain(boot_arg: usize) -> ! {
         timer::frequency(),
         timer::spin_window().as_micros()
     );
+    smp::start(&info);
 
     net::packet::init_pool(net_pool_size());
     let mut pci = info.pcie.map(|p| pci::init(&p));
@@ -82,7 +84,9 @@ pub fn kmain(boot_arg: usize) -> ! {
     cpuload::spawn();
     if let Some((ports, hosts, shared)) = net {
         executor::spawn(Priority::Datapath, "net", net::stack::run(ports, shared));
-        executor::spawn(Priority::Service, "svc", net::svc::run(hosts, shared));
+        // Services on their own core when there is one (M11).
+        let svc_core = if smp::online() > 1 { 1 } else { 0 };
+        executor::spawn_on(svc_core, Priority::Service, "svc", net::svc::run(hosts, shared));
     }
     executor::run()
 }
@@ -95,6 +99,7 @@ fn net_pool_size() -> usize {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    fatal_println!("\n!!! KERNEL PANIC: {info}");
+    fatal_println!("\n!!! KERNEL PANIC (core {}): {info}", smp::current());
+    smp::stop_others();
     arch::cpu::halt()
 }

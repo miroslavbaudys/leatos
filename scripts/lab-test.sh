@@ -130,8 +130,8 @@ fi
 # transfers) more of it. Negative control: a kernel without the split (one
 # `net` task doing everything, e.g. commit bdcf72e) has no `svc` task and fails.
 line=$(tr -d '\r' <"$WORK/router.log" | grep "  cpu  " | tail -1 || true)
-net_ms=$(echo "$line" | sed -n 's/.*, net \([0-9]*\) ms.*/\1/p')
-svc_ms=$(echo "$line" | sed -n 's/.*, svc \([0-9]*\) ms.*/\1/p')
+net_ms=$(echo "$line" | sed -n 's/.*, net@[0-9]* \([0-9]*\) ms.*/\1/p')
+svc_ms=$(echo "$line" | sed -n 's/.*, svc@[0-9]* \([0-9]*\) ms.*/\1/p')
 what="net (datapath) ${net_ms:-?} ms, svc (services) ${svc_ms:-?} ms"
 if [[ -z "$net_ms" || -z "$svc_ms" ]]; then
   echo "  LAB FAIL: cpu split: $what (no per-task counters)"; router_fails=$((router_fails + 1))

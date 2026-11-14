@@ -123,6 +123,9 @@ pub struct BootInfo {
     /// Human-readable firmware source, e.g. "dtb @ 0x40000000 (1048576 bytes)".
     pub firmware: (&'static str, usize, usize),
     pub cpus: usize,
+    /// Hardware ID of each core (aarch64: MPIDR affinity from the DTB;
+    /// x86_64: local APIC ID from the MADT), boot core first.
+    pub cpu_ids: [u64; crate::smp::MAX_CORES],
     /// (start, size) of the RAM bank that contains the kernel.
     pub ram: (usize, usize),
     pub console_base: Option<usize>,

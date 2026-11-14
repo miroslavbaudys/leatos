@@ -71,6 +71,12 @@ SECTIONS
         __stack_bottom = .;
         . += STACK_SIZE;
         __stack_top = .;
+
+        /* Secondary cores 1..3 (kernel/src/mm/stacks.rs): per core
+         * [guard] exception stack [guard] kernel stack, same sizes. */
+        __ap_stacks = .;
+        . += 3 * (2 * PAGE + EXC_STACK_SIZE + STACK_SIZE);
+        __ap_stacks_end = .;
     }
 
     . = ALIGN(PAGE);
