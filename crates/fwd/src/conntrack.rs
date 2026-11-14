@@ -121,6 +121,11 @@ pub struct Conntrack {
     used_ports: BTreeMap<(u8, u16), ()>,
     max_conns: usize,
     hash_key: u64,
+    /// This table is shard `shard` of `shards` (`forwarder::shard_of`): it
+    /// only allocates NAT ports `p` with `p % shards == shard`, so a reply
+    /// to an external port finds its shard without a lookup.
+    shards: u16,
+    shard: u16,
     pub stats: Stats,
 }
 
@@ -145,6 +150,15 @@ fn host_hash(key: u64, a: Ipv4Addr) -> u16 {
 
 impl Conntrack {
     pub fn new(max_conns: usize, hash_key: u64) -> Self {
+        Self::new_shard(max_conns, hash_key, 1, 0)
+    }
+
+    /// Shard `shard` of `shards` (all shards share `hash_key`).
+    pub fn new_shard(max_conns: usize, hash_key: u64, shards: u16, shard: u16) -> Self {
+        assert!(
+            shards >= 1 && shard < shards,
+            "conntrack: bad shard {shard}/{shards}"
+        );
         Self {
             conns: Vec::new(),
             free: Vec::new(),
@@ -153,8 +167,15 @@ impl Conntrack {
             used_ports: BTreeMap::new(),
             max_conns,
             hash_key,
+            shards,
+            shard,
             stats: Stats::default(),
         }
+    }
+
+    /// `(shards, shard)` of this table.
+    pub fn shard(&self) -> (u16, u16) {
+        (self.shards, self.shard)
     }
 
     pub fn len(&self) -> usize {
@@ -185,8 +206,10 @@ impl Conntrack {
         } else {
             lo + (mix(self.hash_key, preferred as u64) as u32 % span) as u16
         };
+        let (n, k) = (self.shards, self.shard);
         (0..span)
             .map(|i| lo + ((start - lo) as u32 + i).rem_euclid(span) as u16)
+            .filter(|p| p % n == k)
             .find(|p| !self.used_ports.contains_key(&(proto, *p)))
     }
 

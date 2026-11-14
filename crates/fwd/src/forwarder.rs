@@ -247,12 +247,61 @@ fn extract_key(f: &[u8], v: &Ipv4View) -> Key {
     }
 }
 
+/// Shard of the internal endpoint `(proto, ip, port)`: every connection
+/// of one endpoint (EIM shares its NAT port) lives in the same shard.
+pub fn endpoint_shard(proto: u8, ip: Ipv4Addr, port: u16, shards: usize, hash_key: u64) -> usize {
+    if shards <= 1 {
+        return 0;
+    }
+    let v = (u32::from(ip) as u64) << 24 | (port as u64) << 8 | proto as u64;
+    (crate::conntrack::mix(hash_key ^ 0x0073_6861_7264, v) % shards as u64) as usize
+}
+
+/// Which of `shards` forwarder shards (`Forwarder::new_shard`, same
+/// `hash_key`) a frame received on an interface with `role` belongs to.
+/// Both directions of a connection map to the same shard:
+/// - LAN ingress: the internal endpoint (source; for an ICMP error, the
+///   embedded packet's destination) → [`endpoint_shard`]
+/// - WAN ingress: the external (NAT) port, which the shard allocated from
+///   its residue class: destination port (for an ICMP error, the embedded
+///   packet's source port) `% shards`
+///
+/// Everything else (ARP, non-IPv4, fragments, untracked protocols) → 0;
+/// those frames are local, dropped, or never tracked.
+pub fn shard_of(role: Role, frame: &[u8], shards: usize, hash_key: u64) -> usize {
+    if shards <= 1 || wire::ethertype(frame) != Some(ETHERTYPE_IPV4) {
+        return 0;
+    }
+    let Some(v) = Ipv4View::parse(frame, ETH_HDR) else {
+        return 0;
+    };
+    if v.is_fragment {
+        return 0;
+    }
+    match (role, extract_key(frame, &v)) {
+        (Role::Lan, Key::Flow(t, _)) => endpoint_shard(t.proto, t.src, t.sport, shards, hash_key),
+        (Role::Lan, Key::Related { inner, .. }) => {
+            endpoint_shard(inner.proto, inner.dst, inner.dport, shards, hash_key)
+        }
+        (Role::Wan, Key::Flow(t, _)) => t.dport as usize % shards,
+        (Role::Wan, Key::Related { inner, .. }) => inner.sport as usize % shards,
+        (_, Key::Other) => 0,
+    }
+}
+
 impl Forwarder {
     pub fn new(max_conns: usize, hash_key: u64) -> Self {
+        Self::new_shard(max_conns, hash_key, 1, 0)
+    }
+
+    /// Shard `shard` of `shards`: its own conntrack (NAT ports in its
+    /// residue class); interfaces and routes must be configured the same on
+    /// every shard. Feed it only frames [`shard_of`] maps to it.
+    pub fn new_shard(max_conns: usize, hash_key: u64, shards: u16, shard: u16) -> Self {
         Self {
             ifs: Vec::new(),
             routes: RouteTable::new(),
-            ct: Conntrack::new(max_conns, hash_key),
+            ct: Conntrack::new_shard(max_conns, hash_key, shards, shard),
             stats: Stats::default(),
             icmp_tokens: ICMP_BURST,
             icmp_refill_ms: 0,
@@ -973,5 +1022,163 @@ mod tests {
             let ifx = (i % 2) as IfIndex;
             let _ = fw.process(i, ifx, &mut f, len);
         }
+    }
+
+    // ---- sharding (M11): both directions of every connection hit one shard
+
+    const SHARDS: usize = 8;
+
+    fn shards() -> Vec<Forwarder> {
+        (0..SHARDS)
+            .map(|k| {
+                let mut fw = Forwarder::new_shard(1000, 42, SHARDS as u16, k as u16);
+                fw.add_interface(Interface {
+                    mac: WAN_MAC,
+                    addr: Some((ROUTER_WAN, 24)),
+                    role: Role::Wan,
+                });
+                fw.add_interface(Interface {
+                    mac: LAN_MAC,
+                    addr: Some((ROUTER_LAN, 24)),
+                    role: Role::Lan,
+                });
+                fw.set_default_route(Some((WAN, GW)));
+                fw
+            })
+            .collect()
+    }
+
+    /// LAN → WAN through the shard `shard_of` picks; returns (shard, NAT port, translated frame).
+    fn out_sharded(
+        fws: &mut [Forwarder],
+        proto: u8,
+        host: Ipv4Addr,
+        sport: u16,
+        server: Ipv4Addr,
+    ) -> (usize, u16, Vec<u8>) {
+        let l4 = match proto {
+            PROTO_TCP => tcp_segment(host, server, sport, 80, TCP_SYN, b""),
+            PROTO_UDP => udp_datagram(host, server, sport, 53, b"q"),
+            _ => icmp_echo(ICMP_ECHO_REQUEST, sport, 1),
+        };
+        let mut f = to(LAN_MAC, ipv4_frame(host, server, proto, 64, &l4));
+        let len = f.len() - 64;
+        let k = shard_of(Role::Lan, &f[..len], SHARDS, 42);
+        let Verdict::Forward { len, .. } = fws[k].process(0, LAN, &mut f, len) else {
+            panic!("outbound {proto} {host}:{sport} not forwarded")
+        };
+        let f = f[..len].to_vec();
+        let v = view(&f);
+        let port = if proto == PROTO_ICMP {
+            wire::get16(&f, v.l4 + 4)
+        } else {
+            wire::get16(&f, v.l4)
+        };
+        (k, port, f)
+    }
+
+    #[test]
+    fn shards_keep_both_directions_together() {
+        let mut fws = shards();
+        let mut used = [0usize; SHARDS];
+        for i in 0..200u16 {
+            let proto = [PROTO_TCP, PROTO_UDP, PROTO_ICMP][i as usize % 3];
+            let host = Ipv4Addr::new(192, 168, 1, 100 + (i % 50) as u8);
+            let (k, port, _) = out_sharded(&mut fws, proto, host, 20_000 + i, SERVER);
+            used[k] += 1;
+            assert_eq!(
+                port as usize % SHARDS,
+                k,
+                "NAT port outside the shard's class"
+            );
+            let l4 = match proto {
+                PROTO_TCP => tcp_segment(SERVER, ROUTER_WAN, 80, port, TCP_SYN | TCP_ACK, b""),
+                PROTO_UDP => udp_datagram(SERVER, ROUTER_WAN, 53, port, b"a"),
+                _ => icmp_echo(ICMP_ECHO_REPLY, port, 1),
+            };
+            let mut r = to(WAN_MAC, ipv4_frame(SERVER, ROUTER_WAN, proto, 50, &l4));
+            let len = r.len() - 64;
+            assert_eq!(
+                shard_of(Role::Wan, &r[..len], SHARDS, 42),
+                k,
+                "reply maps to another shard"
+            );
+            let Verdict::Forward {
+                egress, next_hop, ..
+            } = fws[k].process(1, WAN, &mut r, len)
+            else {
+                panic!("reply not forwarded")
+            };
+            assert_eq!((egress, next_hop), (LAN, host));
+            // Negative control: another shard does not know the connection,
+            // so the reply is not forwarded (it goes to the router stack).
+            let mut r2 = to(WAN_MAC, ipv4_frame(SERVER, ROUTER_WAN, proto, 50, &l4));
+            let other = fws[(k + 1) % SHARDS].process(1, WAN, &mut r2, len);
+            assert!(
+                !matches!(other, Verdict::Forward { .. }),
+                "wrong shard forwarded: {other:?}"
+            );
+        }
+        assert!(
+            used.iter().all(|&n| n > 0),
+            "flows not spread over shards: {used:?}"
+        );
+    }
+
+    #[test]
+    fn shards_keep_endpoint_independent_mapping() {
+        let mut fws = shards();
+        let (k1, p1, _) = out_sharded(&mut fws, PROTO_UDP, HOST, 5000, SERVER);
+        let (k2, p2, _) = out_sharded(
+            &mut fws,
+            PROTO_UDP,
+            HOST,
+            5000,
+            Ipv4Addr::new(198, 51, 100, 99),
+        );
+        assert_eq!(
+            (k1, p1),
+            (k2, p2),
+            "one internal endpoint, one shard and one external port"
+        );
+        // The internal port is kept when it is in the shard's class.
+        let preserved = (0..SHARDS as u16 * 4)
+            .map(|i| out_sharded(&mut fws, PROTO_UDP, HOST, 30_000 + i, SERVER))
+            .filter(|&(_, p, _)| (30_000..30_000 + SHARDS as u16 * 4).contains(&p))
+            .count();
+        assert!(preserved > 0);
+    }
+
+    #[test]
+    fn shards_route_icmp_errors_to_the_connection() {
+        let mut fws = shards();
+        let (k, port, out) = out_sharded(&mut fws, PROTO_UDP, HOST, 6000, SERVER);
+        // Destination unreachable from SERVER about our translated packet.
+        let mut icmp = vec![wire::ICMP_DEST_UNREACH, 3, 0, 0, 0, 0, 0, 0];
+        icmp.extend_from_slice(&out[ETH_HDR..ETH_HDR + 28]);
+        let c = wire::checksum(&icmp);
+        icmp[2..4].copy_from_slice(&c.to_be_bytes());
+        let mut e = to(
+            WAN_MAC,
+            ipv4_frame(SERVER, ROUTER_WAN, PROTO_ICMP, 50, &icmp),
+        );
+        let len = e.len() - 64;
+        assert_eq!(wire::get16(&out, view(&out).l4), port);
+        assert_eq!(shard_of(Role::Wan, &e[..len], SHARDS, 42), k);
+        let Verdict::Forward {
+            egress, next_hop, ..
+        } = fws[k].process(2, WAN, &mut e, len)
+        else {
+            panic!("ICMP error not forwarded")
+        };
+        assert_eq!((egress, next_hop), (LAN, HOST));
+    }
+
+    #[test]
+    fn unsharded_is_unchanged() {
+        assert_eq!(shard_of(Role::Lan, &[0u8; 60], 1, 42), 0);
+        let mut fw = router();
+        assert_eq!(fw.ct.shard(), (1, 0));
+        syn_out(&mut fw);
     }
 }
