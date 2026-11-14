@@ -1,0 +1,11 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Serial console CLI: line editor and command parser, sans-IO."
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -274,6 +274,25 @@ config. No save is accepted while a trial is pending, since it would
 overwrite the previous record, the only confirmed one. Without a previous
 record, a revert lands on the defaults.
 
+### Serial console (`kernel/src/cli.rs`, `crates/cli`)
+For when the network is not an option: the console prompt `rrouter> `.
+- Commands:
+  - `status`, `leases`, `help`, `reboot`
+  - `config show [running|stored|pending]`
+  - `config set <setting> = <value>` (a TOML assignment, `Config::with_assignment`), `config unset <setting>` (back to the default)
+  - `config diff` (pending vs stored), `config save`, `config discard`
+- Edits go to a pending copy of the stored config. Unknown settings and
+  wrong types are refused at `set`. The cross-field checks run at `save`,
+  with paths, so related changes can be made in any order.
+- `config save` stores and applies like a web save. A change the web
+  interface would boot as a trial (LAN address, management) is saved for
+  good and reboots: on the console nobody can lock themselves out.
+- No authentication: the serial port is physical access.
+- Input is polled from the services task: every 50 ms, every 2 ms for 2 s
+  after a byte (on x86_64 the UART interrupt would need IOAPIC routing).
+- The line editor handles Backspace, Ctrl-U, Ctrl-C and Up/Down history,
+  on any VT100 terminal (`screen`, QEMU's stdio).
+
 ## 7. Drivers
 - QEMU: virtio-blk (`drivers::virtio_blk` over `virtio-drivers`
   `VirtIOBlk`), aarch64 and x86_64. Polled, one request in flight; the
@@ -319,6 +338,12 @@ record, a revert lands on the defaults.
   `trial_secs`, Revert → reverted, router killed during the trial → the
   next boot reverts. Negative controls: corrupt the new record → the previous one;
   corrupt both → `config: defaults`.
+
+- `scripts/cli-test.sh` (`RROUTER_ARCH=x86_64`, `QEMU_STORE_BUS=sd` too)
+  types into the UART: help, status, leases, line editing, unknown
+  commands and settings, a refused invalid save, a live save, a LAN
+  change that reboots and is kept. Negative control:
+  `CLI_TEST_SKIP_SAVE=1` fails the persistence checks.
 
 ## 9. Status
 | Step | Status |

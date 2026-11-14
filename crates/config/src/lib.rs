@@ -7,6 +7,8 @@
 //! - [`parse_json`], [`Config::to_json`]: the same schema as JSON, for the
 //!   web interface's forms
 //! - [`Config::needs_trial`]: does a change need confirm-or-revert?
+//! - [`Config::with_assignment`], [`Config::without`], [`diff_lines`]: one
+//!   setting at a time (the serial CLI)
 //! - [`Config::default`]: what the router runs without a stored config
 //!
 //! Every section and field has a default, so a file may set only what it
@@ -19,9 +21,11 @@
 
 extern crate alloc;
 
+mod edit;
 mod types;
 mod validate;
 
+pub use edit::{diff_lines, flat_lines};
 pub use types::{Cidr, Mac};
 pub use validate::Issue;
 

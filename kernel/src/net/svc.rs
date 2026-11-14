@@ -12,6 +12,7 @@
 //! lease changes and reboot/upgrade requests go to the datapath as
 //! `net::shared::Control` messages.
 
+use crate::cli::{Cli, CliAction, Ctx};
 use crate::net::datapath;
 use crate::net::device::PortDevice;
 use crate::net::mgmt::{Mgmt, StoreOp};
@@ -216,6 +217,29 @@ fn lease_json(c: &LeaseChange) -> alloc::string::String {
     )
 }
 
+fn lease_text(c: &LeaseChange) -> String {
+    let Some((addr, prefix)) = c.addr else {
+        return String::from("no lease");
+    };
+    let dns: Vec<_> = c.dns.iter().map(|d| alloc::format!("{d}")).collect();
+    alloc::format!(
+        "{addr}/{prefix}, gateway {}, dns {}",
+        c.gateway.map(|g| alloc::format!("{g}")).unwrap_or_else(|| "-".into()),
+        if dns.is_empty() { String::from("-") } else { dns.join(", ") }
+    )
+}
+
+/// A saved config becomes the running one (no trial): shaping, DHCP and
+/// DNS are reconfigured in place.
+fn apply_saved(cfg: crate::config::schema::Config, source: String, sh: &Shared, services: Option<&mut LanServices>) {
+    let old = crate::config::qos();
+    crate::config::apply(cfg, source);
+    stack::apply_qos(sh, &old, &crate::config::qos());
+    if let Some(svc) = services {
+        svc.reconfigure();
+    }
+}
+
 /// Poll every router-stack interface; wake the TX task of each port that
 /// got frames in its qdisc.
 fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
@@ -287,6 +311,7 @@ pub async fn run(
         LanServices::new(&mut lan[0], Some(&mut wan[0]))
     });
     let mut mgmt = Mgmt::new(&mut hosts, store.is_some());
+    let mut cli = Cli::new(store.is_some());
     let events = [sh.svc_kick];
 
     loop {
@@ -298,6 +323,7 @@ pub async fn run(
                 gateway: change.gateway,
             });
             mgmt.set_wan_lease(lease_json(&change));
+            cli.set_wan(lease_text(&change));
             if let Some(svc) = services.as_mut() {
                 svc.set_upstreams(&change.dns);
                 svc.set_wan_up(change.addr.is_some());
@@ -316,14 +342,44 @@ pub async fn run(
             let r = store_op(st, &op).await;
             if let (Ok((_, Some(source))), StoreOp::Save { flags: 0, cfg, .. }) = (&r, &op) {
                 // Saved without a trial: run it now, no reboot.
-                let old = crate::config::qos();
-                crate::config::apply((**cfg).clone(), source.clone());
-                stack::apply_qos(sh, &old, &crate::config::qos());
-                if let Some(svc) = services.as_mut() {
-                    svc.reconfigure();
-                }
+                apply_saved((**cfg).clone(), source.clone(), sh, services.as_mut());
             }
             mgmt.op_done(conn, &op, r.map(|(detail, _)| detail));
+        }
+        let cli_action = cli.step(&Ctx {
+            hosts: &hosts,
+            sh,
+            services: services.as_ref(),
+        });
+        let mut action = action;
+        match cli_action {
+            Some(CliAction::Reboot) => action = Some(crate::net::mgmt::Action::Reboot),
+            Some(CliAction::Save(cfg)) => match store.as_mut() {
+                Some(st) => {
+                    let reboot = cfg.needs_trial(&crate::config::base());
+                    let op = StoreOp::Save {
+                        toml: cfg.to_toml(),
+                        flags: 0,
+                        cfg,
+                    };
+                    let r = store_op(st, &op).await;
+                    match (r, op) {
+                        (Ok((detail, source)), StoreOp::Save { cfg, .. }) => {
+                            println!("  cli             : config saved ({detail})");
+                            if reboot {
+                                action = Some(crate::net::mgmt::Action::Reboot);
+                            } else if let Some(source) = source {
+                                apply_saved(*cfg, source, sh, services.as_mut());
+                            }
+                            cli.save_done(Ok(detail), reboot);
+                        }
+                        (Err(e), _) => cli.save_done(Err(e), false),
+                        (Ok(_), _) => unreachable!("a save stays a save"),
+                    }
+                }
+                None => cli.save_done(Err(String::from("no store")), false),
+            },
+            None => {}
         }
         if let Some(action) = action {
             // The datapath stops the NICs and acts; nothing left to do here.
@@ -356,6 +412,7 @@ pub async fn run(
         if let Some(at) = pinger.deadline() {
             delay = delay.min(at.saturating_duration_since(timer::Instant::now()));
         }
+        delay = delay.min(cli.wake_at().saturating_duration_since(timer::Instant::now()));
         if let Some(at) = mgmt.wake_at() {
             delay = delay.min(at.saturating_duration_since(timer::Instant::now()));
         }

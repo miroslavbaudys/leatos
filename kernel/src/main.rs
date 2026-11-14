@@ -18,6 +18,7 @@
 extern crate alloc;
 
 mod arch;
+mod cli;
 mod config;
 mod console;
 mod cpuload;

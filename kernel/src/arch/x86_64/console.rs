@@ -9,6 +9,7 @@ const FCR: u16 = 2;
 const LCR: u16 = 3;
 const MCR: u16 = 4;
 const LSR: u16 = 5;
+const LSR_DR: u8 = 1 << 0;
 const LSR_THRE: u8 = 1 << 5;
 const LSR_TEMT: u8 = 1 << 6;
 
@@ -54,6 +55,13 @@ fn write_raw(s: &str) {
 pub fn write_str(s: &str) {
     let _g = LOCK.lock();
     write_raw(s);
+}
+
+/// One received byte, if any (polled: the serial CLI; COM1's interrupt
+/// would need IOAPIC routing). Thread context.
+pub fn read_byte() -> Option<u8> {
+    let _g = LOCK.lock();
+    (inb(COM1 + LSR) & LSR_DR != 0).then(|| inb(COM1))
 }
 
 pub fn emergency_write_str(s: &str) {

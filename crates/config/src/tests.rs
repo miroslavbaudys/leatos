@@ -521,3 +521,80 @@ fn trial_for_changes_that_can_lock_the_user_out() {
     m.mgmt.on_wan = true;
     assert!(m.needs_trial(&old));
 }
+
+#[test]
+fn assignments_edit_one_setting() {
+    let c = Config::default();
+    let d = c.with_assignment("dns.cache_entries = 1234").unwrap();
+    assert_eq!(d.dns.cache_entries, 1234);
+    assert_eq!(d.dns.rebind_protection, c.dns.rebind_protection, "siblings kept");
+    let d = d
+        .with_assignment(r#"time.ntp_servers = ["a.example", "192.0.2.1"]"#)
+        .unwrap()
+        .with_assignment("shaping.up_kbit = 18000")
+        .unwrap()
+        .with_assignment(r#"lan.dhcp.static = [{ mac = "52:54:00:00:00:05", ip = "192.168.1.10", hostname = "nas" }]"#)
+        .unwrap();
+    assert_eq!(d.time.ntp_servers, ["a.example", "192.0.2.1"]);
+    assert_eq!(d.shaping.up_kbit, Some(18000));
+    assert_eq!(d.lan.dhcp.statics[0].hostname.as_deref(), Some("nas"));
+    // Whole sections can be given as inline tables, and merge.
+    let e = d.with_assignment("shaping = { overhead = 20 }").unwrap();
+    assert_eq!((e.shaping.overhead, e.shaping.up_kbit), (20, Some(18000)));
+    // Not validated yet: out-of-range values pass, save catches them.
+    assert!(c.with_assignment("dns.cache_entries = 5").unwrap().validate().is_err());
+}
+
+#[test]
+fn assignment_errors() {
+    let c = Config::default();
+    for bad in [
+        "dns.cache_entries",              // no value
+        "nosuch.x = 1",                   // unknown section
+        "dns.nosuch = 1",                 // unknown field
+        "dns.cache_entries = \"many\"",   // wrong type
+        "shaping.qdisc = \"pfifo\"",      // unknown variant
+        "lan.ipv4 = \"10.0.0.1\"",        // bad value
+        "version = 2",
+        "dns.cache_entries = ",
+    ] {
+        assert!(
+            matches!(c.with_assignment(bad), Err(Error::Syntax(_))),
+            "{bad} must fail"
+        );
+    }
+}
+
+#[test]
+fn unset_restores_defaults() {
+    let c = Config::default()
+        .with_assignment("dns.cache_entries = 1234")
+        .unwrap()
+        .with_assignment("shaping.up_kbit = 18000")
+        .unwrap();
+    let d = c.without("dns.cache_entries").unwrap().without("shaping.up_kbit").unwrap();
+    assert_eq!(d, Config::default());
+    assert_eq!(Config::default().without("shaping.down_kbit").unwrap(), Config::default());
+    assert!(c.without("dns.nosuch").is_err());
+    assert!(c.without("nosuch.x").is_err());
+    assert!(c.without("version").is_err());
+    assert!(c.without("dns.").is_err());
+    // A whole section.
+    assert_eq!(c.without("dns").unwrap().dns, Dns::default());
+}
+
+#[test]
+fn diff_shows_changed_settings() {
+    let a = Config::default();
+    assert!(diff_lines(&a, &a).is_empty());
+    let b = a
+        .with_assignment("dns.cache_entries = 1234")
+        .unwrap()
+        .with_assignment(r#"lan.dhcp.static = [{ mac = "52:54:00:00:00:05", ip = "192.168.1.10" }]"#)
+        .unwrap();
+    let d = diff_lines(&a, &b);
+    assert!(d.contains(&"- dns.cache_entries = 4096".to_string()), "{d:?}");
+    assert!(d.contains(&"+ dns.cache_entries = 1234".to_string()), "{d:?}");
+    assert!(d.contains(&"+ lan.dhcp.static[0].ip = \"192.168.1.10\"".to_string()), "{d:?}");
+    assert!(flat_lines(&a).iter().any(|l| l == "version = 1"));
+}

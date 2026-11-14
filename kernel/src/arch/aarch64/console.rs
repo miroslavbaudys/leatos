@@ -1,5 +1,5 @@
 //! PL011 UART console backend. QEMU's PL011 needs no initialisation: poll
-//! the TX-FIFO-full flag and write bytes.
+//! the TX-FIFO-full flag and write bytes; poll RX-FIFO-empty to read.
 
 use crate::mmio::Region;
 use spin::Mutex;
@@ -10,6 +10,7 @@ const SIZE: usize = 0x1000;
 const UARTDR: usize = 0x00;
 const UARTFR: usize = 0x18;
 const FR_TXFF: u32 = 1 << 5;
+const FR_RXFE: u32 = 1 << 4;
 
 static UART: Mutex<Option<Region>> = Mutex::new(None);
 
@@ -45,6 +46,18 @@ pub fn write_str(s: &str) {
     let mut guard = UART.lock();
     let uart = guard.get_or_insert_with(|| new_region(DEFAULT_BASE));
     write_with(uart, s);
+}
+
+/// One received byte, if any (polled: the serial CLI). Thread context.
+pub fn read_byte() -> Option<u8> {
+    let mut guard = UART.lock();
+    let uart = guard.get_or_insert_with(|| new_region(DEFAULT_BASE));
+    if uart.read32(UARTFR) & FR_RXFE != 0 {
+        return None;
+    }
+    // Bits 8-11 are error flags (framing, parity, break, overrun): a
+    // byte with an error is still returned; the line editor copes.
+    Some(uart.read32(UARTDR) as u8)
 }
 
 /// Fatal paths only (panic, unhandled exception): never returns to normal
