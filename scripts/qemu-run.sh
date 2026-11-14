@@ -35,6 +35,9 @@
 #   QEMU_STORE=img       attach img as a virtio-blk disk (the router's store; create
 #                        one with `cargo run -q -p rrstore -- create img`). Written
 #                        in place: pass a copy to keep the original
+#   QEMU_STORE_BUS=virtio|sd   how QEMU_STORE is attached: virtio-blk (default) or an
+#                        SD card behind QEMU's sdhci-pci (the apu4's SD driver).
+#                        SD images must be a power of two in size (rrstore create --mib 32)
 #   QEMU_NIC=virtio|igb  NIC model for WAN and LAN (default virtio): igb = QEMU's
 #                        Intel 82576, driven by the same igb driver as the apu4's i211
 #   QEMU_APPEND="..."    kernel command line (DTB /chosen/bootargs), e.g.
@@ -140,7 +143,11 @@ fi
 # After the NICs, so their PCI slots (and the WAN/LAN order) stay the same.
 STORE=()
 if [[ -n "${QEMU_STORE:-}" ]]; then
-  STORE=(-drive "file=$QEMU_STORE,format=raw,if=none,id=store,cache=writethrough" -device virtio-blk-pci,drive=store)
+  case "${QEMU_STORE_BUS:-virtio}" in
+    virtio) STORE=(-drive "file=$QEMU_STORE,format=raw,if=none,id=store,cache=writethrough" -device virtio-blk-pci,drive=store) ;;
+    sd) STORE=(-drive "file=$QEMU_STORE,format=raw,if=none,id=store,cache=writethrough" -device sdhci-pci,id=sdhci -device sd-card,drive=store,bus=sd-bus) ;;
+    *) echo "QEMU_STORE_BUS must be virtio or sd" >&2; exit 2 ;;
+  esac
 fi
 
 GDB=()

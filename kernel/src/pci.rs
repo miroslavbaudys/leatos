@@ -57,6 +57,7 @@ impl PciDevice {
             (0x8086, 0x1533 | 0x1536 | 0x1537 | 0x1538 | 0x157b) => "Intel i210 (igb)",
             (0x8086, 0x1539) => "Intel i211 (igb)",
             (0x8086, _) if self.info.class == 0x02 => "Intel NIC",
+            _ if (self.info.class, self.info.subclass) == (0x08, 0x05) => "SD host (SDHCI)",
             _ => match self.info.class {
                 0x01 => "storage",
                 0x02 => "network",

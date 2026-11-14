@@ -60,6 +60,7 @@
   #cfgmsg, #trialmsg { white-space:pre-wrap; }
   #cfgmsg.err { color:var(--bad); }
   .hint { color:var(--muted); font-size:13px; }
+  .ovr { color:var(--bad); font-size:12px; }
 </style>
 </head>
 <body>
@@ -112,6 +113,7 @@
       </fieldset>
     </form>
     <div class="row"><button id="save">Save and reboot</button><button id="discard" class="plain">Discard changes</button>
+      <button id="effective" class="plain" hidden title="Fill the form with the values the router runs with, boot arguments included; then Save, and remove those boot arguments">Use values in effect</button>
       <a href="/api/config" download="config.toml">Export config.toml</a>
       <label class="check" style="margin:0">Import:<input id="import" type="file" accept=".toml,text/plain"></label></div>
     <div id="cfgmsg"></div>
@@ -245,8 +247,10 @@ async function refresh() {
     ["Forwarded", n(st.forwarded)], ["Dropped", n(st.dropped)], ["Connections", n(st.conntrack)],
     ["Packet pool", `${n(st.pool.free)} free of ${n(st.pool.capacity)}` + (st.pool.alloc_failures ? `, ${n(st.pool.alloc_failures)} failures` : "")],
     ["Heap", `${n(Math.round(st.heap.used / 1024))} KiB used, ${n(Math.round(st.heap.free / 1048576))} MiB free`],
+    ["Command line", esc(st.cmdline || "–")],
     ["Config", esc(st.config) + (st.store ? "" : " · no store: changes cannot be saved")],
     ["Upgrade", st.mgmt.upgrade ? "enabled" : "disabled (boot with mgmt_pass=…)"]]);
+  showOverrides(st.overrides ?? {});
   $("trialbar").hidden = !st.trial;
   if (st.trial) $("trialleft").textContent = st.trial.remaining_s;
   $("save").disabled = !st.store || !!st.trial;
@@ -382,6 +386,28 @@ async function postConfig(body, type) {
     cfgSay(`${j.detail}. This page reconnects by itself.`);
   }
 }
+// Boot arguments win over the stored config: say so at each field they
+// set, with the value in effect (the form shows the stored value).
+function showOverrides(ov) {
+  $("effective").hidden = !Object.keys(ov).length;
+  document.querySelectorAll("#cfg .ovr").forEach((e) => e.remove());
+  for (const [path, kv] of Object.entries(ov)) {
+    const el = document.querySelector(`#cfg [data-path="${path}"]`);
+    const label = el && el.closest("label");
+    if (!label) continue;
+    const note = document.createElement("span");
+    note.className = "ovr";
+    note.textContent = `In effect: boot argument ${kv} (overrides the saved value)`;
+    label.append(note);
+  }
+}
+$("effective").onclick = async () => {
+  try {
+    const eff = await (await fetch("/api/config/effective.json", { cache: "no-store" })).json();
+    fillForm(eff); markIssues([]);
+    cfgSay("The form now holds the values in effect. Save to store them, then remove the boot arguments marked in red.");
+  } catch (e) { cfgSay("Could not load the values in effect: " + e, true); }
+};
 $("addstatic").onclick = () => staticRow();
 $("discard").onclick = () => { loadConfig(); cfgSay(""); };
 $("save").onclick = () => {

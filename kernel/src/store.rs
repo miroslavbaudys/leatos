@@ -3,7 +3,7 @@
 //!
 //! The format, slot choice and write plan are in `crates/config-store`;
 //! this module only moves sectors between it and the disk
-//! (`drivers::virtio_blk`). Reads at boot run through
+//! (`drivers::Disk`: virtio-blk in QEMU, an SD card on the apu4). Reads at boot run through
 //! `executor::block_on`; writes run in the services task and yield while
 //! the disk works, so they never block the datapath.
 //!
@@ -12,7 +12,7 @@
 //! never formats (only `rrstore`, the host tool, does), and every access is
 //! checked to lie inside the partition.
 
-use crate::drivers::virtio_blk::{self, MAX_REQUEST_SECTORS, VirtioBlk};
+use crate::drivers::{DISK_MAX_SECTORS as MAX_REQUEST_SECTORS, Disk, DiskError};
 use crate::executor::block_on;
 use crate::pci::Pci;
 use crate::println;
@@ -23,7 +23,7 @@ use config_store::{Area, AreaState, Layout, RecordHeader, SECTOR, Slot, SlotStat
 
 #[derive(Debug)]
 pub enum Error {
-    Disk(virtio_blk::Error),
+    Disk(DiskError),
     /// The area does not exist in this store's layout.
     NoArea(&'static str),
     Plan(config_store::Error),
@@ -36,7 +36,7 @@ pub enum Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Error::Disk(e) => write!(f, "disk error: {e:?}"),
+            Error::Disk(e) => write!(f, "disk error ({e})"),
             Error::NoArea(a) => write!(f, "store has no area '{a}'"),
             Error::Plan(e) => write!(f, "{e:?}"),
             Error::OutOfRange => f.write_str("access outside the store partition"),
@@ -45,8 +45,8 @@ impl core::fmt::Display for Error {
     }
 }
 
-impl From<virtio_blk::Error> for Error {
-    fn from(e: virtio_blk::Error) -> Self {
+impl From<DiskError> for Error {
+    fn from(e: DiskError) -> Self {
         Error::Disk(e)
     }
 }
@@ -59,79 +59,111 @@ pub struct Record {
 }
 
 pub struct Store {
-    disk: VirtioBlk,
+    disk: Disk,
     /// First sector of the partition on the disk, and its length.
     base: u64,
     sectors: u64,
     layout: Layout,
 }
 
-/// Find the store: the first virtio-blk device with a store partition and
-/// a valid store header. Logs what it finds on every block device.
-pub fn open(pci: &mut Pci) -> Option<Store> {
-    let devs: Vec<_> = pci
-        .devices
-        .iter()
-        .filter(|d| d.is_virtio_blk())
-        .cloned()
-        .collect();
-    if devs.is_empty() {
-        println!("  store           : none (no block device)");
-    }
-    for dev in devs {
-        let disk = match VirtioBlk::new(pci, &dev) {
-            Ok(d) => d,
-            Err(e) => {
-                println!(
-                    "  store           : virtio-blk {}: init failed: {e:?}",
-                    dev.df
-                );
-                continue;
-            }
-        };
-        match probe(disk) {
-            Ok(s) => {
-                let names: Vec<_> = s.layout.areas().iter().map(|a| a.name()).collect();
-                println!(
-                    "  store           : virtio-blk {}, partition at LBA {}, {} MiB, areas {}",
-                    dev.df,
-                    s.base,
-                    s.sectors >> 11,
-                    names.join(", ")
-                );
-                return Some(s);
-            }
-            Err(why) => println!("  store           : virtio-blk {}: {why}, not used", dev.df),
-        }
-    }
-    None
+/// What [`open`] found on each block device (for `/api/status`).
+static PROBES: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+
+/// One line per block device: model, size, partitions, and whether it
+/// holds the store (or why not).
+pub fn probes() -> Vec<String> {
+    PROBES.lock().clone()
 }
 
-fn probe(mut disk: VirtioBlk) -> Result<Store, String> {
-    if disk.readonly() {
-        return Err(String::from("read-only"));
+/// Find the store: the first block device (virtio-blk or SD card) with a
+/// store partition and a valid store header. Logs what it finds on every
+/// block device.
+pub fn open(pci: &mut Pci) -> Option<Store> {
+    let devs: Vec<_> = pci.devices.clone();
+    let mut found = None;
+    for dev in devs {
+        let Some(disk) = block_on(Disk::open(pci, &dev)) else {
+            continue; // not a block device
+        };
+        let line = match disk {
+            Err(e) => format!("{}: init failed: {e}", dev.df),
+            Ok(_) if found.is_some() => format!("{}: not probed (store already found)", dev.df),
+            Ok(disk) => {
+                let what = disk.describe();
+                match probe(disk) {
+                    Ok((s, parts)) => {
+                        let names: Vec<_> = s.layout.areas().iter().map(|a| a.name()).collect();
+                        let l = format!(
+                            "{} {what}, {parts}: store at LBA {}, {} MiB, areas {}",
+                            dev.df,
+                            s.base,
+                            s.sectors >> 11,
+                            names.join(", ")
+                        );
+                        found = Some(s);
+                        l
+                    }
+                    Err(why) => format!("{} {what}: {why}, not used", dev.df),
+                }
+            }
+        };
+        println!("  store           : {line}");
+        PROBES.lock().push(line);
     }
-    let mbr = block_on(disk.read(0, 1)).map_err(|e| format!("reading the MBR: {e:?}"))?;
+    if PROBES.lock().is_empty() {
+        println!("  store           : none (no block device)");
+    }
+    found
+}
+
+/// The MBR's partitions for the log: `p1 0x0c 64 MiB, p2 0xda 16 MiB`.
+fn partitions(mbr: &[u8]) -> String {
+    match mbr::partitions(mbr) {
+        None => String::from("no MBR"),
+        Some(ps) => {
+            let v: Vec<_> = ps
+                .iter()
+                .flatten()
+                .map(|p| format!("p{} {:#04x} {} MiB", p.index + 1, p.kind, p.sectors >> 11))
+                .collect();
+            if v.is_empty() {
+                String::from("MBR without partitions")
+            } else {
+                v.join(", ")
+            }
+        }
+    }
+}
+
+fn probe(mut disk: Disk) -> Result<(Store, String), String> {
+    let mbr = block_on(disk.read(0, 1)).map_err(|e| format!("reading the MBR: {e}"))?;
+    let parts = partitions(&mbr);
     let part = mbr::find_store(&mbr).ok_or_else(|| {
         format!(
-            "no store partition (MBR type {:#04x})",
+            "{parts}; no store partition (type {:#04x})",
             mbr::STORE_PARTITION_TYPE
         )
     })?;
+    if disk.readonly() {
+        return Err(format!("{parts}; read-only"));
+    }
     let (base, sectors) = (part.first_lba as u64, part.sectors as u64);
     if base + sectors > disk.capacity() {
-        return Err(String::from("store partition extends past the disk"));
+        return Err(format!("{parts}; store partition extends past the disk"));
     }
     let hdr =
-        block_on(disk.read(base, 1)).map_err(|e| format!("reading the store header: {e:?}"))?;
+        block_on(disk.read(base, 1)).map_err(|e| format!("reading the store header: {e}"))?;
     let layout = Layout::parse(&hdr, sectors)
-        .map_err(|e| format!("store header invalid ({e:?}): not formatted"))?;
-    Ok(Store {
-        disk,
-        base,
-        sectors,
-        layout,
-    })
+        .map_err(|e| format!("{parts}; store header invalid ({e:?}): not formatted"))?;
+    Ok((
+        Store {
+            disk,
+            base,
+            sectors,
+            layout,
+        },
+        parts,
+    ))
 }
 
 impl Store {

@@ -39,11 +39,13 @@ pub fn bootargs() -> &'static str {
 /// Build the configuration (needs the heap): defaults or the store's
 /// `config.toml`, then boot arguments. Called once, before any service
 /// starts and before anything reads [`get`].
-pub fn load(store: Option<&mut crate::store::Store>) {
+/// `virtual_machine`: the lab's fixtures (the `nas` reservation) are added
+/// to the defaults only there, never on hardware.
+pub fn load(store: Option<&mut crate::store::Store>, virtual_machine: bool) {
     let (stored, source) = stored(store);
     let from_store = stored.is_some();
     let mut c = stored.unwrap_or_default();
-    if !from_store {
+    if !from_store && virtual_machine {
         add_lab_reservation(&mut c);
     }
     BASE.call_once(|| c.clone());
@@ -189,6 +191,40 @@ pub fn get() -> &'static schema::Config {
     CONFIG.get().expect("config::load not called")
 }
 
+/// Config fields a boot argument sets in this boot, as (field path, the
+/// argument): such a field ignores the stored value, so the web form must
+/// say so. Same keys as [`apply_bootargs`].
+pub fn overrides() -> Vec<(&'static str, &'static str)> {
+    const MAP: &[(&str, &str)] = &[
+        ("lan", "lan.ipv4"),
+        ("shape_up", "shaping.up_kbit"),
+        ("shape_down", "shaping.down_kbit"),
+        ("shape_overhead", "shaping.overhead"),
+        ("ecn_up", "shaping.ecn_up"),
+        ("ecn_down", "shaping.ecn_down"),
+        ("ecn", "shaping.ecn_up"),
+        ("ecn", "shaping.ecn_down"),
+        ("qdisc", "shaping.qdisc"),
+        ("isolation", "shaping.isolation"),
+    ];
+    let args = bootargs();
+    let mut v = Vec::new();
+    for kv in args.split_whitespace() {
+        let key = kv.split('=').next().unwrap_or("");
+        for &(k, path) in MAP {
+            // ecn= only where no ecn_up= / ecn_down= takes precedence.
+            let shadowed = k == "ecn" && arg(args, path.trim_start_matches("shaping.")).is_some();
+            if k == key && !shadowed && !v.iter().any(|&(p, _)| p == path) {
+                v.push((path, kv));
+            }
+        }
+    }
+    if arg(args, "mgmt") == Some("wan") {
+        v.push(("mgmt.on_wan", "mgmt=wan"));
+    }
+    v
+}
+
 /// Boot arguments on top of the defaults or the stored config. Invalid
 /// values are ignored, as before the config existed.
 fn apply_bootargs(c: &mut schema::Config, args: &str) {
@@ -244,7 +280,7 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
     }
 }
 
-/// Without a stored config: the lab's `nas` reservation (host .10, MAC
+/// Without a stored config, on a virtual machine: the lab's `nas` reservation (host .10, MAC
 /// 52:54:00:00:00:05), which `scripts/lab-test.sh` resolves as `nas.lan`.
 fn add_lab_reservation(c: &mut schema::Config) {
     let ip = c.lan.ipv4.host(10);

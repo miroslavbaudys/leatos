@@ -23,8 +23,8 @@ reboots, and how the management web interface changes it. Part of M8.
 partition next to the boot partition:
 
 ```
-p1  FAT32, 64 MiB      Limine + kernel (read-only for the kernel)
-p2  type 0xda, 16 MiB  rrouter store
+p1  FAT32, 1–64 MiB    Limine + kernel (read-only for the kernel)
+p2  type 0xda, 16 MiB  rrouter store (64–80 MiB; formatted by tools/rrstore)
 ```
 
 The store starts with a **store header** (sector 0) that lists the
@@ -182,6 +182,18 @@ Boot arguments (`lan=`, `shape_up=`, ...) still override, for
 development and recovery. `config=defaults` ignores the store entirely
 (recovery: add it in the Limine menu over serial).
 
+### Moving boot arguments into the config
+Boot arguments override the stored config, field by field. `/api/status`
+lists them (`overrides`: field path → argument), and the form marks each
+such field. `GET /api/config/effective` returns the config in effect;
+saving it ("Use values in effect" on the page) and then removing the
+arguments leaves the router with the same settings from the store. For a
+new SD image: `scripts/apu-image.sh --mgmt-pass --config FILE` writes
+FILE (validated) into the store, and the command line keeps only
+`mgmt_pass=` (no password field in the schema yet). Lab fixtures (the
+`nas` reservation) are added to the defaults on virtual machines only,
+so they never end up in a hardware config.
+
 ### Validation
 `crates/config` checks across sections before anything is saved: the
 DHCP pool and reservations lie inside the LAN subnet, no two reservations
@@ -260,8 +272,22 @@ record, a revert lands on the defaults.
   creates and formats store images, writes and reads records through the
   same `config-store` code, and flips payload bytes for negative controls.
   `QEMU_STORE=img scripts/qemu-run.sh` attaches an image as virtio-blk.
-- apu4: the SD slot (expected: FCH SDHCI, PCI class 08:05; to be
-  confirmed from the PCI scan), PIO first. AHCI if an mSATA SSD is used.
+- apu4: the SD slot, `drivers::sdhci` (any standard SDHCI 2.0/3.0, PCI
+  class 08:05). On the apu4 (checked 2026-11-14): AMD FCH SD host at
+  00:14.7, SDHCI 2.00, base clock 50 MHz; an 8 GB SDHC card initialises
+  and its MBR reads. PIO through the buffer data port, polled, no DMA and
+  no interrupts. SD v1/v2, SDSC (byte addresses) and SDHC/SDXC (block
+  addresses), 4-bit bus at 25 MHz, multi-block transfers with Auto CMD12.
+  A write completes only after the card has programmed it, so the store's
+  flush is a no-op there. Every wait yields. A transfer abandoned midway
+  is cleaned up (line reset + CMD12) before the next one. Card detect
+  that is not wired is overridden, and the commands decide whether a card
+  is there. AHCI if an mSATA SSD is used.
+- QEMU: `QEMU_STORE_BUS=sd` attaches the store image as an SD card behind
+  `sdhci-pci` (image size a power of two; QEMU emulates SDSC up to 2 GiB
+  and SDHC above). `scripts/store-test.sh` runs over it too.
+- `/api/status` lists what the store probe found on each block device
+  (`disks`): model, size, partitions, store or why not.
 - Drivers are async and run at service priority: a store write never
   blocks the datapath.
 
@@ -288,4 +314,4 @@ record, a revert lands on the defaults.
 | Kernel: one `Config` loaded at boot (refactor, no behaviour change) | ✅ `config::load()`; boot arguments overlay it |
 | virtio-blk + store partition in QEMU, lab check | ✅ `drivers::virtio_blk`, `store`, `tools/rrstore`, `GET`/`POST /api/config`, `scripts/store-test.sh` (aarch64 + x86_64) |
 | Web interface: config pages, save + reboot, confirm/revert | ✅ form + import/export on the status page, JSON API, trial records (flags), `scripts/store-test.sh` covers confirm, timeout, revert and a kill during the trial (aarch64 + x86_64) |
-| apu4: SD driver, store partition in `apu-image.sh` | |
+| apu4: SD driver, store partition in `apu-image.sh` | ✅ in QEMU (`sdhci-pci`, SDSC + SDHC, both arches, full `store-test.sh`) and SeaBIOS → Limine with the apu4 image as the SD card; on the apu4 the card initialises and reads (no store partition on the old image yet). Pending: write test on the apu4 after flashing the new image |

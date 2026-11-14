@@ -7,6 +7,9 @@
 #   scripts/store-test.sh                       # aarch64 (HVF on Apple Silicon)
 #   RROUTER_ARCH=x86_64 scripts/store-test.sh   # x86_64 (TCG)
 #   LAB_VERBOSE=1 ...                           # print the router consoles
+#   QEMU_STORE_BUS=sd ...                       # store on an SD card (sdhci-pci)
+#   STORE_MIB=2048 ...                          # image size; QEMU's SD card is
+#                                               # SDHC (block addressing) above 1 GiB
 #
 # Boot-time reads (each a control for the others):
 #   empty store -> defaults; stored config -> used; stored config that does
@@ -33,6 +36,8 @@ PORT="${STORE_TEST_PORT:-18081}"
 URL="http://127.0.0.1:$PORT"
 WORK="$(mktemp -d -t rrouter-store.XXXXXX)"
 IMG="$WORK/store.img"
+# Power of two: QEMU's SD card needs it.
+STORE_MIB="${STORE_MIB:-32}"
 LOG=
 QPID=
 stop() {
@@ -78,8 +83,8 @@ boot_config() { # name append: boot, return the config line, stop
   stop
 }
 
-echo "== boot-time reads ($ARCH)"
-"$RRSTORE" create "$IMG" >/dev/null
+echo "== boot-time reads ($ARCH, ${QEMU_STORE_BUS:-virtio}, $STORE_MIB MiB)"
+"$RRSTORE" create "$IMG" --mib "$STORE_MIB" >/dev/null
 r="$(boot_config empty "")"
 check "empty store -> defaults" "defaults (store has no valid config)" "${r%%,*}"
 
@@ -90,14 +95,14 @@ check "stored config used" "stored (slot A, seq 1), lan 10.20.0.1/24" "${r%%, dh
 r="$(boot_config ignored "config=defaults")"
 check "config=defaults ignores the store" "defaults (config=defaults: store ignored)" "${r%%,*}"
 
-"$RRSTORE" create "$IMG" >/dev/null
+"$RRSTORE" create "$IMG" --mib "$STORE_MIB" >/dev/null
 printf 'version = 1\nbogus = 1\n' >"$WORK/bad.toml"
 "$RRSTORE" put "$IMG" config "$WORK/bad.toml" --raw >/dev/null
 r="$(boot_config rejected "")"
 check "stored config that does not validate -> defaults" "defaults (stored config slot A rejected" "${r%%:*}"
 
 echo "== save through the management interface"
-"$RRSTORE" create "$IMG" >/dev/null
+"$RRSTORE" create "$IMG" --mib "$STORE_MIB" >/dev/null
 "$RRSTORE" put "$IMG" config "$WORK/a.toml" >/dev/null # A, seq 1: lan 10.20.0.1/24
 boot save "mgmt=wan mgmt_pass=test trial_secs=20" QEMU_NET=user QEMU_WAN_HOSTFWD="tcp:127.0.0.1:$PORT-:80"
 BOOTS=1
@@ -121,6 +126,10 @@ curl -s -m 10 -o "$WORK/cfg.json" "$URL/api/config.json" || true
 check "GET /api/config.json shows the stored LAN" "10.20.0.1/24" "$(json "$WORK/cfg.json" lan.ipv4)"
 check "status reports the config source" "stored (slot A, seq 1)" "$(status config)"
 check "status: no trial" "null" "$(json "$WORK/status" trial)"
+check "status lists the boot-argument overrides (mgmt=wan only)" '{"mgmt.on_wan": "mgmt=wan"}' "$(json "$WORK/status" overrides)"
+curl -s -m 10 -o "$WORK/eff.json" "$URL/api/config/effective.json" || true
+check "effective config = stored + boot arguments (on_wan from mgmt=wan)" "10.20.0.1/24 true false" \
+  "$(json "$WORK/eff.json" lan.ipv4) $(json "$WORK/eff.json" mgmt.on_wan) $(json "$WORK/cfg.json" mgmt.on_wan)"
 lan_toml 10.30.0.1
 check "save without password -> 401" 401 "$(code -X POST --data-binary @"$WORK/lan.toml" "$URL/api/config")"
 check "invalid TOML -> 422" 422 "$(save_toml "$WORK/bad.toml")"
@@ -197,4 +206,5 @@ check "newest record corrupt -> previous record" "stored (slot A, seq 3), lan 10
 r="$(boot_config both "")"
 check "both records corrupt -> defaults" "defaults (store has no valid config)" "${r%%,*}"
 
-if [[ "$FAILED" == 0 ]]; then echo "STORE TEST ($ARCH): PASS"; else echo "STORE TEST ($ARCH): FAIL"; exit 1; fi
+WHAT="$ARCH, ${QEMU_STORE_BUS:-virtio}, $STORE_MIB MiB"
+if [[ "$FAILED" == 0 ]]; then echo "STORE TEST ($WHAT): PASS"; else echo "STORE TEST ($WHAT): FAIL"; exit 1; fi

@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 # Build a bootable disk image for the PC Engines apu4 (coreboot + SeaBIOS):
-# MBR + one FAT32 partition holding Limine (BIOS) and the x86_64 kernel,
-# which Limine starts via Multiboot2. Write it to a USB stick or SD card.
+# MBR + a FAT32 partition holding Limine (BIOS) and the x86_64 kernel,
+# which Limine starts via Multiboot2, and the rrouter store (p2, type 0xda,
+# 16 MiB, formatted by tools/rrstore: the config saved from the web
+# interface lives there; docs/config-and-storage.md). Write it to the SD
+# card (the kernel reads and writes the store through the SD slot).
 #
 #   scripts/apu-image.sh                       # release kernel -> target/apu4/rrouter-apu4.img
 #   scripts/apu-image.sh --debug               # debug kernel (slower, more checks)
 #   scripts/apu-image.sh --cmdline "shape_up=20000 shape_down=100000"
-#   scripts/apu-image.sh --mgmt-wan            # web interface + upgrades on the WAN too
-#                                              # (development: the Mac reaches the apu4 via
-#                                              # its WAN); password in target/apu4/mgmt-pass,
-#                                              # used by scripts/apu-upload.sh
+#   scripts/apu-image.sh --mgmt-pass           # command line gets mgmt_pass= (upgrades, saves);
+#                                              # password in target/apu4/mgmt-pass, used by
+#                                              # scripts/apu-upload.sh
+#   scripts/apu-image.sh --mgmt-wan            # --mgmt-pass plus mgmt=wan (web interface on the
+#                                              # WAN too; development: the Mac reaches the apu4
+#                                              # via its WAN). Prefer [mgmt] on_wan in --config
+#   scripts/apu-image.sh --config FILE         # seed the store with FILE (config.toml, validated):
+#                                              # the router boots with it, no boot arguments needed
 #   scripts/apu-image.sh --features smoke-test --out FILE   # used by smoke-test.sh
 #
 # Test the image in QEMU exactly as SeaBIOS boots it on the apu4:
@@ -25,6 +32,8 @@ FEATURES=
 CMDLINE=
 OUT=target/apu4/rrouter-apu4.img
 MGMT_WAN=0
+MGMT_PASS=0
+CONFIG=
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --debug) PROFILE=debug ;;
@@ -32,14 +41,16 @@ while [[ $# -gt 0 ]]; do
     --features) FEATURES="$2"; shift ;;
     --cmdline) CMDLINE="$2"; shift ;;
     --out) OUT="$2"; shift ;;
-    --mgmt-wan) MGMT_WAN=1 ;;
-    -h | --help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --mgmt-wan) MGMT_WAN=1 MGMT_PASS=1 ;;
+    --mgmt-pass) MGMT_PASS=1 ;;
+    --config) CONFIG="$2"; shift ;;
+    -h | --help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
 done
 
-if [[ "$MGMT_WAN" == 1 ]]; then
+if [[ "$MGMT_PASS" == 1 ]]; then
   PASSFILE=target/apu4/mgmt-pass
   mkdir -p target/apu4
   if [[ ! -s "$PASSFILE" ]]; then
@@ -47,8 +58,10 @@ if [[ "$MGMT_WAN" == 1 ]]; then
     pw="$(head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')"
     (umask 077; printf '%s' "${pw:0:16}" >"$PASSFILE")
   fi
-  CMDLINE="mgmt=wan mgmt_pass=$(cat "$PASSFILE")${CMDLINE:+ $CMDLINE}"
+  CMDLINE="mgmt_pass=$(cat "$PASSFILE")${CMDLINE:+ $CMDLINE}"
 fi
+[[ "$MGMT_WAN" == 1 ]] && CMDLINE="mgmt=wan $CMDLINE"
+[[ -z "$CONFIG" || -f "$CONFIG" ]] || { echo "--config: no such file: $CONFIG" >&2; exit 2; }
 
 for tool in limine mformat mcopy mmd; do
   command -v "$tool" >/dev/null || { echo "missing $tool: brew install limine mtools" >&2; exit 1; }
@@ -62,9 +75,11 @@ args=(build -p rrouter-kernel --target x86_64-unknown-none --quiet)
 cargo "${args[@]}"
 KERNEL="target/x86_64-unknown-none/$PROFILE/rrouter"
 
-IMG_MIB=64
-PART_LBA=2048 # partition at 1 MiB
-PART_SECTORS=$(((IMG_MIB << 11) - PART_LBA))
+IMG_MIB=80
+PART_LBA=2048 # boot partition at 1 MiB, up to 64 MiB
+PART_SECTORS=$(((64 << 11) - PART_LBA))
+STORE_LBA=$((64 << 11)) # store partition: the last 16 MiB
+STORE_SECTORS=$(((IMG_MIB << 11) - STORE_LBA))
 
 mkdir -p "$(dirname "$OUT")"
 WORK="$(mktemp -d -t rrouter-img.XXXXXX)"
@@ -77,6 +92,9 @@ le32() { printf '\\x%02x\\x%02x\\x%02x\\x%02x' $(($1 & 255)) $((($1 >> 8) & 255)
 # MBR partition 1: active, type 0x0c (FAT32 LBA), CHS fields unused (0xfe/0xff).
 entry="\\x80\\xfe\\xff\\xff\\x0c\\xfe\\xff\\xff$(le32 $PART_LBA)$(le32 $PART_SECTORS)"
 printf "$entry" | dd of="$IMG" bs=1 seek=446 conv=notrunc 2>/dev/null
+# MBR partition 2: type 0xda (non-FS data), the rrouter store.
+entry="\\x00\\xfe\\xff\\xff\\xda\\xfe\\xff\\xff$(le32 $STORE_LBA)$(le32 $STORE_SECTORS)"
+printf "$entry" | dd of="$IMG" bs=1 seek=462 conv=notrunc 2>/dev/null
 printf '\x55\xaa' | dd of="$IMG" bs=1 seek=510 conv=notrunc 2>/dev/null
 
 cat >"$WORK/limine.conf" <<EOF
@@ -96,8 +114,13 @@ mformat -i "$P" -F -v RROUTER -T "$PART_SECTORS" -h 64 -s 32 -H "$PART_LBA" ::
 mmd -i "$P" ::/boot ::/boot/limine
 mcopy -i "$P" "$LIMINE_SHARE/limine-bios.sys" "$WORK/limine.conf" ::/boot/limine/
 mcopy -i "$P" "$KERNEL" ::/boot/rrouter
+cargo build -p rrstore --release --quiet
+target/release/rrstore format "$IMG" >/dev/null
+# Validated by rrstore (the same checks as the kernel's): a config the
+# router would reject never reaches the card.
+[[ -n "$CONFIG" ]] && target/release/rrstore put "$IMG" config "$CONFIG" >/dev/null
 out="$(limine bios-install "$IMG" 2>&1)" || { echo "$out" >&2; exit 1; }
 
 mv "$IMG" "$OUT"
 SHOWN="$(printf '%s' "$CMDLINE" | sed 's/mgmt_pass=[^ ]*/mgmt_pass=***/')"
-echo "image: $OUT ($IMG_MIB MiB, $PROFILE kernel${FEATURES:+, features $FEATURES}${CMDLINE:+, cmdline \"$SHOWN\"})"
+echo "image: $OUT ($IMG_MIB MiB: boot + 16 MiB store${CONFIG:+ with $CONFIG}, $PROFILE kernel${FEATURES:+, features $FEATURES}${CMDLINE:+, cmdline \"$SHOWN\"})"

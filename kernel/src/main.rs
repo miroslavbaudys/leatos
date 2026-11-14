@@ -78,7 +78,7 @@ pub fn kmain(boot_arg: usize) -> ! {
     // The config may live on a disk, so it is loaded once PCI is up. Code
     // above this line reads only boot arguments, never `config::get`.
     let mut store = pci.as_mut().and_then(store::open);
-    config::load(store.as_mut());
+    config::load(store.as_mut(), info.virtual_machine);
     let qos = config::qos();
     let net = pci.as_mut().and_then(|p| net::stack::bring_up(p, &qos));
     let has_net = net.is_some();

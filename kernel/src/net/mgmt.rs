@@ -11,6 +11,9 @@
 //! - `GET /api/config` (TOML, export) and `GET /api/config.json` (the
 //!   page's form): the configuration without boot-argument overrides
 //!   (`config::base`).
+//! - `GET /api/config/effective` (TOML) and `/api/config/effective.json`:
+//!   the config in effect, boot arguments applied (`config::get`): what
+//!   to save to move boot arguments into the stored config.
 //! - `POST /api/config`: body = `config.toml`, or JSON with
 //!   `Content-Type: application/json`; parsed and validated
 //!   (`crates/config`; 422 with the message and, for inconsistencies, the
@@ -87,6 +90,9 @@ enum Route {
     Reboot,
     ConfigGet,
     ConfigJson,
+    /// The config in effect: stored or defaults, plus boot arguments.
+    EffectiveGet,
+    EffectiveJson,
     ConfigPut,
     ConfigConfirm,
     ConfigRevert,
@@ -368,13 +374,16 @@ impl Mgmt {
             (Method::Post, "/api/reboot") => Ok(Route::Reboot),
             (Method::Get, "/api/config") => Ok(Route::ConfigGet),
             (Method::Get, "/api/config.json") => Ok(Route::ConfigJson),
+            (Method::Get, "/api/config/effective") => Ok(Route::EffectiveGet),
+            (Method::Get, "/api/config/effective.json") => Ok(Route::EffectiveJson),
             (Method::Post, "/api/config") => Ok(Route::ConfigPut),
             (Method::Post, "/api/config/confirm") => Ok(Route::ConfigConfirm),
             (Method::Post, "/api/config/revert") => Ok(Route::ConfigRevert),
             (
                 _,
                 "/" | "/index.html" | "/api/status" | "/api/upgrade" | "/api/reboot"
-                | "/api/config" | "/api/config.json" | "/api/config/confirm"
+                | "/api/config" | "/api/config.json" | "/api/config/effective"
+                | "/api/config/effective.json" | "/api/config/confirm"
                 | "/api/config/revert",
             ) => {
                 Err((405, "method not allowed"))
@@ -461,6 +470,14 @@ impl Mgmt {
             }
             Route::ConfigJson => {
                 let json = config::base().to_json();
+                self.conns[i].respond_json(200, &json);
+            }
+            Route::EffectiveGet => {
+                let toml = config::get().to_toml();
+                self.conns[i].respond(200, "application/toml", &[], toml.as_bytes());
+            }
+            Route::EffectiveJson => {
+                let json = config::get().to_json();
                 self.conns[i].respond_json(200, &json);
             }
             Route::ConfigPut => self.check_config(i),
@@ -756,7 +773,7 @@ fn status_json(
     cpu.push_str("]}");
     let _ = write!(
         s,
-        "{{\"version\":{},\"arch\":{},\"config\":{},\"store\":{},\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"conntrack\":{},\
+        "{{\"version\":{},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"conntrack\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"wan_lease\":{wan_lease},\
          \"mgmt\":{{\"on_wan\":{},\"upgrade\":{}}},\"interfaces\":[",
@@ -766,8 +783,19 @@ fn status_json(
         } else {
             "aarch64"
         }),
+        json_str(&format!("{}", config::Redacted(config::bootargs()))),
         json_str(config::source()),
+        config::overrides()
+            .iter()
+            .map(|(path, kv)| format!("{}:{}", json_str(path), json_str(kv)))
+            .collect::<Vec<_>>()
+            .join(","),
         mgmt.has_store,
+        crate::store::probes()
+            .iter()
+            .map(|d| json_str(d))
+            .collect::<Vec<_>>()
+            .join(","),
         trial,
         timer::uptime().as_secs(),
         datapath::FORWARDED.load(Ordering::Relaxed),
