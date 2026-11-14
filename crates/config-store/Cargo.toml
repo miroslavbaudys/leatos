@@ -1,0 +1,12 @@
+[package]
+name = "config-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Power-fail-safe persistent store: store header with areas, A/B record slots, MBR lookup, write plans."
+
+[dependencies]
+boot-image = { workspace = true }
+
+[lints]
+workspace = true

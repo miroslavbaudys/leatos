@@ -20,6 +20,7 @@ fwd = { path = "crates/fwd" }
 qdisc = { path = "crates/qdisc" }
 boot-image = { path = "crates/boot-image" }
 proto-http = { path = "crates/proto-http" }
+config-store = { path = "crates/config-store" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
