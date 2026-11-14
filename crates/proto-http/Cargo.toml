@@ -1,0 +1,11 @@
+[package]
+name = "proto-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Minimal HTTP/1.1 server side for the management interface: incremental request parser (streaming bodies), responses, Basic auth, JSON escaping."
+
+[dependencies]
+
+[lints]
+workspace = true

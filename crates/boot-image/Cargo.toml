@@ -1,0 +1,11 @@
+[package]
+name = "boot-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kernel images for in-place upgrades: ELF64 validation and flattening, Multiboot2 header check and boot-information builder, CRC-32."
+
+[dependencies]
+
+[lints]
+workspace = true
