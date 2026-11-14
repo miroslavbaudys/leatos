@@ -50,6 +50,32 @@ static POLLS: AtomicU64 = AtomicU64::new(0);
 static IDLE_WAITS: AtomicU64 = AtomicU64::new(0);
 static IDLE_SPINS: AtomicU64 = AtomicU64::new(0);
 static SPIN_TICKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Timer ticks spent in `wfi`/`hlt` (on x86_64 including the IRQ
+/// handlers, which run inside `sti; hlt`; on aarch64 they run after it).
+static WAIT_TICKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Timer ticks spent polling tasks, per priority class.
+static POLL_TICKS: [AtomicU64; CLASSES] = [const { AtomicU64::new(0) }; CLASSES];
+
+/// Cumulative CPU time accounting in timer ticks (`cpuload` takes the
+/// differences).
+#[derive(Clone, Copy, Debug)]
+pub struct CpuTicks {
+    /// When the snapshot was taken.
+    pub at: u64,
+    /// Waiting: `wfi`/`hlt` plus hybrid-idle spinning.
+    pub idle: u64,
+    pub datapath: u64,
+    pub service: u64,
+}
+
+pub fn cpu_ticks() -> CpuTicks {
+    CpuTicks {
+        at: timer::ticks(),
+        idle: WAIT_TICKS_TOTAL.load(Ordering::Relaxed) + SPIN_TICKS_TOTAL.load(Ordering::Relaxed),
+        datapath: POLL_TICKS[Priority::Datapath as usize].load(Ordering::Relaxed),
+        service: POLL_TICKS[Priority::Service as usize].load(Ordering::Relaxed),
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Stats {
@@ -98,7 +124,10 @@ fn poll_task(task: Arc<Task>) {
     let mut slot = task.future.lock();
     if let Some(fut) = slot.as_mut() {
         POLLS.fetch_add(1, Ordering::Relaxed);
-        if let Poll::Ready(()) = fut.as_mut().poll(&mut cx) {
+        let t0 = timer::ticks();
+        let done = fut.as_mut().poll(&mut cx).is_ready();
+        POLL_TICKS[task.prio as usize].fetch_add(timer::ticks() - t0, Ordering::Relaxed);
+        if done {
             *slot = None; // completed; drop the future now
         }
     }
@@ -143,7 +172,11 @@ pub fn run() -> ! {
             }
             IDLE_WAITS.fetch_add(1, Ordering::Relaxed);
             #[cfg(not(feature = "idle-poll"))]
-            crate::arch::cpu::wait_for_interrupt();
+            {
+                let t0 = timer::ticks();
+                crate::arch::cpu::wait_for_interrupt();
+                WAIT_TICKS_TOTAL.fetch_add(timer::ticks() - t0, Ordering::Relaxed);
+            }
         }
         irq::enable(); // pending IRQs are taken here
     }

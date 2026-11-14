@@ -5,9 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rrouter</title>
 <style>
-  :root { --bg:#f6f7f9; --card:#fff; --fg:#1d2330; --muted:#6b7280; --line:#e3e6eb; --ok:#15803d; --bad:#b91c1c; --accent:#2563eb; }
+  :root { --bg:#f6f7f9; --card:#fff; --fg:#1d2330; --muted:#6b7280; --line:#e3e6eb; --ok:#15803d; --bad:#b91c1c; --accent:#2563eb;
+          --s1:#2a78d6; --s2:#eb6834; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#111418; --card:#1a1f26; --fg:#e6e9ee; --muted:#9aa3af; --line:#2a313b; --ok:#4ade80; --bad:#f87171; --accent:#60a5fa; }
+    :root { --bg:#111418; --card:#1a1f26; --fg:#e6e9ee; --muted:#9aa3af; --line:#2a313b; --ok:#4ade80; --bad:#f87171; --accent:#60a5fa;
+            --s1:#3987e5; --s2:#d95926; }
   }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
@@ -28,11 +30,31 @@
   .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:6px 0; }
   #msg { white-space:pre-wrap; color:var(--muted); }
   .warn { color:var(--bad); font-weight:600; }
+  .stat { display:flex; gap:20px; align-items:baseline; flex-wrap:wrap; margin-bottom:6px; }
+  .stat b { font-size:26px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .stat span { color:var(--muted); }
+  .legend { display:flex; gap:14px; color:var(--muted); font-size:13px; }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
+  .chart { position:relative; }
+  .chart svg { display:block; width:100%; height:170px; touch-action:none; }
+  .chart .grid { stroke:var(--line); stroke-width:1; }
+  .chart text { fill:var(--muted); font-size:11px; font-variant-numeric:tabular-nums; }
+  .chart .hair { stroke:var(--muted); stroke-width:1; }
+  .tip { position:absolute; top:4px; pointer-events:none; background:var(--card); border:1px solid var(--line); border-radius:6px;
+         padding:6px 8px; font-size:12px; font-variant-numeric:tabular-nums; white-space:nowrap; box-shadow:0 2px 8px rgba(0,0,0,.12); }
+  .tip i { display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:5px; }
+  details { margin-top:6px; color:var(--muted); }
 </style>
 </head>
 <body>
 <header><h1>rrouter</h1><span id="ver">…</span><span id="up"></span><span id="wanwarn" class="warn"></span></header>
 <main>
+  <section class="wide"><h2>CPU load (core 0, the only core in use)</h2>
+    <div class="stat"><div><b id="cpunow">–</b> <span>last second</span></div><div><b id="cpuavg">–</b> <span id="cpuavgl">average</span></div>
+      <div class="legend"><span><i style="background:var(--s1)"></i>Network task (forwarding, DHCP, DNS, web)</span><span><i style="background:var(--s2)"></i>Other (IRQs, timers, executor)</span></div></div>
+    <div class="chart"><svg id="cpu" role="img" aria-label="CPU load over the last 5 minutes"></svg><div id="cputip" class="tip" hidden></div></div>
+    <details><summary>Last 10 seconds as a table</summary><table id="cputab"></table></details>
+  </section>
   <section class="wide"><h2>Interfaces</h2><table id="ifs"></table></section>
   <section><h2>WAN lease</h2><table id="wan"></table></section>
   <section><h2>System</h2><table id="sys"></table></section>
@@ -51,10 +73,80 @@ const n = (x) => Number(x).toLocaleString();
 const rows = (pairs) => pairs.map(([k, v]) => `<tr><th>${esc(k)}</th><td>${v}</td></tr>`).join("");
 const dur = (s) => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + "d " : "") + h + "h " + m + "m " + (s % 60) + "s"; };
 
+// CPU load: samples are [busy, datapath, service] in permille, oldest first,
+// one per second. "datapath" is the network task (it also runs DHCP, DNS and
+// this web server); stacked on top: the rest of busy (IRQs, timers, the
+// executor, service-priority tasks).
+let cpuS = [], cpuEv = null;
+const pct = (p) => (p / 10).toFixed(1) + " %";
+function drawCpu() {
+  const svg = $("cpu"), s = cpuS, N = 300;
+  const W = Math.max(svg.clientWidth, 200), H = 170, L = 40, R = 6, T = 8, B = 20;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const x = (i) => L + (W - L - R) * (N - s.length + i) / (N - 1);
+  const y = (v) => T + (H - T - B) * (1 - Math.min(v, 1000) / 1000);
+  let g = "";
+  for (const v of [0, 500, 1000]) {
+    g += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v / 10} %</text>`;
+  }
+  g += `<text x="${L}" y="${H - 4}">5 min ago</text><text x="${W - R}" y="${H - 4}" text-anchor="end">now</text>`;
+  if (s.length >= 2) {
+    const pts = (f) => s.map((d, i) => `${x(i).toFixed(1)},${y(f(d)).toFixed(1)}`);
+    const dp = pts((d) => d[1]), tot = pts((d) => Math.max(d[0], d[1]));
+    const x0 = x(0).toFixed(1), xn = x(s.length - 1).toFixed(1), y0 = y(0);
+    g += `<path d="M${x0},${y0}L${dp.join("L")}L${xn},${y0}Z" fill="var(--s1)" fill-opacity=".16"/>`;
+    g += `<path d="M${tot.join("L")}L${dp.slice().reverse().join("L")}Z" fill="var(--s2)" fill-opacity=".16"/>`;
+    g += `<polyline points="${tot.join(" ")}" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>`;
+    g += `<polyline points="${dp.join(" ")}" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>`;
+  } else {
+    g += `<text x="${(L + W) / 2}" y="${H / 2}" text-anchor="middle">collecting…</text>`;
+  }
+  g += `<line id="hair" class="hair" y1="${T}" y2="${H - B}" visibility="hidden"/>`;
+  svg.innerHTML = g;
+  svg.cpuMap = { x, L, R, W, N };
+  if (cpuEv) cpuHover(cpuEv);
+}
+function cpuHover(ev) {
+  cpuEv = ev;
+  const svg = $("cpu"), m = svg.cpuMap, s = cpuS;
+  if (!m || !s.length) return;
+  const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) * m.W / r.width;
+  const i = Math.max(0, Math.min(s.length - 1, Math.round((px - m.L) / (m.W - m.L - m.R) * (m.N - 1)) - (m.N - s.length)));
+  const [busy, dp] = s[i], hx = m.x(i), ago = s.length - 1 - i;
+  const h = $("hair");
+  h.setAttribute("x1", hx); h.setAttribute("x2", hx); h.setAttribute("visibility", "visible");
+  const tip = $("cputip"), line = (color, label, v) => {
+    const d = document.createElement("div");
+    if (color) { const k = document.createElement("i"); k.style.background = color; d.append(k); }
+    d.append(label + (v === undefined ? "" : ": " + pct(v)));
+    return d;
+  };
+  tip.replaceChildren(line(null, ago ? `${ago} s ago` : "last second"),
+    line("var(--s1)", "Network task", dp), line("var(--s2)", "Other", Math.max(busy - dp, 0)), line(null, "Total", busy));
+  tip.hidden = false;
+  const left = hx * r.width / m.W;
+  tip.style.left = (left + 12 + tip.offsetWidth > r.width ? left - 12 - tip.offsetWidth : left + 12) + "px";
+}
+$("cpu").addEventListener("pointermove", cpuHover);
+$("cpu").addEventListener("pointerleave", () => { cpuEv = null; $("cputip").hidden = true; const h = $("hair"); if (h) h.setAttribute("visibility", "hidden"); });
+window.addEventListener("resize", drawCpu);
+function showCpu(cpu) {
+  cpuS = cpu.samples;
+  const last = cpuS[cpuS.length - 1];
+  $("cpunow").textContent = last ? pct(last[0]) : "–";
+  $("cpuavg").textContent = cpuS.length ? pct(cpuS.reduce((a, d) => a + d[0], 0) / cpuS.length) : "–";
+  const secs = cpuS.length * cpu.interval_s;
+  $("cpuavgl").textContent = secs >= 60 ? `average, last ${Math.round(secs / 60)} min` : `average, last ${secs} s`;
+  $("cputab").innerHTML = "<tr><th>Seconds ago</th><th>Total</th><th>Network task</th><th>Other</th></tr>" +
+    cpuS.slice(-10).reverse().map((d, i) => `<tr><td>${i}</td><td>${pct(d[0])}</td><td>${pct(d[1])}</td><td>${pct(Math.max(d[0] - d[1], 0))}</td></tr>`).join("");
+  drawCpu();
+}
+
 async function refresh() {
   let st;
   try { st = await (await fetch("/api/status", {cache: "no-store"})).json(); }
   catch (e) { $("up").textContent = "offline"; return; }
+  if (st.cpu) showCpu(st.cpu);
   $("ver").textContent = `v${st.version} · ${st.arch}`;
   $("up").textContent = "up " + dur(st.uptime_s);
   $("wanwarn").textContent = st.mgmt.on_wan ? "management open on WAN (mgmt=wan)" : "";

@@ -181,7 +181,11 @@ impl Mgmt {
         let staging = crate::mm::heap::take_staging();
         println!(
             "  mgmt            : http :{PORT} on {}, upgrade {}",
-            if cfg.on_wan { "lan + WAN (mgmt=wan: development only!)" } else { "lan" },
+            if cfg.on_wan {
+                "lan + WAN (mgmt=wan: development only!)"
+            } else {
+                "lan"
+            },
             match (&staging, cfg.password) {
                 (None, _) => "unavailable (no staging area on this platform)",
                 (Some(_), None) => "disabled (boot with mgmt_pass=...)",
@@ -208,7 +212,9 @@ impl Mgmt {
             return Err((403, "disabled: boot with mgmt_pass=<password>"));
         };
         match proto_http::basic_auth(head) {
-            Some((u, p)) if u == "admin" && proto_http::ct_eq(p.as_bytes(), pass.as_bytes()) => Ok(()),
+            Some((u, p)) if u == "admin" && proto_http::ct_eq(p.as_bytes(), pass.as_bytes()) => {
+                Ok(())
+            }
             _ => Err((401, "wrong or missing credentials (user admin)")),
         }
     }
@@ -350,7 +356,10 @@ impl Mgmt {
         }
         let c = &mut self.conns[i];
         if self.uploader == Some(i) && c.responded_at.is_none() {
-            let st = self.staging.as_deref_mut().expect("uploader without staging");
+            let st = self
+                .staging
+                .as_deref_mut()
+                .expect("uploader without staging");
             let end = c.upload_len + step.body.len();
             st[c.upload_len..end].copy_from_slice(step.body);
             c.crc = boot_image::crc32(c.crc, step.body);
@@ -409,7 +418,11 @@ impl Mgmt {
                     After::Nothing => {}
                 }
             }
-            let limit = if self.uploader == Some(i) { UPLOAD_TIMEOUT } else { REQUEST_TIMEOUT };
+            let limit = if self.uploader == Some(i) {
+                UPLOAD_TIMEOUT
+            } else {
+                REQUEST_TIMEOUT
+            };
             // Answered before the body was read (an early error): the client
             // has its answer, the rest of the body is unwanted.
             let early = flushed && !c.parser.is_done();
@@ -445,14 +458,36 @@ fn status_json(
     let mut s = String::with_capacity(2048);
     let (pool_free, pool_cap, pool_fail) = crate::net::packet::pool_stats();
     let (heap_used, heap_free) = crate::mm::heap::usage();
+    // CPU load history: [busy, datapath, service] in permille, oldest first.
+    let mut cpu = format!(
+        "{{\"interval_s\":{},\"samples\":[",
+        crate::cpuload::INTERVAL.as_secs()
+    );
+    let mut first = true;
+    crate::cpuload::history(|x| {
+        let _ = write!(
+            cpu,
+            "{}[{},{},{}]",
+            if first { "" } else { "," },
+            x.busy,
+            x.datapath,
+            x.service
+        );
+        first = false;
+    });
+    cpu.push_str("]}");
     let _ = write!(
         s,
         "{{\"version\":{},\"arch\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"conntrack\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
-         \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"wan_lease\":{wan_lease},\
+         \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"wan_lease\":{wan_lease},\
          \"mgmt\":{{\"on_wan\":{},\"upgrade\":{}}},\"interfaces\":[",
         json_str(env!("CARGO_PKG_VERSION")),
-        json_str(if cfg!(target_arch = "x86_64") { "x86_64" } else { "aarch64" }),
+        json_str(if cfg!(target_arch = "x86_64") {
+            "x86_64"
+        } else {
+            "aarch64"
+        }),
         timer::uptime().as_secs(),
         datapath::FORWARDED.load(Ordering::Relaxed),
         datapath::DROPPED.load(Ordering::Relaxed),
@@ -464,7 +499,9 @@ fn status_json(
         let st = nif.dev.stats();
         let q = nif.qdisc.stats();
         let link = match nif.link {
-            Some((up, mbps, full)) => format!("{{\"up\":{up},\"mbps\":{mbps},\"full_duplex\":{full}}}"),
+            Some((up, mbps, full)) => {
+                format!("{{\"up\":{up},\"mbps\":{mbps},\"full_duplex\":{full}}}")
+            }
             None => String::from("null"),
         };
         let addrs: Vec<String> = nif
@@ -486,7 +523,10 @@ fn status_json(
             if n > 0 { "," } else { "" },
             json_str(nif.name),
             json_str(nif.dev.model()),
-            json_str(&format!("{}", smoltcp::wire::EthernetAddress(nif.dev.mac()))),
+            json_str(&format!(
+                "{}",
+                smoltcp::wire::EthernetAddress(nif.dev.mac())
+            )),
             addrs.join(","),
             st.rx_packets,
             st.rx_bytes,
@@ -509,7 +549,10 @@ fn status_json(
                 if n > 0 { "," } else { "" },
                 json_str(&format!("{}", smoltcp::wire::EthernetAddress(l.mac))),
                 json_str(&format!("{}", l.ip)),
-                l.hostname.as_deref().map(json_str).unwrap_or_else(|| String::from("null")),
+                l.hostname
+                    .as_deref()
+                    .map(json_str)
+                    .unwrap_or_else(|| String::from("null")),
                 l.state == proto_dhcp::v4::server::LeaseState::Bound,
                 l.expires.saturating_sub(now),
             );

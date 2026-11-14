@@ -20,6 +20,7 @@ extern crate alloc;
 mod arch;
 mod config;
 mod console;
+mod cpuload;
 mod drivers;
 mod executor;
 mod irq;
@@ -81,6 +82,7 @@ pub fn kmain(boot_arg: usize) -> ! {
 
     selftest::fault_tests();
     selftest::spawn(has_net);
+    cpuload::spawn();
     executor::spawn(Priority::Datapath, "net", net::stack::run(ifs));
     executor::run()
 }
