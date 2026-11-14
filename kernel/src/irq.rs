@@ -117,12 +117,15 @@ pub fn register(intid: u32, action: fn(u32), event: &'static IrqEvent) {
         Entry { action, event }
     });
     assert!(first, "irq: intid {intid} registered twice");
-    EVENTS.lock().push(event);
 }
 
-/// Allocate an event that lives forever (one per device/IRQ source).
+/// Allocate an event that lives forever: one per device/IRQ source
+/// ([`register`]), or a wakeup between tasks (`signal` from thread
+/// context). Either way the executor delivers it ([`wake_fired`]).
 pub fn new_event() -> &'static IrqEvent {
-    Box::leak(Box::new(IrqEvent::new()))
+    let ev: &'static IrqEvent = Box::leak(Box::new(IrqEvent::new()));
+    EVENTS.lock().push(ev);
+    ev
 }
 
 /// Called by the arch IRQ entry for each acknowledged interrupt.

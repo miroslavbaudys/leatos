@@ -18,9 +18,10 @@
 //! Each connection serves one request (`Connection: close`). A response is
 //! queued whole; the socket is closed once it is sent.
 
-use crate::net::datapath::{self, Datapath};
+use crate::net::datapath;
 use crate::net::services::LanServices;
-use crate::net::stack::NetIf;
+use crate::net::shared::Shared;
+use crate::net::svc::HostIf;
 use crate::upgrade::{self, Prepared};
 use crate::{config, println, timer};
 use alloc::format;
@@ -164,8 +165,8 @@ fn tcp_socket() -> tcp::Socket<'static> {
 }
 
 impl Mgmt {
-    /// `ifs[0]` = WAN, `ifs[1]` = LAN.
-    pub fn new(ifs: &mut [NetIf]) -> Self {
+    /// `hosts[0]` = WAN, `hosts[1]` = LAN.
+    pub fn new(ifs: &mut [HostIf]) -> Self {
         let cfg = config::mgmt();
         let mut conns = Vec::new();
         for (ifx, nif) in ifs.iter_mut().enumerate().take(2) {
@@ -370,8 +371,8 @@ impl Mgmt {
     /// Serve all connections. Returns an action once its response is sent.
     pub fn step(
         &mut self,
-        ifs: &mut [NetIf],
-        dp: &Datapath,
+        ifs: &mut [HostIf],
+        sh: &Shared,
         services: Option<&LanServices>,
     ) -> Option<Action> {
         let mut action = None;
@@ -389,7 +390,7 @@ impl Mgmt {
             let c = &self.conns[i];
             if c.head.is_some() && c.responded_at.is_none() && c.parser.is_done() {
                 let mut json = (c.route == Some(Route::Status))
-                    .then(|| status_json(ifs, dp, services, &self.wan_lease, self));
+                    .then(|| status_json(ifs, sh, services, &self.wan_lease, self));
                 self.on_done(i, &mut || json.take().unwrap_or_default());
             }
             // Send, close, recycle.
@@ -449,8 +450,8 @@ impl Mgmt {
 }
 
 fn status_json(
-    ifs: &[NetIf],
-    dp: &Datapath,
+    ifs: &[HostIf],
+    sh: &Shared,
     services: Option<&LanServices>,
     wan_lease: &str,
     mgmt: &Mgmt,
@@ -491,28 +492,30 @@ fn status_json(
         timer::uptime().as_secs(),
         datapath::FORWARDED.load(Ordering::Relaxed),
         datapath::DROPPED.load(Ordering::Relaxed),
-        dp.fwd.ct.len(),
+        sh.conntrack(),
         mgmt.on_wan,
         mgmt.password.is_some() && (mgmt.staging.is_some() || mgmt.uploader.is_some()),
     );
-    for (n, nif) in ifs.iter().enumerate() {
-        let st = nif.dev.stats();
-        let q = nif.qdisc.stats();
-        let link = match nif.link {
+    for (n, (host, nif)) in ifs.iter().zip(&sh.ports).enumerate() {
+        let snap = *nif.snap.lock();
+        let st = snap.stats;
+        let (q, rate) = {
+            let q = nif.qdisc.lock();
+            (q.stats(), q.rate())
+        };
+        let link = match snap.link {
             Some((up, mbps, full)) => {
                 format!("{{\"up\":{up},\"mbps\":{mbps},\"full_duplex\":{full}}}")
             }
             None => String::from("null"),
         };
-        let addrs: Vec<String> = nif
+        let addrs: Vec<String> = host
             .iface
             .ip_addrs()
             .iter()
             .map(|a| json_str(&format!("{a}")))
             .collect();
-        let rate = nif
-            .qdisc
-            .rate()
+        let rate = rate
             .map(|r| format!("{}", r.bits_per_sec / 1000))
             .unwrap_or_else(|| String::from("null"));
         let _ = write!(
@@ -522,11 +525,8 @@ fn status_json(
              \"qdisc\":{{\"shaped_kbit\":{rate},\"sent\":{},\"dropped\":{},\"ecn_marked\":{},\"backlog_packets\":{}}}}}",
             if n > 0 { "," } else { "" },
             json_str(nif.name),
-            json_str(nif.dev.model()),
-            json_str(&format!(
-                "{}",
-                smoltcp::wire::EthernetAddress(nif.dev.mac())
-            )),
+            json_str(nif.model),
+            json_str(&format!("{}", smoltcp::wire::EthernetAddress(nif.mac))),
             addrs.join(","),
             st.rx_packets,
             st.rx_bytes,

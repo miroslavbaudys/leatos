@@ -9,7 +9,7 @@
 //! `:<random high port>` (queries to upstream servers).
 
 use crate::config;
-use crate::net::stack::NetIf;
+use crate::net::svc::HostIf;
 use crate::{println, timer};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -50,7 +50,7 @@ fn now_secs() -> u64 {
 }
 
 impl LanServices {
-    pub fn new(lan: &mut NetIf, wan: Option<&mut NetIf>) -> Self {
+    pub fn new(lan: &mut HostIf, wan: Option<&mut HostIf>) -> Self {
         let cfg = config::lan();
         let dns_cfg = config::dns();
 

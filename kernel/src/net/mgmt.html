@@ -6,10 +6,10 @@
 <title>rrouter</title>
 <style>
   :root { --bg:#f6f7f9; --card:#fff; --fg:#1d2330; --muted:#6b7280; --line:#e3e6eb; --ok:#15803d; --bad:#b91c1c; --accent:#2563eb;
-          --s1:#2a78d6; --s2:#eb6834; }
+          --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; }
   @media (prefers-color-scheme: dark) {
     :root { --bg:#111418; --card:#1a1f26; --fg:#e6e9ee; --muted:#9aa3af; --line:#2a313b; --ok:#4ade80; --bad:#f87171; --accent:#60a5fa;
-            --s1:#3987e5; --s2:#d95926; }
+            --s1:#3987e5; --s2:#d95926; --s3:#199e70; }
   }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
@@ -51,7 +51,7 @@
 <main>
   <section class="wide"><h2>CPU load (core 0, the only core in use)</h2>
     <div class="stat"><div><b id="cpunow">–</b> <span>last second</span></div><div><b id="cpuavg">–</b> <span id="cpuavgl">average</span></div>
-      <div class="legend"><span><i style="background:var(--s1)"></i>Network task (forwarding, DHCP, DNS, web)</span><span><i style="background:var(--s2)"></i>Other (IRQs, timers, executor)</span></div></div>
+      <div class="legend"><span><i style="background:var(--s1)"></i>Datapath (forwarding, CAKE)</span><span><i style="background:var(--s2)"></i>Services (DHCP, DNS, web)</span><span><i style="background:var(--s3)"></i>Other (IRQs, timers)</span></div></div>
     <div class="chart"><svg id="cpu" role="img" aria-label="CPU load over the last 5 minutes"></svg><div id="cputip" class="tip" hidden></div></div>
     <details><summary>Last 10 seconds as a table</summary><table id="cputab"></table></details>
   </section>
@@ -74,9 +74,9 @@ const rows = (pairs) => pairs.map(([k, v]) => `<tr><th>${esc(k)}</th><td>${v}</t
 const dur = (s) => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + "d " : "") + h + "h " + m + "m " + (s % 60) + "s"; };
 
 // CPU load: samples are [busy, datapath, service] in permille, oldest first,
-// one per second. "datapath" is the network task (it also runs DHCP, DNS and
-// this web server); stacked on top: the rest of busy (IRQs, timers, the
-// executor, service-priority tasks).
+// one per second. Stacked from the bottom: datapath (the forwarding task),
+// services (router stack, DHCP, DNS, this web server), other (the rest of
+// busy: IRQs, timers, the executor).
 let cpuS = [], cpuEv = null;
 const pct = (p) => (p / 10).toFixed(1) + " %";
 function drawCpu() {
@@ -92,12 +92,15 @@ function drawCpu() {
   g += `<text x="${L}" y="${H - 4}">5 min ago</text><text x="${W - R}" y="${H - 4}" text-anchor="end">now</text>`;
   if (s.length >= 2) {
     const pts = (f) => s.map((d, i) => `${x(i).toFixed(1)},${y(f(d)).toFixed(1)}`);
-    const dp = pts((d) => d[1]), tot = pts((d) => Math.max(d[0], d[1]));
+    const dp = pts((d) => d[1]), sv = pts((d) => d[1] + d[2]), tot = pts((d) => Math.max(d[0], d[1] + d[2]));
     const x0 = x(0).toFixed(1), xn = x(s.length - 1).toFixed(1), y0 = y(0);
+    const band = (top, bottom) => `M${top.join("L")}L${bottom.slice().reverse().join("L")}Z`;
     g += `<path d="M${x0},${y0}L${dp.join("L")}L${xn},${y0}Z" fill="var(--s1)" fill-opacity=".16"/>`;
-    g += `<path d="M${tot.join("L")}L${dp.slice().reverse().join("L")}Z" fill="var(--s2)" fill-opacity=".16"/>`;
-    g += `<polyline points="${tot.join(" ")}" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round"/>`;
-    g += `<polyline points="${dp.join(" ")}" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>`;
+    g += `<path d="${band(sv, dp)}" fill="var(--s2)" fill-opacity=".16"/>`;
+    g += `<path d="${band(tot, sv)}" fill="var(--s3)" fill-opacity=".16"/>`;
+    for (const [p, c] of [[tot, "--s3"], [sv, "--s2"], [dp, "--s1"]]) {
+      g += `<polyline points="${p.join(" ")}" fill="none" stroke="var(${c})" stroke-width="2" stroke-linejoin="round"/>`;
+    }
   } else {
     g += `<text x="${(L + W) / 2}" y="${H / 2}" text-anchor="middle">collecting…</text>`;
   }
@@ -112,7 +115,7 @@ function cpuHover(ev) {
   if (!m || !s.length) return;
   const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) * m.W / r.width;
   const i = Math.max(0, Math.min(s.length - 1, Math.round((px - m.L) / (m.W - m.L - m.R) * (m.N - 1)) - (m.N - s.length)));
-  const [busy, dp] = s[i], hx = m.x(i), ago = s.length - 1 - i;
+  const [busy, dp, sv] = s[i], hx = m.x(i), ago = s.length - 1 - i;
   const h = $("hair");
   h.setAttribute("x1", hx); h.setAttribute("x2", hx); h.setAttribute("visibility", "visible");
   const tip = $("cputip"), line = (color, label, v) => {
@@ -122,7 +125,7 @@ function cpuHover(ev) {
     return d;
   };
   tip.replaceChildren(line(null, ago ? `${ago} s ago` : "last second"),
-    line("var(--s1)", "Network task", dp), line("var(--s2)", "Other", Math.max(busy - dp, 0)), line(null, "Total", busy));
+    line("var(--s1)", "Datapath", dp), line("var(--s2)", "Services", sv), line("var(--s3)", "Other", Math.max(busy - dp - sv, 0)), line(null, "Total", busy));
   tip.hidden = false;
   const left = hx * r.width / m.W;
   tip.style.left = (left + 12 + tip.offsetWidth > r.width ? left - 12 - tip.offsetWidth : left + 12) + "px";
@@ -137,8 +140,8 @@ function showCpu(cpu) {
   $("cpuavg").textContent = cpuS.length ? pct(cpuS.reduce((a, d) => a + d[0], 0) / cpuS.length) : "–";
   const secs = cpuS.length * cpu.interval_s;
   $("cpuavgl").textContent = secs >= 60 ? `average, last ${Math.round(secs / 60)} min` : `average, last ${secs} s`;
-  $("cputab").innerHTML = "<tr><th>Seconds ago</th><th>Total</th><th>Network task</th><th>Other</th></tr>" +
-    cpuS.slice(-10).reverse().map((d, i) => `<tr><td>${i}</td><td>${pct(d[0])}</td><td>${pct(d[1])}</td><td>${pct(Math.max(d[0] - d[1], 0))}</td></tr>`).join("");
+  $("cputab").innerHTML = "<tr><th>Seconds ago</th><th>Total</th><th>Datapath</th><th>Services</th><th>Other</th></tr>" +
+    cpuS.slice(-10).reverse().map((d, i) => `<tr><td>${i}</td><td>${pct(d[0])}</td><td>${pct(d[1])}</td><td>${pct(d[2])}</td><td>${pct(Math.max(d[0] - d[1] - d[2], 0))}</td></tr>`).join("");
   drawCpu();
 }
 

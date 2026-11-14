@@ -43,7 +43,7 @@ we need a panic handler that reboots plus a watchdog (milestone M7).
 ```
 
 ### Packet path (implemented in M4: `kernel/src/net/datapath.rs` + `crates/fwd`)
-1. A virtio-net RX interrupt wakes the network task, which drains the RX queue in batches.
+1. A NIC RX interrupt wakes the datapath task (`net`), which drains the RX queue in batches.
 2. Classification: if the packet is addressed to the router (one of its IPs,
    ARP/NDP for its IPs, PPPoE discovery or control frames), hand it to the local
    path (smoltcp or a protocol state machine). Otherwise it goes to the forwarding plane.
@@ -52,9 +52,10 @@ we need a panic handler that reboots plus a watchdog (milestone M7).
    flow and host hashes, tin, wire length), WAN-ingress CAKE (download
    shaping), route lookup (LPM), neighbor resolution (queue the packet if the
    neighbor is unresolved), TTL decrement and incremental checksum update.
-   Packets *for* the router go into a small bounded per-port queue and
-   from there into smoltcp. The router's own transmissions also go through
-   the port's qdisc, so the qdisc sees all egress traffic.
+   Packets *for* the router go into a small bounded per-port queue
+   (`local_rx`) and from there into smoltcp, which runs in the services
+   task. The router's own transmissions go straight into the port's qdisc,
+   so the qdisc sees all egress traffic.
 4. Egress: enqueue into the egress interface's qdisc (CAKE on the WAN; a bounded FIFO until M6). A TX
    task **pulls** from the qdisc when the driver has ring space and the
    shaper allows it, then encapsulates and transmits. The qdisc is the only
@@ -69,6 +70,20 @@ the project (it effectively replaces netfilter), and it must be fuzzed.
 - Timers are **tickless** and high-resolution: program the next deadline in
   `CNTV_CVAL`. There is no periodic tick.
 - The executor has **priority classes**. Datapath work (RX → forward → qdisc → TX) runs before service tasks.
+
+### Tasks (M11 step 1)
+| Task | Priority | Owns | Does |
+|---|---|---|---|
+| `net` (`net::stack::run`) | Datapath | NICs (`Port`), `Datapath` (forwarder, neighbor table) | RX → forward → qdisc → TX, NAPI, housekeeping |
+| `svc` (`net::svc::run`) | Service | smoltcp interfaces and sockets (`HostIf`), DHCP client, LAN DHCP server, DNS, mgmt | the router's own traffic |
+
+They share only `net::shared`: per port a locked qdisc and `local_rx`
+queue, a stats snapshot for the status page, `Control` messages (WAN
+lease → forwarder, reboot/upgrade → the datapath quiesces the NICs) and two
+events (`dp_kick`, `svc_kick`). A service poll therefore delays forwarding
+by at most one poll, and the CPU accounting separates the two (`/api/status`
+`cpu`, the console's per-task `cpu` line). Next: the services and each
+direction of the datapath on their own cores (roadmap M11).
 - Interrupt handlers only acknowledge hardware and set flags or wake
   state. No allocation, no locks shared with thread context, no printing.
 - TX is pull-based with byte-limited driver rings (BQL-style).

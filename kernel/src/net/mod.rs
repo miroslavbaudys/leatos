@@ -6,4 +6,6 @@ pub mod device;
 pub mod mgmt;
 pub mod packet;
 pub mod services;
+pub mod shared;
 pub mod stack;
+pub mod svc;

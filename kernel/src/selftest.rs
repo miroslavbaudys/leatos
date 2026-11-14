@@ -154,8 +154,8 @@ pub fn spawn(has_net: bool) {
                 .unwrap();
             let ok = loop {
                 let (dhcp, ping) = (
-                    net::stack::DHCP_OK.load(Ordering::Acquire),
-                    net::stack::PING_OK.load(Ordering::Acquire),
+                    net::svc::DHCP_OK.load(Ordering::Acquire),
+                    net::svc::PING_OK.load(Ordering::Acquire),
                 );
                 if dhcp && ping {
                     break true;

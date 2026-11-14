@@ -91,7 +91,7 @@ if [[ "${LAB_VERBOSE:-0}" == "1" ]]; then
 fi
 
 echo "== router"
-tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|net wan0 .*lease|net ping|qos |qdisc " | sed 's/^/  /' || true
+tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|net wan0 .*lease|net ping|qos |qdisc |cpu  " | sed 's/^/  /' || true
 echo "== results"
 tr -d '\r' <"$WORK/client.log" | grep -E "^LAB (PASS|FAIL|INFO|WARN)|^    \|" | sed 's/^/  /' || true
 
@@ -122,6 +122,23 @@ if [[ "$SHAPE_KBIT" != 0 ]]; then
       router_fails=$((router_fails + 1))
     fi
   done
+fi
+
+# CPU time per task (services split, M11): forwarding runs in the `net`
+# (datapath) task, DHCP/DNS/web in the `svc` task. After the client's run
+# `svc` must have done work and `net` (which forwarded the shaped
+# transfers) more of it. Negative control: a kernel without the split (one
+# `net` task doing everything, e.g. commit bdcf72e) has no `svc` task and fails.
+line=$(tr -d '\r' <"$WORK/router.log" | grep "  cpu  " | tail -1 || true)
+net_ms=$(echo "$line" | sed -n 's/.*, net \([0-9]*\) ms.*/\1/p')
+svc_ms=$(echo "$line" | sed -n 's/.*, svc \([0-9]*\) ms.*/\1/p')
+what="net (datapath) ${net_ms:-?} ms, svc (services) ${svc_ms:-?} ms"
+if [[ -z "$net_ms" || -z "$svc_ms" ]]; then
+  echo "  LAB FAIL: cpu split: $what (no per-task counters)"; router_fails=$((router_fails + 1))
+elif [[ "$svc_ms" -gt 0 && "$net_ms" -gt "$svc_ms" ]]; then
+  echo "  LAB PASS: cpu split: $what"
+else
+  echo "  LAB FAIL: cpu split: expected svc > 0 and net > svc: $what"; router_fails=$((router_fails + 1))
 fi
 
 if [[ "$router_fails" == 0 ]] && tr -d '\r' <"$WORK/client.log" | grep -q "LAB DONE fails=0" && ! tr -d '\r' <"$WORK/client.log" | grep -q "LAB FAIL"; then

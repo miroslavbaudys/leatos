@@ -74,16 +74,16 @@ pub fn kmain(boot_arg: usize) -> ! {
         pci::print(pci);
     }
     let qos = config::qos();
-    let ifs = pci
-        .as_mut()
-        .map(|p| net::stack::bring_up(p, &qos))
-        .unwrap_or_default();
-    let has_net = !ifs.is_empty();
+    let net = pci.as_mut().and_then(|p| net::stack::bring_up(p, &qos));
+    let has_net = net.is_some();
 
     selftest::fault_tests();
     selftest::spawn(has_net);
     cpuload::spawn();
-    executor::spawn(Priority::Datapath, "net", net::stack::run(ifs));
+    if let Some((ports, hosts, shared)) = net {
+        executor::spawn(Priority::Datapath, "net", net::stack::run(ports, shared));
+        executor::spawn(Priority::Service, "svc", net::svc::run(hosts, shared));
+    }
     executor::run()
 }
 

@@ -8,14 +8,18 @@
 //!  port qdisc ─► (pull, while the NIC has room) ─► NIC TX
 //! ```
 //!
-//! The qdisc (a bounded FIFO until CAKE lands in M6) is the only place
-//! packets wait; the neighbor table holds at most 3 packets per unresolved
-//! next hop. RX is drained with a per-port budget so one busy port cannot
-//! starve the other.
+//! The qdisc is the only place packets wait; the neighbor table holds at
+//! most 3 packets per unresolved next hop. RX is drained with a per-port
+//! budget so one busy port cannot starve the other.
+//!
+//! Runs in the datapath task. The qdiscs and `local_rx` queues are the
+//! ports' shared, locked ones (`net::shared`): the services task's router
+//! stack reads `local_rx` and puts its own frames into the qdiscs.
 
 use crate::config;
 use crate::net::packet::{PacketBuf, PacketMeta};
-use crate::net::stack::NetIf;
+use crate::net::shared::{LOCAL_RX_MAX, Shared};
+use crate::net::stack::Port;
 use crate::timer;
 use core::net::Ipv4Addr;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -26,8 +30,6 @@ use qdisc::{Dequeue, Qdisc};
 
 /// Frames handled per port per loop iteration.
 const RX_BUDGET: usize = 64;
-/// Bound on frames waiting for the router stack (drained every iteration).
-pub const LOCAL_RX_MAX: usize = 64;
 const MAX_CONNS: usize = 16_384;
 const HOUSEKEEPING_MS: u64 = 1_000;
 
@@ -40,6 +42,7 @@ pub static FORWARDED: AtomicU64 = AtomicU64::new(0);
 pub static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 pub struct Datapath {
+    sh: &'static Shared,
     pub fwd: Forwarder,
     neigh: NeighTable<PacketBuf>,
     next_housekeeping: u64,
@@ -92,10 +95,10 @@ fn meta_from(class: &Classification, ingress: IfIndex, len: usize, now: u64) -> 
 }
 
 impl Datapath {
-    /// `ifs[0]` is the WAN, `ifs[1]` the LAN.
-    pub fn new(ifs: &[NetIf]) -> Self {
+    /// `sh.ports[0]` is the WAN, `sh.ports[1]` the LAN.
+    pub fn new(sh: &'static Shared) -> Self {
         let mut fwd = Forwarder::new(MAX_CONNS, timer::ticks() ^ 0x9e37_79b9_7f4a_7c15);
-        for (i, nif) in ifs.iter().enumerate() {
+        for (i, port) in sh.ports.iter().enumerate() {
             let (role, addr) = if i as IfIndex == WAN {
                 (Role::Wan, None)
             } else {
@@ -103,12 +106,13 @@ impl Datapath {
                 (Role::Lan, Some((lan.addr, lan.prefix)))
             };
             fwd.add_interface(Interface {
-                mac: nif.dev.mac(),
+                mac: port.mac,
                 addr,
                 role,
             });
         }
         Self {
+            sh,
             fwd,
             neigh: NeighTable::new(),
             next_housekeeping: 0,
@@ -131,28 +135,27 @@ impl Datapath {
             .set_default_route(gateway.filter(|_| addr.is_some()).map(|gw| (WAN, gw)));
     }
 
-    fn enqueue(&mut self, ifs: &mut [NetIf], egress: IfIndex, pkt: PacketBuf) {
+    fn enqueue(&mut self, egress: IfIndex, pkt: PacketBuf) {
         let now = now_ns();
-        if ifs[egress as usize].qdisc.enqueue(pkt, now).is_err() {
+        if self.sh.ports[egress as usize]
+            .qdisc
+            .lock()
+            .enqueue(pkt, now)
+            .is_err()
+        {
             self.qdisc_drops += 1;
             DROPPED.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Fill in the Ethernet addresses and queue for transmission.
-    fn send_resolved(
-        &mut self,
-        ifs: &mut [NetIf],
-        egress: IfIndex,
-        mac: wire::Mac,
-        mut pkt: PacketBuf,
-    ) {
+    fn send_resolved(&mut self, egress: IfIndex, mac: wire::Mac, mut pkt: PacketBuf) {
         let src = self.fwd.interface(egress).mac;
         wire::set_macs(pkt.data_mut(), mac, src);
-        self.enqueue(ifs, egress, pkt);
+        self.enqueue(egress, pkt);
     }
 
-    fn send_arp_request(&mut self, ifs: &mut [NetIf], ifx: IfIndex, target: Ipv4Addr) {
+    fn send_arp_request(&mut self, ifx: IfIndex, target: Ipv4Addr) {
         let iface = *self.fwd.interface(ifx);
         let (Some((my_ip, _)), Some(mut pkt)) = (iface.addr, PacketBuf::alloc()) else {
             return;
@@ -160,7 +163,7 @@ impl Datapath {
         pkt.set_len(60); // minimum Ethernet frame
         pkt.data_mut().fill(0);
         wire::build_arp_request(pkt.data_mut(), iface.mac, my_ip, target);
-        self.enqueue(ifs, ifx, pkt);
+        self.enqueue(ifx, pkt);
     }
 
     /// ECN diagnostics on a forwarded frame (before NAT/egress): codepoint
@@ -186,7 +189,7 @@ impl Datapath {
     }
 
     /// Learn neighbors from ARP and release packets waiting for them.
-    fn snoop_arp(&mut self, ifs: &mut [NetIf], ifx: IfIndex, frame: &[u8], now: u64) {
+    fn snoop_arp(&mut self, ifx: IfIndex, frame: &[u8], now: u64) {
         let Some(arp) = wire::parse_arp(frame) else {
             return;
         };
@@ -203,26 +206,27 @@ impl Datapath {
             return;
         }
         for pkt in self.neigh.learn(ifx, arp.sender_ip, arp.sender_mac, now) {
-            self.send_resolved(ifs, ifx, arp.sender_mac, pkt);
+            self.send_resolved(ifx, arp.sender_mac, pkt);
         }
     }
 
     /// Drain every NIC's RX ring (up to the budget) through the forwarder.
-    pub fn rx(&mut self, ifs: &mut [NetIf]) {
+    pub fn rx(&mut self, ports: &mut [Port]) {
         let now = now_ms();
         self.more_rx = false;
-        for i in 0..ifs.len() {
+        let mut local = false;
+        for (i, port) in ports.iter_mut().enumerate() {
             let ifx = i as IfIndex;
             for n in 0.. {
                 if n == RX_BUDGET {
                     self.more_rx = true;
                     break;
                 }
-                let Some(mut pkt) = ifs[i].dev.receive() else {
+                let Some(mut pkt) = port.dev.receive() else {
                     break;
                 };
                 if wire::ethertype(pkt.data()) == Some(wire::ETHERTYPE_ARP) {
-                    self.snoop_arp(ifs, ifx, pkt.data(), now);
+                    self.snoop_arp(ifx, pkt.data(), now);
                 }
                 let len = pkt.len();
                 match self
@@ -230,9 +234,10 @@ impl Datapath {
                     .process(now, ifx, pkt.data_with_tailroom_mut(), len)
                 {
                     Verdict::Local => {
-                        let q = &mut ifs[i].local_rx;
+                        let mut q = self.sh.ports[i].local_rx.lock();
                         if q.len() < LOCAL_RX_MAX {
                             q.push_back(pkt);
+                            local = true;
                         } else {
                             self.local_rx_drops += 1;
                         }
@@ -248,9 +253,9 @@ impl Datapath {
                         pkt.meta = meta_from(&class, ifx, len, now_ns());
                         FORWARDED.fetch_add(1, Ordering::Relaxed);
                         match self.neigh.resolve(egress, next_hop, pkt, now) {
-                            Resolve::Ready(mac, pkt) => self.send_resolved(ifs, egress, mac, pkt),
+                            Resolve::Ready(mac, pkt) => self.send_resolved(egress, mac, pkt),
                             Resolve::Queued { send_arp: true } => {
-                                self.send_arp_request(ifs, egress, next_hop)
+                                self.send_arp_request(egress, next_hop)
                             }
                             Resolve::Queued { send_arp: false } => {}
                         }
@@ -261,17 +266,20 @@ impl Datapath {
                 }
             }
         }
+        if local {
+            self.sh.svc_kick.signal();
+        }
     }
 
     /// Once a second: expire connections, retry ARP.
-    pub fn housekeeping(&mut self, ifs: &mut [NetIf]) {
+    pub fn housekeeping(&mut self, ports: &mut [Port]) {
         let now = now_ms();
         if now < self.next_housekeeping {
             return;
         }
         self.next_housekeeping = now + HOUSEKEEPING_MS;
         self.fwd.expire(now);
-        for nif in ifs.iter_mut() {
+        for nif in ports.iter_mut() {
             let changed = nif.dev.link_changed();
             if changed.is_some() {
                 nif.link = changed;
@@ -288,23 +296,24 @@ impl Datapath {
         }
         if now >= self.next_stats {
             self.next_stats = now + STATS_MS;
-            self.print_qdisc_stats(ifs);
+            self.print_qdisc_stats(ports);
         }
         for (ifx, ip) in self.neigh.poll(now) {
-            self.send_arp_request(ifs, ifx, ip);
+            self.send_arp_request(ifx, ip);
         }
     }
 
     /// Move packets from each qdisc to its NIC while the NIC has room and
     /// the shaper allows.
-    pub fn flush_tx(&mut self, ifs: &mut [NetIf]) -> FlushResult {
+    pub fn flush_tx(&mut self, ports: &mut [Port]) -> FlushResult {
         let now = now_ns();
         let mut r = FlushResult::default();
-        for nif in ifs.iter_mut() {
+        for (nif, sp) in ports.iter_mut().zip(&self.sh.ports) {
             nif.dev.reap_tx();
             let mut shaper_wait = None;
+            let mut qdisc = sp.qdisc.lock();
             while nif.dev.can_transmit() {
-                match nif.qdisc.dequeue(now) {
+                match qdisc.dequeue(now) {
                     Dequeue::Packet(p) => {
                         if nif.dev.transmit(p).is_err() {
                             self.qdisc_drops += 1;
@@ -319,16 +328,30 @@ impl Datapath {
             }
             if let Some(t) = shaper_wait {
                 r.shaper_wake_ns = Some(r.shaper_wake_ns.map_or(t, |w: u64| w.min(t)));
-            } else if nif.qdisc.stats().backlog_packets > 0 {
+            } else if qdisc.stats().backlog_packets > 0 {
                 r.ring_full_backlog = true;
             }
         }
         r
     }
 
+    /// Publish port counters and the connection count for the status page.
+    pub fn publish(&self, ports: &[Port]) {
+        for (nif, sp) in ports.iter().zip(&self.sh.ports) {
+            *sp.snap.lock() = crate::net::shared::PortSnap {
+                stats: nif.dev.stats(),
+                link: nif.link,
+            };
+        }
+        self.sh
+            .conntrack
+            .store(self.fwd.ct.len(), Ordering::Relaxed);
+    }
+
     /// One console line per port that sent traffic since the last report.
-    fn print_qdisc_stats(&mut self, ifs: &mut [NetIf]) {
-        for (i, nif) in ifs.iter().enumerate().take(2) {
+    fn print_qdisc_stats(&mut self, ports: &mut [Port]) {
+        let mut printed = false;
+        for (i, nif) in ports.iter().enumerate().take(2) {
             let total: u64 = self.ecn_seen[i].iter().sum();
             if total == self.ecn_reported[i] {
                 continue;
@@ -346,20 +369,25 @@ impl Datapath {
                 self.tcp_cwr[i]
             );
         }
-        for (i, nif) in ifs.iter_mut().enumerate().take(2) {
-            let s = nif.qdisc.stats();
+        for (i, nif) in ports.iter().enumerate().take(2) {
+            let mut qdisc = self.sh.ports[i].qdisc.lock();
+            let s = qdisc.stats();
             if s.dequeued == self.last_dequeued[i] {
                 continue;
             }
             self.last_dequeued[i] = s.dequeued;
-            let aqm = nif.qdisc.inner_mut();
+            printed = true;
+            let throttled = qdisc.throttled;
+            let rate = qdisc.rate();
+            let aqm = qdisc.inner_mut();
             let max_sojourn = aqm.take_max_sojourn_ns();
             let flows = aqm.diag();
-            let shaped = match nif.qdisc.rate() {
+            drop(qdisc); // the console is slow: print without holding the lock
+            let shaped = match rate {
                 Some(r) => alloc::format!(
                     "shaped {} kbit/s, throttled {}, ",
                     r.bits_per_sec / 1000,
-                    nif.qdisc.throttled
+                    throttled
                 ),
                 None => alloc::string::String::new(),
             };
@@ -373,6 +401,22 @@ impl Datapath {
                 s.backlog_packets,
                 max_sojourn / 1_000_000,
                 (max_sojourn / 1_000) % 1_000
+            );
+        }
+        // Cumulative CPU time by task class (scripts/lab-test.sh checks
+        // that forwarding lands in the datapath and DHCP/DNS in services).
+        if printed {
+            let t = crate::executor::cpu_ticks();
+            let ms = |ticks: u64| timer::ticks_to_duration(ticks).as_millis();
+            let mut tasks = alloc::string::String::new();
+            crate::executor::task_ticks(|name, ticks| {
+                use core::fmt::Write;
+                let _ = write!(tasks, ", {name} {} ms", ms(ticks));
+            });
+            crate::println!(
+                "  cpu             : idle {} ms, uptime {} ms{tasks}",
+                ms(t.idle),
+                timer::uptime().as_millis()
             );
         }
     }

@@ -5,10 +5,15 @@
 //! - TX: frames from the router's own stack go into the port's **qdisc**,
 //!   the same queue as forwarded traffic, so CAKE sees all egress traffic.
 //!   smoltcp only gets a TX token while the qdisc has room.
+//!
+//! The device is used by the services task (`net::svc`); queue and qdisc
+//! are the port's shared, locked ones (`net::shared::PortShared`). Each
+//! frame takes the lock briefly; `queued` counts frames put into the qdisc
+//! so the caller can wake the datapath.
 
 use crate::config::{AqmKind, Qos};
 use crate::net::packet::PacketBuf;
-use alloc::collections::VecDeque;
+use crate::net::shared::PortShared;
 use alloc::format;
 use alloc::string::String;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -133,9 +138,10 @@ impl Qdisc<PacketBuf> for Aqm {
 }
 
 pub struct PortDevice<'a> {
-    pub local_rx: &'a mut VecDeque<PacketBuf>,
-    pub qdisc: &'a mut PortQdisc,
+    pub port: &'a PortShared,
     pub now_ns: u64,
+    /// Frames put into the qdisc (the datapath must be woken to send them).
+    pub queued: &'a mut u32,
 }
 
 pub struct RxToken(PacketBuf);
@@ -147,8 +153,9 @@ impl phy::RxToken for RxToken {
 }
 
 pub struct TxToken<'a> {
-    qdisc: &'a mut PortQdisc,
+    port: &'a PortShared,
     now_ns: u64,
+    queued: &'a mut u32,
 }
 
 impl phy::TxToken for TxToken<'_> {
@@ -159,8 +166,10 @@ impl phy::TxToken for TxToken<'_> {
                 let r = f(pkt.data_mut());
                 pkt.meta.wire_len = len as u32;
                 pkt.meta.enqueue_ts = self.now_ns;
-                if self.qdisc.enqueue(pkt, self.now_ns).is_err() {
+                if self.port.qdisc.lock().enqueue(pkt, self.now_ns).is_err() {
                     TX_DROPS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    *self.queued += 1;
                 }
                 r
             }
@@ -185,21 +194,24 @@ impl Device for PortDevice<'_> {
         Self: 'a;
 
     fn receive(&mut self, _ts: Instant) -> Option<(RxToken, TxToken<'_>)> {
-        let pkt = self.local_rx.pop_front()?;
+        let pkt = self.port.local_rx.lock().pop_front()?;
         Some((
             RxToken(pkt),
             TxToken {
-                qdisc: self.qdisc,
+                port: self.port,
                 now_ns: self.now_ns,
+                queued: self.queued,
             },
         ))
     }
 
     fn transmit(&mut self, _ts: Instant) -> Option<TxToken<'_>> {
         let now_ns = self.now_ns;
-        self.qdisc.has_room().then_some(TxToken {
-            qdisc: self.qdisc,
+        let room = self.port.qdisc.lock().has_room();
+        room.then_some(TxToken {
+            port: self.port,
             now_ns,
+            queued: self.queued,
         })
     }
 

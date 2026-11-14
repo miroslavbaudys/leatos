@@ -2,8 +2,8 @@
 //! the last second core 0 was busy, split into datapath polls, service
 //! polls and the rest (IRQ handling, timers, the executor itself).
 //!
-//! "Datapath" is the `net` task, which also runs DHCP, DNS and the web
-//! interface; "service" is the service-priority tasks.
+//! "Datapath" is the `net` task (forwarding, CAKE); "service" is the
+//! service-priority tasks, mainly `svc` (router stack, DHCP, DNS, web).
 //!
 //! The executor accounts the time ([`executor::cpu_ticks`]): idle = time
 //! in `wfi`/`hlt` plus hybrid-idle spinning (waiting, not work), and the

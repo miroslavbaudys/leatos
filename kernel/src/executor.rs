@@ -37,13 +37,16 @@ const CLASSES: usize = 2;
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 struct Task {
-    #[allow(dead_code)] // for future diagnostics (task listing)
     name: &'static str,
     prio: Priority,
+    /// Timer ticks spent in this task's polls.
+    busy: AtomicU64,
     queued: AtomicBool,
     future: Mutex<Option<BoxFuture>>,
 }
 
+/// Every task ever spawned (for per-task CPU time).
+static TASKS: Mutex<alloc::vec::Vec<Arc<Task>>> = Mutex::new(alloc::vec::Vec::new());
 static QUEUES: [Mutex<VecDeque<Arc<Task>>>; CLASSES] =
     [const { Mutex::new(VecDeque::new()) }; CLASSES];
 static POLLS: AtomicU64 = AtomicU64::new(0);
@@ -66,6 +69,13 @@ pub struct CpuTicks {
     pub idle: u64,
     pub datapath: u64,
     pub service: u64,
+}
+
+/// Each task's name and the timer ticks its polls took so far.
+pub fn task_ticks(mut f: impl FnMut(&'static str, u64)) {
+    for t in TASKS.lock().iter() {
+        f(t.name, t.busy.load(Ordering::Relaxed));
+    }
 }
 
 pub fn cpu_ticks() -> CpuTicks {
@@ -103,9 +113,11 @@ pub fn spawn(prio: Priority, name: &'static str, fut: impl Future<Output = ()> +
     let task = Arc::new(Task {
         name,
         prio,
+        busy: AtomicU64::new(0),
         queued: AtomicBool::new(true),
         future: Mutex::new(Some(Box::pin(fut))),
     });
+    TASKS.lock().push(task.clone());
     QUEUES[prio as usize].lock().push_back(task);
 }
 
@@ -126,7 +138,9 @@ fn poll_task(task: Arc<Task>) {
         POLLS.fetch_add(1, Ordering::Relaxed);
         let t0 = timer::ticks();
         let done = fut.as_mut().poll(&mut cx).is_ready();
-        POLL_TICKS[task.prio as usize].fetch_add(timer::ticks() - t0, Ordering::Relaxed);
+        let dt = timer::ticks() - t0;
+        POLL_TICKS[task.prio as usize].fetch_add(dt, Ordering::Relaxed);
+        task.busy.fetch_add(dt, Ordering::Relaxed);
         if done {
             *slot = None; // completed; drop the future now
         }
