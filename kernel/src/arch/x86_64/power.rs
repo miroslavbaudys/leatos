@@ -1,7 +1,7 @@
 //! ACPI S5 (soft off): `SLP_TYP | SLP_EN` into PM1a/PM1b control. In QEMU
 //! this exits the emulator.
 
-use super::port::outw;
+use super::port::{inb, outb, outw};
 use crate::platform::PowerMethod;
 use spin::Once;
 
@@ -9,6 +9,26 @@ static METHOD: Once<PowerMethod> = Once::new();
 
 pub fn init(method: PowerMethod) {
     METHOD.call_once(|| method);
+}
+
+/// Reset the machine: the PCI reset control register (0xcf9, chipsets
+/// since the PIIX, including the apu4's AMD FCH and QEMU q35), then the
+/// keyboard controller's reset line as a fallback.
+pub fn reset() -> ! {
+    super::cpu::irq_disable();
+    outb(0xcf9, 0x02); // reset type: hard, not yet
+    outb(0xcf9, 0x06); // + do it
+    for _ in 0..1_000_000 {
+        core::hint::spin_loop();
+    }
+    for _ in 0..10_000 {
+        if inb(0x64) & 0x02 == 0 {
+            break; // input buffer empty
+        }
+    }
+    outb(0x64, 0xfe); // 8042: pulse the reset line
+    crate::fatal_println!("reset failed; halting");
+    super::cpu::halt()
 }
 
 #[cfg_attr(not(feature = "smoke-test"), allow(dead_code))] // used by smoke tests; later by the CLI

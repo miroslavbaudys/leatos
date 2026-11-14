@@ -34,6 +34,9 @@ environment variables:
 | `QEMU_SMP` | `1` | number of CPUs |
 | `QEMU_GDB` | `0` | `1` = start paused, with a gdb stub on `:1234` |
 | `QEMU_NET` | `none` | `user` = two virtio-net-pci NICs on user-mode networking (WAN `52:54:00:00:00:01`, LAN `…:02`); `lab` = WAN and LAN on UDP socket links to the lab ISP and client VMs |
+| `QEMU_DISK` | unset | x86_64: boot this disk image through SeaBIOS (e.g. `target/apu4/rrouter-apu4.img` from `scripts/apu-image.sh`: Limine → Multiboot2, the apu4 boot path) instead of `-kernel`; `QEMU_APPEND` is ignored (the command line is in `limine.conf`) |
+| `QEMU_NIC` | `virtio` | NIC model for WAN and LAN: `igb` = QEMU's Intel 82576, driven by the igb driver written for the apu4's i211 (pinned to slots 4 and 6: each igb reserves SR-IOV VF functions at devfn + 0x80) |
+| `QEMU_WAN_HOSTFWD` | unset | with `QEMU_NET=user`: forward a host port to the router's WAN, e.g. `tcp:127.0.0.1:8080-:80` (management interface; boot with `mgmt=wan`) |
 | `QEMU_PCAP_DIR` | unset | with `QEMU_NET=user`, write `wan.pcap` and `lan.pcap` |
 | `QEMU_EXTRA` | unset | extra arguments passed to QEMU |
 

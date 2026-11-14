@@ -1,8 +1,8 @@
 //! The network task: ports (NIC + qdisc + router stack), the forwarding
 //! datapath, and the router's own services.
 //!
-//! - WAN (first virtio-net): DHCPv4 client (smoltcp socket for now).
-//! - LAN (second virtio-net): static 192.168.1.1/24, DHCP server, DNS.
+//! - WAN (first NIC: virtio-net or igb, in PCI order): DHCPv4 client (smoltcp socket for now).
+//! - LAN (second NIC): static 192.168.1.1/24, DHCP server, DNS.
 //! - Every received frame goes through `net::datapath` first: frames for
 //!   the router reach smoltcp, everything else is forwarded (NAT, firewall).
 //! - After a WAN lease: ICMP echo to the gateway (boot self-test).
@@ -11,10 +11,11 @@
 //! wakes, clears the device's interrupt status, polls until idle, and
 //! unmasks. The task runs at `Priority::Datapath`.
 
-use crate::drivers::virtio_net::VirtioNet;
+use crate::drivers::{self, Nic};
 use crate::irq::{self, IrqEvent, Trigger};
 use crate::net::datapath::{self, Datapath};
 use crate::net::device::{Aqm, PortDevice, PortQdisc};
+use crate::net::mgmt::{Action, Mgmt};
 use crate::net::packet::PacketBuf;
 use crate::net::services::LanServices;
 use crate::pci::Pci;
@@ -41,7 +42,6 @@ pub static DHCP_OK: AtomicBool = AtomicBool::new(false);
 /// Set once the gateway answered a ping.
 pub static PING_OK: AtomicBool = AtomicBool::new(false);
 
-const LAN_ADDR: Ipv4Cidr = Ipv4Cidr::new(Ipv4Address::new(192, 168, 1, 1), 24);
 const PING_IDENT: u16 = 0x22b;
 const PING_COUNT: u16 = 3;
 const PING_INTERVAL: Duration = Duration::from_millis(200);
@@ -52,6 +52,11 @@ const PING_INTERVAL: Duration = Duration::from_millis(200);
 const QDISC_PACKETS: usize = 384;
 const QDISC_BYTES: usize = 384 * 1514;
 
+fn lan_cidr() -> Ipv4Cidr {
+    let lan = crate::config::lan();
+    Ipv4Cidr::new(lan.addr, lan.prefix)
+}
+
 /// Per-port variation for the AQM's random seed.
 fn mac_seed(mac: &[u8; 6]) -> u64 {
     mac.iter().fold(0, |a, &b| a << 8 | b as u64)
@@ -59,13 +64,15 @@ fn mac_seed(mac: &[u8; 6]) -> u64 {
 
 pub struct NetIf {
     pub name: &'static str,
-    pub dev: VirtioNet,
+    pub dev: Nic,
     /// Egress queue: forwarded traffic and the router's own traffic.
     pub qdisc: PortQdisc,
     /// Frames for the router stack (filled by the datapath, drained by smoltcp).
     pub local_rx: VecDeque<PacketBuf>,
-    iface: Interface,
+    pub(crate) iface: Interface,
     pub(crate) sockets: SocketSet<'static>,
+    /// Last known link state (up, Mbit/s, full duplex), if the NIC reports one.
+    pub link: Option<(bool, u32, bool)>,
     irq: Option<(u32, &'static IrqEvent)>,
     masked: bool,
 }
@@ -80,19 +87,19 @@ fn mask_intx(intid: u32) {
     arch::irqchip::disable(intid);
 }
 
-/// Bring up every virtio-net device: first = WAN, second = LAN.
+/// Bring up the first two supported NICs: first = WAN, second = LAN.
 /// WAN egress is shaped at the upload rate, LAN egress at the download rate.
 pub fn bring_up(pci: &mut Pci, qos: &crate::config::Qos) -> Vec<NetIf> {
     let devs: Vec<_> = pci
         .devices
         .iter()
-        .filter(|d| d.is_virtio_net())
+        .filter(|d| drivers::is_nic(d))
         .cloned()
         .collect();
     let mut ifs = Vec::new();
     for (i, d) in devs.iter().enumerate().take(2) {
         let name = if i == 0 { "wan0" } else { "lan0" };
-        let mut dev = match VirtioNet::new(pci, d) {
+        let mut dev = match Nic::new(pci, d) {
             Ok(dev) => dev,
             Err(e) => {
                 println!("  net {name}: init failed: {e:?}");
@@ -133,13 +140,13 @@ pub fn bring_up(pci: &mut Pci, qos: &crate::config::Qos) -> Vec<NetIf> {
         if i == 0 {
             sockets.add(dhcpv4::Socket::new());
         } else {
-            iface.update_ip_addrs(|a| a.push(IpCidr::Ipv4(LAN_ADDR)).expect("lan addr"));
+            iface.update_ip_addrs(|a| a.push(IpCidr::Ipv4(lan_cidr())).expect("lan addr"));
         }
         // Legacy INTx where the platform routes it (aarch64 DTB), otherwise
         // MSI-X (x86_64: INTx routing would need ACPI AML).
         let line = d.intx.map(|intid| (intid, Trigger::Level, "")).or_else(|| {
             let vector = arch::irqchip::msi_vector(i)?;
-            dev.route_msix(pci, d, 0).ok()?;
+            dev.prepare_msix(pci, d).ok()?;
             pci.enable_msix(d, vector)?;
             Some((vector, Trigger::Edge, " (MSI-X)"))
         });
@@ -147,10 +154,12 @@ pub fn bring_up(pci: &mut Pci, qos: &crate::config::Qos) -> Vec<NetIf> {
             let ev = irq::new_event();
             irq::register(intid, mask_intx, ev);
             arch::irqchip::enable(intid, trigger);
+            dev.enable_irq(trigger == Trigger::Edge);
             (intid, ev, kind)
         });
         println!(
-            "  net {name}       : virtio-net {} mac {} {}",
+            "  net {name}       : {} {} mac {} {}",
+            dev.model(),
             d.df,
             EthernetAddress(mac),
             match irq {
@@ -159,7 +168,7 @@ pub fn bring_up(pci: &mut Pci, qos: &crate::config::Qos) -> Vec<NetIf> {
             }
         );
         if i == 1 {
-            println!("  net {name}       : {LAN_ADDR} (static)");
+            println!("  net {name}       : {} (static)", lan_cidr());
         }
         ifs.push(NetIf {
             name,
@@ -170,6 +179,7 @@ pub fn bring_up(pci: &mut Pci, qos: &crate::config::Qos) -> Vec<NetIf> {
             sockets,
             irq: irq.map(|(intid, ev, _)| (intid, ev)),
             masked: false,
+            link: None,
         });
     }
     ifs
@@ -313,6 +323,15 @@ fn handle_dhcp(nif: &mut NetIf, pinger: &mut Pinger) -> Option<LeaseChange> {
                     .unwrap_or_else(|| "-".into()),
                 dns.join(", ")
             );
+            let lan = lan_cidr();
+            let shorter = cfg.address.prefix_len().min(lan.prefix_len());
+            let net = |a: Ipv4Address| u32::from(a) & (u32::MAX.checked_shl(32 - shorter as u32).unwrap_or(0));
+            if net(cfg.address.address()) == net(lan.address()) {
+                println!(
+                    "  net WARNING     : WAN {} overlaps LAN {lan}: forwarding between them breaks; boot with e.g. lan=10.10.0.1/24",
+                    cfg.address
+                );
+            }
             DHCP_OK.store(true, Ordering::Release);
             pinger.target = cfg.router;
             Some(LeaseChange {
@@ -339,6 +358,22 @@ fn handle_dhcp(nif: &mut NetIf, pinger: &mut Pinger) -> Option<LeaseChange> {
     }
 }
 
+fn lease_json(c: &LeaseChange) -> alloc::string::String {
+    use proto_http::json_str;
+    let Some((addr, prefix)) = c.addr else {
+        return "null".into();
+    };
+    let dns: Vec<_> = c.dns.iter().map(|d| json_str(&alloc::format!("{d}"))).collect();
+    alloc::format!(
+        "{{\"addr\":{},\"gateway\":{},\"dns\":[{}]}}",
+        json_str(&alloc::format!("{addr}/{prefix}")),
+        c.gateway
+            .map(|g| json_str(&alloc::format!("{g}")))
+            .unwrap_or_else(|| "null".into()),
+        dns.join(",")
+    )
+}
+
 fn poll_stacks(ifs: &mut [NetIf]) {
     let t = now();
     let now_ns = datapath::now_ns();
@@ -363,6 +398,7 @@ pub async fn run(mut ifs: Vec<NetIf>) {
         let (wan, lan) = ifs.split_at_mut(1);
         LanServices::new(&mut lan[0], Some(&mut wan[0]))
     });
+    let mut mgmt = Mgmt::new(&mut ifs);
     let events: Vec<&'static IrqEvent> = ifs.iter().filter_map(|n| n.irq.map(|(_, e)| e)).collect();
 
     loop {
@@ -385,6 +421,7 @@ pub async fn run(mut ifs: Vec<NetIf>) {
         poll_stacks(&mut ifs);
         if let Some(change) = handle_dhcp(&mut ifs[0], &mut pinger) {
             dp.set_wan(change.addr, change.gateway);
+            mgmt.set_wan_lease(lease_json(&change));
             if let Some(svc) = services.as_mut() {
                 svc.set_upstreams(&change.dns);
             }
@@ -393,6 +430,17 @@ pub async fn run(mut ifs: Vec<NetIf>) {
         if let Some(svc) = services.as_mut() {
             let (wan, lan) = ifs.split_at_mut(1);
             svc.step(&mut lan[0].sockets, Some(&mut wan[0].sockets));
+        }
+        if let Some(action) = mgmt.step(&mut ifs, &dp, services.as_ref()) {
+            // Quiesce: dropping the interfaces resets the NICs (no more DMA).
+            drop(services);
+            drop(ifs);
+            match action {
+                Action::Reboot => arch::power::reset(),
+                Action::Exec(staging, prepared, cmdline) => {
+                    crate::upgrade::exec(staging, prepared, &cmdline)
+                }
+            }
         }
         poll_stacks(&mut ifs);
         dp.housekeeping(&mut ifs);
@@ -441,6 +489,9 @@ pub async fn run(mut ifs: Vec<NetIf>) {
         }
         // TX completion normally raises an interrupt; poll as a fallback while
         // a NIC ring is full with a backlog, and for devices without an IRQ.
+        if mgmt.busy() {
+            delay = delay.min(Duration::from_millis(10));
+        }
         if tx.ring_full_backlog || ifs.iter().any(|n| n.irq.is_none()) {
             delay = delay.min(Duration::from_millis(1));
         }

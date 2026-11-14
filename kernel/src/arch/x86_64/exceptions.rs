@@ -5,6 +5,10 @@
 //!   kernel stack overflow into the guard page is still reported.
 //! - Vectors >= 32 are interrupts: dispatch to `crate::irq`, then EOI the
 //!   local APIC (except the spurious vector, which must not be EOI'd).
+//! - 224-239: the legacy PICs, remapped there and masked. Only their
+//!   spurious IRQ 7/15, or an IRQ latched before masking, can arrive
+//!   (real hardware does this right after the first `sti`); it is
+//!   acknowledged at the PIC and counted as spurious.
 
 use super::{cpu, irqchip};
 use crate::{fatal_println, mm};
@@ -16,8 +20,9 @@ core::arch::global_asm!(include_str!("isr.S"), options(att_syntax));
 pub const TIMER_VECTOR: u32 = 32;
 pub const MSI_VECTORS: core::ops::RangeInclusive<u32> = 48..=63;
 pub const SPURIOUS_VECTOR: u32 = 255;
+pub const PIC_VECTORS: core::ops::RangeInclusive<u32> = 224..=239;
 /// Number of (vector, stub) pairs in isr.S.
-const STUBS: usize = 32 + 1 + 16 + 1;
+const STUBS: usize = 32 + 1 + 16 + 16 + 1;
 
 unsafe extern "C" {
     static isr_vectors: [[u64; 2]; STUBS];
@@ -146,6 +151,11 @@ extern "C" fn x86_trap(f: &mut Frame) {
     let vector = f.vector as u32;
     if vector >= 32 {
         if vector == SPURIOUS_VECTOR {
+            crate::irq::note_spurious();
+            return;
+        }
+        if PIC_VECTORS.contains(&vector) {
+            irqchip::legacy_pic_ack((vector - PIC_VECTORS.start()) as u8);
             crate::irq::note_spurious();
             return;
         }

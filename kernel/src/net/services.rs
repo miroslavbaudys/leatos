@@ -112,6 +112,11 @@ impl LanServices {
         }
     }
 
+    /// Current DHCP leases (status page).
+    pub fn leases(&self) -> impl Iterator<Item = &dhcp::Lease> {
+        self.dhcp.leases()
+    }
+
     /// The WAN lease changed: new upstream DNS servers.
     pub fn set_upstreams(&mut self, servers: &[Ipv4Addr]) {
         self.dns.set_upstreams(servers);

@@ -28,6 +28,14 @@ pub fn irqs_enabled() -> bool {
     flags & (1 << 9) != 0
 }
 
+/// Order memory accesses against a DMA-capable device. x86 is TSO and
+/// orders write-back stores before uncached MMIO stores (and loads with
+/// loads), so only the compiler must not reorder.
+#[inline]
+pub fn dma_barrier() {
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
 /// Called with interrupts disabled (the executor's idle path). `sti; hlt`
 /// is atomic: the interrupt shadow of `sti` covers `hlt`, so an IRQ that
 /// arrives in between still wakes the CPU. Interrupts stay enabled after.

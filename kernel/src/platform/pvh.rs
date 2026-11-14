@@ -9,11 +9,29 @@ use spin::Once;
 const MAGIC: u32 = 0x336e_c578;
 const E820_RAM: u32 = 1;
 
+/// Memory map entries kept for the in-RAM upgrade (Multiboot2 info for
+/// the next kernel): (base, length, type; 1 = RAM).
+pub const MAX_MMAP: usize = 64;
+pub type MmapEntry = (u64, u64, u32);
+
 pub struct StartInfo {
     /// The RAM region that contains `kernel_start`: (start, size).
     pub ram: (usize, usize),
     pub rsdp: u64,
     pub cmdline: &'static str,
+    pub mmap: [MmapEntry; MAX_MMAP],
+    pub mmap_len: usize,
+}
+
+/// Copy (base, length, type) entries into a fixed array (no heap yet).
+pub(super) fn collect_mmap(entries: impl Iterator<Item = MmapEntry>) -> ([MmapEntry; MAX_MMAP], usize) {
+    let mut map = [(0, 0, 0); MAX_MMAP];
+    let mut n = 0;
+    for e in entries.take(MAX_MMAP) {
+        map[n] = e;
+        n += 1;
+    }
+    (map, n)
 }
 
 /// The command line is copied out of firmware memory (which is unmapped
@@ -43,14 +61,20 @@ pub fn parse(start_info: usize, kernel_start: usize) -> Result<StartInfo, &'stat
         .filter_map(|e| Some((u64_at(e, 0)?, u64_at(e, 8)?)))
         .find(|&(start, size)| start <= k && k < start + size)
         .ok_or("pvh: no RAM region contains the kernel")?;
+    let (mmap, mmap_len) = collect_mmap(
+        map.chunks_exact(24)
+            .filter_map(|e| Some((u64_at(e, 0)?, u64_at(e, 8)?, u32_at(e, 16)?))),
+    );
     Ok(StartInfo {
         ram: (ram.0 as usize, ram.1 as usize),
         rsdp,
         cmdline,
+        mmap,
+        mmap_len,
     })
 }
 
-fn copy_cmdline(src: &[u8]) -> &'static str {
+pub(super) fn copy_cmdline(src: &[u8]) -> &'static str {
     let (buf, len) = CMDLINE.call_once(|| {
         let n = src.iter().position(|&b| b == 0).unwrap_or(src.len());
         let mut buf = [0u8; 1024];

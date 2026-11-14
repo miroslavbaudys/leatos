@@ -1,5 +1,6 @@
 //! Arch-neutral description of the machine, filled in by a firmware
-//! backend: DTB (aarch64 QEMU virt) or PVH start info + ACPI (x86_64).
+//! backend: DTB (aarch64 QEMU virt) or PVH start info / Multiboot2 info +
+//! ACPI (x86_64).
 //!
 //! Discovery runs **before the heap exists**, so these types are plain
 //! `Copy` data with fixed-size arrays and no allocation.
@@ -13,6 +14,8 @@ pub mod acpi;
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)] // the one constructor that views firmware memory as bytes
 pub mod phys;
+#[cfg(target_arch = "x86_64")]
+pub mod multiboot2;
 #[cfg(target_arch = "x86_64")]
 pub mod pvh;
 
@@ -159,7 +162,7 @@ impl BootInfo {
             }
         );
         if !self.bootargs.is_empty() {
-            println!("  bootargs        : {}", self.bootargs);
+            println!("  bootargs        : {}", crate::config::Redacted(self.bootargs));
         }
         match self.irqchip {
             Some(IrqChipInfo::GicV3 { gicd, gicr, .. }) => {

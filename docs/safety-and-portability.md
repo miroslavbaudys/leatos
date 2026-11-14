@@ -8,7 +8,7 @@ Only a few kinds of operation fundamentally need it:
 | CPU control | MMU/TTBR switch, exception vectors, IRQ entry, PSCI | changes the memory model or control flow |
 | System registers without a safe wrapper | GICv3 `ICC_*` | inline asm |
 | Creating an MMIO handle | UART, GIC, PCIe ECAM, BARs | an address becomes "a device we own" |
-| DMA ownership hand-off | virtio queue buffers | the device writes memory behind Rust's back |
+| DMA ownership hand-off | virtio queue buffers, igb descriptor addresses | the device writes memory behind Rust's back |
 | Global allocator init | heap region | memory becomes "ours" |
 | Firmware data | DTB (later ACPI tables) | raw pointer to a blob |
 
@@ -22,12 +22,17 @@ page-table *construction*, PCI enumeration logic, driver state machines) can be 
 - Only these modules may opt out, with `#[allow(unsafe_code)]` on the `mod`
   declaration, so `grep allow(unsafe_code)` lists the whole audit surface:
   - `arch::<target>`: CPU, vectors, IRQ entry, sysregs, MMU activation, power
-  - `mm::heap`: allocator init
-  - `mm::dma`: the `virtio_drivers::Hal` implementation
+  - `mm::heap`: allocator init; `take_staging` (the upgrade staging area as one `&'static mut [u8]`, handed out once)
+  - `mm::dma`: the `virtio_drivers::Hal` implementation; `DmaRegion`
+    (descriptor rings: volatile access, and `unsafe fn write_buffer_addr`,
+    the hand-off)
   - `mmio`: one constructor that turns an address into an MMIO region
   - `platform::dtb`: DTB blob pointer
   - `drivers::virtio_net`: the DMA buffer hand-off (begin/complete pairs)
+  - `drivers::igb`: the register window (`Region::new` over BAR0) and the
+    two hand-offs (RX refill, TX post)
   - `selftest`: deliberate faults, feature-gated
+  - `arch::x86_64::kexec` (inside the arch backend): the in-RAM upgrade's CR3 switch + jump into the trampoline (`kexec.S`), and the view of the trampoline bytes
 - `crates/*`: `#![forbid(unsafe_code)]` (cannot be overridden).
 - Lints: `unsafe_op_in_unsafe_fn = deny`, `clippy::undocumented_unsafe_blocks`
   (every block needs `// SAFETY:`), `clippy::multiple_unsafe_ops_per_block`.
@@ -41,7 +46,8 @@ page-table *construction*, PCI enumeration logic, driver state machines) can be 
 | `aarch64-cpu` crate (tock-registers) | typed, safe access to CNTV_*, DAIF, MPIDR, CurrentEL, …; replaces hand-written `asm!` |
 | `PciRoot<MmioCam>` from `virtio-drivers` | safe config-space access, BAR info and assignment |
 | `mm::dma::Hal` (identity-mapped DMA) | `virtio-drivers` queues |
-| `drivers::virtio_net` slot ownership | **owned `PacketBuf`s**: a buffer lent to the device lives in a slot until completion, so the type system prevents touching it while the device owns it |
+| `mm::dma::DmaRegion` (leaked, zeroed, device-shared memory) | descriptor rings with bounds-checked volatile `read32` / `write32` / `write64`; only putting a *buffer address* into a ring is `unsafe` |
+| `drivers::virtio_net` / `drivers::igb` slot ownership | **owned `PacketBuf`s**: a buffer lent to the device lives in a slot until completion, so the type system prevents touching it while the device owns it |
 | `irq::IrqEvent` | IRQ → executor signalling with atomics only; `spin::Once` handler table, no raw pointers |
 | page-table builder (`mm::mmu`) | page tables held in an owned arena (`Vec<Box<Table>>`), indices instead of raw descriptor pointers. Only `activate()` is unsafe (arch) |
 
@@ -90,7 +96,7 @@ kernel/src/
   platform/          neutral BootInfo; dtb (aarch64); pvh + acpi + phys (x86_64)
   mm/                heap, page-table builder, dma
   irq.rs timer.rs executor.rs console.rs pci.rs mmio.rs   (neutral)
-  drivers/           virtio_net (neutral)
+  drivers/           Nic (one interface), virtio_net, igb (neutral)
   net/               packet buffers, netdev, smoltcp glue (neutral)
 ```
 **Rule:** nothing outside `arch/` may use `core::arch`, `asm!` or arch-specific

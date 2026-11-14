@@ -271,6 +271,21 @@ impl Datapath {
         }
         self.next_housekeeping = now + HOUSEKEEPING_MS;
         self.fwd.expire(now);
+        for nif in ifs.iter_mut() {
+            let changed = nif.dev.link_changed();
+            if changed.is_some() {
+                nif.link = changed;
+            }
+            match changed {
+                Some((true, speed, fd)) => crate::println!(
+                    "  net {}       : link up, {speed} Mbit/s {} duplex",
+                    nif.name,
+                    if fd { "full" } else { "half" }
+                ),
+                Some((false, ..)) => crate::println!("  net {}       : link down", nif.name),
+                None => {}
+            }
+        }
         if now >= self.next_stats {
             self.next_stats = now + STATS_MS;
             self.print_qdisc_stats(ifs);

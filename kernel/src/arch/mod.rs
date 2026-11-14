@@ -3,7 +3,8 @@
 //! docs/safety-and-portability.md). Each backend provides:
 //!
 //! - `discover(boot_arg) -> Result<BootInfo, &str>`: firmware → platform info
-//! - `cpu`: `privilege_level`, `irq_enable`, `irq_disable`, `wait_for_interrupt`, `halt`
+//! - `cpu`: `privilege_level`, `irq_enable`, `irq_disable`, `wait_for_interrupt`, `halt`,
+//!   `dma_barrier` (order descriptor accesses against device DMA and MMIO)
 //! - `console`: `init(base)`, `write_str`, `emergency_write_str`
 //! - `irqchip`: `init(&BootInfo)`, `enable(intid, Trigger)`, `disable(intid)`;
 //!   the backend's IRQ entry calls `crate::irq::dispatch(intid)`. MSI-X:
@@ -16,7 +17,9 @@
 //!   `block_allowed`, `is_valid`, `is_table`, `desc_addr`, `table_desc`,
 //!   `leaf_desc`), `PLATFORM_MMIO`, `unsafe fn activate(root)`,
 //!   `sync_tables` (after adding entries to the live tables)
-//! - `power`: `init(PowerMethod)`, `off() -> !`
+//! - `power`: `init(PowerMethod)`, `off() -> !`, `reset() -> !`
+//! - `kexec`: `SUPPORTED`, `SCRATCH_SIZE`, `exec(flat, dst, entry, cmdline, scratch) -> !`
+//!   (enter a new kernel in RAM; x86_64 only)
 //!
 //! `cargo kcheck-x86` type-checks neutral code against the x86_64 stubs.
 

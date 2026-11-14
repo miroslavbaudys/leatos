@@ -212,7 +212,7 @@ pub fn spawn(has_net: bool) {
 
         #[cfg(not(feature = "smoke-test"))]
         {
-            println!("idle (Ctrl-A X to quit QEMU)");
+            println!("running (under QEMU, Ctrl-A X quits)");
             loop {
                 timer::sleep(Duration::from_secs(60)).await;
                 println!("uptime {} s", timer::uptime().as_secs());

@@ -31,26 +31,85 @@ pub struct Dns {
     pub rebind_protection: bool,
 }
 
+/// The kernel command line, stored once at boot ([`init`]).
+static BOOTARGS: spin::Once<&'static str> = spin::Once::new();
+
+pub fn init(bootargs: &'static str) {
+    BOOTARGS.call_once(|| bootargs);
+}
+
+/// A command line for logs, `mgmt_pass=` values masked. Formats without
+/// allocating (the boot report prints it before the heap exists).
+pub struct Redacted<'a>(pub &'a str);
+
+impl core::fmt::Display for Redacted<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (i, kv) in self.0.split_whitespace().enumerate() {
+            let kv = if kv.starts_with("mgmt_pass=") { "mgmt_pass=***" } else { kv };
+            write!(f, "{}{kv}", if i > 0 { " " } else { "" })?;
+        }
+        Ok(())
+    }
+}
+
+pub fn bootargs() -> &'static str {
+    BOOTARGS.get().copied().unwrap_or("")
+}
+
+/// Default LAN: 192.168.1.1/24. Boot argument `lan=10.10.0.1/24` moves it
+/// (needed when the upstream network uses the same subnet). The DHCP pool
+/// is host .100–.199 of the subnet (clamped for small subnets), the static
+/// `nas` entry host .10.
 pub fn lan() -> Lan {
+    let (addr, prefix) = arg(bootargs(), "lan")
+        .and_then(parse_cidr)
+        .filter(|&(_, p)| (8..=29).contains(&p))
+        .unwrap_or((Ipv4Addr::new(192, 168, 1, 1), 24));
+    let mask = u32::MAX << (32 - prefix as u32);
+    let net = u32::from(addr) & mask;
+    let last = net | !mask; // broadcast
+    let host = |n: u32| Ipv4Addr::from((net + n).min(last - 1));
+    let (lo, hi) = if !mask >= 200 { (100, 199) } else { (2, !mask - 1) };
     Lan {
-        addr: Ipv4Addr::new(192, 168, 1, 1),
-        prefix: 24,
+        addr,
+        prefix,
         domain: "lan",
-        dhcp_range: (
-            Ipv4Addr::new(192, 168, 1, 100),
-            Ipv4Addr::new(192, 168, 1, 199),
-        ),
+        dhcp_range: (host(lo), host(hi)),
         lease_secs: 12 * 3600,
         statics: vec![StaticLease {
             mac: [0x52, 0x54, 0x00, 0x00, 0x00, 0x05],
-            ip: Ipv4Addr::new(192, 168, 1, 10),
+            ip: host(10),
             hostname: Some(String::from("nas")),
         }],
     }
 }
 
+/// `a.b.c.d/len`
+fn parse_cidr(s: &str) -> Option<(Ipv4Addr, u8)> {
+    let (a, p) = s.split_once('/')?;
+    Some((a.parse().ok()?, p.parse().ok()?))
+}
+
+/// Management web interface (`net::mgmt`): HTTP on port 80.
+pub struct Mgmt {
+    /// Also listen on the WAN (`mgmt=wan`). Development only: a router's
+    /// management belongs on the LAN.
+    pub on_wan: bool,
+    /// HTTP Basic password (user `admin`), `mgmt_pass=`. Without one,
+    /// pages are readable but upgrades are refused.
+    pub password: Option<&'static str>,
+}
+
+pub fn mgmt() -> Mgmt {
+    Mgmt {
+        on_wan: arg(bootargs(), "mgmt") == Some("wan"),
+        password: arg(bootargs(), "mgmt_pass").filter(|p| !p.is_empty()),
+    }
+}
+
 /// `key=value` from the kernel command line.
 fn arg<'a>(bootargs: &'a str, key: &str) -> Option<&'a str> {
+    // `key=value` only: `lan=` must not match `lan_x=`.
     bootargs
         .split_whitespace()
         .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))

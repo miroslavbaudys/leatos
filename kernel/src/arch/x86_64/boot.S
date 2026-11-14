@@ -1,10 +1,13 @@
 /*
- * rrouter x86_64 entry (PVH boot protocol).
+ * rrouter x86_64 entry: PVH (QEMU `-kernel`) or Multiboot2 (Limine on the
+ * apu4, booted by SeaBIOS from USB/SD).
  *
- * QEMU `-kernel` (and Xen, and PVH-capable bootloaders) find the 32-bit
- * entry point in the XEN_ELFNOTE_PHYS32_ENTRY note below and jump to it in
- * 32-bit protected mode, paging off, with %ebx = physical address of the
- * hvm_start_info structure (memory map, command line, ACPI RSDP).
+ * PVH loaders find the 32-bit entry point in the XEN_ELFNOTE_PHYS32_ENTRY
+ * note below; Multiboot2 loaders find the header in .multiboot2 (first
+ * 32 KiB of the file) and use the ELF entry, the same _start32. Both enter
+ * in 32-bit protected mode, paging off, with %ebx = physical address of
+ * the boot information (PVH hvm_start_info / Multiboot2 info); Multiboot2
+ * also sets %eax = 0x36d76289, which kernel_main gets as its second argument.
  *
  * This stub:
  *   1. zeroes .bss and the boot page tables,
@@ -27,13 +30,27 @@
     .balign 4
     .popsection
 
+    /* Multiboot2 header: magic, architecture 0 (i386), length, checksum,
+     * then only the end tag (the ELF headers say where to load). */
+    .section .multiboot2, "a"
+    .balign 8
+mb2_header:
+    .long   0xe85250d6
+    .long   0
+    .long   mb2_header_end - mb2_header
+    .long   0x100000000 - (0xe85250d6 + (mb2_header_end - mb2_header))
+    .word   0, 0
+    .long   8
+mb2_header_end:
+
     .section .text.boot, "ax"
     .code32
     .global _start32
 _start32:
     cli
     cld
-    mov     %ebx, %ebp                  /* keep the start-info pointer */
+    mov     %ebx, %ebp                  /* keep the boot-info pointer */
+    mov     %eax, %esi                  /* and the Multiboot2 magic */
 
     /* zero .bss */
     mov     $__bss_start, %edi
@@ -103,7 +120,8 @@ _start64:
     mov     %ax, %fs
     mov     %ax, %gs
     mov     $__stack_top, %rsp
-    mov     %ebp, %edi                  /* arg 0: start-info (zero-extended) */
+    mov     %ebp, %edi                  /* arg 0: boot info (zero-extended) */
+    mov     %esi, %esi                  /* arg 1: magic (clear the upper half) */
     xor     %ebp, %ebp
     call    kernel_main
 3:  cli

@@ -9,8 +9,8 @@
 //! enable) and IRQ context (EOI, NAPI-style disable), so every access runs
 //! with IRQs masked (`with_lapic`). On a single core that is deadlock-free.
 
-use super::exceptions::{MSI_VECTORS, SPURIOUS_VECTOR, TIMER_VECTOR};
-use super::port::outb;
+use super::exceptions::{MSI_VECTORS, PIC_VECTORS, SPURIOUS_VECTOR, TIMER_VECTOR};
+use super::port::{inb, outb};
 use crate::irq::Trigger;
 use crate::mmio::Region;
 use crate::platform::{BootInfo, IrqChipInfo};
@@ -53,13 +53,56 @@ pub(super) fn with_lapic<R>(f: impl FnOnce(&mut Region) -> R) -> R {
     r
 }
 
+const PIC1: u16 = 0x20;
+const PIC2: u16 = 0xa0;
+const PIC_EOI: u8 = 0x20;
+
+fn pic_wait() {
+    outb(0x80, 0); // POST port: a short delay between PIC commands
+}
+
+fn remap_and_mask_pics() {
+    let base = *PIC_VECTORS.start() as u8;
+    for (port, icw2, icw3) in [(PIC1, base, 1 << 2), (PIC2, base + 8, 2)] {
+        outb(port, 0x11); // ICW1: init, cascade, ICW4 follows
+        pic_wait();
+        outb(port + 1, icw2); // vector base
+        pic_wait();
+        outb(port + 1, icw3); // master: slave on IRQ 2; slave: cascade identity
+        pic_wait();
+        outb(port + 1, 0x01); // ICW4: 8086 mode
+        pic_wait();
+        outb(port + 1, 0xff); // mask all
+    }
+    // Clear anything the BIOS left in service.
+    outb(PIC2, PIC_EOI);
+    outb(PIC1, PIC_EOI);
+}
+
+/// A legacy PIC vector arrived (`irq` 0-15). A spurious IRQ 7/15 has no
+/// in-service bit and takes no EOI from that PIC (a spurious IRQ 15 still
+/// takes one from the master: the cascade IRQ 2 was acknowledged). Called
+/// from the trap handler.
+pub(super) fn legacy_pic_ack(irq: u8) {
+    let (port, bit) = if irq < 8 { (PIC1, irq) } else { (PIC2, irq - 8) };
+    outb(port, 0x0b); // OCW3: next read returns the in-service register
+    let in_service = inb(port) & (1 << bit) != 0;
+    if in_service {
+        outb(port, PIC_EOI);
+    }
+    if irq >= 8 {
+        outb(PIC1, PIC_EOI);
+    }
+}
+
 pub fn init(info: &BootInfo) {
     let Some(IrqChipInfo::Apic { lapic, .. }) = info.irqchip else {
         panic!("irqchip: no local APIC described");
     };
-    // Mask both 8259 PICs: every interrupt comes through the local APIC.
-    outb(0x21, 0xff);
-    outb(0xa1, 0xff);
+    // Every interrupt comes through the local APIC: remap the 8259 PICs
+    // away from the CPU exception vectors (BIOS leaves them at 8-15, where
+    // a spurious IRQ 7 looks like exception 15) and mask them.
+    remap_and_mask_pics();
     // SAFETY: the MADT's local APIC page, mapped as device memory by
     // mm::mmu (PLATFORM_MMIO), owned exclusively by this module.
     *LAPIC.lock() = Some(unsafe { Region::new(lapic, 0x1000) });

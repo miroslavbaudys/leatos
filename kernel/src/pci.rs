@@ -53,6 +53,9 @@ impl PciDevice {
             (0x1af4, 0x1001 | 0x1042) => "virtio-blk",
             (0x1af4, _) => "virtio (other)",
             (0x1b36, 0x0008) => "host bridge",
+            (0x8086, 0x10c9) => "Intel 82576 (igb)",
+            (0x8086, 0x1533 | 0x1536 | 0x1537 | 0x1538 | 0x157b) => "Intel i210 (igb)",
+            (0x8086, 0x1539) => "Intel i211 (igb)",
             (0x8086, _) if self.info.class == 0x02 => "Intel NIC",
             _ => match self.info.class {
                 0x01 => "storage",
@@ -193,12 +196,15 @@ fn assign_bars(
 
 /// Enumerate every function on every bus in the ECAM window.
 pub fn init(info: &PcieInfo) -> Pci {
+    // Firmware may describe fewer than 256 buses (coreboot: often 64).
+    // Only buses inside the window are ever accessed (the loop below).
     assert!(
-        info.ecam_size >= 256 << 20,
-        "pci: ECAM window smaller than 256 MiB"
+        info.ecam_size >= ((info.bus_end as usize) + 1) << 20,
+        "pci: ECAM window smaller than its bus range"
     );
     // SAFETY: the ECAM window comes from firmware, is mapped as device
-    // memory by mm::mmu, and is accessed only through this PciRoot.
+    // memory by mm::mmu, and is accessed only through this PciRoot, for
+    // buses bus_start..=bus_end, which lie inside the window.
     let cam = unsafe { MmioCam::new(info.ecam as *mut u8, Cam::Ecam) };
     // SAFETY: `ro` is used only to read the read-only Interrupt Pin register.
     let ro = unsafe { cam.unsafe_clone() };

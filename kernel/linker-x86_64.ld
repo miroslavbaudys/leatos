@@ -25,6 +25,7 @@ SECTIONS
 
     __text_start = .;
     .text : {
+        KEEP(*(.multiboot2)) /* Multiboot2 header: must be in the first 32 KiB of the file */
         KEEP(*(.text.boot))
         *(.text .text.*)
     }

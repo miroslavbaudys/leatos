@@ -26,18 +26,33 @@
 #   MAC_WAN_IF=en0       mac-internet mode: interface to bridge the WAN onto
 #   MAC_LAN_RANGE=192.168.1.2,192.168.1.9   mac modes: vmnet's own address range
 #                        (its first address goes to the Mac's bridge interface)
+#   QEMU_WAN_HOSTFWD=tcp:127.0.0.1:8080-:80
+#                        with QEMU_NET=user: forward a host port to the router's
+#                        WAN address (management tests; boot with mgmt=wan)
 #   QEMU_PCAP_DIR=dir    with QEMU_NET=user: dump WAN/LAN traffic to pcap files
+#   QEMU_DISK=img        boot a disk image via SeaBIOS + Limine instead of -kernel
+#                        (x86_64; scripts/apu-image.sh); QEMU_APPEND is ignored
+#   QEMU_NIC=virtio|igb  NIC model for WAN and LAN (default virtio): igb = QEMU's
+#                        Intel 82576, driven by the same igb driver as the apu4's i211
 #   QEMU_APPEND="..."    kernel command line (DTB /chosen/bootargs), e.g.
 #                        "shape_up=42000 shape_down=50000 idle_spin_us=0"
 #   QEMU_EXTRA="..."     extra QEMU arguments
 set -euo pipefail
 
-KERNEL="${1:?usage: qemu-run.sh <kernel-elf>}"
-shift || true
-
-# ELF e_machine (bytes 18-19): 0xb7 = aarch64, 0x3e = x86-64.
-ARCH=aarch64
-if [[ "$(od -An -tx1 -j18 -N1 "$KERNEL" | tr -d ' ')" == "3e" ]]; then ARCH=x86_64; fi
+# QEMU_DISK=img: boot a disk image through the firmware (x86_64 only; built
+# by scripts/apu-image.sh: SeaBIOS -> Limine -> Multiboot2), as on the apu4.
+if [[ -n "${QEMU_DISK:-}" ]]; then
+  KERNEL=
+  ARCH=x86_64
+  BOOT=(-drive "file=$QEMU_DISK,format=raw,snapshot=on")
+else
+  KERNEL="${1:?usage: qemu-run.sh <kernel-elf> (or QEMU_DISK=image)}"
+  shift || true
+  BOOT=(-kernel "$KERNEL")
+  # ELF e_machine (bytes 18-19): 0xb7 = aarch64, 0x3e = x86-64.
+  ARCH=aarch64
+  if [[ "$(od -An -tx1 -j18 -N1 "$KERNEL" | tr -d ' ')" == "3e" ]]; then ARCH=x86_64; fi
+fi
 
 if [[ -z "${QEMU_ACCEL:-}" ]]; then
   if [[ "$ARCH" == aarch64 && "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
@@ -67,11 +82,21 @@ else
   DEFAULT_BIN=qemu-system-aarch64
 fi
 
+# Fixed slots for igb: each one reserves its SR-IOV VF functions at
+# devfn + 0x80, which collide when QEMU places two igbs next to each other.
+WAN_ADDR=
+LAN_ADDR=
+case "${QEMU_NIC:-virtio}" in
+  virtio) NIC=virtio-net-pci ;;
+  igb) NIC=igb WAN_ADDR=,addr=0x4 LAN_ADDR=,addr=0x6 ;;
+  *) echo "QEMU_NIC must be virtio or igb" >&2; exit 2 ;;
+esac
+
 NET=(-nic none)
 if [[ "${QEMU_NET:-none}" == "user" ]]; then
   NET=(
-    -netdev user,id=wan -device virtio-net-pci,netdev=wan,mac=52:54:00:00:00:01
-    -netdev user,id=lan -device virtio-net-pci,netdev=lan,mac=52:54:00:00:00:02
+    -netdev "user,id=wan${QEMU_WAN_HOSTFWD:+,hostfwd=$QEMU_WAN_HOSTFWD}" -device "$NIC,netdev=wan,mac=52:54:00:00:00:01$WAN_ADDR"
+    -netdev user,id=lan -device "$NIC,netdev=lan,mac=52:54:00:00:00:02$LAN_ADDR"
   )
 fi
 if [[ "${QEMU_NET:-none}" == "lab" ]]; then
@@ -79,9 +104,9 @@ if [[ "${QEMU_NET:-none}" == "lab" ]]; then
   wp="${LAB_WAN_PORT:-10005}"
   NET=(
     -netdev "dgram,id=wan,local.type=inet,local.host=127.0.0.1,local.port=$wp,remote.type=inet,remote.host=127.0.0.1,remote.port=$((wp + 1))"
-    -device virtio-net-pci,netdev=wan,mac=52:54:00:00:00:01
+    -device "$NIC,netdev=wan,mac=52:54:00:00:00:01$WAN_ADDR"
     -netdev "dgram,id=lan,local.type=inet,local.host=127.0.0.1,local.port=$lp,remote.type=inet,remote.host=127.0.0.1,remote.port=$((lp + 1))"
-    -device virtio-net-pci,netdev=lan,mac=52:54:00:00:00:02
+    -device "$NIC,netdev=lan,mac=52:54:00:00:00:02$LAN_ADDR"
   )
 fi
 if [[ "${QEMU_NET:-none}" == "mac" || "${QEMU_NET:-none}" == "mac-internet" ]]; then
@@ -94,9 +119,9 @@ if [[ "${QEMU_NET:-none}" == "mac" || "${QEMU_NET:-none}" == "mac-internet" ]]; 
   fi
   NET=(
     -netdev "$WAN_NETDEV"
-    -device virtio-net-pci,netdev=wan,mac=52:54:00:00:00:01
+    -device "$NIC,netdev=wan,mac=52:54:00:00:00:01$WAN_ADDR"
     -netdev "vmnet-host,id=lan,start-address=$vstart,end-address=$vend,subnet-mask=255.255.255.0"
-    -device virtio-net-pci,netdev=lan,mac=52:54:00:00:00:02
+    -device "$NIC,netdev=lan,mac=52:54:00:00:00:02$LAN_ADDR"
   )
 fi
 if [[ "${QEMU_NET:-none}" =~ ^(user|lab|mac|mac-internet)$ ]]; then
@@ -117,7 +142,7 @@ fi
 
 # shellcheck disable=SC2206
 EXTRA=(${QEMU_EXTRA:-})
-if [[ -n "${QEMU_APPEND:-}" ]]; then EXTRA+=(-append "$QEMU_APPEND"); fi
+if [[ -n "${QEMU_APPEND:-}" && -z "${QEMU_DISK:-}" ]]; then EXTRA+=(-append "$QEMU_APPEND"); fi
 
 # QEMU_BIN (sudo callers) names the aarch64 binary; derive the x86 one from it.
 BIN="${QEMU_BIN:-$DEFAULT_BIN}"
@@ -129,7 +154,7 @@ exec "$BIN" \
   -smp "${QEMU_SMP:-1}" \
   -m "${QEMU_MEM:-256M}" \
   -nographic \
-  -kernel "$KERNEL" \
+  "${BOOT[@]}" \
   "${NET[@]}" \
   ${GDB[@]+"${GDB[@]}"} \
   ${EXTRA[@]+"${EXTRA[@]}"} \

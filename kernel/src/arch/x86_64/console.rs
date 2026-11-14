@@ -10,6 +10,7 @@ const LCR: u16 = 3;
 const MCR: u16 = 4;
 const LSR: u16 = 5;
 const LSR_THRE: u8 = 1 << 5;
+const LSR_TEMT: u8 = 1 << 6;
 
 static LOCK: Mutex<()> = Mutex::new(());
 
@@ -17,6 +18,14 @@ static LOCK: Mutex<()> = Mutex::new(());
 /// (MMIO) is not used on x86.
 pub fn init(_base: Option<usize>) {
     let _g = LOCK.lock();
+    // Let the transmitter drain first: reprogramming the divisor while a
+    // byte is still shifting out garbles it (seen on the apu4).
+    for _ in 0..100_000 {
+        if inb(COM1 + LSR) & LSR_TEMT != 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
     outb(COM1 + IER, 0); // no UART interrupts (polled output)
     outb(COM1 + LCR, 0x80); // DLAB: divisor follows
     outb(COM1, 1); // divisor 1 = 115200 baud

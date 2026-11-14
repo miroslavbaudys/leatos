@@ -25,6 +25,7 @@
 //! never afterwards, so the accesses never interleave. Remove this when
 //! `virtio-drivers` supports MSI-X.
 
+use crate::drivers::Stats;
 use crate::mm::dma::DmaHal;
 use crate::mmio::Region16;
 use crate::net::packet::PacketBuf;
@@ -42,15 +43,6 @@ pub const DEFAULT_TX_BYTE_LIMIT: usize = 8 * 1514;
 const MAX_HDR: usize = 16;
 
 type Raw = VirtIONetRaw<DmaHal, PciTransport, QUEUE_SIZE>;
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Stats {
-    pub rx_packets: u64,
-    pub rx_bytes: u64,
-    pub rx_dropped_no_buf: u64,
-    pub tx_packets: u64,
-    pub tx_bytes: u64,
-}
 
 pub struct VirtioNet {
     // Declared first: dropped first, which resets the device before the

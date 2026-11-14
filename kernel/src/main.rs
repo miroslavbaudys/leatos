@@ -33,6 +33,7 @@ mod platform;
 #[allow(unsafe_code)] // feature-gated deliberate faults
 mod selftest;
 mod timer;
+mod upgrade;
 
 use executor::Priority;
 
@@ -49,6 +50,7 @@ pub fn kmain(boot_arg: usize) -> ! {
     arch::power::init(info.power);
     info.print();
 
+    config::init(info.bootargs);
     mm::heap::init(&info);
     mm::mmu::init(&info);
     arch::irqchip::init(&info);
@@ -83,7 +85,7 @@ pub fn kmain(boot_arg: usize) -> ! {
 }
 
 /// Packet buffers to preallocate: 2 NICs × (RX ring + TX ring) plus room
-/// for queues. 1024 × 2 KiB = 2 MiB.
+/// for queues. 1024 × 2.125 KiB ≈ 2.1 MiB.
 fn net_pool_size() -> usize {
     1024
 }

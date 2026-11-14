@@ -31,6 +31,15 @@ pub fn irqs_enabled() -> bool {
     daif & (1 << 7) == 0
 }
 
+/// Order memory accesses against a DMA-capable device (descriptor writes
+/// before the doorbell MMIO write; status read before the data it guards).
+/// `dmb osh`: the outer-shareable domain includes the devices.
+#[inline]
+pub fn dma_barrier() {
+    // SAFETY: a memory barrier; no other effect.
+    unsafe { asm!("dmb osh", options(nostack, preserves_flags)) };
+}
+
 /// Sleep until an interrupt is pending (works even while IRQs are masked).
 #[cfg_attr(feature = "idle-poll", allow(dead_code))]
 pub fn wait_for_interrupt() {

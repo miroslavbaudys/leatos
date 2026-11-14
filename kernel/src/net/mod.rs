@@ -3,6 +3,7 @@
 
 pub mod datapath;
 pub mod device;
+pub mod mgmt;
 pub mod packet;
 pub mod services;
 pub mod stack;

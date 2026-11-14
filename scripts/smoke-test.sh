@@ -7,6 +7,8 @@
 #   SMOKE_CASES="boot" scripts/smoke-test.sh
 #   QEMU_ACCEL=tcg scripts/smoke-test.sh  # without hardware acceleration
 #   RROUTER_ARCH=x86_64 scripts/smoke-test.sh   # x86_64 kernel on QEMU q35 (TCG)
+#   RROUTER_BOOT=limine scripts/smoke-test.sh   # x86_64 via the apu4 disk image:
+#                                               # SeaBIOS -> Limine -> Multiboot2
 #   SMOKE_VERBOSE=1 ...                   # print full console output
 #
 # Cases:
@@ -17,6 +19,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CASES="${SMOKE_CASES:-boot fault-wx fault-stack}"
+BOOT_MODE="${RROUTER_BOOT:-kernel}"
+case "$BOOT_MODE" in kernel) ;; limine) RROUTER_ARCH=x86_64 ;; *) echo "RROUTER_BOOT must be kernel or limine" >&2; exit 2 ;; esac
 ARCH="${RROUTER_ARCH:-aarch64}"
 case "$ARCH" in aarch64 | x86_64) ;; *) echo "RROUTER_ARCH must be aarch64 or x86_64" >&2; exit 2 ;; esac
 TARGET="$ARCH-unknown-none"
@@ -24,13 +28,22 @@ KERNEL="target/$TARGET/debug/rrouter"
 # x86_64 runs under TCG on Apple Silicon: allow more time.
 [[ "$ARCH" == x86_64 ]] && SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-40}"
 LOG="$(mktemp -t rrouter-smoke.XXXXXX)"
-trap 'rm -f "$LOG"' EXIT
+IMG="$LOG.img"
+trap 'rm -f "$LOG" "$IMG"' EXIT
 FAILED=0
 
 boot() { # features
-  cargo build -p rrouter-kernel --target "$TARGET" --features "$1" --quiet
+  if [[ "$BOOT_MODE" == limine ]]; then
+    scripts/apu-image.sh --debug --features "$1" --out "$IMG" >/dev/null
+  else
+    cargo build -p rrouter-kernel --target "$TARGET" --features "$1" --quiet
+  fi
   # macOS has no `timeout`: a background watchdog kills QEMU if the kernel hangs.
-  QEMU_NET="${QEMU_NET:-user}" scripts/qemu-run.sh "$KERNEL" >"$LOG" 2>&1 &
+  if [[ "$BOOT_MODE" == limine ]]; then
+    QEMU_DISK="$IMG" QEMU_NET="${QEMU_NET:-user}" scripts/qemu-run.sh >"$LOG" 2>&1 &
+  else
+    QEMU_NET="${QEMU_NET:-user}" scripts/qemu-run.sh "$KERNEL" >"$LOG" 2>&1 &
+  fi
   local qpid=$!
   ( sleep "${SMOKE_TIMEOUT:-20}"; kill "$qpid" 2>/dev/null ) &
   local wpid=$!

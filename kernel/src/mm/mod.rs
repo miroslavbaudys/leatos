@@ -1,6 +1,6 @@
 //! Memory management: heap, page tables, DMA.
 
-#[allow(unsafe_code)] // virtio-drivers `Hal`: DMA allocation and address translation
+#[allow(unsafe_code)] // virtio-drivers `Hal`, `DmaRegion` (volatile access to device-shared memory)
 pub mod dma;
 #[allow(unsafe_code)] // global allocator initialisation
 pub mod heap;

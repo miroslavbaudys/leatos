@@ -11,6 +11,8 @@ use super::phys::{self, u16_at, u32_at, u64_at};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Acpi {
+    /// Where the (validated) RSDP was found.
+    pub rsdp_pa: u64,
     pub lapic: usize,
     /// (MMIO address, first GSI) of the first IOAPIC.
     pub ioapic: Option<(usize, u32)>,
@@ -85,7 +87,10 @@ pub fn parse(rsdp_pa: u64) -> Result<Acpi, &'static str> {
         (u32_at(rsdp, 16).unwrap_or(0) as u64, 4)
     };
     let (_, root) = table(root)?;
-    let mut acpi = Acpi::default();
+    let mut acpi = Acpi {
+        rsdp_pa,
+        ..Acpi::default()
+    };
     for e in root[36..].chunks_exact(entry_size) {
         let pa = if entry_size == 8 {
             u64_at(e, 0)

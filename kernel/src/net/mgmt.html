@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rrouter</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --fg:#1d2330; --muted:#6b7280; --line:#e3e6eb; --ok:#15803d; --bad:#b91c1c; --accent:#2563eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111418; --card:#1a1f26; --fg:#e6e9ee; --muted:#9aa3af; --line:#2a313b; --ok:#4ade80; --bad:#f87171; --accent:#60a5fa; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
+  header { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:18px; }
+  header span { color:var(--muted); }
+  main { padding:16px; display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr)); max-width:1200px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 14px; min-width:0; }
+  h2 { margin:0 0 8px; font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  td, th { text-align:left; padding:3px 6px 3px 0; border-bottom:1px solid var(--line); vertical-align:top; overflow-wrap:anywhere; }
+  th { color:var(--muted); font-weight:500; }
+  .up { color:var(--ok); } .down { color:var(--bad); }
+  .wide { grid-column:1 / -1; }
+  input, button { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); max-width:100%; }
+  button { background:var(--accent); color:#fff; border:none; cursor:pointer; }
+  button.danger { background:var(--bad); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:6px 0; }
+  #msg { white-space:pre-wrap; color:var(--muted); }
+  .warn { color:var(--bad); font-weight:600; }
+</style>
+</head>
+<body>
+<header><h1>rrouter</h1><span id="ver">…</span><span id="up"></span><span id="wanwarn" class="warn"></span></header>
+<main>
+  <section class="wide"><h2>Interfaces</h2><table id="ifs"></table></section>
+  <section><h2>WAN lease</h2><table id="wan"></table></section>
+  <section><h2>System</h2><table id="sys"></table></section>
+  <section class="wide"><h2>DHCP leases</h2><table id="leases"></table></section>
+  <section class="wide"><h2>Upgrade (in RAM; a power cycle boots the SD card again)</h2>
+    <div class="row"><input id="pass" type="password" placeholder="admin password (mgmt_pass)" autocomplete="current-password"></div>
+    <div class="row"><input id="file" type="file"><input id="cmd" placeholder="kernel command line (empty = keep current)" size="40"></div>
+    <div class="row"><button id="go">Upload and start</button><button id="reboot" class="danger">Reboot</button></div>
+    <div id="msg"></div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const n = (x) => Number(x).toLocaleString();
+const rows = (pairs) => pairs.map(([k, v]) => `<tr><th>${esc(k)}</th><td>${v}</td></tr>`).join("");
+const dur = (s) => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + "d " : "") + h + "h " + m + "m " + (s % 60) + "s"; };
+
+async function refresh() {
+  let st;
+  try { st = await (await fetch("/api/status", {cache: "no-store"})).json(); }
+  catch (e) { $("up").textContent = "offline"; return; }
+  $("ver").textContent = `v${st.version} · ${st.arch}`;
+  $("up").textContent = "up " + dur(st.uptime_s);
+  $("wanwarn").textContent = st.mgmt.on_wan ? "management open on WAN (mgmt=wan)" : "";
+  $("ifs").innerHTML = "<tr><th>Port</th><th>NIC</th><th>MAC</th><th>Link</th><th>Address</th><th>RX pkts</th><th>TX pkts</th><th>Shaper</th><th>Qdisc sent / drops / ECN / backlog</th></tr>" +
+    st.interfaces.map((i) => `<tr><td>${esc(i.name)}</td><td>${esc(i.model)}</td><td>${esc(i.mac)}</td>` +
+      `<td>${i.link === null ? "–" : i.link.up ? `<span class="up">up ${i.link.mbps} Mbit/s${i.link.full_duplex ? "" : " half"}</span>` : '<span class="down">down</span>'}</td>` +
+      `<td>${i.addrs.map(esc).join("<br>") || "–"}</td><td>${n(i.rx_packets)}</td><td>${n(i.tx_packets)}</td>` +
+      `<td>${i.qdisc.shaped_kbit === null ? "unshaped" : n(i.qdisc.shaped_kbit) + " kbit/s"}</td>` +
+      `<td>${n(i.qdisc.sent)} / ${n(i.qdisc.dropped)} / ${n(i.qdisc.ecn_marked)} / ${n(i.qdisc.backlog_packets)}</td></tr>`).join("");
+  const l = st.wan_lease;
+  $("wan").innerHTML = l ? rows([["Address", esc(l.addr)], ["Gateway", esc(l.gateway ?? "–")], ["DNS", l.dns.map(esc).join(", ") || "–"]]) : rows([["Lease", "none"]]);
+  $("sys").innerHTML = rows([
+    ["Forwarded", n(st.forwarded)], ["Dropped", n(st.dropped)], ["Connections", n(st.conntrack)],
+    ["Packet pool", `${n(st.pool.free)} free of ${n(st.pool.capacity)}` + (st.pool.alloc_failures ? `, ${n(st.pool.alloc_failures)} failures` : "")],
+    ["Heap", `${n(Math.round(st.heap.used / 1024))} KiB used, ${n(Math.round(st.heap.free / 1048576))} MiB free`],
+    ["Upgrade", st.mgmt.upgrade ? "enabled" : "disabled (boot with mgmt_pass=…)"]]);
+  $("leases").innerHTML = st.dhcp_leases.length
+    ? "<tr><th>Host</th><th>IP</th><th>MAC</th><th>State</th><th>Expires in</th></tr>" + st.dhcp_leases.map((d) =>
+        `<tr><td>${esc(d.hostname ?? "–")}</td><td>${esc(d.ip)}</td><td>${esc(d.mac)}</td><td>${d.bound ? "bound" : "offered"}</td><td>${dur(d.expires_in_s)}</td></tr>`).join("")
+    : rows([["Leases", "none"]]);
+}
+
+const auth = () => ({ Authorization: "Basic " + btoa("admin:" + $("pass").value) });
+const say = (t) => { $("msg").textContent = t; };
+
+$("go").onclick = async () => {
+  const f = $("file").files[0];
+  if (!f) return say("Choose a kernel ELF first.");
+  const headers = auth();
+  if ($("cmd").value.trim()) headers["X-Cmdline"] = $("cmd").value.trim();
+  say(`Uploading ${n(f.size)} bytes…`);
+  try {
+    const r = await fetch("/api/upgrade", { method: "POST", headers, body: f });
+    const j = await r.json();
+    if (!j.ok) return say(`Refused (${r.status}): ${j.error}`);
+    say(`Accepted: ${j.detail}\nStarting the new kernel; this page reconnects by itself.`);
+  } catch (e) { say("Upload failed: " + e); }
+};
+$("reboot").onclick = async () => {
+  if (!confirm("Reboot the router?")) return;
+  try {
+    const r = await fetch("/api/reboot", { method: "POST", headers: auth() });
+    const j = await r.json();
+    say(j.ok ? "Rebooting…" : `Refused (${r.status}): ${j.error}`);
+  } catch (e) { say("Request failed: " + e); }
+};
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

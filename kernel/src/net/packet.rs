@@ -16,10 +16,14 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
-/// Buffer size: a full Ethernet frame + VLAN + PPPoE + virtio header + headroom.
-pub const BUF_SIZE: usize = 2048;
 /// Space reserved in front of the payload for headers added on egress.
 pub const HEADROOM: usize = 128;
+/// Receive area after the headroom: 2 KiB, because NICs size receive
+/// buffers in 1 KiB steps (igb `SRRCTL.BSIZEPACKET`) and a full frame with
+/// VLAN tag (1522 bytes) needs two of them.
+pub const RX_AREA: usize = 2048;
+/// Buffer size: headroom + receive area.
+pub const BUF_SIZE: usize = HEADROOM + RX_AREA;
 
 type Storage = Box<[u8; BUF_SIZE]>;
 
