@@ -14,7 +14,7 @@
 
 use crate::net::datapath;
 use crate::net::device::PortDevice;
-use crate::net::mgmt::Mgmt;
+use crate::net::mgmt::{Mgmt, StoreOp};
 use crate::net::services::LanServices;
 use crate::net::shared::{Shared, WanChange};
 use crate::net::stack::{self, WaitAny};
@@ -235,19 +235,40 @@ fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
     }
 }
 
-/// Write `config.toml` to the store's `config` area.
-async fn save_config(st: &mut crate::store::Store, toml: &str) -> Result<String, String> {
+/// Carry out a management request on the store's `config` area.
+async fn store_op(st: &mut crate::store::Store, op: &StoreOp) -> Result<String, String> {
     use crate::config::schema;
-    let (slot, h) = st
-        .write_record("config", schema::VERSION, schema::VERSION, toml.as_bytes())
-        .await
-        .map_err(|e| alloc::format!("{e}"))?;
-    Ok(alloc::format!(
-        "slot {}, seq {}, {} bytes",
-        crate::store::slot_name(slot),
-        h.seq,
-        h.len
-    ))
+    let e = |e: crate::store::Error| alloc::format!("{e}");
+    match op {
+        StoreOp::Save { toml, flags } => {
+            let (slot, h) = st
+                .write_record(
+                    "config",
+                    schema::VERSION,
+                    schema::VERSION,
+                    toml.as_bytes(),
+                    *flags,
+                )
+                .await
+                .map_err(e)?;
+            Ok(alloc::format!(
+                "slot {}, seq {}, {} bytes",
+                crate::store::slot_name(slot),
+                h.seq,
+                h.len
+            ))
+        }
+        StoreOp::Confirm(slot, h) => st
+            .rewrite_header("config", *slot, *h)
+            .await
+            .map(|()| String::from("confirmed"))
+            .map_err(e),
+        StoreOp::Revert(slot) => st
+            .erase("config", *slot)
+            .await
+            .map(|()| String::from("erased"))
+            .map_err(e),
+    }
 }
 
 /// The services task: never returns.
@@ -283,12 +304,12 @@ pub async fn run(
             svc.step(&mut lan[0].sockets, Some(&mut wan[0].sockets));
         }
         let action = mgmt.step(&mut hosts, sh, services.as_ref());
-        if let Some((conn, toml)) = mgmt.take_save()
+        if let Some((conn, op)) = mgmt.take_op()
             && let Some(st) = store.as_mut()
         {
             // Yields while the disk works: the datapath keeps running.
-            let r = save_config(st, &toml).await;
-            mgmt.save_done(conn, r);
+            let r = store_op(st, &op).await;
+            mgmt.op_done(conn, &op, r);
         }
         if let Some(action) = action {
             // The datapath stops the NICs and acts; nothing left to do here.
@@ -319,6 +340,9 @@ pub async fn run(
             );
         }
         if let Some(at) = pinger.deadline() {
+            delay = delay.min(at.saturating_duration_since(timer::Instant::now()));
+        }
+        if let Some(at) = mgmt.wake_at() {
             delay = delay.min(at.saturating_duration_since(timer::Instant::now()));
         }
         if mgmt.busy() {

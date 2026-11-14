@@ -15,6 +15,10 @@ impl Disk {
         Disk { bytes }
     }
 
+    fn clone_bytes(&self) -> Vec<u8> {
+        self.bytes.clone()
+    }
+
     fn sector_mut(&mut self, lba: u64) -> &mut [u8] {
         let at = lba as usize * SECTOR;
         &mut self.bytes[at..at + SECTOR]
@@ -305,6 +309,7 @@ fn length_beyond_slot_is_corrupt() {
         version: 1,
         len: 4 * SECTOR as u32,
         crc: 0,
+        flags: 0,
     };
     let mut slot = vec![0; le.slot_sectors as usize * SECTOR];
     slot[..SECTOR].copy_from_slice(&h.encode(&le));
@@ -319,6 +324,7 @@ fn length_beyond_slot_is_corrupt() {
         version: 1,
         len: 100,
         crc: 0,
+        flags: 0,
     };
     assert_eq!(check_slot(&le, &h.encode(&le)), SlotState::Corrupt);
 }
@@ -436,9 +442,64 @@ fn header_round_trips() {
         version: 7,
         len: 4096,
         crc: 0xdead_beef,
+        flags: FLAG_TRIAL | FLAG_BOOTED,
     };
     assert_eq!(RecordHeader::parse(&c, &h.encode(&c)), Ok(h));
     assert_eq!(h.payload_sectors(), 8);
     assert_eq!(RecordHeader { len: 4097, ..h }.payload_sectors(), 9);
     assert_eq!(RecordHeader { len: 0, ..h }.payload_sectors(), 0);
+}
+
+/// Trials (docs/config-and-storage.md §6): flags live in the header
+/// sector only, so marking and confirming rewrite one sector; reverting
+/// erases it. Every outcome, torn rewrites included, leaves either the
+/// trial or the previous record current, never something else.
+#[test]
+fn trial_mark_confirm_and_revert() {
+    let l = small_layout();
+    let c = *l.area("config").unwrap();
+    let mut d = Disk::new(&l);
+    let old = payload(700, 1);
+    let new = payload(800, 2);
+    d.save(&c, 1, &old); // A, seq 1, confirmed
+    let st = d.state(&c);
+    let plan = st
+        .plan_write(&c, st.current(1).map(|x| x.0), 1, &new)
+        .unwrap()
+        .with_flags(&c, FLAG_TRIAL);
+    for (lba, data) in Disk::steps(&plan) {
+        d.write(lba, &data);
+    }
+    let (slot, h) = d.state(&c).current(1).unwrap();
+    assert_eq!((slot, h.seq, h.flags), (Slot::B, 2, FLAG_TRIAL));
+    assert!(h.is_trial());
+
+    // Mark booted: the payload stays valid under the rewritten header.
+    let lba = c.slot_lba(Slot::B);
+    let booted = h.with_flags(FLAG_TRIAL | FLAG_BOOTED);
+    let mut clean = d.clone_bytes();
+    d.write(lba, &booted.encode(&c));
+    assert_eq!(d.state(&c).current(1), Some((Slot::B, booted)));
+    assert_eq!(d.load(&c).unwrap(), new);
+
+    // Confirm, torn in half: falls back to the previous record.
+    let confirmed = booted.with_flags(0).encode(&c);
+    let mut torn = d.slot(&c, Slot::B)[..SECTOR].to_vec();
+    torn[..SECTOR / 2].copy_from_slice(&confirmed[..SECTOR / 2]);
+    d.write(lba, &torn);
+    assert_eq!(d.load(&c).unwrap(), old);
+    // Confirm, whole: the new record, no flags.
+    d.write(lba, &confirmed);
+    assert_eq!(d.state(&c).current(1).unwrap().1.flags, 0);
+    assert_eq!(d.load(&c).unwrap(), new);
+
+    // Revert instead: an erased header sector makes the slot empty.
+    core::mem::swap(&mut d.bytes, &mut clean);
+    d.write(lba, &[0; SECTOR]);
+    assert_eq!(*d.state(&c).slot(Slot::B), SlotState::Empty);
+    assert_eq!(d.state(&c).current(1).map(|x| x.0), Some(Slot::A));
+    assert_eq!(d.load(&c).unwrap(), old);
+    // The next save goes into the erased slot, with a seq above both.
+    let p = d.save(&c, 1, &payload(10, 3));
+    assert_eq!((p.slot, p.header.seq), (Slot::B, 2));
 }

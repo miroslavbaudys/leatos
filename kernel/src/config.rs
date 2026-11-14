@@ -26,6 +26,7 @@ static BOOTARGS: spin::Once<&'static str> = spin::Once::new();
 static CONFIG: spin::Once<schema::Config> = spin::Once::new();
 static BASE: spin::Once<schema::Config> = spin::Once::new();
 static SOURCE: spin::Once<String> = spin::Once::new();
+static TRIAL: spin::Once<(config_store::Slot, config_store::RecordHeader)> = spin::Once::new();
 
 pub fn init(bootargs: &'static str) {
     BOOTARGS.call_once(|| bootargs);
@@ -68,25 +69,73 @@ pub fn load(store: Option<&mut crate::store::Store>) {
 /// `config.toml` from the store's `config` area, and where the config came
 /// from (for the log and the status page). Never fails the boot: any
 /// problem means defaults (docs/config-and-storage.md §1).
+///
+/// Trials (§6): a trial record is marked booted, then used ([`trial`]);
+/// one found already marked was never confirmed (the router lost power,
+/// crashed or was reset first), so it is erased and the previous record
+/// is used.
 fn stored(store: Option<&mut crate::store::Store>) -> (Option<schema::Config>, String) {
+    use crate::executor::block_on;
     use crate::store::{describe, slot_name};
+    use config_store::{FLAG_BOOTED, FLAG_TRIAL};
     if arg(bootargs(), "config") == Some("defaults") {
         return (None, String::from("defaults (config=defaults: store ignored)"));
     }
     let Some(store) = store else {
         return (None, String::from("defaults (no store)"));
     };
-    let (rec, state) = match store.read_current_blocking("config", schema::VERSION) {
-        Ok(r) => r,
-        Err(e) => return (None, alloc::format!("defaults (store: {e})")),
+    let mut reverted = None;
+    let rec = loop {
+        let (rec, state) = match block_on(store.read_current("config", schema::VERSION)) {
+            Ok(r) => r,
+            Err(e) => return (None, alloc::format!("defaults (store: {e})")),
+        };
+        println!(
+            "  store config    : slot A {}, slot B {}",
+            describe(&state.a),
+            describe(&state.b)
+        );
+        let Some(rec) = rec else { break None };
+        if !rec.header.is_trial() {
+            break Some(rec);
+        }
+        let h = rec.header;
+        if h.flags & FLAG_BOOTED == 0 && reverted.is_none() {
+            let marked = h.with_flags(FLAG_TRIAL | FLAG_BOOTED);
+            match block_on(store.rewrite_header("config", rec.slot, marked)) {
+                Ok(()) => {
+                    TRIAL.call_once(|| (rec.slot, marked));
+                    println!(
+                        "  config          : trial (slot {}, seq {}): confirm within {} s or the router reverts",
+                        slot_name(rec.slot),
+                        h.seq,
+                        trial_secs()
+                    );
+                    break Some(rec);
+                }
+                Err(e) => println!("  config          : cannot mark the trial booted ({e}): reverting"),
+            }
+        } else {
+            println!(
+                "  config          : trial (slot {}, seq {}) was never confirmed: reverting",
+                slot_name(rec.slot),
+                h.seq
+            );
+        }
+        if reverted.is_some() {
+            // Erasing did not take: never boot an unconfirmable trial.
+            return (None, String::from("defaults (trial could not be reverted)"));
+        }
+        if let Err(e) = block_on(store.erase("config", rec.slot)) {
+            println!("  config          : erasing the trial failed: {e}");
+        }
+        reverted = Some(h.seq);
     };
-    println!(
-        "  store config    : slot A {}, slot B {}",
-        describe(&state.a),
-        describe(&state.b)
-    );
+    let note = reverted
+        .map(|seq| alloc::format!(", trial seq {seq} reverted"))
+        .unwrap_or_default();
     let Some(rec) = rec else {
-        return (None, String::from("defaults (store has no valid config)"));
+        return (None, alloc::format!("defaults (store has no valid config{note})"));
     };
     let parsed = core::str::from_utf8(&rec.payload)
         .map_err(|_| String::from("not UTF-8"))
@@ -95,7 +144,7 @@ fn stored(store: Option<&mut crate::store::Store>) -> (Option<schema::Config>, S
         Ok(c) => (
             Some(c),
             alloc::format!(
-                "stored (slot {}, seq {})",
+                "stored (slot {}, seq {}{note})",
                 slot_name(rec.slot),
                 rec.header.seq
             ),
@@ -103,12 +152,26 @@ fn stored(store: Option<&mut crate::store::Store>) -> (Option<schema::Config>, S
         Err(e) => (
             None,
             alloc::format!(
-                "defaults (stored config slot {} rejected: {})",
+                "defaults (stored config slot {} rejected: {}{note})",
                 slot_name(rec.slot),
                 e.replace('\n', "; ")
             ),
         ),
     }
+}
+
+/// The trial this boot runs (its slot and marked header), if the current
+/// config is one: the web interface must confirm it within [`trial_secs`].
+pub fn trial() -> Option<(config_store::Slot, config_store::RecordHeader)> {
+    TRIAL.get().copied()
+}
+
+/// Seconds a trial waits for Confirm: 120, boot argument `trial_secs=`
+/// (tests).
+pub fn trial_secs() -> u64 {
+    arg_u64(bootargs(), "trial_secs")
+        .filter(|&s| s >= 5)
+        .unwrap_or(120)
 }
 
 /// The config without boot-argument overrides ([`load`] must have run).

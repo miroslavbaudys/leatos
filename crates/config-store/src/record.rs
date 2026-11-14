@@ -8,6 +8,14 @@ use alloc::vec::Vec;
 pub const RECORD_MAGIC: [u8; 4] = *b"RREC";
 pub const RECORD_FORMAT: u16 = 1;
 
+/// [`RecordHeader::flags`]: the record is a **trial** (a change that could
+/// lock the user out). It must be confirmed, or the reader reverts to the
+/// previous record (docs/config-and-storage.md §6).
+pub const FLAG_TRIAL: u32 = 1 << 0;
+/// With [`FLAG_TRIAL`]: the router has booted this record once. Finding it
+/// set at boot means that boot was never confirmed: revert.
+pub const FLAG_BOOTED: u32 = 1 << 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slot {
     A,
@@ -42,6 +50,9 @@ pub struct RecordHeader {
     pub len: u32,
     /// CRC-32 of the payload.
     pub crc: u32,
+    /// [`FLAG_TRIAL`], [`FLAG_BOOTED`]; 0 = a confirmed record. Bytes
+    /// 36..40, zero in records written before flags existed.
+    pub flags: u32,
 }
 
 impl RecordHeader {
@@ -66,6 +77,7 @@ impl RecordHeader {
             version: le32(s, 24),
             len: le32(s, 28),
             crc: le32(s, 32),
+            flags: le32(s, 36),
         };
         if h.len as usize > area.max_payload() {
             return Err(Error::PayloadTooLarge {
@@ -74,6 +86,17 @@ impl RecordHeader {
             });
         }
         Ok(h)
+    }
+
+    pub fn is_trial(&self) -> bool {
+        self.flags & FLAG_TRIAL != 0
+    }
+
+    /// The same record with other flags: rewriting only the header sector
+    /// (one sector, atomic: a torn write fails the CRC and the reader falls
+    /// back to the previous record) marks, confirms or keeps a trial.
+    pub fn with_flags(&self, flags: u32) -> Self {
+        RecordHeader { flags, ..*self }
     }
 
     /// Payload sectors after the header sector.
@@ -90,6 +113,7 @@ impl RecordHeader {
         s[24..28].copy_from_slice(&self.version.to_le_bytes());
         s[28..32].copy_from_slice(&self.len.to_le_bytes());
         s[32..36].copy_from_slice(&self.crc.to_le_bytes());
+        s[36..40].copy_from_slice(&self.flags.to_le_bytes());
         seal_sector(&mut s);
         s
     }
@@ -203,6 +227,7 @@ impl AreaState {
             version,
             len: payload.len() as u32,
             crc: crc32(payload),
+            flags: 0,
         };
         let mut data = vec![0; header.payload_sectors() as usize * SECTOR];
         data[..payload.len()].copy_from_slice(payload);
@@ -231,4 +256,13 @@ pub struct WritePlan {
     pub payload: Vec<u8>,
     pub header_lba: u64,
     pub header_sector: [u8; SECTOR],
+}
+
+impl WritePlan {
+    /// The same write with header `flags` (e.g. [`FLAG_TRIAL`]).
+    pub fn with_flags(mut self, area: &Area, flags: u32) -> Self {
+        self.header.flags = flags;
+        self.header_sector = self.header.encode(area);
+        self
+    }
 }

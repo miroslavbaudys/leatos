@@ -44,11 +44,32 @@
          padding:6px 8px; font-size:12px; font-variant-numeric:tabular-nums; white-space:nowrap; box-shadow:0 2px 8px rgba(0,0,0,.12); }
   .tip i { display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:5px; }
   details { margin-top:6px; color:var(--muted); }
+  .banner { grid-column:1 / -1; background:var(--card); border:2px solid var(--bad); border-radius:8px; padding:12px 14px; }
+  .banner b { font-variant-numeric:tabular-nums; }
+  .cfg { display:grid; gap:12px 20px; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); }
+  fieldset { border:1px solid var(--line); border-radius:6px; padding:8px 10px 10px; margin:0; min-width:0; }
+  legend { color:var(--muted); padding:0 4px; }
+  label { display:grid; gap:2px; margin:6px 0; color:var(--muted); }
+  label.check { display:flex; gap:8px; align-items:center; color:var(--fg); }
+  label input:not([type=checkbox]), label select { width:100%; }
+  select { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); }
+  .bad { outline:2px solid var(--bad); outline-offset:1px; }
+  #statics input { width:100%; min-width:0; }
+  #statics td { border:none; padding:2px 6px 2px 0; }
+  button.plain { background:none; color:var(--accent); border:1px solid var(--line); }
+  #cfgmsg, #trialmsg { white-space:pre-wrap; }
+  #cfgmsg.err { color:var(--bad); }
+  .hint { color:var(--muted); font-size:13px; }
 </style>
 </head>
 <body>
 <header><h1>rrouter</h1><span id="ver">…</span><span id="up"></span><span id="wanwarn" class="warn"></span></header>
 <main>
+  <div id="trialbar" class="banner" hidden>
+    <div><b>Trial configuration.</b> Confirm within <b id="trialleft">–</b> s, or the router reverts to the previous configuration and reboots.</div>
+    <div class="row"><button id="confirm">Confirm</button><button id="revert" class="danger">Revert now</button></div>
+    <div id="trialmsg"></div>
+  </div>
   <section class="wide"><h2>CPU load per core</h2>
     <div class="legend"><span><i style="background:var(--s1)"></i>Datapath (forwarding, CAKE)</span><span><i style="background:var(--s2)"></i>Services (DHCP, DNS, web)</span><span><i style="background:var(--s3)"></i>Other (IRQs, timers)</span></div>
     <div id="cpucharts"></div>
@@ -58,8 +79,44 @@
   <section><h2>WAN lease</h2><table id="wan"></table></section>
   <section><h2>System</h2><table id="sys"></table></section>
   <section class="wide"><h2>DHCP leases</h2><table id="leases"></table></section>
+  <section class="wide"><h2>Configuration</h2>
+    <div class="row"><input id="pass" type="password" placeholder="admin password (mgmt_pass)" autocomplete="current-password"><span class="hint">needed to save, confirm, upgrade and reboot</span></div>
+    <form id="cfg" class="cfg" autocomplete="off">
+      <fieldset><legend>LAN</legend>
+        <label>Router address / prefix<input data-path="lan.ipv4" placeholder="192.168.1.1/24"></label>
+        <label>Local domain<input data-path="lan.domain" placeholder="lan"></label>
+        <label>DHCP pool (empty = automatic, hosts .100–.199)
+          <span class="row" style="margin:0"><input id="rlo" data-path="lan.dhcp.range" placeholder="first" style="flex:1"><input id="rhi" data-path="lan.dhcp.range" placeholder="last" style="flex:1"></span></label>
+        <label>Lease time (hours)<input id="lease" data-path="lan.dhcp.lease_secs" type="number" min="0.02" step="any"></label>
+      </fieldset>
+      <fieldset><legend>DNS</legend>
+        <label>Cache entries<input data-path="dns.cache_entries" type="number" min="16" max="65536"></label>
+        <label class="check"><input data-path="dns.rebind_protection" type="checkbox">Rebind protection (drop answers pointing into private ranges)</label>
+      </fieldset>
+      <fieldset><legend>Shaping (CAKE)</legend>
+        <label>Upload, kbit/s (empty = unshaped)<input data-path="shaping.up_kbit" data-opt type="number" min="64"></label>
+        <label>Download, kbit/s (empty = unshaped)<input data-path="shaping.down_kbit" data-opt type="number" min="64"></label>
+        <label>Overhead per packet, bytes<input data-path="shaping.overhead" type="number" min="0" max="256"></label>
+        <label class="check"><input data-path="shaping.ecn_up" type="checkbox">ECN marking on upload</label>
+        <label class="check"><input data-path="shaping.ecn_down" type="checkbox">ECN marking on download</label>
+        <label>Queue discipline<select data-path="shaping.qdisc"><option value="cake">CAKE</option><option value="fq_codel">FQ-CoDel</option><option value="codel">CoDel (one queue)</option></select></label>
+        <label>Fairness<select data-path="shaping.isolation"><option value="triple-isolate">triple-isolate</option><option value="dual-srchost">dual-srchost</option><option value="dual-dsthost">dual-dsthost</option><option value="flows">flows</option></select></label>
+      </fieldset>
+      <fieldset><legend>Management</legend>
+        <label class="check"><input data-path="mgmt.on_wan" type="checkbox">Also on the WAN (development only)</label>
+        <p class="hint">Changing the LAN address or these settings boots as a trial: confirm it from the new address, or the router reverts.</p>
+      </fieldset>
+      <fieldset style="grid-column:1 / -1"><legend>DHCP reservations</legend>
+        <table id="statics"></table>
+        <div class="row"><button type="button" id="addstatic" class="plain">Add reservation</button></div>
+      </fieldset>
+    </form>
+    <div class="row"><button id="save">Save and reboot</button><button id="discard" class="plain">Discard changes</button>
+      <a href="/api/config" download="config.toml">Export config.toml</a>
+      <label class="check" style="margin:0">Import:<input id="import" type="file" accept=".toml,text/plain"></label></div>
+    <div id="cfgmsg"></div>
+  </section>
   <section class="wide"><h2>Upgrade (in RAM; a power cycle boots the SD card again)</h2>
-    <div class="row"><input id="pass" type="password" placeholder="admin password (mgmt_pass)" autocomplete="current-password"></div>
     <div class="row"><input id="file" type="file"><input id="cmd" placeholder="kernel command line (empty = keep current)" size="40"></div>
     <div class="row"><button id="go">Upload and start</button><button id="reboot" class="danger">Reboot</button></div>
     <div id="msg"></div>
@@ -167,6 +224,7 @@ function showCpu(cpu) {
   $("cputab").innerHTML = `<tr><th>Seconds ago</th>${head}</tr>` + rows10.join("");
 }
 
+let lastUptime = null;
 async function refresh() {
   let st;
   try { st = await (await fetch("/api/status", {cache: "no-store"})).json(); }
@@ -187,7 +245,14 @@ async function refresh() {
     ["Forwarded", n(st.forwarded)], ["Dropped", n(st.dropped)], ["Connections", n(st.conntrack)],
     ["Packet pool", `${n(st.pool.free)} free of ${n(st.pool.capacity)}` + (st.pool.alloc_failures ? `, ${n(st.pool.alloc_failures)} failures` : "")],
     ["Heap", `${n(Math.round(st.heap.used / 1024))} KiB used, ${n(Math.round(st.heap.free / 1048576))} MiB free`],
+    ["Config", esc(st.config) + (st.store ? "" : " · no store: changes cannot be saved")],
     ["Upgrade", st.mgmt.upgrade ? "enabled" : "disabled (boot with mgmt_pass=…)"]]);
+  $("trialbar").hidden = !st.trial;
+  if (st.trial) $("trialleft").textContent = st.trial.remaining_s;
+  $("save").disabled = !st.store || !!st.trial;
+  // A reboot (uptime went back): reload the form from the new config.
+  if (lastUptime !== null && st.uptime_s < lastUptime) loadConfig();
+  lastUptime = st.uptime_s;
   $("leases").innerHTML = st.dhcp_leases.length
     ? "<tr><th>Host</th><th>IP</th><th>MAC</th><th>State</th><th>Expires in</th></tr>" + st.dhcp_leases.map((d) =>
         `<tr><td>${esc(d.hostname ?? "–")}</td><td>${esc(d.ip)}</td><td>${esc(d.mac)}</td><td>${d.bound ? "bound" : "offered"}</td><td>${dur(d.expires_in_s)}</td></tr>`).join("")
@@ -218,6 +283,132 @@ $("reboot").onclick = async () => {
     say(j.ok ? "Rebooting…" : `Refused (${r.status}): ${j.error}`);
   } catch (e) { say("Request failed: " + e); }
 };
+// ---- Configuration form: /api/config.json <-> fields (data-path = the
+// field's path in the schema, which is also how validation issues name it).
+let cfgOrig = null;
+const getp = (o, path) => path.split(".").reduce((x, k) => x == null ? x : x[k], o);
+const setp = (o, path, v) => {
+  const ks = path.split("."), last = ks.pop();
+  const t = ks.reduce((x, k) => (x[k] ??= {}), o);
+  if (v === undefined) delete t[last]; else t[last] = v;
+};
+const cfgSay = (t, err) => { $("cfgmsg").textContent = t; $("cfgmsg").className = err ? "err" : ""; };
+const fields = () => [...document.querySelectorAll("#cfg [data-path]")].filter((e) => !e.closest("#statics") && e.id !== "rlo" && e.id !== "rhi" && e.id !== "lease");
+
+function staticRow(s = {}) {
+  const i = $("statics").rows.length - 1;
+  const tr = document.createElement("tr");
+  for (const [k, ph] of [["mac", "52:54:00:12:34:56"], ["ip", "192.168.1.10"], ["hostname", "name (optional)"]]) {
+    const td = document.createElement("td"), inp = document.createElement("input");
+    inp.dataset.key = k; inp.placeholder = ph; inp.value = s[k] ?? "";
+    td.append(inp); tr.append(td);
+  }
+  const td = document.createElement("td"), b = document.createElement("button");
+  b.type = "button"; b.className = "plain"; b.textContent = "Remove"; b.onclick = () => { tr.remove(); renumber(); };
+  td.append(b); tr.append(td);
+  $("statics").append(tr);
+  renumber();
+}
+function renumber() {
+  [...$("statics").rows].slice(1).forEach((tr, i) => tr.querySelectorAll("input").forEach((inp) => {
+    inp.dataset.path = `lan.dhcp.static[${i}].${inp.dataset.key}`;
+  }));
+}
+function fillForm(c) {
+  for (const e of fields()) {
+    const v = getp(c, e.dataset.path);
+    if (e.type === "checkbox") e.checked = !!v; else e.value = v ?? "";
+  }
+  const r = c.lan?.dhcp?.range;
+  $("rlo").value = r ? r[0] : ""; $("rhi").value = r ? r[1] : "";
+  const ls = c.lan?.dhcp?.lease_secs;
+  $("lease").value = ls === undefined ? "" : +(ls / 3600).toFixed(4);
+  $("statics").innerHTML = "<tr><th>MAC</th><th>IP address</th><th>Hostname</th><th></th></tr>";
+  (c.lan?.dhcp?.static ?? []).forEach((s) => staticRow(s));
+}
+function readForm() {
+  const c = structuredClone(cfgOrig);
+  for (const e of fields()) {
+    let v;
+    if (e.type === "checkbox") v = e.checked;
+    else if (e.type === "number") v = e.value.trim() === "" ? (e.hasAttribute("data-opt") ? undefined : NaN) : Number(e.value);
+    else v = e.value.trim();
+    setp(c, e.dataset.path, v);
+  }
+  const lo = $("rlo").value.trim(), hi = $("rhi").value.trim();
+  setp(c, "lan.dhcp.range", lo || hi ? [lo, hi] : undefined);
+  setp(c, "lan.dhcp.lease_secs", Math.round(Number($("lease").value) * 3600));
+  const st = [...$("statics").rows].slice(1).map((tr) => {
+    const o = {};
+    tr.querySelectorAll("input").forEach((i) => { if (i.value.trim()) o[i.dataset.key] = i.value.trim(); });
+    return o;
+  }).filter((o) => Object.keys(o).length);
+  setp(c, "lan.dhcp.static", st.length ? st : undefined);
+  return c;
+}
+function markIssues(issues) {
+  document.querySelectorAll("#cfg .bad").forEach((e) => e.classList.remove("bad"));
+  for (const x of issues) {
+    for (const e of document.querySelectorAll("#cfg [data-path]")) {
+      const p = e.dataset.path;
+      if (x.path === p || x.path.startsWith(p + ".") || x.path.startsWith(p + "[") || p.startsWith(x.path + ".")) e.classList.add("bad");
+    }
+  }
+}
+async function loadConfig() {
+  try {
+    const r = await fetch("/api/config.json", { cache: "no-store" });
+    cfgOrig = await r.json();
+    fillForm(cfgOrig); markIssues([]);
+  } catch (e) { cfgSay("Could not load the configuration: " + e, true); }
+}
+async function postConfig(body, type) {
+  markIssues([]);
+  cfgSay("Saving…");
+  let r, j;
+  try {
+    r = await fetch("/api/config", { method: "POST", headers: { ...auth(), "Content-Type": type }, body });
+    j = await r.json();
+  } catch (e) { return cfgSay("Request failed: " + e, true); }
+  if (!j.ok) {
+    markIssues(j.issues ?? []);
+    return cfgSay(`Not saved (${r.status}):\n${j.error}`, true);
+  }
+  if (j.trial) {
+    cfgSay(`${j.detail}.\nThis change boots as a trial. The router's LAN address is now ${j.lan}: ` +
+      `open http://${j.lan}/ (renew your DHCP lease if needed) and press Confirm within ${j.confirm_within_s} s, ` +
+      "or the router goes back to the previous configuration.");
+  } else {
+    cfgSay(`${j.detail}. This page reconnects by itself.`);
+  }
+}
+$("addstatic").onclick = () => staticRow();
+$("discard").onclick = () => { loadConfig(); cfgSay(""); };
+$("save").onclick = () => {
+  if (!cfgOrig) return;
+  const c = readForm();
+  if (JSON.stringify(c) === JSON.stringify(cfgOrig)) return cfgSay("Nothing changed.");
+  postConfig(JSON.stringify(c), "application/json");
+};
+$("import").onchange = async () => {
+  const f = $("import").files[0];
+  $("import").value = "";
+  if (!f || !confirm(`Replace the configuration with ${f.name} and reboot?`)) return;
+  postConfig(await f.text(), "application/toml");
+};
+async function trialOp(what) {
+  $("trialmsg").textContent = "…";
+  try {
+    const r = await fetch("/api/config/" + what, { method: "POST", headers: auth() });
+    const j = await r.json();
+    $("trialmsg").textContent = j.ok ? j.detail : `Refused (${r.status}): ${j.error}`;
+    refresh();
+  } catch (e) { $("trialmsg").textContent = "Request failed: " + e; }
+}
+$("confirm").onclick = () => trialOp("confirm");
+$("revert").onclick = () => { if (confirm("Go back to the previous configuration and reboot?")) trialOp("revert"); };
+
+loadConfig();
 refresh();
 setInterval(refresh, 2000);
 </script>

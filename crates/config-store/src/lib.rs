@@ -27,7 +27,7 @@ mod record;
 
 pub use layout::{Area, LAYOUT_VERSION, Layout, MAX_AREAS, STANDARD_MIN_SECTORS, STORE_MAGIC};
 pub use record::{
-    AreaState, RECORD_FORMAT, RECORD_MAGIC, RecordHeader, Slot, SlotState, WritePlan, check_slot,
+    AreaState, FLAG_BOOTED, FLAG_TRIAL, RECORD_FORMAT, RECORD_MAGIC, RecordHeader, Slot, SlotState, WritePlan, check_slot,
 };
 
 /// Sector size of the store, in bytes.

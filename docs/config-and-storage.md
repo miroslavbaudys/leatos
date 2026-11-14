@@ -65,6 +65,7 @@ A slot is one header sector followed by the payload:
 | 24..28 | payload schema version (e.g. config `version`) |
 | 28..32 | payload length in bytes |
 | 32..36 | CRC-32 of the payload |
+| 36..40 | flags: bit 0 trial, bit 1 trial booted (§6); 0 = confirmed |
 | 508..512 | CRC-32 of bytes 0..508 |
 
 ## 3. Reading
@@ -205,16 +206,47 @@ comments and custom ordering in an uploaded file are not kept. The file
 is UI-managed, with import/export.
 
 ## 6. Management interface
+The status page has a **Configuration** section: a form for LAN (address,
+domain, DHCP pool, lease time), DHCP reservations, DNS, shaping and
+management, with Save, Discard, Export (`config.toml`) and Import. Fields
+named by validation issues are highlighted.
+
 - `GET /api/config`: current config as TOML (secrets omitted), without
-  boot-argument overrides (what a save starts from).
-- `POST /api/config` (Basic auth): validate, save, reboot. Errors: 422 with
-  the parser or validation message (line and column), 501 without a
-  store. The kernel stores the canonical TOML of the parsed structs. The
-  save runs in the services task and yields while the disk works.
-- Shaper rates apply live; Save makes them persistent.
-- **Confirm or revert:** a change to the LAN address or management
-  settings boots as a trial. Without Confirm from the web interface within
-  120 s, the router reboots into the previous record.
+  boot-argument overrides (what a save starts from). `GET
+  /api/config.json`: the same as JSON (the form).
+- `POST /api/config` (Basic auth): TOML, or JSON with `Content-Type:
+  application/json` (the form). Validate, save, reboot. Errors: 422 with
+  the parser or validation message (line and column) and, for
+  inconsistencies, `issues: [{path, msg}]`; 409 while a trial is pending;
+  501 without a store. The kernel stores the canonical TOML of the parsed
+  structs. The save runs in the services task and yields while the disk
+  works.
+- `POST /api/config/confirm`, `POST /api/config/revert` (Basic auth; 409
+  without a pending trial). `/api/status` has `config` (where it came
+  from), `store` and `trial` (`{seq, remaining_s}` or `null`).
+- Shaper rates apply live; Save makes them persistent. (Not yet: a change
+  reboots.)
+
+### Confirm or revert
+A save that changes the LAN address or the management settings
+(`Config::needs_trial`) could cut the user off, so it is written as a
+**trial** (record flag bit 0):
+
+1. Boot finds a trial without the booted bit: rewrites its header with
+   the booted bit (one sector) and runs it. The web interface shows a
+   banner with a countdown; Confirm rewrites the header with flags 0.
+2. No Confirm within 120 s (boot argument `trial_secs=` for tests), or
+   Revert: the trial's header sector is zeroed (the slot becomes empty)
+   and the router reboots into the previous record.
+3. Boot finds a trial **with** the booted bit: the last boot never
+   confirmed it (power cut, crash, reset). It is erased the same way
+   before anything uses it.
+
+Every step writes one header sector. A torn write fails the CRC, so the
+previous record wins: the outcome is always the trial or the previous
+config. No save is accepted while a trial is pending, since it would
+overwrite the previous record, the only confirmed one. Without a previous
+record, a revert lands on the defaults.
 
 ## 7. Drivers
 - QEMU: virtio-blk (`drivers::virtio_blk` over `virtio-drivers`
@@ -242,7 +274,10 @@ is UI-managed, with import/export.
   defaults; `config=defaults` ignores the store; save through the web
   interface (401 without password, 422 for invalid or inconsistent
   configs, store unchanged after them), reboot, the router uses the new
-  record. Negative controls: corrupt the new record → the previous one;
+  record. Trials: a LAN change boots as a trial, 409 for saves meanwhile,
+  confirm keeps it across a reboot; controls: no confirm → reverted after
+  `trial_secs`, Revert → reverted, router killed during the trial → the
+  next boot reverts. Negative controls: corrupt the new record → the previous one;
   corrupt both → `config: defaults`.
 
 ## 9. Status
@@ -252,5 +287,5 @@ is UI-managed, with import/export.
 | `crates/config`: schema v1 (LAN, DHCP + reservations, DNS, shaping, mgmt), defaults, validation, TOML | ✅ host-tested |
 | Kernel: one `Config` loaded at boot (refactor, no behaviour change) | ✅ `config::load()`; boot arguments overlay it |
 | virtio-blk + store partition in QEMU, lab check | ✅ `drivers::virtio_blk`, `store`, `tools/rrstore`, `GET`/`POST /api/config`, `scripts/store-test.sh` (aarch64 + x86_64) |
-| Web interface: config pages, save + reboot, confirm/revert | |
+| Web interface: config pages, save + reboot, confirm/revert | ✅ form + import/export on the status page, JSON API, trial records (flags), `scripts/store-test.sh` covers confirm, timeout, revert and a kill during the trial (aarch64 + x86_64) |
 | apu4: SD driver, store partition in `apu-image.sh` | |

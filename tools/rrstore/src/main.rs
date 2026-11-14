@@ -168,7 +168,22 @@ fn describe(s: &SlotState) -> String {
     match s {
         SlotState::Empty => "empty".into(),
         SlotState::Corrupt => "corrupt".into(),
-        SlotState::Valid(h) => format!("seq {} version {} {} bytes", h.seq, h.version, h.len),
+        SlotState::Valid(h) => format!(
+            "seq {} version {} {} bytes{}{}",
+            h.seq,
+            h.version,
+            h.len,
+            if h.flags & config_store::FLAG_TRIAL != 0 {
+                " trial"
+            } else {
+                ""
+            },
+            if h.flags & config_store::FLAG_BOOTED != 0 {
+                " booted"
+            } else {
+                ""
+            },
+        ),
     }
 }
 
@@ -229,8 +244,8 @@ fn get(path: &str, area: &str) -> Result<()> {
         .ok_or(format!("{area}: no valid record"))?;
     let buf = if slot == Slot::A { sa } else { sb };
     eprintln!(
-        "{area}: slot {slot:?}, seq {}, version {}",
-        h.seq, h.version
+        "{area}: slot {slot:?}, seq {}, version {}, flags {}",
+        h.seq, h.version, h.flags
     );
     std::io::stdout()
         .write_all(&buf[SECTOR..SECTOR + h.len as usize])

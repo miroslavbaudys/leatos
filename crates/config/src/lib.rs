@@ -4,6 +4,9 @@
 //! - [`parse`]: text → checked [`Config`] (size limit, schema version,
 //!   TOML, unknown fields, [`Config::validate`])
 //! - [`Config::to_toml`]: the canonical text (what the store holds)
+//! - [`parse_json`], [`Config::to_json`]: the same schema as JSON, for the
+//!   web interface's forms
+//! - [`Config::needs_trial`]: does a change need confirm-or-revert?
 //! - [`Config::default`]: what the router runs without a stored config
 //!
 //! Every section and field has a default, so a file may set only what it
@@ -268,6 +271,20 @@ pub fn parse(text: &str) -> Result<Config, Error> {
     Ok(c)
 }
 
+/// JSON (the web interface's form) → a checked [`Config`]: the same
+/// schema, defaults and checks as [`parse`].
+pub fn parse_json(text: &str) -> Result<Config, Error> {
+    if text.len() > MAX_LEN {
+        return Err(Error::TooLarge { len: text.len() });
+    }
+    let c: Config = serde_json::from_str(text).map_err(|e| Error::Syntax(e.to_string()))?;
+    if c.version > VERSION {
+        return Err(Error::NewerVersion(c.version));
+    }
+    c.validate().map_err(Error::Invalid)?;
+    Ok(c)
+}
+
 /// The `version` field alone, ignoring everything else, so a newer
 /// document is reported as newer rather than as full of unknown fields.
 fn version_of(text: &str) -> Result<u32, Error> {
@@ -290,6 +307,19 @@ impl Config {
         // Serialisation fails only for types TOML cannot express; the
         // schema has none (tested).
         toml::to_string(self).unwrap_or_default()
+    }
+
+    /// The config as JSON (every field, like [`Self::to_toml`]).
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Changing from `old` to `self` could cut the user off from the web
+    /// interface (another LAN address or subnet, management settings): such
+    /// a save boots as a trial that must be confirmed
+    /// (docs/config-and-storage.md §6).
+    pub fn needs_trial(&self, old: &Config) -> bool {
+        self.lan.ipv4 != old.lan.ipv4 || self.mgmt != old.mgmt
     }
 
     /// Cross-field checks; every problem found, not just the first.

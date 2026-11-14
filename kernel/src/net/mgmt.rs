@@ -8,14 +8,23 @@
 //!   it in RAM. `X-Cmdline` replaces the kernel command line for the new
 //!   kernel (default: keep the current one).
 //! - `POST /api/reboot`: firmware reset.
-//! - `GET /api/config`: the configuration as TOML, without boot-argument
-//!   overrides (`config::base`).
-//! - `POST /api/config`: body = `config.toml`; parsed and validated
-//!   (`crates/config`; 422 with the message on error), saved to the store
-//!   by the services task (`crate::store`, canonical TOML from the parsed
-//!   structs), then the router reboots into it. 501 without a store.
+//! - `GET /api/config` (TOML, export) and `GET /api/config.json` (the
+//!   page's form): the configuration without boot-argument overrides
+//!   (`config::base`).
+//! - `POST /api/config`: body = `config.toml`, or JSON with
+//!   `Content-Type: application/json`; parsed and validated
+//!   (`crates/config`; 422 with the message and, for inconsistencies, the
+//!   `issues` with their paths), saved to the store by the services task
+//!   (`crate::store`, canonical TOML from the parsed structs), then the
+//!   router reboots into it. 501 without a store.
+//! - **Trials** (docs/config-and-storage.md §6): a save that changes the
+//!   LAN address or management settings (`Config::needs_trial`) is stored
+//!   as a trial. The next boot runs it; `POST /api/config/confirm` keeps it,
+//!   `POST /api/config/revert` or no confirm within `config::trial_secs`
+//!   erases it and reboots into the previous record. No save while a trial
+//!   is pending (it would overwrite the only confirmed record).
 //!
-//! Upgrade, reboot and config saves need HTTP Basic auth (user `admin`, password from the
+//! Upgrade, reboot and config changes need HTTP Basic auth (user `admin`, password from the
 //! `mgmt_pass=` boot argument); without a password they are refused.
 //! Listens on the LAN; on the WAN too only with `mgmt=wan` (development:
 //! a router's management belongs on the LAN). Plain HTTP: the password
@@ -37,6 +46,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
+use config_store::{RecordHeader, Slot};
 use proto_http::{Error as HttpError, Head, Method, Parser, json_str, response};
 use qdisc::Qdisc;
 use smoltcp::iface::SocketHandle;
@@ -76,7 +86,29 @@ enum Route {
     Upgrade,
     Reboot,
     ConfigGet,
+    ConfigJson,
     ConfigPut,
+    ConfigConfirm,
+    ConfigRevert,
+}
+
+/// Work for the store, done by the services task (it may take a while and
+/// must not block this state machine): [`Mgmt::take_op`], then
+/// [`Mgmt::op_done`].
+pub enum StoreOp {
+    /// Write a new `config` record (`flags`: trial or not).
+    Save { toml: String, flags: u32 },
+    /// Clear the trial flags of this boot's record.
+    Confirm(Slot, RecordHeader),
+    /// Erase this boot's trial record.
+    Revert(Slot),
+}
+
+/// The trial this boot runs.
+struct Trial {
+    slot: Slot,
+    header: RecordHeader,
+    deadline: timer::Instant,
 }
 
 enum After {
@@ -166,9 +198,16 @@ pub struct Mgmt {
     wan_lease: String,
     /// A store exists: `POST /api/config` can save.
     has_store: bool,
-    /// A validated config waiting for the services task to save it:
-    /// (connection, canonical TOML).
-    save: Option<(usize, String)>,
+    /// Store work waiting for the services task, and for which connection
+    /// (`None`: the trial timed out).
+    op: Option<(Option<usize>, StoreOp)>,
+    /// A store operation is queued or running.
+    op_busy: bool,
+    trial: Option<Trial>,
+    /// Reboot at the next step (after a timed-out trial was reverted).
+    reboot_pending: bool,
+    /// The LAN address of the config being saved (for the answer).
+    saved_lan: Option<String>,
 }
 
 fn tcp_socket() -> tcp::Socket<'static> {
@@ -217,37 +256,90 @@ impl Mgmt {
             on_wan: cfg.on_wan,
             wan_lease: String::from("null"),
             has_store,
-            save: None,
+            op: None,
+            op_busy: false,
+            trial: config::trial().map(|(slot, header)| Trial {
+                slot,
+                header,
+                deadline: timer::Instant::now()
+                    .checked_add(Duration::from_secs(config::trial_secs()))
+                    .expect("trial deadline"),
+            }),
+            reboot_pending: false,
+            saved_lan: None,
         }
     }
 
-    /// A validated config to save: the services task writes it to the
-    /// store, then reports with [`Self::save_done`].
-    pub fn take_save(&mut self) -> Option<(usize, String)> {
-        self.save.take()
+    /// Store work for the services task.
+    pub fn take_op(&mut self) -> Option<(Option<usize>, StoreOp)> {
+        self.op.take()
     }
 
-    /// The store write for connection `i` finished: answer, and reboot
-    /// into the new config once the answer is sent.
-    pub fn save_done(&mut self, i: usize, result: Result<String, String>) {
-        let c = &mut self.conns[i];
-        match result {
-            Ok(detail) => {
-                println!("  mgmt            : config saved ({detail}), rebooting");
-                c.respond_json(
-                    200,
-                    &format!(
-                        "{{\"ok\":true,\"detail\":{}}}",
-                        json_str(&format!("saved ({detail}), rebooting"))
-                    ),
+    /// The services task finished `op` (for connection `conn`): answer;
+    /// reboot after a save or a revert.
+    pub fn op_done(&mut self, conn: Option<usize>, op: &StoreOp, result: Result<String, String>) {
+        self.op_busy = false;
+        let (status, body, reboot) = match (op, result) {
+            (StoreOp::Save { flags, .. }, Ok(detail)) => {
+                let trial = *flags != 0;
+                println!(
+                    "  mgmt            : config saved ({detail}{}), rebooting",
+                    if trial { ", trial" } else { "" }
                 );
+                let lan = self.saved_lan.take().unwrap_or_default();
+                (
+                    200,
+                    format!(
+                        "{{\"ok\":true,\"detail\":{},\"trial\":{trial},\"confirm_within_s\":{},\"lan\":{}}}",
+                        json_str(&format!("saved ({detail}), rebooting")),
+                        if trial { config::trial_secs() } else { 0 },
+                        json_str(&lan)
+                    ),
+                    true,
+                )
+            }
+            (StoreOp::Confirm(..), Ok(_)) => {
+                println!("  mgmt            : trial config confirmed");
+                self.trial = None;
+                (200, String::from("{\"ok\":true,\"detail\":\"confirmed\"}"), false)
+            }
+            (StoreOp::Revert(_), r) => {
+                // Reboot even if erasing failed: the record is marked
+                // booted, so the next boot reverts it.
+                match &r {
+                    Ok(_) => println!("  mgmt            : trial config reverted, rebooting"),
+                    Err(e) => println!("  mgmt            : reverting the trial failed ({e}), rebooting"),
+                }
+                if conn.is_none() {
+                    self.reboot_pending = true;
+                }
+                (
+                    200,
+                    String::from("{\"ok\":true,\"detail\":\"reverted, rebooting\"}"),
+                    true,
+                )
+            }
+            (_, Err(e)) => {
+                println!("  mgmt            : store operation failed: {e}");
+                (
+                    500,
+                    format!("{{\"ok\":false,\"error\":{}}}", json_str(&format!("store: {e}"))),
+                    false,
+                )
+            }
+        };
+        if let Some(i) = conn {
+            let c = &mut self.conns[i];
+            c.respond_json(status, &body);
+            if reboot {
                 c.after = After::Reboot;
             }
-            Err(e) => {
-                println!("  mgmt            : config save failed: {e}");
-                c.error(500, &format!("save failed: {e}"));
-            }
         }
+    }
+
+    /// When the trial times out ([`Self::step`] reverts it then).
+    pub fn wake_at(&self) -> Option<timer::Instant> {
+        self.trial.as_ref().map(|t| t.deadline)
     }
 
     /// The WAN lease for the status page (already JSON).
@@ -275,22 +367,40 @@ impl Mgmt {
             (Method::Post, "/api/upgrade") => Ok(Route::Upgrade),
             (Method::Post, "/api/reboot") => Ok(Route::Reboot),
             (Method::Get, "/api/config") => Ok(Route::ConfigGet),
+            (Method::Get, "/api/config.json") => Ok(Route::ConfigJson),
             (Method::Post, "/api/config") => Ok(Route::ConfigPut),
+            (Method::Post, "/api/config/confirm") => Ok(Route::ConfigConfirm),
+            (Method::Post, "/api/config/revert") => Ok(Route::ConfigRevert),
             (
                 _,
                 "/" | "/index.html" | "/api/status" | "/api/upgrade" | "/api/reboot"
-                | "/api/config",
+                | "/api/config" | "/api/config.json" | "/api/config/confirm"
+                | "/api/config/revert",
             ) => {
                 Err((405, "method not allowed"))
             }
             _ => Err((404, "not found")),
         };
         let route = route.and_then(|r| {
-            if matches!(r, Route::Upgrade | Route::Reboot | Route::ConfigPut) {
+            let changes_config =
+                matches!(r, Route::ConfigPut | Route::ConfigConfirm | Route::ConfigRevert);
+            if changes_config || matches!(r, Route::Upgrade | Route::Reboot) {
                 self.authorized(&head)?;
             }
-            if r == Route::ConfigPut && !self.has_store {
+            if changes_config && !self.has_store {
                 return Err((501, "no store: the config cannot be saved"));
+            }
+            if changes_config && self.op_busy {
+                return Err((409, "another config change is in progress"));
+            }
+            match r {
+                Route::ConfigPut if self.trial.is_some() => {
+                    return Err((409, "a trial config is pending: confirm or revert it first"));
+                }
+                Route::ConfigConfirm | Route::ConfigRevert if self.trial.is_none() => {
+                    return Err((409, "no trial config pending"));
+                }
+                _ => {}
             }
             Ok(r)
         });
@@ -349,23 +459,81 @@ impl Mgmt {
                 let toml = config::base().to_toml();
                 self.conns[i].respond(200, "application/toml", &[], toml.as_bytes());
             }
+            Route::ConfigJson => {
+                let json = config::base().to_json();
+                self.conns[i].respond_json(200, &json);
+            }
             Route::ConfigPut => self.check_config(i),
+            Route::ConfigConfirm | Route::ConfigRevert => {
+                let Some(t) = &self.trial else { return };
+                let op = if route == Route::ConfigConfirm {
+                    StoreOp::Confirm(t.slot, t.header.with_flags(0))
+                } else {
+                    StoreOp::Revert(t.slot)
+                };
+                self.op = Some((Some(i), op));
+                self.op_busy = true;
+            }
         }
     }
 
-    /// `POST /api/config`: parse and validate; queue the save.
+    /// `POST /api/config`: parse (TOML, or JSON by content type) and
+    /// validate; queue the save, as a trial if it could lock the user out.
     fn check_config(&mut self, i: usize) {
+        use config::schema;
         let c = &mut self.conns[i];
-        let parsed = core::str::from_utf8(&c.body)
-            .map_err(|_| String::from("config.toml must be UTF-8"))
-            .and_then(|t| config::schema::parse(t).map_err(|e| format!("{e}")));
+        let json = c
+            .head
+            .as_ref()
+            .and_then(|h| h.header("content-type"))
+            .is_some_and(|t| t.trim_start().starts_with("application/json"));
+        let parsed = match core::str::from_utf8(&c.body) {
+            Err(_) => Err(schema::Error::Syntax(String::from("not UTF-8"))),
+            Ok(t) if json => schema::parse_json(t),
+            Ok(t) => schema::parse(t),
+        };
         match parsed {
             Err(e) => {
-                println!("  mgmt            : config rejected: {}", e.replace('\n', "; "));
-                c.error(422, &e);
+                let msg = format!("{e}");
+                println!("  mgmt            : config rejected: {}", msg.replace('\n', "; "));
+                let issues = match &e {
+                    schema::Error::Invalid(v) => v
+                        .iter()
+                        .map(|x| {
+                            format!(
+                                "{{\"path\":{},\"msg\":{}}}",
+                                json_str(&x.path),
+                                json_str(&x.msg)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    _ => String::new(),
+                };
+                c.respond_json(
+                    422,
+                    &format!(
+                        "{{\"ok\":false,\"error\":{},\"issues\":[{issues}]}}",
+                        json_str(&msg)
+                    ),
+                );
             }
-            Ok(_) if self.save.is_some() => c.error(409, "another save is in progress"),
-            Ok(cfg) => self.save = Some((i, cfg.to_toml())),
+            Ok(cfg) => {
+                let flags = if cfg.needs_trial(config::base()) {
+                    config_store::FLAG_TRIAL
+                } else {
+                    0
+                };
+                self.saved_lan = Some(format!("{}", cfg.lan.ipv4.addr));
+                self.op = Some((
+                    Some(i),
+                    StoreOp::Save {
+                        toml: cfg.to_toml(),
+                        flags,
+                    },
+                ));
+                self.op_busy = true;
+            }
         }
     }
 
@@ -455,6 +623,21 @@ impl Mgmt {
         services: Option<&LanServices>,
     ) -> Option<Action> {
         let mut action = None;
+        if self.reboot_pending {
+            return Some(Action::Reboot);
+        }
+        if let Some(t) = &self.trial
+            && !self.op_busy
+            && timer::Instant::now() >= t.deadline
+        {
+            println!(
+                "  mgmt            : trial config not confirmed within {} s: reverting",
+                config::trial_secs()
+            );
+            self.op = Some((None, StoreOp::Revert(t.slot)));
+            self.op_busy = true;
+            self.trial = None;
+        }
         for i in 0..self.conns.len() {
             let (ifx, handle) = (self.conns[i].ifx, self.conns[i].handle);
             let sock = ifs[ifx].sockets.get_mut::<tcp::Socket>(handle);
@@ -536,6 +719,16 @@ fn status_json(
     mgmt: &Mgmt,
 ) -> String {
     let mut s = String::with_capacity(2048);
+    let trial = match &mgmt.trial {
+        Some(t) => format!(
+            "{{\"seq\":{},\"remaining_s\":{}}}",
+            t.header.seq,
+            t.deadline
+                .saturating_duration_since(timer::Instant::now())
+                .as_secs()
+        ),
+        None => String::from("null"),
+    };
     let (pool_free, pool_cap, pool_fail) = crate::net::packet::pool_stats();
     let (heap_used, heap_free) = crate::mm::heap::usage();
     // CPU load history per core: [busy, datapath, service] in permille,
@@ -563,7 +756,7 @@ fn status_json(
     cpu.push_str("]}");
     let _ = write!(
         s,
-        "{{\"version\":{},\"arch\":{},\"config\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"conntrack\":{},\
+        "{{\"version\":{},\"arch\":{},\"config\":{},\"store\":{},\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"conntrack\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"wan_lease\":{wan_lease},\
          \"mgmt\":{{\"on_wan\":{},\"upgrade\":{}}},\"interfaces\":[",
@@ -574,6 +767,8 @@ fn status_json(
             "aarch64"
         }),
         json_str(config::source()),
+        mgmt.has_store,
+        trial,
         timer::uptime().as_secs(),
         datapath::FORWARDED.load(Ordering::Relaxed),
         datapath::DROPPED.load(Ordering::Relaxed),

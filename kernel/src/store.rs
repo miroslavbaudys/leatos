@@ -220,13 +220,15 @@ impl Store {
         version: u32,
         max_version: u32,
         payload: &[u8],
+        flags: u32,
     ) -> Result<(Slot, RecordHeader), Error> {
         let area = self.area(name)?;
         let (state, _) = self.state(&area).await?;
         let current = state.current(max_version).map(|(s, _)| s);
         let plan = state
             .plan_write(&area, current, version, payload)
-            .map_err(Error::Plan)?;
+            .map_err(Error::Plan)?
+            .with_flags(&area, flags);
         if !plan.payload.is_empty() {
             self.write(plan.payload_lba, &plan.payload).await?;
             self.disk.flush()?;
@@ -240,13 +242,40 @@ impl Store {
         }
     }
 
-    /// [`Self::read_current`] outside the executor (boot).
-    pub fn read_current_blocking(
+    /// Replace the header of the valid record in `slot` with `header` (the
+    /// same record, other flags: mark or confirm a trial). One sector:
+    /// torn, it fails its CRC and the reader falls back to the other slot.
+    pub async fn rewrite_header(
         &mut self,
         name: &'static str,
-        max_version: u32,
-    ) -> Result<(Option<Record>, AreaState), Error> {
-        block_on(self.read_current(name, max_version))
+        slot: Slot,
+        header: RecordHeader,
+    ) -> Result<(), Error> {
+        let area = self.area(name)?;
+        let cur = self.read_slot(&area, slot).await?;
+        match config_store::check_slot(&area, &cur) {
+            SlotState::Valid(h) if h.with_flags(header.flags) == header => {}
+            _ => return Err(Error::Verify), // not the record the caller means
+        }
+        self.write(area.slot_lba(slot), &header.encode(&area))
+            .await?;
+        self.disk.flush()?;
+        let back = self.read_slot(&area, slot).await?;
+        match config_store::check_slot(&area, &back) {
+            SlotState::Valid(h) if h == header => Ok(()),
+            _ => Err(Error::Verify),
+        }
+    }
+
+    /// Erase the record in `slot` (zero its header sector): revert a trial.
+    pub async fn erase(&mut self, name: &'static str, slot: Slot) -> Result<(), Error> {
+        let area = self.area(name)?;
+        self.write(area.slot_lba(slot), &[0; SECTOR]).await?;
+        self.disk.flush()?;
+        match config_store::check_slot(&area, &self.read(area.slot_lba(slot), 1).await?) {
+            SlotState::Empty => Ok(()),
+            _ => Err(Error::Verify),
+        }
     }
 }
 

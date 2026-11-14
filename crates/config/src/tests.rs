@@ -442,3 +442,61 @@ fn value_types() {
         assert!(bad.parse::<Mac>().is_err(), "{bad}");
     }
 }
+
+#[test]
+fn json_round_trips_with_the_same_checks() {
+    let mut c = Config::default();
+    c.lan.dhcp.statics.push(StaticLease {
+        mac: Mac([0x52, 0x54, 0, 0, 0, 7]),
+        ip: ip(192, 168, 1, 7),
+        hostname: Some("printer".into()),
+    });
+    c.shaping.up_kbit = Some(18000);
+    let j = c.to_json();
+    assert!(j.contains(r#""ipv4":"192.168.1.1/24""#), "{j}");
+    assert!(j.contains(r#""mac":"52:54:00:00:00:07""#), "{j}");
+    assert_eq!(parse_json(&j).unwrap(), c);
+    // Sparse documents get defaults, as in TOML.
+    let s = parse_json(r#"{"lan":{"ipv4":"10.1.0.1/16"}}"#).unwrap();
+    assert_eq!(s.lan.ipv4, Cidr::new(ip(10, 1, 0, 1), 16));
+    assert_eq!(s.dns, Config::default().dns);
+    // Unknown fields, bad values, inconsistencies and newer versions fail.
+    assert!(matches!(
+        parse_json(r#"{"bogus":1}"#),
+        Err(Error::Syntax(_))
+    ));
+    assert!(matches!(
+        parse_json(r#"{"lan":{"ipv4":"10.1.0.1"}}"#),
+        Err(Error::Syntax(_))
+    ));
+    let e =
+        parse_json(r#"{"lan":{"ipv4":"10.1.0.1/24","dhcp":{"range":["10.2.0.1","10.2.0.9"]}}}"#);
+    assert!(
+        paths(e.unwrap_err())
+            .iter()
+            .any(|p| p.starts_with("lan.dhcp.range"))
+    );
+    assert_eq!(parse_json(r#"{"version":2}"#), Err(Error::NewerVersion(2)));
+    let big = alloc::format!(r#"{{"lan":{{"domain":"{}"}}}}"#, "x".repeat(MAX_LEN));
+    assert!(matches!(parse_json(&big), Err(Error::TooLarge { .. })));
+}
+
+#[test]
+fn trial_for_changes_that_can_lock_the_user_out() {
+    let old = Config::default();
+    let mut c = old.clone();
+    assert!(!c.needs_trial(&old));
+    c.dns.cache_entries = 100;
+    c.shaping.down_kbit = Some(90000);
+    c.lan.domain = "home".into();
+    assert!(
+        !c.needs_trial(&old),
+        "harmless changes apply without a trial"
+    );
+    let mut lan = old.clone();
+    lan.lan.ipv4.prefix = 16;
+    assert!(lan.needs_trial(&old));
+    let mut m = old.clone();
+    m.mgmt.on_wan = true;
+    assert!(m.needs_trial(&old));
+}
