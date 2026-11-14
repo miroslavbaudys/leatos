@@ -97,13 +97,22 @@ does one 64-bit access. TCG answered either way.
   with 2 cores both directions are on core 0 and the services on core 1.
   `dp_down` is the primary: it also handles control messages,
   housekeeping and the status snapshot.
-- **Shared between the two:**
-  - `Mutex<Datapath>` (forwarder: conntrack/NAT/routes; neighbor table:
-    ARP replies arrive on the other direction's RX), locked per RX batch
+- **Shared between the two** (`net::datapath::Datapath`, no outer lock):
+  - the forwarder in 16 shards (`fwd::forwarder::shard_of`), each with
+    its own conntrack and lock. Both directions of a connection hit the
+    same shard: LAN ingress picks it by the internal endpoint (so EIM
+    keeps one external port per endpoint), WAN ingress by the NAT port,
+    which the shard allocated from its residue class (`port % 16`).
+    ICMP errors go by their embedded header.
+  - per port: the neighbor table (ARP replies arrive on the other
+    direction's RX) and the interface address, each with its own lock;
+    counters are atomics
   - per port `Mutex<Option<Nic>>`: RX by one direction, TX by the other.
     A batch is taken off the NIC under a short lock, then forwarded
     without it.
-  - **Lock order:** NIC, then datapath, then qdisc; never the reverse.
+  - **Lock order:** NIC, then one forwarder shard, then the egress
+    neighbor table, then the qdisc; each released before the next is
+    taken, except the NIC around a batch.
 - **Wakeups:**
   - Per port `tx_kick` wakes whoever transmits on that port: the other
     direction (ARP-released packets), `svc` (router-local frames), or the

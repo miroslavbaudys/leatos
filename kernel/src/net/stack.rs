@@ -259,11 +259,12 @@ pub struct Dir {
     pub primary: bool,
 }
 
-/// The forwarding state both directions share.
-pub type SharedDatapath = &'static Mutex<Datapath>;
+/// The forwarding state both directions share (locked inside, per shard
+/// and per port; see `net::datapath`).
+pub type SharedDatapath = &'static Datapath;
 
 pub fn new_datapath(sh: &'static Shared) -> SharedDatapath {
-    alloc::boxed::Box::leak(alloc::boxed::Box::new(Mutex::new(Datapath::new(sh))))
+    alloc::boxed::Box::leak(alloc::boxed::Box::new(Datapath::new(sh)))
 }
 
 /// Wait forever (the NICs were stopped; the primary task is rebooting).
@@ -345,9 +346,7 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
         };
         let mut touched = [false; 2];
         if !batch.is_empty() {
-            let mut g = dp.lock();
-            g.rx_batch(d.rx as fwd::IfIndex, &mut batch);
-            touched = g.take_touched();
+            dp.rx_batch(d.rx as fwd::IfIndex, &mut batch, &mut touched);
         }
 
         // Step 3 (primary): control messages, housekeeping, status.
@@ -370,16 +369,11 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
                     }
                 }
             }
-            {
-                let mut g = dp.lock();
-                if let Some(w) = wan {
-                    g.set_wan(w.addr, w.gateway);
-                }
-                g.housekeeping();
-                let t = g.take_touched();
-                touched = [touched[0] | t[0], touched[1] | t[1]];
-                next_hk = g.next_housekeeping();
+            if let Some(w) = wan {
+                dp.set_wan(w.addr, w.gateway);
             }
+            dp.housekeeping(&mut touched);
+            next_hk = dp.next_housekeeping();
             let now = timer::uptime().as_millis() as u64;
             if now >= next_links {
                 next_links = now + 1000;
