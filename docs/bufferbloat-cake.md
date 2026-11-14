@@ -526,5 +526,4 @@ allocation failures. Window rates above the shaped 90/18 are timing error
   ~21 % at 90 Mbit/s. A linear extrapolation (optimistic: bursts and
   cache effects grow with rate) puts the single-core limit near
   300 Mbit/s combined, and the split one near 400 Mbit/s download.
-- Not measured yet: unshaped, and gigabit (needs a faster line or a LAN
-  test host).
+- Not measured: gigabit (needs a faster line or a LAN test host).
