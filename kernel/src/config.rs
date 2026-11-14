@@ -451,6 +451,11 @@ pub fn cores() -> Option<usize> {
 }
 
 /// `key=value` from the kernel command line.
+/// The boot argument `key=value`'s value (works before [`load`]).
+pub fn arg_of(key: &str) -> Option<&'static str> {
+    arg(bootargs(), key)
+}
+
 fn arg<'a>(bootargs: &'a str, key: &str) -> Option<&'a str> {
     // `key=value` only: `lan=` must not match `lan_x=`.
     bootargs

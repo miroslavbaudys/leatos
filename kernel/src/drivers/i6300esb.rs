@@ -56,11 +56,12 @@ pub fn probe(pci: &mut Pci) -> Option<I6300esb> {
         fired: false,
     };
     w.fired = w.regs.read16(RELOAD) & TIMEOUT_BIT != 0;
-    // Clear the flag, and stop a watchdog left running by a previous
-    // kernel (in-RAM upgrade) until `start`.
+    // Clear the flag and reload. A watchdog left running by the previous
+    // kernel (in-RAM upgrade, kernel from the store) keeps running: this
+    // kernel gets the full timeout to reach `watchdog::start`, and a hang
+    // on the way resets the machine.
     w.unlock();
     w.regs.write16(RELOAD, TIMEOUT_BIT | RELOAD_BIT);
-    w.lock.write8(usize::from(LOCK_REG & 3), 0);
     Some(w)
 }
 

@@ -34,7 +34,7 @@ The store starts with a **store header** (sector 0) that lists the
 |---|---|---|---|---|
 | `config` | 4 KiB | 256 KiB | `config.toml` (UTF-8 TOML) | on Save |
 | `leases` | 1 MiB | 128 KiB | dynamic DHCP leases (binary) | in batches (e.g. every 10 min) and on shutdown |
-| `images` | 2 MiB | rest / 2 | kernel images for persistent upgrades (later) | on persistent upgrade |
+| `images` | 2 MiB | rest / 2 | kernels from persistent upgrades (docs/upgrades.md) | on persistent upgrade |
 
 The slot size is stored in the header, so areas can grow in a later
 layout without reformatting the logic. Sector size is 512 bytes.
@@ -109,8 +109,8 @@ between two slots. Negligible for SD cards and SSDs.
 **Known limit (schema versions):** the previous slot survives one save.
 After two saves with a new schema, a rollback to an old kernel finds no
 config it can read and uses defaults. During a kernel trial (persistent
-upgrades, later), the kernel therefore saves at most once until the
-image is confirmed.
+upgrades, docs/upgrades.md), the kernel therefore saves no config at
+all until the kernel is confirmed (409, and refused on the console).
 
 ## 5. Configuration
 ### Format

@@ -7,6 +7,15 @@
 //!   optional `X-Image-CRC32` header), then the network task hands over to
 //!   it in RAM. `X-Cmdline` replaces the kernel command line for the new
 //!   kernel (default: keep the current one).
+//! - `POST /api/upgrade/persist`: the same upload and checks, then the
+//!   kernel is written to the store's `images` area as a trial and the
+//!   router reboots into it (`crate::upgrade`, docs/upgrades.md). The
+//!   stored kernel boots with the boot partition's command line, so
+//!   `X-Cmdline` is refused. `POST /api/upgrade/confirm` keeps it; `POST
+//!   /api/upgrade/revert`, or no confirm within `config::trial_secs`,
+//!   erases it and reboots into the previous kernel. While a trial kernel
+//!   runs, no upgrade and no config save is accepted (a config saved by a
+//!   newer kernel might not be readable by the one a rollback returns to).
 //! - `POST /api/reboot`: firmware reset.
 //! - `GET /api/config` (TOML, export) and `GET /api/config.json` (the
 //!   page's form): the configuration without boot-argument overrides
@@ -87,6 +96,9 @@ enum Route {
     Index,
     Status,
     Upgrade,
+    UpgradePersist,
+    UpgradeConfirm,
+    UpgradeRevert,
     Reboot,
     ConfigGet,
     ConfigJson,
@@ -109,14 +121,18 @@ pub enum StoreOp {
         flags: u32,
         cfg: alloc::boxed::Box<config::schema::Config>,
     },
-    /// Clear the trial flags of this boot's record.
-    Confirm(Slot, RecordHeader),
-    /// Erase this boot's trial record.
-    Revert(Slot),
+    /// Write a kernel ELF to the `images` area as a trial (then reboot).
+    SaveImage(Vec<u8>),
+    /// Clear the trial flags of this boot's record in an area (`config`
+    /// or `images`).
+    Confirm(&'static str, Slot, RecordHeader),
+    /// Erase this boot's trial record in an area.
+    Revert(&'static str, Slot),
 }
 
-/// The trial this boot runs.
+/// A trial this boot runs (a config or a kernel).
 struct Trial {
+    area: &'static str,
     slot: Slot,
     header: RecordHeader,
     deadline: timer::Instant,
@@ -215,10 +231,38 @@ pub struct Mgmt {
     /// A store operation is queued or running.
     op_busy: bool,
     trial: Option<Trial>,
+    /// This boot's kernel is a trial from the store (`crate::upgrade`).
+    image_trial: Option<Trial>,
     /// Reboot at the next step (after a timed-out trial was reverted).
     reboot_pending: bool,
     /// The LAN address of the config being saved (for the answer).
     saved_lan: Option<String>,
+}
+
+impl Trial {
+    fn new(area: &'static str, slot: Slot, header: RecordHeader) -> Self {
+        Self {
+            area,
+            slot,
+            header,
+            deadline: timer::Instant::now()
+                .checked_add(Duration::from_secs(config::trial_secs()))
+                .expect("trial deadline"),
+        }
+    }
+
+    fn json(t: Option<&Trial>) -> String {
+        match t {
+            Some(t) => format!(
+                "{{\"seq\":{},\"remaining_s\":{}}}",
+                t.header.seq,
+                t.deadline
+                    .saturating_duration_since(timer::Instant::now())
+                    .as_secs()
+            ),
+            None => String::from("null"),
+        }
+    }
 }
 
 fn tcp_socket() -> tcp::Socket<'static> {
@@ -269,13 +313,9 @@ impl Mgmt {
             has_store,
             op: None,
             op_busy: false,
-            trial: config::trial().map(|(slot, header)| Trial {
-                slot,
-                header,
-                deadline: timer::Instant::now()
-                    .checked_add(Duration::from_secs(config::trial_secs()))
-                    .expect("trial deadline"),
-            }),
+            trial: config::trial().map(|(slot, header)| Trial::new("config", slot, header)),
+            image_trial: upgrade::trial()
+                .map(|(slot, header)| Trial::new(upgrade::AREA, slot, header)),
             reboot_pending: false,
             saved_lan: None,
         }
@@ -314,17 +354,35 @@ impl Mgmt {
                     trial,
                 )
             }
-            (StoreOp::Confirm(..), Ok(_)) => {
-                println!("  mgmt            : trial config confirmed");
-                self.trial = None;
+            (StoreOp::SaveImage(_), Ok(detail)) => {
+                println!("  mgmt            : kernel stored as a trial ({detail}), rebooting");
+                (
+                    200,
+                    format!(
+                        "{{\"ok\":true,\"detail\":{},\"trial\":true,\"confirm_within_s\":{}}}",
+                        json_str(&format!("stored as a trial ({detail}), rebooting")),
+                        config::trial_secs()
+                    ),
+                    true,
+                )
+            }
+            (StoreOp::Confirm(area, ..), Ok(_)) => {
+                let what = what_trial(area);
+                println!("  mgmt            : trial {what} confirmed");
+                if *area == upgrade::AREA {
+                    self.image_trial = None;
+                } else {
+                    self.trial = None;
+                }
                 (200, String::from("{\"ok\":true,\"detail\":\"confirmed\"}"), false)
             }
-            (StoreOp::Revert(_), r) => {
+            (StoreOp::Revert(area, _), r) => {
                 // Reboot even if erasing failed: the record is marked
                 // booted, so the next boot reverts it.
+                let what = what_trial(area);
                 match &r {
-                    Ok(_) => println!("  mgmt            : trial config reverted, rebooting"),
-                    Err(e) => println!("  mgmt            : reverting the trial failed ({e}), rebooting"),
+                    Ok(_) => println!("  mgmt            : trial {what} reverted, rebooting"),
+                    Err(e) => println!("  mgmt            : reverting the trial {what} failed ({e}), rebooting"),
                 }
                 if conn.is_none() {
                     self.reboot_pending = true;
@@ -353,9 +411,19 @@ impl Mgmt {
         }
     }
 
-    /// When the trial times out ([`Self::step`] reverts it then).
+    /// When a trial times out ([`Self::step`] reverts it then).
     pub fn wake_at(&self) -> Option<timer::Instant> {
-        self.trial.as_ref().map(|t| t.deadline)
+        [&self.trial, &self.image_trial]
+            .into_iter()
+            .flatten()
+            .map(|t| t.deadline)
+            .min()
+    }
+
+    /// This boot's kernel is an unconfirmed trial: no config saves (the
+    /// serial console asks too).
+    pub fn image_trial_pending(&self) -> bool {
+        self.image_trial.is_some()
     }
 
     /// The WAN lease for the status page (already JSON).
@@ -381,6 +449,9 @@ impl Mgmt {
             (Method::Get, "/" | "/index.html") => Ok(Route::Index),
             (Method::Get, "/api/status") => Ok(Route::Status),
             (Method::Post, "/api/upgrade") => Ok(Route::Upgrade),
+            (Method::Post, "/api/upgrade/persist") => Ok(Route::UpgradePersist),
+            (Method::Post, "/api/upgrade/confirm") => Ok(Route::UpgradeConfirm),
+            (Method::Post, "/api/upgrade/revert") => Ok(Route::UpgradeRevert),
             (Method::Post, "/api/reboot") => Ok(Route::Reboot),
             (Method::Get, "/api/config") => Ok(Route::ConfigGet),
             (Method::Get, "/api/config.json") => Ok(Route::ConfigJson),
@@ -391,7 +462,8 @@ impl Mgmt {
             (Method::Post, "/api/config/revert") => Ok(Route::ConfigRevert),
             (
                 _,
-                "/" | "/index.html" | "/api/status" | "/api/upgrade" | "/api/reboot"
+                "/" | "/index.html" | "/api/status" | "/api/upgrade" | "/api/upgrade/persist"
+                | "/api/upgrade/confirm" | "/api/upgrade/revert" | "/api/reboot"
                 | "/api/config" | "/api/config.json" | "/api/config/effective"
                 | "/api/config/effective.json" | "/api/config/confirm"
                 | "/api/config/revert",
@@ -403,28 +475,51 @@ impl Mgmt {
         let route = route.and_then(|r| {
             let changes_config =
                 matches!(r, Route::ConfigPut | Route::ConfigConfirm | Route::ConfigRevert);
-            if changes_config || matches!(r, Route::Upgrade | Route::Reboot) {
+            let changes_image =
+                matches!(r, Route::UpgradePersist | Route::UpgradeConfirm | Route::UpgradeRevert);
+            if changes_config || changes_image || matches!(r, Route::Upgrade | Route::Reboot) {
                 self.authorized(&head)?;
             }
             if changes_config && !self.has_store {
                 return Err((501, "no store: the config cannot be saved"));
             }
-            if changes_config && self.op_busy {
-                return Err((409, "another config change is in progress"));
+            if changes_image && !self.has_store {
+                return Err((501, "no store: the kernel cannot be stored"));
+            }
+            if (changes_config || changes_image) && self.op_busy {
+                return Err((409, "another store operation is in progress"));
             }
             match r {
                 Route::ConfigPut if self.trial.is_some() => {
                     return Err((409, "a trial config is pending: confirm or revert it first"));
                 }
+                Route::ConfigPut if self.image_trial.is_some() => {
+                    return Err((409, "a trial kernel is pending: confirm or revert it first"));
+                }
                 Route::ConfigConfirm | Route::ConfigRevert if self.trial.is_none() => {
                     return Err((409, "no trial config pending"));
+                }
+                Route::Upgrade | Route::UpgradePersist if self.image_trial.is_some() => {
+                    return Err((409, "a trial kernel is pending: confirm or revert it first"));
+                }
+                Route::UpgradePersist if self.trial.is_some() => {
+                    return Err((409, "a trial config is pending: confirm or revert it first"));
+                }
+                Route::UpgradePersist if head.header("x-cmdline").is_some() => {
+                    return Err((
+                        422,
+                        "X-Cmdline: a stored kernel boots with the boot partition's command line",
+                    ));
+                }
+                Route::UpgradeConfirm | Route::UpgradeRevert if self.image_trial.is_none() => {
+                    return Err((409, "no trial kernel pending"));
                 }
                 _ => {}
             }
             Ok(r)
         });
         let route = route.and_then(|r| {
-            if r != Route::Upgrade {
+            if !matches!(r, Route::Upgrade | Route::UpgradePersist) {
                 return if head.content_length > MAX_SMALL_BODY {
                     Err((413, "body too large"))
                 } else {
@@ -473,7 +568,7 @@ impl Mgmt {
                 c.respond_json(200, "{\"ok\":true,\"detail\":\"rebooting\"}");
                 c.after = After::Reboot;
             }
-            Route::Upgrade => self.finish_upload(i),
+            Route::Upgrade | Route::UpgradePersist => self.finish_upload(i, route),
             Route::ConfigGet => {
                 let toml = config::base().to_toml();
                 self.conns[i].respond(200, "application/toml", &[], toml.as_bytes());
@@ -491,12 +586,17 @@ impl Mgmt {
                 self.conns[i].respond_json(200, &json);
             }
             Route::ConfigPut => self.check_config(i),
-            Route::ConfigConfirm | Route::ConfigRevert => {
-                let Some(t) = &self.trial else { return };
-                let op = if route == Route::ConfigConfirm {
-                    StoreOp::Confirm(t.slot, t.header.with_flags(0))
+            Route::ConfigConfirm
+            | Route::ConfigRevert
+            | Route::UpgradeConfirm
+            | Route::UpgradeRevert => {
+                let image = matches!(route, Route::UpgradeConfirm | Route::UpgradeRevert);
+                let t = if image { &self.image_trial } else { &self.trial };
+                let Some(t) = t else { return };
+                let op = if matches!(route, Route::ConfigConfirm | Route::UpgradeConfirm) {
+                    StoreOp::Confirm(t.area, t.slot, t.header.with_flags(0))
                 } else {
-                    StoreOp::Revert(t.slot)
+                    StoreOp::Revert(t.area, t.slot)
                 };
                 self.op = Some((Some(i), op));
                 self.op_busy = true;
@@ -565,14 +665,20 @@ impl Mgmt {
         }
     }
 
-    fn finish_upload(&mut self, i: usize) {
+    fn finish_upload(&mut self, i: usize, route: Route) {
         let c = &mut self.conns[i];
         let len = c.upload_len;
         let head = c.head.as_ref().expect("upload without head");
         let want_crc = head
             .header("x-image-crc32")
             .map(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16));
-        let cmdline = String::from(head.header("x-cmdline").unwrap_or(config::bootargs()));
+        // `image=ram`: the new kernel must not act as the loader and enter
+        // the store's kernel instead of itself.
+        let cmdline = upgrade::with_arg(
+            head.header("x-cmdline").unwrap_or(config::bootargs()),
+            "image",
+            "ram",
+        );
         let staging = self.staging.as_deref_mut().expect("upload without staging");
         let result = match want_crc {
             Some(Err(_)) => Err(String::from("X-Image-CRC32: not a hex number")),
@@ -583,6 +689,17 @@ impl Mgmt {
             _ => upgrade::prepare(staging, len),
         };
         match result {
+            Ok(p) if route == Route::UpgradePersist => {
+                println!(
+                    "  mgmt            : kernel accepted for the store: {} bytes, crc32 {:08x}, {}",
+                    len,
+                    c.crc,
+                    p.describe()
+                );
+                let image = staging[..len].to_vec();
+                self.op = Some((Some(i), StoreOp::SaveImage(image)));
+                self.op_busy = true;
+            }
             Ok(p) => {
                 let detail = format!("{} bytes, crc32 {:08x}, {}", len, c.crc, p.describe());
                 println!("  mgmt            : upgrade accepted: {detail}");
@@ -654,17 +771,21 @@ impl Mgmt {
         if self.reboot_pending {
             return Some(Action::Reboot);
         }
-        if let Some(t) = &self.trial
-            && !self.op_busy
-            && timer::Instant::now() >= t.deadline
-        {
-            println!(
-                "  mgmt            : trial config not confirmed within {} s: reverting",
-                config::trial_secs()
-            );
-            self.op = Some((None, StoreOp::Revert(t.slot)));
-            self.op_busy = true;
-            self.trial = None;
+        for image in [false, true] {
+            let t = if image { &mut self.image_trial } else { &mut self.trial };
+            if let Some(tr) = t
+                && !self.op_busy
+                && timer::Instant::now() >= tr.deadline
+            {
+                println!(
+                    "  mgmt            : trial {} not confirmed within {} s: reverting",
+                    what_trial(tr.area),
+                    config::trial_secs()
+                );
+                self.op = Some((None, StoreOp::Revert(tr.area, tr.slot)));
+                self.op_busy = true;
+                *t = None;
+            }
         }
         for i in 0..self.conns.len() {
             let (ifx, handle) = (self.conns[i].ifx, self.conns[i].handle);
@@ -739,6 +860,11 @@ impl Mgmt {
     }
 }
 
+/// "config" or "kernel", for logs.
+fn what_trial(area: &str) -> &'static str {
+    if area == upgrade::AREA { "kernel" } else { "config" }
+}
+
 fn status_json(
     ifs: &[HostIf],
     sh: &Shared,
@@ -747,16 +873,12 @@ fn status_json(
     mgmt: &Mgmt,
 ) -> String {
     let mut s = String::with_capacity(2048);
-    let trial = match &mgmt.trial {
-        Some(t) => format!(
-            "{{\"seq\":{},\"remaining_s\":{}}}",
-            t.header.seq,
-            t.deadline
-                .saturating_duration_since(timer::Instant::now())
-                .as_secs()
-        ),
-        None => String::from("null"),
-    };
+    let trial = Trial::json(mgmt.trial.as_ref());
+    let image = format!(
+        "{{\"source\":{},\"trial\":{}}}",
+        json_str(upgrade::source()),
+        Trial::json(mgmt.image_trial.as_ref())
+    );
     let (pool_free, pool_cap, pool_fail) = crate::net::packet::pool_stats();
     let (heap_used, heap_free) = crate::mm::heap::usage();
     // CPU load history per core: [busy, datapath, service] in permille,
@@ -784,11 +906,12 @@ fn status_json(
     cpu.push_str("]}");
     let _ = write!(
         s,
-        "{{\"version\":{},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"conntrack\":{},\
+        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"conntrack\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"wan_lease\":{wan_lease},\
-         \"mgmt\":{{\"on_wan\":{},\"upgrade\":{}}},\"interfaces\":[",
+         \"mgmt\":{{\"on_wan\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
         json_str(env!("CARGO_PKG_VERSION")),
+        json_str(env!("RROUTER_BUILD")),
         json_str(if cfg!(target_arch = "x86_64") {
             "x86_64"
         } else {
@@ -814,6 +937,9 @@ fn status_json(
         sh.conntrack(),
         mgmt.on_wan,
         mgmt.password.is_some() && (mgmt.staging.is_some() || mgmt.uploader.is_some()),
+        mgmt.password.is_some()
+            && mgmt.has_store
+            && (mgmt.staging.is_some() || mgmt.uploader.is_some()),
     );
     for (n, (host, nif)) in ifs.iter().zip(&sh.ports).enumerate() {
         let snap = *nif.snap.lock();

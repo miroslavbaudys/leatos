@@ -19,6 +19,12 @@
 //! accuse anyone: the whole machine was paused (a VM on a sleeping host),
 //! and everyone is late together.
 //!
+//! The hardware timer is armed twice: early ([`arm_early`], right after
+//! the probe, before the NICs are brought up or a kernel from the store
+//! is entered), so a hang during the rest of the boot resets too; and
+//! again in [`start`]. A probe never stops a timer the previous kernel
+//! left running (in-RAM upgrade, kernel from the store), it reloads it.
+//!
 //! Boot arguments: `watchdog=0` turns both layers off (gdb), and
 //! `watchdog_secs=N` sets the hardware timeout (default 30 s).
 
@@ -56,6 +62,18 @@ pub fn status() -> Option<Status> {
     STATUS.get().copied()
 }
 
+/// Arm the hardware timer right after its probe (unless `watchdog=0`):
+/// nothing pets it until [`start`], so the rest of the boot must take
+/// less than the timeout.
+pub fn arm_early(hw: &mut Option<Box<dyn HwWatchdog>>) {
+    let cfg = config::watchdog();
+    if cfg.enabled
+        && let Some(w) = hw.as_mut()
+    {
+        w.start(cfg.hw_secs);
+    }
+}
+
 /// Arm the hardware watchdog (if any) and start one checker per online
 /// core. Call once, after the other tasks are spawned, just before
 /// `executor::run`.
@@ -76,8 +94,12 @@ pub fn start(hw: Option<Box<dyn HwWatchdog>>) {
         ""
     };
     if !cfg.enabled {
+        // The previous kernel may have left it running (the probe keeps it).
+        if let Some(mut w) = hw {
+            w.stop();
+        }
         println!("  watchdog        : off (watchdog=0){last}");
-        return; // the probe left the hardware timer stopped
+        return;
     }
     let online = smp::online();
     match hw {
@@ -120,8 +142,8 @@ pub fn stop() {
 
 /// Restart the hardware countdown now: right before entering a new kernel
 /// in RAM, which then has the full timeout to boot and take over (its
-/// probe stops the timer, `start` arms it again). A new kernel that hangs
-/// on the way is reset.
+/// probe reloads the timer, `start` arms it again). A new kernel that
+/// hangs on the way is reset.
 pub fn pet_now() {
     if let Some(mut hw) = HW.try_lock()
         && let Some(w) = hw.as_mut()

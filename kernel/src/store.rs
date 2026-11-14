@@ -242,6 +242,18 @@ impl Store {
         Ok((rec, state))
     }
 
+    /// The record header in `slot` of `name`, read alone (one sector; the
+    /// payload's CRC is not checked): `None` if it is not a valid header.
+    pub async fn header(
+        &mut self,
+        name: &'static str,
+        slot: Slot,
+    ) -> Result<Option<RecordHeader>, Error> {
+        let area = self.area(name)?;
+        let sector = self.read(area.slot_lba(slot), 1).await?;
+        Ok(RecordHeader::parse(&area, &sector).ok())
+    }
+
     /// Write a new record into the slot that is not current
     /// (docs/config-and-storage.md §4): payload, flush, header, flush, then
     /// read the slot back and check it. The slots are re-read first, so the

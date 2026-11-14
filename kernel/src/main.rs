@@ -49,7 +49,11 @@ use executor::Priority;
 pub fn kmain(boot_arg: usize) -> ! {
     timer::init_clock();
     println!();
-    println!("rrouter {} — bare metal", env!("CARGO_PKG_VERSION"));
+    println!(
+        "rrouter {} — bare metal (build {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("RROUTER_BUILD")
+    );
     println!("  privilege level : {}", arch::cpu::privilege_level());
 
     let info = arch::discover(boot_arg).unwrap_or_else(|e| panic!("platform discovery: {e}"));
@@ -82,10 +86,16 @@ pub fn kmain(boot_arg: usize) -> ! {
     // The config may live on a disk, so it is loaded once PCI is up. Code
     // above this line reads only boot arguments, never `config::get`.
     let mut store = pci.as_mut().and_then(store::open);
+    // Armed early (and again by `watchdog::start`): a hang in the rest of
+    // the boot, or in a kernel entered from the store, resets.
+    let mut hw_watchdog = pci.as_mut().and_then(drivers::watchdog::probe);
+    watchdog::arm_early(&mut hw_watchdog);
+    // Persistent upgrades (docs/upgrades.md): the boot partition's kernel
+    // enters the kernel stored on the disk, if there is one, and returns
+    // only if it boots itself. Before `config::load`: the stored kernel
+    // must be the one to mark a config trial booted.
+    upgrade::boot(store.as_mut(), &mut hw_watchdog);
     config::load(store.as_mut(), info.virtual_machine);
-    // Found now, armed last (`watchdog::start`): probing stops a timer a
-    // previous kernel left running.
-    let hw_watchdog = pci.as_mut().and_then(drivers::watchdog::probe);
     let qos = config::qos();
     let net = pci.as_mut().and_then(|p| net::stack::bring_up(p, &qos));
     let has_net = net.is_some();

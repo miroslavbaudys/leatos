@@ -57,7 +57,7 @@
   #statics input { width:100%; min-width:0; }
   #statics td { border:none; padding:2px 6px 2px 0; }
   button.plain { background:none; color:var(--accent); border:1px solid var(--line); }
-  #cfgmsg, #trialmsg { white-space:pre-wrap; }
+  #cfgmsg, #trialmsg, #ktrialmsg { white-space:pre-wrap; }
   #cfgmsg.err { color:var(--bad); }
   .hint { color:var(--muted); font-size:13px; }
   .ovr { color:var(--bad); font-size:12px; }
@@ -66,6 +66,11 @@
 <body>
 <header><h1>rrouter</h1><span id="ver">…</span><span id="up"></span><span id="wanwarn" class="warn"></span></header>
 <main>
+  <div id="ktrialbar" class="banner" hidden>
+    <div><b>Trial kernel</b> (<span id="ksrc"></span>). Confirm within <b id="ktrialleft">–</b> s, or the router reboots into the previous kernel.</div>
+    <div class="row"><button id="kconfirm">Confirm kernel</button><button id="krevert" class="danger">Roll back now</button></div>
+    <div id="ktrialmsg"></div>
+  </div>
   <div id="trialbar" class="banner" hidden>
     <div><b>Trial configuration.</b> Confirm within <b id="trialleft">–</b> s, or the router reverts to the previous configuration and reboots.</div>
     <div class="row"><button id="confirm">Confirm</button><button id="revert" class="danger">Revert now</button></div>
@@ -235,7 +240,7 @@ async function refresh() {
   try { st = await (await fetch("/api/status", {cache: "no-store"})).json(); }
   catch (e) { $("up").textContent = "offline"; return; }
   if (st.cpu) showCpu(st.cpu);
-  $("ver").textContent = `v${st.version} · ${st.arch}`;
+  $("ver").textContent = `v${st.version} · ${st.build ?? "?"} · ${st.arch}`;
   $("up").textContent = "up " + dur(st.uptime_s);
   $("wanwarn").textContent = st.mgmt.on_wan ? "management open on WAN (mgmt=wan)" : "";
   $("ifs").innerHTML = "<tr><th>Port</th><th>NIC</th><th>MAC</th><th>Link</th><th>Address</th><th>RX pkts</th><th>TX pkts</th><th>Shaper</th><th>Qdisc sent / drops / ECN / backlog</th></tr>" +
@@ -257,11 +262,15 @@ async function refresh() {
         (st.watchdog.last_reset_by_watchdog ? ' · <span class="warn">last reset by the watchdog</span>' : "")],
     ["Command line", esc(st.cmdline || "–")],
     ["Config", esc(st.config) + (st.store ? "" : " · no store: changes cannot be saved")],
-    ["Upgrade", st.mgmt.upgrade ? "enabled" : "disabled (boot with mgmt_pass=…)"]]);
+    ["Kernel", esc(st.image?.source ?? "–")],
+    ["Upgrade", st.mgmt.upgrade ? "enabled" + (st.mgmt.persist ? " (in RAM or stored)" : " (in RAM only: no store)") : "disabled (boot with mgmt_pass=…)"]]);
   showOverrides(st.overrides ?? {});
   $("trialbar").hidden = !st.trial;
   if (st.trial) $("trialleft").textContent = st.trial.remaining_s;
-  $("save").disabled = !st.store || !!st.trial;
+  const kt = st.image?.trial;
+  $("ktrialbar").hidden = !kt;
+  if (kt) { $("ktrialleft").textContent = kt.remaining_s; $("ksrc").textContent = st.image.source; }
+  $("save").disabled = !st.store || !!st.trial || !!kt;
   // A reboot (uptime went back): reload the form from the new config.
   if (lastUptime !== null && st.uptime_s < lastUptime) loadConfig();
   lastUptime = st.uptime_s;
@@ -433,17 +442,19 @@ $("import").onchange = async () => {
   if (!f || !confirm(`Replace the configuration with ${f.name} and reboot?`)) return;
   postConfig(await f.text(), "application/toml");
 };
-async function trialOp(what) {
-  $("trialmsg").textContent = "…";
+async function trialOp(what, base = "/api/config/", msg = "trialmsg") {
+  $(msg).textContent = "…";
   try {
-    const r = await fetch("/api/config/" + what, { method: "POST", headers: auth() });
+    const r = await fetch(base + what, { method: "POST", headers: auth() });
     const j = await r.json();
-    $("trialmsg").textContent = j.ok ? j.detail : `Refused (${r.status}): ${j.error}`;
+    $(msg).textContent = j.ok ? j.detail : `Refused (${r.status}): ${j.error}`;
     refresh();
-  } catch (e) { $("trialmsg").textContent = "Request failed: " + e; }
+  } catch (e) { $(msg).textContent = "Request failed: " + e; }
 }
 $("confirm").onclick = () => trialOp("confirm");
 $("revert").onclick = () => { if (confirm("Go back to the previous configuration and reboot?")) trialOp("revert"); };
+$("kconfirm").onclick = () => trialOp("confirm", "/api/upgrade/", "ktrialmsg");
+$("krevert").onclick = () => { if (confirm("Go back to the previous kernel and reboot?")) trialOp("revert", "/api/upgrade/", "ktrialmsg"); };
 
 loadConfig();
 refresh();

@@ -44,7 +44,8 @@ pub fn init(info: &BootInfo) {
     );
 }
 
-/// The staging area, handed out once (to the management server).
+/// The staging area, handed out once at a time (to the boot loader in
+/// `crate::upgrade`, then the management server).
 pub fn take_staging() -> Option<&'static mut [u8]> {
     let &(start, len) = STAGING.get()?;
     if STAGING_TAKEN.swap(true, Ordering::AcqRel) {
@@ -54,6 +55,17 @@ pub fn take_staging() -> Option<&'static mut [u8]> {
     // mapped RW by mm::mmu (its heap mapping runs to the end of RAM),
     // and this is the only reference ever created (STAGING_TAKEN).
     Some(unsafe { core::slice::from_raw_parts_mut(start as *mut u8, len) })
+}
+
+/// Hand the staging area back (the boot loader in `crate::upgrade` did not
+/// use it), so [`take_staging`] can give it out again. Taking the slice by
+/// value ends the caller's only reference to it.
+pub fn return_staging(staging: &'static mut [u8]) {
+    let ours = STAGING
+        .get()
+        .is_some_and(|&(start, len)| staging.as_ptr() as usize == start && staging.len() == len);
+    assert!(ours, "return_staging: not the staging area");
+    STAGING_TAKEN.store(false, Ordering::Release);
 }
 
 /// (used, free) bytes.

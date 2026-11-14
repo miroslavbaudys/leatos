@@ -84,12 +84,18 @@ pub fn probe(smbus_rev: Option<u8>) -> Option<Box<dyn HwWatchdog>> {
     if ctl & DISABLED != 0 {
         return None;
     }
-    // Writing FIRED back clears it; stop until `start`.
-    regs.write32(CONTROL, ctl & !(RUN | ACTION_POWEROFF));
-    Some(Box::new(FchWdt {
+    // Writing FIRED back clears it. A timer left running by the previous
+    // kernel (in-RAM upgrade, kernel from the store) keeps running,
+    // reloaded: a hang before `watchdog::start` still resets.
+    regs.write32(CONTROL, ctl & !ACTION_POWEROFF);
+    let mut w = FchWdt {
         regs,
         fired: ctl & FIRED != 0,
-    }))
+    };
+    if ctl & RUN != 0 {
+        w.pet();
+    }
+    Some(Box::new(w))
 }
 
 impl HwWatchdog for FchWdt {

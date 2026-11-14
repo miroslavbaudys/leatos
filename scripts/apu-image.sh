@@ -3,8 +3,12 @@
 # MBR + a FAT32 partition holding Limine (BIOS) and the x86_64 kernel,
 # which Limine starts via Multiboot2, and the rrouter store (p2, type 0xda,
 # 16 MiB, formatted by tools/rrstore: the config saved from the web
-# interface lives there; docs/config-and-storage.md). Write it to the SD
-# card (the kernel reads and writes the store through the SD slot).
+# interface and kernels from persistent upgrades live there;
+# docs/config-and-storage.md, docs/upgrades.md). Write it to the SD card
+# (the kernel reads and writes the store through the SD slot).
+# The boot partition's kernel is the loader and the last fallback: it
+# enters the kernel stored by `scripts/apu-upload.sh --persist` if there is
+# one. The second Limine entry ("boot partition kernel") skips that.
 #
 #   scripts/apu-image.sh                       # release kernel -> target/apu4/rrouter-apu4.img
 #   scripts/apu-image.sh --debug               # debug kernel (slower, more checks)
@@ -44,7 +48,7 @@ while [[ $# -gt 0 ]]; do
     --mgmt-wan) MGMT_WAN=1 MGMT_PASS=1 ;;
     --mgmt-pass) MGMT_PASS=1 ;;
     --config) CONFIG="$2"; shift ;;
-    -h | --help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -107,6 +111,11 @@ serial_baudrate: 115200
     protocol: multiboot2
     path: boot():/boot/rrouter
     cmdline: $CMDLINE
+
+/rrouter (boot partition kernel, ignore stored kernels)
+    protocol: multiboot2
+    path: boot():/boot/rrouter
+    cmdline: ${CMDLINE:+$CMDLINE }image=golden
 EOF
 
 P="$IMG@@$((PART_LBA * 512))"

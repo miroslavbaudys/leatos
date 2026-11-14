@@ -259,7 +259,8 @@ fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
     }
 }
 
-/// Carry out a management request on the store's `config` area. Returns
+/// Carry out a management request on the store (`config` area, or
+/// `images` for a kernel). Returns
 /// a detail for the answer and, for a save, where the config now comes
 /// from (`config::source`).
 async fn store_op(
@@ -286,13 +287,29 @@ async fn store_op(
                 Some(alloc::format!("stored (slot {slot}, seq {})", h.seq)),
             ))
         }
-        StoreOp::Confirm(slot, h) => st
-            .rewrite_header("config", *slot, *h)
+        StoreOp::SaveImage(image) => {
+            use crate::upgrade::{AREA, IMAGE_FORMAT};
+            let (slot, h) = st
+                .write_record(AREA, IMAGE_FORMAT, IMAGE_FORMAT, image, config_store::FLAG_TRIAL)
+                .await
+                .map_err(e)?;
+            Ok((
+                alloc::format!(
+                    "slot {}, seq {}, {} bytes",
+                    crate::store::slot_name(slot),
+                    h.seq,
+                    h.len
+                ),
+                None,
+            ))
+        }
+        StoreOp::Confirm(area, slot, h) => st
+            .rewrite_header(area, *slot, *h)
             .await
             .map(|()| (String::from("confirmed"), None))
             .map_err(e),
-        StoreOp::Revert(slot) => st
-            .erase("config", *slot)
+        StoreOp::Revert(area, slot) => st
+            .erase(area, *slot)
             .await
             .map(|()| (String::from("erased"), None))
             .map_err(e),
@@ -354,6 +371,12 @@ pub async fn run(
         let mut action = action;
         match cli_action {
             Some(CliAction::Reboot) => action = Some(crate::net::mgmt::Action::Reboot),
+            Some(CliAction::Save(_)) if mgmt.image_trial_pending() => cli.save_done(
+                Err(String::from(
+                    "a trial kernel is running: confirm it first (POST /api/upgrade/confirm)",
+                )),
+                false,
+            ),
             Some(CliAction::Save(cfg)) => match store.as_mut() {
                 Some(st) => {
                     let reboot = cfg.needs_trial(&crate::config::base());
