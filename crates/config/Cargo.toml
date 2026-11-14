@@ -1,0 +1,13 @@
+[package]
+name = "config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Router configuration: schema with defaults, validation, config.toml parsing and writing."
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+toml = { version = "1.2", default-features = false, features = ["serde", "parse", "display"] }
+
+[lints]
+workspace = true

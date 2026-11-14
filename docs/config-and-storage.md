@@ -127,7 +127,7 @@ ipv4 = "10.10.0.1/24"
 domain = "lan"
 
 [lan.dhcp]
-range = ["10.10.0.100", "10.10.0.199"]
+range = ["10.10.0.100", "10.10.0.199"]   # optional: default .100–.199
 lease_secs = 43200
 
 [[lan.dhcp.static]]
@@ -135,24 +135,43 @@ mac = "52:54:00:00:00:05"
 ip = "10.10.0.10"
 hostname = "nas"
 
-[[firewall.forward]]
+[dns]
+cache_entries = 4096
+rebind_protection = true
+
+[shaping]
+up_kbit = 18000          # optional: unset = not shaped
+down_kbit = 90000
+overhead = 20
+ecn_up = false
+ecn_down = true
+qdisc = "cake"           # cake | fq_codel | codel
+isolation = "triple-isolate"
+
+[mgmt]
+on_wan = false
+```
+
+Schema version 1 (`crates/config`) has the sections above. Every field
+has a default, so a file may set only what it changes. Later versions add
+`[wan]`, `[firewall]` (rules, `[[firewall.forward]]`), VLANs and the
+management password hash, as the kernel implements them:
+
+```toml
+[[firewall.forward]]     # later
 name = "nas-https"
 proto = "tcp"
 wan_port = 8443
 to = "10.10.0.10:443"
-
-[shaping]
-up_kbit = 18000
-down_kbit = 90000
-overhead = 20
-
-[mgmt]
-password_hash = "pbkdf2-sha256$..."
 ```
 
 The full target schema is in `docs/soho-features.md`. List entries
 (reservations, rules, forwards) carry a stable key (`name`, `mac`) so the
-web interface can edit or delete one entry.
+web interface can edit or delete one entry. The bounds the validation
+enforces (version 1): prefix 8–29, lease 60 s–30 days, ≤ 1024
+reservations, DNS cache 16–65536 entries, rates 64 kbit/s–10 Gbit/s,
+overhead ≤ 256 bytes. Validation problems carry a path
+(`lan.dhcp.static[2].ip`, indices from 0) for the web interface.
 
 ### Layering
 ```
@@ -213,7 +232,7 @@ is UI-managed, with import/export.
 | Step | Status |
 |---|---|
 | `crates/config-store`: layout, records, MBR lookup, write plans | ✅ host-tested |
-| `crates/config`: schema, defaults, validation, TOML | |
+| `crates/config`: schema v1 (LAN, DHCP + reservations, DNS, shaping, mgmt), defaults, validation, TOML | ✅ host-tested |
 | Kernel: one `Config` loaded at boot (refactor, no behaviour change) | |
 | virtio-blk + store partition in QEMU, lab check | |
 | Web interface: config pages, save + reboot, confirm/revert | |
