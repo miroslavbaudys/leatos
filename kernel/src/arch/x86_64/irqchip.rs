@@ -110,19 +110,9 @@ pub fn init(info: &BootInfo) {
     // SAFETY: the MADT's local APIC page, mapped as device memory by
     // mm::mmu (PLATFORM_MMIO), owned exclusively by this module.
     *LAPIC.lock() = Some(unsafe { Region::new(lapic, 0x1000) });
-    let (id, version) = with_lapic(|r| {
-        r.write32(TPR, 0); // accept all priorities
-        r.write32(LVT_TIMER, MASKED | TIMER_VECTOR);
-        r.write32(LVT_LINT0, MASKED);
-        r.write32(LVT_LINT1, MASKED);
-        r.write32(LVT_ERROR, MASKED);
-        r.write32(ESR, 0);
-        r.write32(TIMER_DIVIDE, 0b1011); // divide by 1
-        r.write32(TIMER_INITIAL, 0);
-        r.write32(SVR, SVR_ENABLE | SPURIOUS_VECTOR);
-        (r.read32(ID) >> 24, r.read32(VERSION) & 0xff)
-    });
+    let (id, version) = setup_local();
     APIC_ID.store(id, core::sync::atomic::Ordering::Relaxed);
+    APIC_IDS[0].store(id, core::sync::atomic::Ordering::Relaxed);
     super::timer::calibrate_lapic();
     println!(
         "  irqchip         : local APIC id {id}, version {version:#x}, timer {} MHz (8259 PICs masked)",
@@ -189,15 +179,80 @@ pub fn disable(intid: u32) {
     }
 }
 
-/// The wake/stop IPI vector (`smp`). Nothing sends it until the x86_64
-/// SMP backend exists (M11 step 2b); `enable` ignores it.
+/// The wake/stop IPI vector (`smp`). Not maskable per source; `enable`
+/// ignores it.
 pub const IPI_INTID: u32 = 33;
 
-/// Secondary cores' local APIC setup (M11 step 2b).
-pub fn init_secondary() {}
+const ICR_LO: usize = 0x300;
+const ICR_HI: usize = 0x310;
+const ICR_PENDING: u32 = 1 << 12;
 
-/// Send the wake/stop IPI to `core` (M11 step 2b: no other cores yet).
-pub fn send_ipi(_core: usize) {}
+/// Local APIC ID of each core.
+static APIC_IDS: [core::sync::atomic::AtomicU32; crate::smp::MAX_CORES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; crate::smp::MAX_CORES];
+
+/// This core's local APIC: priorities, masked LVTs, timer divider, enable.
+/// Returns (APIC ID, version).
+fn setup_local() -> (u32, u32) {
+    with_lapic(|r| {
+        r.write32(TPR, 0); // accept all priorities
+        r.write32(LVT_TIMER, MASKED | TIMER_VECTOR);
+        r.write32(LVT_LINT0, MASKED);
+        r.write32(LVT_LINT1, MASKED);
+        r.write32(LVT_ERROR, MASKED);
+        r.write32(ESR, 0);
+        r.write32(TIMER_DIVIDE, 0b1011); // divide by 1
+        r.write32(TIMER_INITIAL, 0);
+        r.write32(SVR, SVR_ENABLE | SPURIOUS_VECTOR);
+        (r.read32(ID) >> 24, r.read32(VERSION) & 0xff)
+    })
+}
+
+/// A secondary core's local APIC (the timer calibration is shared).
+pub fn init_secondary() {
+    let (id, _) = setup_local();
+    APIC_IDS[super::cpu::core_id()].store(id, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Write the ICR (destination APIC `id`, command `lo`) once it is free.
+fn icr(id: u32, lo: u32) {
+    with_lapic(|r| {
+        while r.read32(ICR_LO) & ICR_PENDING != 0 {
+            core::hint::spin_loop();
+        }
+        r.write32(ICR_HI, id << 24);
+        r.write32(ICR_LO, lo);
+    });
+}
+
+/// Send the wake/stop IPI to `core` (fixed delivery, physical destination).
+pub fn send_ipi(core: usize) {
+    icr(
+        APIC_IDS[core].load(core::sync::atomic::Ordering::Relaxed),
+        IPI_INTID,
+    );
+}
+
+/// INIT (assert, level) to the APIC `id`: the core resets into
+/// wait-for-SIPI.
+pub(super) fn send_init(id: u32) {
+    icr(id, 0x0000_4500);
+}
+
+/// INIT to a started secondary core.
+pub(super) fn send_init_core(core: usize) {
+    send_init(APIC_IDS[core].load(core::sync::atomic::Ordering::Relaxed));
+}
+
+/// Startup IPI: the core starts in real mode at `page` × 4 KiB.
+pub(super) fn send_sipi(id: u32, page: u8) {
+    icr(id, 0x0000_0600 | page as u32);
+}
+
+/// Record a secondary core's APIC ID before it starts (for `send_ipi`).
+pub(super) fn set_apic_id(core: usize, id: u32) {
+    APIC_IDS[core].store(id, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// End of interrupt (IRQ context).
 pub(super) fn eoi() {

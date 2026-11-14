@@ -73,6 +73,10 @@ pub fn start(
     }
 }
 
+/// Nothing to do on aarch64 (no in-RAM kernel replacement).
+#[allow(dead_code)]
+pub fn park_others() {}
+
 /// Called by `boot.S` on a secondary core.
 #[unsafe(no_mangle)]
 extern "C" fn secondary_rust(core: usize) -> ! {

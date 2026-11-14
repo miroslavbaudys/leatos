@@ -11,6 +11,7 @@
 //!   acknowledged at the PIC and counted as spurious.
 
 use super::{cpu, irqchip};
+use crate::smp::MAX_CORES;
 use crate::{fatal_println, mm};
 use core::arch::asm;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -22,22 +23,25 @@ pub const MSI_VECTORS: core::ops::RangeInclusive<u32> = 48..=63;
 pub const SPURIOUS_VECTOR: u32 = 255;
 pub const PIC_VECTORS: core::ops::RangeInclusive<u32> = 224..=239;
 /// Number of (vector, stub) pairs in isr.S.
-const STUBS: usize = 32 + 1 + 16 + 16 + 1;
+const STUBS: usize = 32 + 2 + 16 + 16 + 1;
 
 unsafe extern "C" {
     static isr_vectors: [[u64; 2]; STUBS];
-    /// The TSS descriptor slot (selector 0x18) in boot.S's GDT.
-    static gdt_tss: [AtomicU64; 2];
+    /// The TSS descriptor slots (selector 0x18 + 16 × core) in boot.S's GDT.
+    static gdt_tss: [[AtomicU64; 2]; MAX_CORES];
 }
 
 #[repr(C, align(16))]
 struct Idt([AtomicU64; 512]);
 static IDT: Idt = Idt([const { AtomicU64::new(0) }; 512]);
 
-/// 104-byte 64-bit TSS; only IST1 and the I/O map base are used.
+/// 104-byte 64-bit TSS; only IST1 and the I/O map base are used. One per core.
 #[repr(C, align(16))]
 struct Tss([AtomicU32; 26]);
-static TSS: Tss = Tss([const { AtomicU32::new(0) }; 26]);
+static TSS: [Tss; MAX_CORES] = [const { Tss([const { AtomicU32::new(0) }; 26]) }; MAX_CORES];
+
+/// Per-core block that GS points at: `[0]` = core index (`cpu::core_id`).
+static PERCPU: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
 
 #[repr(C, packed)]
 struct Dtr {
@@ -48,22 +52,40 @@ struct Dtr {
 /// Install TSS (IST1 = exception stack) and IDT. Called first thing in
 /// 64-bit mode, so even discovery faults are reported.
 pub fn init() {
-    let ist1 = mm::sym::exc_stack_top() as u64;
-    TSS.0[9].store(ist1 as u32, Ordering::Relaxed);
-    TSS.0[10].store((ist1 >> 32) as u32, Ordering::Relaxed);
-    TSS.0[25].store(104 << 16, Ordering::Relaxed); // I/O map base = limit: no bitmap
-    let base = &TSS as *const Tss as u64;
-    // SAFETY: `gdt_tss` is a 16-byte slot in boot.S's writable GDT; it is
-    // only accessed through atomics.
-    let slot = unsafe { &gdt_tss };
+    per_core(0, mm::sym::exc_stack_top() as u64);
+    build_idt();
+    load_idt();
+}
+
+/// The same on a secondary core (the IDT is shared).
+pub fn init_secondary(core: usize) {
+    per_core(core, crate::mm::stacks::secondary(core).0 as u64);
+    load_idt();
+}
+
+/// This core's GS block (core index), TSS and TSS descriptor, then `ltr`.
+fn per_core(core: usize, ist1: u64) {
+    PERCPU[core].store(core as u64, Ordering::Relaxed);
+    super::cpu::set_gs_base(&PERCPU[core] as *const AtomicU64 as u64);
+    let tss = &TSS[core];
+    tss.0[9].store(ist1 as u32, Ordering::Relaxed);
+    tss.0[10].store((ist1 >> 32) as u32, Ordering::Relaxed);
+    tss.0[25].store(104 << 16, Ordering::Relaxed); // I/O map base = limit: no bitmap
+    let base = tss as *const Tss as u64;
+    // SAFETY: `gdt_tss` holds one 16-byte slot per core in boot.S's
+    // writable GDT; it is only accessed through atomics.
+    let slot = unsafe { &gdt_tss[core] };
     slot[0].store(
         103 | (base & 0xff_ffff) << 16 | 0x89 << 40 | (base >> 24 & 0xff) << 56,
         Ordering::Relaxed,
     );
     slot[1].store(base >> 32, Ordering::Relaxed);
-    // SAFETY: selector 0x18 is the TSS descriptor just written.
-    unsafe { asm!("ltr {0:x}", in(reg) 0x18u16, options(nostack, preserves_flags)) };
+    let selector = 0x18 + 16 * core as u16;
+    // SAFETY: `selector` is the TSS descriptor just written for this core.
+    unsafe { asm!("ltr {0:x}", in(reg) selector, options(nostack, preserves_flags)) };
+}
 
+fn build_idt() {
     // SAFETY: `isr_vectors` is constant data in isr.S with exactly STUBS entries.
     let stubs = unsafe { &isr_vectors };
     for &[vector, handler] in stubs {
@@ -76,6 +98,9 @@ pub fn init() {
         IDT.0[vector as usize * 2].store(lo, Ordering::Relaxed);
         IDT.0[vector as usize * 2 + 1].store(handler >> 32, Ordering::Relaxed);
     }
+}
+
+fn load_idt() {
     let dtr = Dtr {
         limit: (core::mem::size_of::<Idt>() - 1) as u16,
         base: &IDT as *const Idt as u64,

@@ -28,6 +28,15 @@ struct BootFacts {
 
 static FACTS: Once<BootFacts> = Once::new();
 
+/// Is `[start, start + len)` inside one firmware "available RAM" region?
+pub(super) fn is_free_ram(start: u64, len: u64) -> bool {
+    FACTS.get().is_some_and(|f| {
+        f.mmap[..f.mmap_len]
+            .iter()
+            .any(|&(b, l, t)| t == 1 && b <= start && start + len <= b + l)
+    })
+}
+
 unsafe extern "C" {
     static kexec_blob_start: u8;
     static kexec_blob_end: u8;
@@ -62,7 +71,10 @@ pub fn exec(flat: &[u8], dst: u64, entry: u64, cmdline: &str, scratch: &mut [u8]
     let base = scratch.as_ptr() as u64;
     assert!(scratch.len() >= SCRATCH_SIZE && base.is_multiple_of(4096));
     assert!(base + SCRATCH_SIZE as u64 <= 1 << 32 && entry < 1 << 32);
-    assert!(flat.as_ptr() as u64 > dst, "kexec: source must lie above the destination");
+    assert!(
+        flat.as_ptr() as u64 > dst,
+        "kexec: source must lie above the destination"
+    );
     let facts = FACTS.get().expect("kexec: boot facts not saved");
 
     let info = multiboot2::build_info(
@@ -70,22 +82,33 @@ pub fn exec(flat: &[u8], dst: u64, entry: u64, cmdline: &str, scratch: &mut [u8]
         &facts.mmap[..facts.mmap_len],
         &facts.rsdp[..facts.rsdp_len],
     );
-    assert!(info.len() <= SCRATCH_SIZE - SCRATCH_INFO, "kexec: boot info too large");
+    assert!(
+        info.len() <= SCRATCH_SIZE - SCRATCH_INFO,
+        "kexec: boot info too large"
+    );
     scratch[SCRATCH_INFO..SCRATCH_INFO + info.len()].copy_from_slice(&info);
 
     // Identity map 0..4 GiB, 2 MiB pages, present | writable | PS, no NX.
     let tables = &mut scratch[SCRATCH_TABLES..SCRATCH_TRAMPOLINE];
     tables.fill(0);
-    let put = |t: &mut [u8], i: usize, v: u64| t[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    let put =
+        |t: &mut [u8], i: usize, v: u64| t[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
     put(tables, 0, (base + 0x1000) | 3); // PML4[0] -> PDPT
     for i in 0..4 {
-        put(&mut tables[0x1000..], i, (base + 0x2000 + i as u64 * 0x1000) | 3);
+        put(
+            &mut tables[0x1000..],
+            i,
+            (base + 0x2000 + i as u64 * 0x1000) | 3,
+        );
     }
     for i in 0..2048 {
         put(&mut tables[0x2000..], i, (i as u64) << 21 | 0x83);
     }
 
-    let (start, end) = (&raw const kexec_blob_start as usize, &raw const kexec_blob_end as usize);
+    let (start, end) = (
+        &raw const kexec_blob_start as usize,
+        &raw const kexec_blob_end as usize,
+    );
     assert!(end - start <= SCRATCH_INFO - SCRATCH_TRAMPOLINE);
     // SAFETY: the trampoline bytes between two labels in .rodata (kexec.S).
     let blob = unsafe { core::slice::from_raw_parts(start as *const u8, end - start) };

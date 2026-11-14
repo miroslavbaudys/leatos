@@ -88,5 +88,8 @@ pub fn prepare(staging: &mut [u8], len: usize) -> Result<Prepared, String> {
 pub fn exec(staging: &'static mut [u8], p: Prepared, cmdline: &str) -> ! {
     let (head, scratch) = staging.split_at_mut(p.scratch_at);
     let flat = &head[p.flat_at..p.flat_at + p.plan.len()];
+    // The other cores must not run while the kernel is overwritten.
+    crate::smp::stop_others();
+    arch::smp::park_others();
     arch::kexec::exec(flat, p.plan.lo, p.plan.entry, cmdline, scratch)
 }

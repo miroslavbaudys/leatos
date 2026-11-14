@@ -129,9 +129,84 @@ _start64:
     jmp     3b
 
 /*
- * GDT: null, 64-bit code (0x08), data (0x10), and a 16-byte TSS descriptor
- * (0x18) that exceptions.rs fills in before `ltr`. Writable (.data): the
- * CPU sets accessed/busy bits in descriptors.
+ * Secondary cores (smp.rs): the real-mode trampoline below is copied to
+ * AP_TRAMPOLINE (< 1 MiB) and started by INIT-SIPI-SIPI. It enters long
+ * mode on the boot page tables (identity 0..4 GiB, executable), then jumps
+ * here: switch to the kernel's final tables, take this core's stack and
+ * call ap_rust(core). ap_boot = [cr3, stack top, core], written by the boot
+ * core before each start.
+ */
+    .section .text
+    .code64
+    .global ap_start64
+ap_start64:
+    mov     $0x10, %ax
+    mov     %ax, %ds
+    mov     %ax, %es
+    mov     %ax, %ss
+    xor     %eax, %eax
+    mov     %ax, %fs
+    mov     %ax, %gs
+    mov     ap_boot(%rip), %rax
+    mov     %rax, %cr3
+    mov     ap_boot+8(%rip), %rsp
+    mov     ap_boot+16(%rip), %rdi
+    xor     %ebp, %ebp
+    call    ap_rust
+4:  cli
+    hlt
+    jmp     4b
+
+    .set    AP_TRAMPOLINE, 0x8000
+    .section .rodata.ap_trampoline, "a"
+    .global ap_trampoline_start, ap_trampoline_end
+    .code16
+ap_trampoline_start:
+    cli
+    cld
+    xor     %ax, %ax
+    mov     %ax, %ds
+    lgdtl   AP_TRAMPOLINE + (ap_gdt_ptr - ap_trampoline_start)
+    mov     %cr0, %eax
+    or      $1, %eax                    /* PE */
+    mov     %eax, %cr0
+    ljmpl   $0x08, $(AP_TRAMPOLINE + (ap_pm32 - ap_trampoline_start))
+    .code32
+ap_pm32:
+    mov     $0x10, %ax
+    mov     %ax, %ds
+    mov     %ax, %es
+    mov     %ax, %ss
+    mov     %cr4, %eax
+    or      $(1 << 5), %eax             /* PAE */
+    mov     %eax, %cr4
+    mov     $__boot_pml4, %eax
+    mov     %eax, %cr3
+    mov     $0xc0000080, %ecx           /* EFER.LME | EFER.NXE */
+    rdmsr
+    or      $((1 << 8) | (1 << 11)), %eax
+    wrmsr
+    mov     %cr0, %eax
+    or      $0x80010001, %eax           /* PG | WP | PE */
+    mov     %eax, %cr0
+    lgdt    gdt_ptr
+    ljmp    $0x08, $ap_start64
+    .balign 8
+ap_gdt:
+    .quad 0
+    .quad 0x00cf9a000000ffff            /* 32-bit code */
+    .quad 0x00cf92000000ffff            /* data */
+ap_gdt_ptr:
+    .word 23
+    .long AP_TRAMPOLINE + (ap_gdt - ap_trampoline_start)
+ap_trampoline_end:
+    .code64
+
+/*
+ * GDT: null, 64-bit code (0x08), data (0x10), and one 16-byte TSS
+ * descriptor per core (0x18, 0x28, 0x38, 0x48) that exceptions.rs fills in
+ * before `ltr`. Writable (.data): the CPU sets accessed/busy bits in
+ * descriptors.
  */
     .section .data
     .balign 16
@@ -142,8 +217,10 @@ gdt:
     .quad 0x00cf92000000ffff            /* data: present, ring 0, writable */
     .global gdt_tss
 gdt_tss:
-    .quad 0
-    .quad 0
+    .quad 0, 0
+    .quad 0, 0
+    .quad 0, 0
+    .quad 0, 0
 gdt_end:
 
     .balign 8

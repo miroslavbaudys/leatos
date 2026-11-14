@@ -68,8 +68,16 @@ pub fn discover(start_info: usize) -> Result<BootInfo, &'static str> {
             ("pvh start info + acpi", start_info, 56)
         },
         cpus: a.cpus.max(1),
-        // MADT order; the x86_64 SMP backend puts the boot core first.
-        cpu_ids: a.apic_ids,
+        // MADT order with the boot core moved to the front.
+        cpu_ids: {
+            let mut ids = a.apic_ids;
+            let n = a.cpus.clamp(1, ids.len());
+            let me = cpu::apic_id();
+            if let Some(i) = ids[..n].iter().position(|&x| x == me) {
+                ids[..=i].rotate_right(1);
+            }
+            ids
+        },
         ram: si.ram,
         console_base: None,
         power: PowerMethod::AcpiS5 {

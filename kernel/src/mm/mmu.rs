@@ -221,6 +221,27 @@ pub fn map_device(start: usize, end: usize) {
     }
 }
 
+/// Map `[start, end)` of RAM read-write (never executable) in the live
+/// address space, skipping pages already mapped. For the x86_64 SMP
+/// trampoline page below 1 MiB, which the boot core writes and the other
+/// cores execute with paging off / on the boot tables.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub fn map_ram_rw(start: usize, end: usize) {
+    let (start, end) = (align_down(start), align_up(end));
+    let mut live = LIVE.lock();
+    let space = live.as_mut().expect("mmu: map_ram_rw before mmu::init");
+    let mut added = false;
+    for page in (start..end).step_by(PAGE) {
+        if !space.is_mapped(page) {
+            space.map(page, page + PAGE, Perm::Rw);
+            added = true;
+        }
+    }
+    if added {
+        hw::sync_tables();
+    }
+}
+
 /// Is `addr` inside one of the unmapped stack guard pages?
 pub fn guard_page_name(addr: usize) -> Option<&'static str> {
     let in_page = |base: usize| addr >= base && addr < base + PAGE;

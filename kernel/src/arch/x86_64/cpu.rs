@@ -28,6 +28,29 @@ pub fn irqs_enabled() -> bool {
     flags & (1 << 9) != 0
 }
 
+/// This core's index (`smp`): the first word of the per-core block that
+/// GS points at (`exceptions::per_core` sets it up first thing).
+#[inline]
+pub fn core_id() -> usize {
+    let v: u64;
+    // SAFETY: reads 8 bytes at GS base, the core's own `PERCPU` slot.
+    unsafe { asm!("mov {}, gs:[0]", out(reg) v, options(nostack, preserves_flags, readonly)) };
+    v as usize
+}
+
+/// Point GS at this core's per-core block (IA32_GS_BASE).
+pub fn set_gs_base(addr: u64) {
+    // SAFETY: writes IA32_GS_BASE; only GS-relative loads use it.
+    unsafe {
+        asm!("wrmsr", in("ecx") 0xc000_0101u32, in("eax") addr as u32, in("edx") (addr >> 32) as u32, options(nostack, preserves_flags))
+    };
+}
+
+/// This core's initial local APIC ID (CPUID.1:EBX[31:24]).
+pub fn apic_id() -> u64 {
+    (cpuid(1).ebx >> 24) as u64
+}
+
 /// Order memory accesses against a DMA-capable device. x86 is TSO and
 /// orders write-back stores before uncached MMIO stores (and loads with
 /// loads), so only the compiler must not reorder.
@@ -40,13 +63,6 @@ pub fn dma_barrier() {
 /// is atomic: the interrupt shadow of `sti` covers `hlt`, so an IRQ that
 /// arrives in between still wakes the CPU. Interrupts stay enabled after.
 #[cfg_attr(feature = "idle-poll", allow(dead_code))]
-/// This core's index (`smp`). Single core until the x86_64 SMP backend
-/// lands (M11 step 2b).
-#[inline]
-pub fn core_id() -> usize {
-    0
-}
-
 pub fn wait_for_interrupt() {
     // SAFETY: `sti; hlt` enables interrupts and halts until one arrives.
     unsafe { asm!("sti", "hlt", options(nomem, nostack)) };

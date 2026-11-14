@@ -21,7 +21,7 @@ page-table *construction*, PCI enumeration logic, driver state machines) can be 
 - `kernel` crate root: `#![deny(unsafe_code)]`.
 - Only these modules may opt out, with `#[allow(unsafe_code)]` on the `mod`
   declaration, so `grep allow(unsafe_code)` lists the whole audit surface:
-  - `arch::<target>`: CPU, vectors, IRQ entry, sysregs, MMU activation, power, SMP (aarch64 `smp.rs`: PSCI `CPU_ON`, one cache-line clean; `irqchip::send_ipi`: `ICC_SGI1R_EL1`)
+  - `arch::<target>`: CPU, vectors, IRQ entry, sysregs, MMU activation, power, SMP (aarch64 `smp.rs`: PSCI `CPU_ON`, one cache-line clean; `irqchip::send_ipi`: `ICC_SGI1R_EL1`; x86_64 `smp.rs`: one copy of the trampoline to its free low page, `cpu`: `IA32_GS_BASE` write and the GS-relative core-index load, per-core `ltr`)
   - `mm::heap`: allocator init; `take_staging` (the upgrade staging area as one `&'static mut [u8]`, handed out once)
   - `mm::dma`: the `virtio_drivers::Hal` implementation; `DmaRegion`
     (descriptor rings: volatile access, and `unsafe fn write_buffer_addr`,
