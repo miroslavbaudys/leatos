@@ -496,3 +496,35 @@ few hundred Mbit/s with CAKE (approximate; varies by SoC), and modern x86
 handles gigabit. Requirements for us: no allocation in the datapath, batching,
 O(1) queue operations, and cache-friendly flow tables. Benchmark early in QEMU
 to catch regressions; absolute numbers only mean something on real hardware.
+
+### apu4: CPU cost with CAKE, 1 core vs 4 (2026-11-14, M11)
+PC Engines apu4 (AMD GX-412TC, 4 × Jaguar 1 GHz, i211), VDSL2 100/20
+behind the home router, Windows PC on the LAN, Waveform bufferbloat test.
+Kernel `a24541e`, `shape_down=90000 shape_up=18000 shape_overhead=20`.
+Router-side record: `/api/status` every 2 s (interface counters, qdisc
+counters) and the per-core CPU history (1 s samples).
+
+| | `cores=4` (default) | `cores=1` |
+|---|---|---|
+| Waveform grade | A+ | A+ |
+| Throughput, best 10 s window (router counters) | ~90 / 17.4 Mbit/s | 87.4 / ~18 Mbit/s |
+| Layout | download on core 0, upload on core 1, services on core 2 | everything on core 0 |
+| Busiest 20 s, average | core 0 20.8 %, core 1 12.9 %, core 2 0.5 % | core 0 33.2 % |
+| Peak 1 s | 26.4 % / 13.5 % | 38.5 % |
+
+**Valid:** in both runs CAKE dropped in both directions (WAN 7810 / 9154,
+LAN 3545 / 4826 drops), about 450k packets were forwarded, no pool
+allocation failures. Window rates above the shaped 90/18 are timing error
+(the recorder polled over Wi-Fi with the Mac's clock).
+
+**Reading:**
+- The total work is about the same (34 % of one core across two cores
+  vs 33 % on one), so the lock and wakeup overhead of the split is
+  small.
+- At this line rate one core has roughly 3× headroom, so the split buys
+  headroom, not throughput. Per direction, the download core runs at
+  ~21 % at 90 Mbit/s. A linear extrapolation (optimistic: bursts and
+  cache effects grow with rate) puts the single-core limit near
+  300 Mbit/s combined, and the split one near 400 Mbit/s download.
+- Not measured yet: unshaped, and gigabit (needs a faster line or a LAN
+  test host).
