@@ -66,6 +66,13 @@ impl PciDevice {
         }
     }
 
+    pub fn is_virtio_blk(&self) -> bool {
+        matches!(
+            (self.info.vendor_id, self.info.device_id),
+            (0x1af4, 0x1001 | 0x1042)
+        )
+    }
+
     pub fn is_virtio_net(&self) -> bool {
         matches!(
             (self.info.vendor_id, self.info.device_id),

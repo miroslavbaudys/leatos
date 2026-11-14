@@ -200,6 +200,7 @@ dependencies = [
  "aarch64-cpu",
  "boot-image",
  "config",
+ "config-store",
  "fdt",
  "fwd",
  "linked_list_allocator",
@@ -211,6 +212,14 @@ dependencies = [
  "smoltcp",
  "spin",
  "virtio-drivers",
+]
+
+[[package]]
+name = "rrstore"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "config-store",
 ]
 
 [[package]]

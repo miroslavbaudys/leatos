@@ -285,3 +285,18 @@ pub async fn yield_now() {
     }
     YieldNow(false).await
 }
+
+/// Run a future to completion outside the executor (boot, before [`run`]).
+/// Only for futures that make progress by polling on their own, like the
+/// block driver's (`drivers::virtio_blk::VirtioBlk::wait` yields, then
+/// polls the device again): nothing here sleeps or waits for a wake-up.
+pub fn block_on<F: Future>(fut: F) -> F::Output {
+    let mut fut = core::pin::pin!(fut);
+    let mut cx = Context::from_waker(core::task::Waker::noop());
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+        core::hint::spin_loop();
+    }
+}

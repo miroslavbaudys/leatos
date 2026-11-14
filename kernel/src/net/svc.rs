@@ -19,6 +19,7 @@ use crate::net::services::LanServices;
 use crate::net::shared::{Shared, WanChange};
 use crate::net::stack::{self, WaitAny};
 use crate::{println, timer};
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -234,14 +235,33 @@ fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
     }
 }
 
+/// Write `config.toml` to the store's `config` area.
+async fn save_config(st: &mut crate::store::Store, toml: &str) -> Result<String, String> {
+    use crate::config::schema;
+    let (slot, h) = st
+        .write_record("config", schema::VERSION, schema::VERSION, toml.as_bytes())
+        .await
+        .map_err(|e| alloc::format!("{e}"))?;
+    Ok(alloc::format!(
+        "slot {}, seq {}, {} bytes",
+        crate::store::slot_name(slot),
+        h.seq,
+        h.len
+    ))
+}
+
 /// The services task: never returns.
-pub async fn run(mut hosts: Vec<HostIf>, sh: &'static Shared) {
+pub async fn run(
+    mut hosts: Vec<HostIf>,
+    sh: &'static Shared,
+    mut store: Option<crate::store::Store>,
+) {
     let mut pinger = Pinger::new(&mut hosts[0].sockets);
     let mut services = (hosts.len() >= 2).then(|| {
         let (wan, lan) = hosts.split_at_mut(1);
         LanServices::new(&mut lan[0], Some(&mut wan[0]))
     });
-    let mut mgmt = Mgmt::new(&mut hosts);
+    let mut mgmt = Mgmt::new(&mut hosts, store.is_some());
     let events = [sh.svc_kick];
 
     loop {
@@ -262,7 +282,15 @@ pub async fn run(mut hosts: Vec<HostIf>, sh: &'static Shared) {
             let (wan, lan) = hosts.split_at_mut(1);
             svc.step(&mut lan[0].sockets, Some(&mut wan[0].sockets));
         }
-        if let Some(action) = mgmt.step(&mut hosts, sh, services.as_ref()) {
+        let action = mgmt.step(&mut hosts, sh, services.as_ref());
+        if let Some((conn, toml)) = mgmt.take_save()
+            && let Some(st) = store.as_mut()
+        {
+            // Yields while the disk works: the datapath keeps running.
+            let r = save_config(st, &toml).await;
+            mgmt.save_done(conn, r);
+        }
+        if let Some(action) = action {
             // The datapath stops the NICs and acts; nothing left to do here.
             sh.post_action(action);
             loop {

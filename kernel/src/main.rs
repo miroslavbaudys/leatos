@@ -34,6 +34,7 @@ mod platform;
 #[allow(unsafe_code)] // feature-gated deliberate faults
 mod selftest;
 mod smp;
+mod store;
 mod timer;
 mod upgrade;
 
@@ -54,7 +55,6 @@ pub fn kmain(boot_arg: usize) -> ! {
 
     config::init(info.bootargs);
     mm::heap::init(&info);
-    config::load();
     mm::mmu::init(&info);
     arch::irqchip::init(&info);
     timer::init_irq(info.timer_intid);
@@ -75,6 +75,10 @@ pub fn kmain(boot_arg: usize) -> ! {
     if let Some(pci) = &pci {
         pci::print(pci);
     }
+    // The config may live on a disk, so it is loaded once PCI is up. Code
+    // above this line reads only boot arguments, never `config::get`.
+    let mut store = pci.as_mut().and_then(store::open);
+    config::load(store.as_mut());
     let qos = config::qos();
     let net = pci.as_mut().and_then(|p| net::stack::bring_up(p, &qos));
     let has_net = net.is_some();
@@ -83,7 +87,7 @@ pub fn kmain(boot_arg: usize) -> ! {
     selftest::spawn(has_net);
     cpuload::spawn();
     if let Some((ports, hosts, shared)) = net {
-        spawn_net(ports, hosts, shared);
+        spawn_net(ports, hosts, shared, store);
     }
     executor::run()
 }
@@ -96,6 +100,7 @@ fn spawn_net(
     ports: &'static [net::stack::Port],
     hosts: alloc::vec::Vec<net::svc::HostIf>,
     shared: &'static net::shared::Shared,
+    store: Option<store::Store>,
 ) {
     use net::stack::{Dir, run_dir};
     let lay = net::stack::layout(ports.len(), smp::online());
@@ -113,7 +118,7 @@ fn spawn_net(
         let one = Dir { rx: 0, tx: 0, primary: true };
         executor::spawn_on(lay.down, Priority::Datapath, "dp", run_dir(one, ports, shared, dp));
     }
-    executor::spawn_on(lay.svc, Priority::Service, "svc", net::svc::run(hosts, shared));
+    executor::spawn_on(lay.svc, Priority::Service, "svc", net::svc::run(hosts, shared, store));
 }
 
 /// Packet buffers to preallocate: 2 NICs × (RX ring + TX ring) plus room

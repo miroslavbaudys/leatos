@@ -1,0 +1,13 @@
+[package]
+name = "rrstore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host tool for rrouter store partitions: create, format, write/read/corrupt records (docs/config-and-storage.md)."
+
+[dependencies]
+config-store = { workspace = true }
+config = { workspace = true }
+
+[lints]
+workspace = true

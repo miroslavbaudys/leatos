@@ -32,6 +32,9 @@
 #   QEMU_PCAP_DIR=dir    with QEMU_NET=user: dump WAN/LAN traffic to pcap files
 #   QEMU_DISK=img        boot a disk image via SeaBIOS + Limine instead of -kernel
 #                        (x86_64; scripts/apu-image.sh); QEMU_APPEND is ignored
+#   QEMU_STORE=img       attach img as a virtio-blk disk (the router's store; create
+#                        one with `cargo run -q -p rrstore -- create img`). Written
+#                        in place: pass a copy to keep the original
 #   QEMU_NIC=virtio|igb  NIC model for WAN and LAN (default virtio): igb = QEMU's
 #                        Intel 82576, driven by the same igb driver as the apu4's i211
 #   QEMU_APPEND="..."    kernel command line (DTB /chosen/bootargs), e.g.
@@ -134,6 +137,12 @@ if [[ "${QEMU_NET:-none}" =~ ^(user|lab|mac|mac-internet)$ ]]; then
   fi
 fi
 
+# After the NICs, so their PCI slots (and the WAN/LAN order) stay the same.
+STORE=()
+if [[ -n "${QEMU_STORE:-}" ]]; then
+  STORE=(-drive "file=$QEMU_STORE,format=raw,if=none,id=store,cache=writethrough" -device virtio-blk-pci,drive=store)
+fi
+
 GDB=()
 if [[ "${QEMU_GDB:-0}" == "1" ]]; then
   GDB=(-s -S)
@@ -156,6 +165,7 @@ exec "$BIN" \
   -nographic \
   "${BOOT[@]}" \
   "${NET[@]}" \
+  ${STORE[@]+"${STORE[@]}"} \
   ${GDB[@]+"${GDB[@]}"} \
   ${EXTRA[@]+"${EXTRA[@]}"} \
   "$@"

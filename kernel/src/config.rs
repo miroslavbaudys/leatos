@@ -2,12 +2,15 @@
 //! [`schema::Config`] built at boot, read by every service.
 //!
 //! ```text
-//! compiled-in defaults ← stored config.toml (M8: store not wired yet) ← boot arguments
+//! compiled-in defaults ← stored config.toml (`crate::store`) ← boot arguments
 //! ```
 //!
 //! [`init`] keeps the command line (before the heap exists); [`load`]
-//! builds the config after `heap::init`. [`lan`], [`dns`], [`qos`] and
-//! [`mgmt`] are views of it in the types the services use.
+//! builds the config once the store is found (after PCI). [`lan`], [`dns`],
+//! [`qos`] and [`mgmt`] are views of it in the types the services use.
+//! [`base`] is the config without boot arguments: what `GET /api/config`
+//! shows and a save starts from. Boot argument `config=defaults` ignores
+//! the store (recovery).
 
 use crate::println;
 use alloc::string::String;
@@ -21,6 +24,8 @@ pub use ::config as schema;
 /// The kernel command line, stored once at boot ([`init`]).
 static BOOTARGS: spin::Once<&'static str> = spin::Once::new();
 static CONFIG: spin::Once<schema::Config> = spin::Once::new();
+static BASE: spin::Once<schema::Config> = spin::Once::new();
+static SOURCE: spin::Once<String> = spin::Once::new();
 
 pub fn init(bootargs: &'static str) {
     BOOTARGS.call_once(|| bootargs);
@@ -30,23 +35,20 @@ pub fn bootargs() -> &'static str {
     BOOTARGS.get().copied().unwrap_or("")
 }
 
-/// Build the configuration (needs the heap). Called once, before any
-/// service starts.
-pub fn load() {
-    let stored = stored();
+/// Build the configuration (needs the heap): defaults or the store's
+/// `config.toml`, then boot arguments. Called once, before any service
+/// starts and before anything reads [`get`].
+pub fn load(store: Option<&mut crate::store::Store>) {
+    let (stored, source) = stored(store);
     let from_store = stored.is_some();
     let mut c = stored.unwrap_or_default();
-    apply_bootargs(&mut c, bootargs());
     if !from_store {
         add_lab_reservation(&mut c);
     }
+    BASE.call_once(|| c.clone());
+    apply_bootargs(&mut c, bootargs());
     println!(
-        "  config          : {}, lan {}, dhcp {}–{}, {} reservation(s)",
-        if from_store {
-            "stored"
-        } else {
-            "defaults (no store)"
-        },
+        "  config          : {source}, lan {}, dhcp {}–{}, {} reservation(s)",
         c.lan.ipv4,
         c.lan.dhcp_range().0,
         c.lan.dhcp_range().1,
@@ -59,13 +61,64 @@ pub fn load() {
             println!("  config          : warning: {i}");
         }
     }
+    SOURCE.call_once(|| source);
     CONFIG.call_once(|| c);
 }
 
-/// `config.toml` from the store partition (docs/config-and-storage.md):
-/// not wired yet (needs the block driver), so always `None`.
-fn stored() -> Option<schema::Config> {
-    None
+/// `config.toml` from the store's `config` area, and where the config came
+/// from (for the log and the status page). Never fails the boot: any
+/// problem means defaults (docs/config-and-storage.md §1).
+fn stored(store: Option<&mut crate::store::Store>) -> (Option<schema::Config>, String) {
+    use crate::store::{describe, slot_name};
+    if arg(bootargs(), "config") == Some("defaults") {
+        return (None, String::from("defaults (config=defaults: store ignored)"));
+    }
+    let Some(store) = store else {
+        return (None, String::from("defaults (no store)"));
+    };
+    let (rec, state) = match store.read_current_blocking("config", schema::VERSION) {
+        Ok(r) => r,
+        Err(e) => return (None, alloc::format!("defaults (store: {e})")),
+    };
+    println!(
+        "  store config    : slot A {}, slot B {}",
+        describe(&state.a),
+        describe(&state.b)
+    );
+    let Some(rec) = rec else {
+        return (None, String::from("defaults (store has no valid config)"));
+    };
+    let parsed = core::str::from_utf8(&rec.payload)
+        .map_err(|_| String::from("not UTF-8"))
+        .and_then(|t| schema::parse(t).map_err(|e| alloc::format!("{e}")));
+    match parsed {
+        Ok(c) => (
+            Some(c),
+            alloc::format!(
+                "stored (slot {}, seq {})",
+                slot_name(rec.slot),
+                rec.header.seq
+            ),
+        ),
+        Err(e) => (
+            None,
+            alloc::format!(
+                "defaults (stored config slot {} rejected: {})",
+                slot_name(rec.slot),
+                e.replace('\n', "; ")
+            ),
+        ),
+    }
+}
+
+/// The config without boot-argument overrides ([`load`] must have run).
+pub fn base() -> &'static schema::Config {
+    BASE.get().expect("config::load not called")
+}
+
+/// Where the config came from, e.g. `stored (slot B, seq 2)`.
+pub fn source() -> &'static str {
+    SOURCE.get().map(|s| s.as_str()).unwrap_or("")
 }
 
 /// The configuration ([`load`] must have run).

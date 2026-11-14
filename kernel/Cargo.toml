@@ -29,6 +29,7 @@ qdisc.workspace = true
 boot-image.workspace = true
 proto-http.workspace = true
 config.workspace = true
+config-store.workspace = true
 linked_list_allocator = "0.10"
 spin = { version = "0.9", default-features = false, features = ["spin_mutex", "once"] }
 virtio-drivers = { version = "0.13", default-features = false }

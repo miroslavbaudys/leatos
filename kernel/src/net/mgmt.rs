@@ -8,8 +8,14 @@
 //!   it in RAM. `X-Cmdline` replaces the kernel command line for the new
 //!   kernel (default: keep the current one).
 //! - `POST /api/reboot`: firmware reset.
+//! - `GET /api/config`: the configuration as TOML, without boot-argument
+//!   overrides (`config::base`).
+//! - `POST /api/config`: body = `config.toml`; parsed and validated
+//!   (`crates/config`; 422 with the message on error), saved to the store
+//!   by the services task (`crate::store`, canonical TOML from the parsed
+//!   structs), then the router reboots into it. 501 without a store.
 //!
-//! Upgrade and reboot need HTTP Basic auth (user `admin`, password from the
+//! Upgrade, reboot and config saves need HTTP Basic auth (user `admin`, password from the
 //! `mgmt_pass=` boot argument); without a password they are refused.
 //! Listens on the LAN; on the WAN too only with `mgmt=wan` (development:
 //! a router's management belongs on the LAN). Plain HTTP: the password
@@ -69,6 +75,8 @@ enum Route {
     Status,
     Upgrade,
     Reboot,
+    ConfigGet,
+    ConfigPut,
 }
 
 enum After {
@@ -86,6 +94,8 @@ struct Conn {
     /// Upload: bytes received into the staging area, running CRC.
     upload_len: usize,
     crc: u32,
+    /// `POST /api/config`: the body.
+    body: Vec<u8>,
     /// Queued response and how much of it has been sent.
     out: Vec<u8>,
     sent: usize,
@@ -105,6 +115,7 @@ impl Conn {
             head: None,
             upload_len: 0,
             crc: 0,
+            body: Vec::new(),
             out: Vec::new(),
             sent: 0,
             after: After::Nothing,
@@ -153,6 +164,11 @@ pub struct Mgmt {
     password: Option<&'static str>,
     on_wan: bool,
     wan_lease: String,
+    /// A store exists: `POST /api/config` can save.
+    has_store: bool,
+    /// A validated config waiting for the services task to save it:
+    /// (connection, canonical TOML).
+    save: Option<(usize, String)>,
 }
 
 fn tcp_socket() -> tcp::Socket<'static> {
@@ -166,7 +182,7 @@ fn tcp_socket() -> tcp::Socket<'static> {
 
 impl Mgmt {
     /// `hosts[0]` = WAN, `hosts[1]` = LAN.
-    pub fn new(ifs: &mut [HostIf]) -> Self {
+    pub fn new(ifs: &mut [HostIf], has_store: bool) -> Self {
         let cfg = config::mgmt();
         let mut conns = Vec::new();
         for (ifx, nif) in ifs.iter_mut().enumerate().take(2) {
@@ -200,6 +216,37 @@ impl Mgmt {
             password: cfg.password,
             on_wan: cfg.on_wan,
             wan_lease: String::from("null"),
+            has_store,
+            save: None,
+        }
+    }
+
+    /// A validated config to save: the services task writes it to the
+    /// store, then reports with [`Self::save_done`].
+    pub fn take_save(&mut self) -> Option<(usize, String)> {
+        self.save.take()
+    }
+
+    /// The store write for connection `i` finished: answer, and reboot
+    /// into the new config once the answer is sent.
+    pub fn save_done(&mut self, i: usize, result: Result<String, String>) {
+        let c = &mut self.conns[i];
+        match result {
+            Ok(detail) => {
+                println!("  mgmt            : config saved ({detail}), rebooting");
+                c.respond_json(
+                    200,
+                    &format!(
+                        "{{\"ok\":true,\"detail\":{}}}",
+                        json_str(&format!("saved ({detail}), rebooting"))
+                    ),
+                );
+                c.after = After::Reboot;
+            }
+            Err(e) => {
+                println!("  mgmt            : config save failed: {e}");
+                c.error(500, &format!("save failed: {e}"));
+            }
         }
     }
 
@@ -227,14 +274,23 @@ impl Mgmt {
             (Method::Get, "/api/status") => Ok(Route::Status),
             (Method::Post, "/api/upgrade") => Ok(Route::Upgrade),
             (Method::Post, "/api/reboot") => Ok(Route::Reboot),
-            (_, "/" | "/index.html" | "/api/status" | "/api/upgrade" | "/api/reboot") => {
+            (Method::Get, "/api/config") => Ok(Route::ConfigGet),
+            (Method::Post, "/api/config") => Ok(Route::ConfigPut),
+            (
+                _,
+                "/" | "/index.html" | "/api/status" | "/api/upgrade" | "/api/reboot"
+                | "/api/config",
+            ) => {
                 Err((405, "method not allowed"))
             }
             _ => Err((404, "not found")),
         };
         let route = route.and_then(|r| {
-            if matches!(r, Route::Upgrade | Route::Reboot) {
+            if matches!(r, Route::Upgrade | Route::Reboot | Route::ConfigPut) {
                 self.authorized(&head)?;
+            }
+            if r == Route::ConfigPut && !self.has_store {
+                return Err((501, "no store: the config cannot be saved"));
             }
             Ok(r)
         });
@@ -289,6 +345,27 @@ impl Mgmt {
                 c.after = After::Reboot;
             }
             Route::Upgrade => self.finish_upload(i),
+            Route::ConfigGet => {
+                let toml = config::base().to_toml();
+                self.conns[i].respond(200, "application/toml", &[], toml.as_bytes());
+            }
+            Route::ConfigPut => self.check_config(i),
+        }
+    }
+
+    /// `POST /api/config`: parse and validate; queue the save.
+    fn check_config(&mut self, i: usize) {
+        let c = &mut self.conns[i];
+        let parsed = core::str::from_utf8(&c.body)
+            .map_err(|_| String::from("config.toml must be UTF-8"))
+            .and_then(|t| config::schema::parse(t).map_err(|e| format!("{e}")));
+        match parsed {
+            Err(e) => {
+                println!("  mgmt            : config rejected: {}", e.replace('\n', "; "));
+                c.error(422, &e);
+            }
+            Ok(_) if self.save.is_some() => c.error(409, "another save is in progress"),
+            Ok(cfg) => self.save = Some((i, cfg.to_toml())),
         }
     }
 
@@ -365,6 +442,8 @@ impl Mgmt {
             st[c.upload_len..end].copy_from_slice(step.body);
             c.crc = boot_image::crc32(c.crc, step.body);
             c.upload_len = end;
+        } else if c.route == Some(Route::ConfigPut) && c.responded_at.is_none() {
+            c.body.extend_from_slice(step.body);
         }
     }
 
@@ -484,7 +563,7 @@ fn status_json(
     cpu.push_str("]}");
     let _ = write!(
         s,
-        "{{\"version\":{},\"arch\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"conntrack\":{},\
+        "{{\"version\":{},\"arch\":{},\"config\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"conntrack\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"wan_lease\":{wan_lease},\
          \"mgmt\":{{\"on_wan\":{},\"upgrade\":{}}},\"interfaces\":[",
@@ -494,6 +573,7 @@ fn status_json(
         } else {
             "aarch64"
         }),
+        json_str(config::source()),
         timer::uptime().as_secs(),
         datapath::FORWARDED.load(Ordering::Relaxed),
         datapath::DROPPED.load(Ordering::Relaxed),

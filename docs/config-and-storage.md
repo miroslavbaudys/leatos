@@ -205,16 +205,29 @@ comments and custom ordering in an uploaded file are not kept. The file
 is UI-managed, with import/export.
 
 ## 6. Management interface
-- `GET /api/config`: current config as TOML (secrets omitted).
-- `POST /api/config`: validate, save, reboot. Errors: 422 with the parser
-  or validation message (line and column).
+- `GET /api/config`: current config as TOML (secrets omitted), without
+  boot-argument overrides (what a save starts from).
+- `POST /api/config` (Basic auth): validate, save, reboot. Errors: 422 with
+  the parser or validation message (line and column), 501 without a
+  store. The kernel stores the canonical TOML of the parsed structs. The
+  save runs in the services task and yields while the disk works.
 - Shaper rates apply live; Save makes them persistent.
 - **Confirm or revert:** a change to the LAN address or management
   settings boots as a trial. Without Confirm from the web interface within
   120 s, the router reboots into the previous record.
 
 ## 7. Drivers
-- QEMU: virtio-blk (`virtio-drivers` `VirtIOBlk`), aarch64 and x86_64.
+- QEMU: virtio-blk (`drivers::virtio_blk` over `virtio-drivers`
+  `VirtIOBlk`), aarch64 and x86_64. Polled, one request in flight; the
+  request's buffers belong to the driver until the device completes it,
+  so a dropped caller never leaves the device writing freed memory.
+  Requests are at most 64 KiB (`crate::store` splits). Known limit:
+  `virtio-drivers` has only a blocking flush, so each flush (two per
+  record) spins until QEMU answers.
+- Host tool `tools/rrstore` (`cargo run -p rrstore -- create|format|show|put|get|corrupt`):
+  creates and formats store images, writes and reads records through the
+  same `config-store` code, and flips payload bytes for negative controls.
+  `QEMU_STORE=img scripts/qemu-run.sh` attaches an image as virtio-blk.
 - apu4: the SD slot (expected: FCH SDHCI, PCI class 08:05; to be
   confirmed from the PCI scan), PIO first. AHCI if an mSATA SSD is used.
 - Drivers are async and run at service priority: a store write never
@@ -224,9 +237,13 @@ is UI-managed, with import/export.
 - `crates/config-store`: layout and record round trips, every corruption
   case, slot selection with schema versions, power cuts and torn sectors
   at every point of a write.
-- Lab: save a config through the web interface, reboot, check the router
-  uses it. Negative control: flip a payload byte; the router must report
-  `config: defaults`.
+- `scripts/store-test.sh` (`RROUTER_ARCH=x86_64` too): empty store →
+  defaults; stored config used; a stored config that fails validation →
+  defaults; `config=defaults` ignores the store; save through the web
+  interface (401 without password, 422 for invalid or inconsistent
+  configs, store unchanged after them), reboot, the router uses the new
+  record. Negative controls: corrupt the new record → the previous one;
+  corrupt both → `config: defaults`.
 
 ## 9. Status
 | Step | Status |
@@ -234,6 +251,6 @@ is UI-managed, with import/export.
 | `crates/config-store`: layout, records, MBR lookup, write plans | ✅ host-tested |
 | `crates/config`: schema v1 (LAN, DHCP + reservations, DNS, shaping, mgmt), defaults, validation, TOML | ✅ host-tested |
 | Kernel: one `Config` loaded at boot (refactor, no behaviour change) | ✅ `config::load()`; boot arguments overlay it |
-| virtio-blk + store partition in QEMU, lab check | |
+| virtio-blk + store partition in QEMU, lab check | ✅ `drivers::virtio_blk`, `store`, `tools/rrstore`, `GET`/`POST /api/config`, `scripts/store-test.sh` (aarch64 + x86_64) |
 | Web interface: config pages, save + reboot, confirm/revert | |
 | apu4: SD driver, store partition in `apu-image.sh` | |

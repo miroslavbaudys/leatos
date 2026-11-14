@@ -3,6 +3,8 @@
 
 #[allow(unsafe_code)] // register window + DMA buffer hand-off (slot ownership)
 pub mod igb;
+#[allow(unsafe_code)] // DMA buffer hand-off (submit/complete pairs, driver-owned buffers)
+pub mod virtio_blk;
 #[allow(unsafe_code)] // DMA buffer hand-off (begin/complete pairs)
 pub mod virtio_net;
 
