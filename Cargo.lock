@@ -199,6 +199,7 @@ version = "0.1.0"
 dependencies = [
  "aarch64-cpu",
  "boot-image",
+ "config",
  "fdt",
  "fwd",
  "linked_list_allocator",

@@ -233,7 +233,7 @@ is UI-managed, with import/export.
 |---|---|
 | `crates/config-store`: layout, records, MBR lookup, write plans | ✅ host-tested |
 | `crates/config`: schema v1 (LAN, DHCP + reservations, DNS, shaping, mgmt), defaults, validation, TOML | ✅ host-tested |
-| Kernel: one `Config` loaded at boot (refactor, no behaviour change) | |
+| Kernel: one `Config` loaded at boot (refactor, no behaviour change) | ✅ `config::load()`; boot arguments overlay it |
 | virtio-blk + store partition in QEMU, lab check | |
 | Web interface: config pages, save + reboot, confirm/revert | |
 | apu4: SD driver, store partition in `apu-image.sh` | |

@@ -52,6 +52,7 @@ pub fn kmain(boot_arg: usize) -> ! {
 
     config::init(info.bootargs);
     mm::heap::init(&info);
+    config::load();
     mm::mmu::init(&info);
     arch::irqchip::init(&info);
     timer::init_irq(info.timer_intid);
@@ -71,7 +72,7 @@ pub fn kmain(boot_arg: usize) -> ! {
     if let Some(pci) = &pci {
         pci::print(pci);
     }
-    let qos = config::qos(info.bootargs);
+    let qos = config::qos();
     let ifs = pci
         .as_mut()
         .map(|p| net::stack::bring_up(p, &qos))

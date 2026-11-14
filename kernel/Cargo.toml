@@ -28,6 +28,7 @@ fwd.workspace = true
 qdisc.workspace = true
 boot-image.workspace = true
 proto-http.workspace = true
+config.workspace = true
 fdt = "0.1.5"
 linked_list_allocator = "0.10"
 spin = { version = "0.9", default-features = false, features = ["spin_mutex", "once"] }
