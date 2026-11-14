@@ -53,9 +53,9 @@ pub fn start(info: &BootInfo) {
         .min(MAX_CORES)
         .min(crate::config::cores().unwrap_or(MAX_CORES))
         .max(1);
-    for core in 1..wanted {
+    for (core, &hw_id) in info.cpu_ids.iter().enumerate().take(wanted).skip(1) {
         let (exc_top, stack_top) = mm::stacks::secondary(core);
-        if let Err(e) = arch::smp::start(core, info.cpu_ids[core], exc_top, stack_top) {
+        if let Err(e) = arch::smp::start(core, hw_id, exc_top, stack_top) {
             println!("  smp             : core {core} did not start: {e}");
             break;
         }

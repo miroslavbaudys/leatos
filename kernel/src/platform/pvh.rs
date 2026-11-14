@@ -24,7 +24,9 @@ pub struct StartInfo {
 }
 
 /// Copy (base, length, type) entries into a fixed array (no heap yet).
-pub(super) fn collect_mmap(entries: impl Iterator<Item = MmapEntry>) -> ([MmapEntry; MAX_MMAP], usize) {
+pub(super) fn collect_mmap(
+    entries: impl Iterator<Item = MmapEntry>,
+) -> ([MmapEntry; MAX_MMAP], usize) {
     let mut map = [(0, 0, 0); MAX_MMAP];
     let mut n = 0;
     for e in entries.take(MAX_MMAP) {
@@ -56,13 +58,17 @@ pub fn parse(start_info: usize, kernel_start: usize) -> Result<StartInfo, &'stat
     let map = phys::bytes(map_pa, entries as usize * 24)?;
     let k = kernel_start as u64;
     let ram = map
-        .chunks_exact(24)
-        .filter(|e| u32_at(e, 16) == Some(E820_RAM))
+        .as_chunks::<24>()
+        .0
+        .iter()
+        .filter(|e| u32_at(*e, 16) == Some(E820_RAM))
         .filter_map(|e| Some((u64_at(e, 0)?, u64_at(e, 8)?)))
         .find(|&(start, size)| start <= k && k < start + size)
         .ok_or("pvh: no RAM region contains the kernel")?;
     let (mmap, mmap_len) = collect_mmap(
-        map.chunks_exact(24)
+        map.as_chunks::<24>()
+            .0
+            .iter()
             .filter_map(|e| Some((u64_at(e, 0)?, u64_at(e, 8)?, u32_at(e, 16)?))),
     );
     Ok(StartInfo {

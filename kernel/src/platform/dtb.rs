@@ -110,8 +110,10 @@ pub unsafe fn discover(x0: usize, kernel_start: usize) -> Result<BootInfo, &'sta
 
 fn be_u32s(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
     bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_be_bytes(*c))
 }
 
 fn cell_prop(node: &FdtNode, name: &str) -> Option<u32> {
@@ -148,7 +150,7 @@ fn pcie_info(node: FdtNode, gic_addr_cells: usize) -> Option<PcieInfo> {
     // space code: 1 = I/O, 2 = 32-bit MMIO, 3 = 64-bit MMIO.
     let mut mem32 = None;
     if let Some(ranges) = node.property("ranges") {
-        for entry in ranges.value.chunks_exact(7 * 4) {
+        for entry in ranges.value.as_chunks::<{ 7 * 4 }>().0 {
             let mut e = [0u32; 7];
             for (dst, src) in e.iter_mut().zip(be_u32s(entry)) {
                 *dst = src;

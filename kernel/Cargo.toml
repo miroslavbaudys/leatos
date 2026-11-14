@@ -29,7 +29,6 @@ qdisc.workspace = true
 boot-image.workspace = true
 proto-http.workspace = true
 config.workspace = true
-fdt = "0.1.5"
 linked_list_allocator = "0.10"
 spin = { version = "0.9", default-features = false, features = ["spin_mutex", "once"] }
 virtio-drivers = { version = "0.13", default-features = false }
@@ -41,6 +40,7 @@ smoltcp = { version = "0.14", default-features = false, features = [
 ] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
+fdt = "0.1.5"
 aarch64-cpu = "11"
 
 [lints]

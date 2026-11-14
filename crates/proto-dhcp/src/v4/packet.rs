@@ -126,7 +126,7 @@ fn ip(b: &[u8]) -> Ipv4Addr {
 }
 
 fn ips(data: &[u8]) -> Vec<Ipv4Addr> {
-    data.chunks_exact(4).map(ip).collect()
+    data.as_chunks::<4>().0.iter().map(|c| ip(c)).collect()
 }
 
 fn u32_be(data: &[u8]) -> Option<u32> {

@@ -62,11 +62,11 @@ pub fn is_multicast_mac(m: &Mac) -> bool {
 
 /// One's-complement sum of `data` (no final inversion).
 fn sum(data: &[u8], mut acc: u32) -> u32 {
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
-        acc += u16::from_be_bytes([c[0], c[1]]) as u32;
+    let (chunks, rest) = data.as_chunks::<2>();
+    for c in chunks {
+        acc += u16::from_be_bytes(*c) as u32;
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = rest {
         acc += (*last as u32) << 8;
     }
     acc
