@@ -105,6 +105,10 @@ static HANDLERS: [Once<Entry>; MAX_INTID] = [const { Once::new() }; MAX_INTID];
 /// Every registered event, for the executor's wake-up scan.
 static EVENTS: Mutex<Vec<&'static IrqEvent>> = Mutex::new(Vec::new());
 static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Device interrupts per core (not the timer, not the wake IPI): shows where
+/// NIC interrupts are delivered (`smp`, M11).
+static DEV_IRQS: [AtomicU64; crate::smp::MAX_CORES] =
+    [const { AtomicU64::new(0) }; crate::smp::MAX_CORES];
 static SPURIOUS: AtomicU64 = AtomicU64::new(0);
 
 /// Register an interrupt: in IRQ context `action` runs (to ack/mask the
@@ -131,6 +135,9 @@ pub fn new_event() -> &'static IrqEvent {
 /// Called by the arch IRQ entry for each acknowledged interrupt.
 pub fn dispatch(intid: u32) {
     IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+    if intid != arch::irqchip::IPI_INTID && intid != crate::timer::intid() {
+        DEV_IRQS[crate::smp::current()].fetch_add(1, Ordering::Relaxed);
+    }
     match HANDLERS.get(intid as usize).and_then(Once::get) {
         Some(e) => {
             (e.action)(intid);
@@ -162,6 +169,11 @@ pub fn has_pending_wakeups() -> bool {
         .lock()
         .iter()
         .any(|ev| ev.is_fired() && ev.waker.lock().is_some())
+}
+
+/// Device interrupts handled on `core`.
+pub fn dev_irqs(core: usize) -> u64 {
+    DEV_IRQS[core].load(Ordering::Relaxed)
 }
 
 /// Total IRQs dispatched / spurious (diagnostics).

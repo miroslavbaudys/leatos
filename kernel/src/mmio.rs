@@ -8,13 +8,12 @@
 //!
 //! Registers are addressed by **byte offset**, matching datasheets. All
 //! accesses are 32-bit and must be 4-byte aligned, except 64-bit registers:
-//! [`Region::write64_split`] (two halves, where the device allows it) and
-//! [`Region::read64`] (one 64-bit access: GICv3 `GICR_TYPER` reads as 0 in
-//! halves under macOS HVF).
+//! [`Region::read64`] / [`Region::write64`] (one 64-bit access: under macOS
+//! HVF the GICv3 ignores 32-bit halves of `GICR_TYPER` and `GICD_IROUTER`).
 
 use core::ptr::NonNull;
 use safe_mmio::UniqueMmioPointer;
-use safe_mmio::fields::{ReadOnly, ReadWrite};
+use safe_mmio::fields::{ReadOnly, ReadWrite, WriteOnly};
 
 pub struct Region {
     regs: UniqueMmioPointer<'static, [ReadWrite<u32>]>,
@@ -75,10 +74,18 @@ impl Region {
         reg.read()
     }
 
-    /// Write a 64-bit register as two 32-bit halves (low first).
-    pub fn write64_split(&mut self, offset: usize, value: u64) {
-        self.write32(offset, value as u32);
-        self.write32(offset + 4, (value >> 32) as u32);
+    /// Write a 64-bit register with one 64-bit access (`offset` 8-aligned).
+    pub fn write64(&mut self, offset: usize, value: u64) {
+        assert!(
+            offset.is_multiple_of(8),
+            "mmio: unaligned 64-bit offset {offset:#x}"
+        );
+        let _ = self.reg(offset + 4);
+        let ptr = NonNull::new((self.base + offset) as *mut WriteOnly<u64>).expect("mmio: null");
+        // SAFETY: as in `read64`: 8 bytes inside this exclusively owned,
+        // mapped device region; `&mut self` keeps the access exclusive.
+        let mut reg = unsafe { UniqueMmioPointer::new(ptr) };
+        reg.write(value);
     }
 }
 

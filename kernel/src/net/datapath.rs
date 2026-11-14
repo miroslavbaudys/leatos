@@ -359,8 +359,11 @@ impl Datapath {
                 use core::fmt::Write;
                 let _ = write!(tasks, ", {name}@{core} {} ms", ms(ticks));
             });
+            let irqs: Vec<u64> = (0..crate::smp::online())
+                .map(crate::irq::dev_irqs)
+                .collect();
             crate::println!(
-                "  cpu             : core 0 idle {} ms, uptime {} ms{tasks}",
+                "  cpu             : core 0 idle {} ms, uptime {} ms{tasks}, dev irqs {irqs:?}",
                 ms(t.idle),
                 timer::uptime().as_millis()
             );

@@ -109,15 +109,15 @@ does one 64-bit access. TCG answered either way.
     direction (ARP-released packets), `svc` (router-local frames), or the
     RX task after its NIC's interrupt (TX completions share the NIC's
     vector).
-  - aarch64 routes each NIC's interrupt to the core that unmasks it,
-    which is its RX task's core. x86_64 MSI-X still targets core 0; the
-    event wakes the RX task by IPI.
+  - Each NIC's interrupt goes to its RX task's core (`net::stack::layout`):
+    x86_64 programs the MSI-X destination APIC at bring-up; aarch64 routes
+    the SPI to the core that unmasks it (`GICD_IROUTER`, written with one
+    64-bit access: HVF ignores 32-bit halves, so before this fix every
+    interrupt stayed on core 0). The console's `cpu` line and the lab's
+    `irq placement` check show device interrupts per core.
 - **Checks (lab):**
   - `cpu split`: each direction's task did more work than `svc` (the
     client's download and upload phases load them).
   - `cpu placement`: `dp_up` on core 1 with `QEMU_SMP` ≥ 3, else core 0.
     Negative control: `QEMU_SMP=4 LAB_ROUTER_ARGS=cores=2` fails it.
-- **Later, if `Mutex<Datapath>` contention limits the gain on the
-  apu4:** shard conntrack (NAT external port % shards = the connection's
-  shard), route x86 MSI-X to the RX core, and give igb separate RX/TX
-  vectors.
+- **Later, if needed:** separate RX/TX MSI-X vectors for igb.

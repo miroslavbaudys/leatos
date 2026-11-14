@@ -263,7 +263,7 @@ pub fn msi_vector(_n: usize) -> Option<u32> {
     None
 }
 
-pub fn msi_message(_vector: u32) -> Option<(u64, u32)> {
+pub fn msi_message(_vector: u32, _core: usize) -> Option<(u64, u32)> {
     None
 }
 
@@ -282,7 +282,9 @@ pub fn enable(intid: u32, trigger: Trigger) {
                 Trigger::Edge => v | bit,
                 Trigger::Level => v & !bit,
             });
-            g.gicd.write64_split(GICD_IROUTER + i * 8, affinity());
+            // IROUTER: Aff3 in bits 32..40 (not GICR_TYPER's layout).
+            g.gicd
+                .write64(GICD_IROUTER + i * 8, super::cpu::hw_core_id());
         }
         g.set_enabled(intid, true);
     });

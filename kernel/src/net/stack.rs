@@ -73,6 +73,38 @@ fn mask_intx(intid: u32) {
     arch::irqchip::disable(intid);
 }
 
+/// Where the network tasks run (docs/smp.md): with two ports one datapath
+/// task per direction, on their own cores when there are 3+, and the
+/// services on the next core.
+#[derive(Clone, Copy, Debug)]
+pub struct Layout {
+    /// `dp_down` (WAN RX → LAN TX), or the single task with one port.
+    pub down: usize,
+    /// `dp_up` (LAN RX → WAN TX).
+    pub up: usize,
+    pub svc: usize,
+}
+
+pub fn layout(ports: usize, cores: usize) -> Layout {
+    match (ports >= 2, cores) {
+        (_, 0 | 1) => Layout {
+            down: 0,
+            up: 0,
+            svc: 0,
+        },
+        (true, 2) | (false, _) => Layout {
+            down: 0,
+            up: 0,
+            svc: 1,
+        },
+        (true, _) => Layout {
+            down: 0,
+            up: 1,
+            svc: 2,
+        },
+    }
+}
+
 /// Bring up the first two supported NICs: first = WAN, second = LAN.
 /// WAN egress is shaped at the upload rate, LAN egress at the download rate.
 /// Returns the datapath's ports, the services' router-stack interfaces and
@@ -90,7 +122,10 @@ pub fn bring_up(
     let mut ports = Vec::new();
     let mut shared_ports = Vec::new();
     let mut hosts = Vec::new();
+    let lay = layout(devs.len().min(2), crate::smp::online());
     for (i, d) in devs.iter().enumerate().take(2) {
+        // Interrupts go to the core of the task that receives on this port.
+        let rx_core = if i == 0 { lay.down } else { lay.up };
         let name = if i == 0 { "wan0" } else { "lan0" };
         let mut dev = match Nic::new(pci, d) {
             Ok(dev) => dev,
@@ -148,7 +183,7 @@ pub fn bring_up(
         let line = d.intx.map(|intid| (intid, Trigger::Level, "")).or_else(|| {
             let vector = arch::irqchip::msi_vector(i)?;
             dev.prepare_msix(pci, d).ok()?;
-            pci.enable_msix(d, vector)?;
+            pci.enable_msix(d, vector, rx_core)?;
             Some((vector, Trigger::Edge, " (MSI-X)"))
         });
         let irq = line.map(|(intid, trigger, kind)| {

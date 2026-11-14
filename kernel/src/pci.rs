@@ -101,8 +101,9 @@ impl Pci {
     /// Route the device's MSI-X entry 0 to `vector` (masked until
     /// `arch::irqchip::enable`) and switch the function from INTx to MSI-X.
     /// `None` if the device or the platform lacks MSI-X.
-    pub fn enable_msix(&mut self, dev: &PciDevice, vector: u32) -> Option<()> {
-        let (addr, data) = arch::irqchip::msi_message(vector)?;
+    /// `core`: the core the interrupt is delivered to.
+    pub fn enable_msix(&mut self, dev: &PciDevice, vector: u32, core: usize) -> Option<()> {
+        let (addr, data) = arch::irqchip::msi_message(vector, core)?;
         let cap = self.capability(dev.df, CAP_MSIX)?;
         let header = self.cfg.read_word(dev.df, cap);
         let table = self.cfg.read_word(dev.df, cap + 4);

@@ -127,10 +127,10 @@ pub fn msi_vector(n: usize) -> Option<u32> {
 }
 
 /// MSI message for `vector`: fixed delivery, edge, physical destination =
-/// this CPU's local APIC.
-pub fn msi_message(vector: u32) -> Option<(u64, u32)> {
+/// the local APIC of `core` (online, or 0).
+pub fn msi_message(vector: u32, core: usize) -> Option<(u64, u32)> {
     MSI_VECTORS.contains(&vector).then(|| {
-        let id = APIC_ID.load(core::sync::atomic::Ordering::Relaxed);
+        let id = APIC_IDS[core].load(core::sync::atomic::Ordering::Relaxed);
         (0xfee0_0000 | (id as u64) << 12, vector)
     })
 }

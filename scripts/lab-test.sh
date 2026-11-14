@@ -153,6 +153,17 @@ else
   echo "  LAB FAIL: cpu placement: expected dp_down on core 0, dp_up on core $want_up, got ${down_core:-?}/${up_core:-?}"
   router_fails=$((router_fails + 1))
 fi
+# 3. interrupts: the LAN NIC's interrupts are delivered to dp_up's core
+#    (x86_64: MSI-X destination; aarch64: GIC routing on unmask), so with
+#    QEMU_SMP >= 3 core 1 handles device interrupts. Same negative control.
+irqs=$(echo "$line" | sed -n 's/.*dev irqs \[\(.*\)\].*/\1/p' | tr -d ' ')
+irq_up=$(echo "$irqs" | cut -d, -f$((want_up + 1)))
+if [[ -n "$irq_up" && "$irq_up" -gt 0 ]]; then
+  echo "  LAB PASS: irq placement: device interrupts per core [$irqs], core $want_up handles the LAN NIC"
+else
+  echo "  LAB FAIL: irq placement: expected device interrupts on core $want_up, got [${irqs:-?}]"
+  router_fails=$((router_fails + 1))
+fi
 
 if [[ "$router_fails" == 0 ]] && tr -d '\r' <"$WORK/client.log" | grep -q "LAB DONE fails=0" && ! tr -d '\r' <"$WORK/client.log" | grep -q "LAB FAIL"; then
   echo "LAB TEST: PASS"

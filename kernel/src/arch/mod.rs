@@ -10,7 +10,7 @@
 //! - `irqchip`: `init(&BootInfo)`, `enable(intid, Trigger)`, `disable(intid)`;
 //!   the backend's IRQ entry calls `crate::irq::dispatch(intid)`. MSI-X:
 //!   `msi_vector(n)` (the n-th device vector, if the platform delivers
-//!   MSI-X), `msi_message(vector)` (address/data to program), and
+//!   MSI-X), `msi_message(vector, core)` (address/data to program, delivered to `core`), and
 //!   `attach_msix(vector, entry)` (the table entry that enable/disable
 //!   unmask/mask). SMP: `IPI_INTID`, `init_secondary()` (this core's
 //!   interface), `send_ipi(core)` (wake/stop IPI)

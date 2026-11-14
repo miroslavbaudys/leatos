@@ -121,6 +121,11 @@ pub fn init_irq(intid: u32) {
     crate::arch::irqchip::enable(intid, Trigger::Level);
 }
 
+/// The timer's interrupt ID (0 before [`init_irq`]).
+pub fn intid() -> u32 {
+    TIMER_INTID.load(Ordering::Relaxed) as u32
+}
+
 /// The same on a secondary core (its own comparator and interrupt).
 pub fn init_secondary() {
     hw::stop();

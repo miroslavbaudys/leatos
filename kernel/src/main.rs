@@ -98,26 +98,22 @@ fn spawn_net(
     shared: &'static net::shared::Shared,
 ) {
     use net::stack::{Dir, run_dir};
-    let cores = smp::online();
+    let lay = net::stack::layout(ports.len(), smp::online());
     let dp = net::stack::new_datapath(shared);
-    let svc_core = if ports.len() >= 2 {
-        let up_core = if cores >= 3 { 1 } else { 0 };
+    if ports.len() >= 2 {
         let down = Dir { rx: 0, tx: 1, primary: true };
         let up = Dir { rx: 1, tx: 0, primary: false };
-        executor::spawn_on(0, Priority::Datapath, "dp_down", run_dir(down, ports, shared, dp));
-        executor::spawn_on(up_core, Priority::Datapath, "dp_up", run_dir(up, ports, shared, dp));
-        println!("  datapath        : download on core 0, upload on core {up_core}");
-        match cores {
-            1 => 0,
-            2 => 1,
-            _ => 2,
-        }
+        executor::spawn_on(lay.down, Priority::Datapath, "dp_down", run_dir(down, ports, shared, dp));
+        executor::spawn_on(lay.up, Priority::Datapath, "dp_up", run_dir(up, ports, shared, dp));
+        println!(
+            "  datapath        : download on core {}, upload on core {}, services on core {}",
+            lay.down, lay.up, lay.svc
+        );
     } else {
         let one = Dir { rx: 0, tx: 0, primary: true };
-        executor::spawn_on(0, Priority::Datapath, "dp", run_dir(one, ports, shared, dp));
-        if cores > 1 { 1 } else { 0 }
-    };
-    executor::spawn_on(svc_core, Priority::Service, "svc", net::svc::run(hosts, shared));
+        executor::spawn_on(lay.down, Priority::Datapath, "dp", run_dir(one, ports, shared, dp));
+    }
+    executor::spawn_on(lay.svc, Priority::Service, "svc", net::svc::run(hosts, shared));
 }
 
 /// Packet buffers to preallocate: 2 NICs × (RX ring + TX ring) plus room
