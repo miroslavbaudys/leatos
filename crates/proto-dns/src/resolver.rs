@@ -113,6 +113,13 @@ impl Resolver {
         }
     }
 
+    /// New settings without a restart: the cache keeps what fits the new
+    /// size; pending queries continue.
+    pub fn reconfigure(&mut self, cfg: Config) {
+        self.cache.set_max_entries(cfg.cache_entries);
+        self.cfg = cfg;
+    }
+
     pub fn zone_mut(&mut self) -> &mut Zone {
         &mut self.zone
     }
@@ -485,6 +492,34 @@ mod tests {
             (RCODE_SERVFAIL, 7)
         );
         assert_eq!(r.next_deadline(), None);
+    }
+
+    #[test]
+    fn reconfigure_resizes_the_cache_and_switches_rebind_protection() {
+        let mut r = resolver();
+        for (i, name) in ["a.com", "b.com", "c.com"].iter().enumerate() {
+            let (_, up) = upstream(&r.handle_query(0, client(1), &build_query(1, name, TYPE_A)));
+            // Shorter TTL = expires sooner = evicted first.
+            r.handle_upstream(
+                1,
+                UP1,
+                &answer(&up, Ipv4Addr::new(93, 0, 0, 1), 100 + i as u32),
+            );
+        }
+        assert_eq!(r.cache_len(), 3);
+        r.reconfigure(Config {
+            cache_entries: 1,
+            rebind_protection: false,
+            ..Default::default()
+        });
+        assert_eq!(r.cache_len(), 1);
+        // c.com (longest TTL) is the one kept: answered from the cache.
+        let a = r.handle_query(2, client(2), &build_query(9, "c.com", TYPE_A));
+        assert_eq!(wire::Header::parse(reply(&a).1).unwrap().id, 9);
+        // Rebind protection off: a private answer passes.
+        let (_, up) = upstream(&r.handle_query(3, client(1), &build_query(1, "intra.com", TYPE_A)));
+        let a = r.handle_upstream(4, UP1, &answer(&up, Ipv4Addr::new(192, 168, 1, 5), 60));
+        assert_eq!(rcode(reply(&a).1), RCODE_NOERROR);
     }
 
     #[test]

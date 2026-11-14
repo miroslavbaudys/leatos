@@ -17,8 +17,9 @@
 # Save (WAN on user networking, mgmt=wan, host port forwarded to :80):
 #   GET /api/config (TOML) and /api/config.json; POST without password ->
 #   401; invalid TOML -> 422, inconsistent config -> 422 naming the field,
-#   both leave the store unchanged; a harmless change (JSON, as the page
-#   sends it) -> saved, reboot into it, no trial.
+#   both leave the store unchanged; a change without a trial (JSON, as the
+#   page sends it) -> saved and applied live, no reboot: shaper rate, qdisc
+#   rebuild, DHCP/DNS reconfigured; a rate-only change keeps the queue.
 # Trials (LAN address changes; trial_secs=20):
 #   saved as a trial -> boots as one; saving again -> 409; confirm without
 #   password -> 401; confirm -> kept across a reboot. Controls: no confirm
@@ -138,71 +139,85 @@ check "inconsistent config -> 422" 422 "$(save_toml "$WORK/incons.toml")"
 check "422 names the field" "lan.dhcp.range" "$(json "$WORK/resp" issues.0.path | cut -d'[' -f1)"
 check "refused saves left the store unchanged" "A 1 0" "$(slot)"
 
-# A harmless change, sent as JSON the way the page does: no trial.
+# A change without a trial, sent as JSON the way the page does: saved and
+# applied live, no reboot (DHCP reservation, DNS cache, shaping, qdisc).
 python3 -I -c 'import json,sys
 c=json.load(open(sys.argv[1])); c["dns"]["cache_entries"]=1000
 c["lan"]["dhcp"]["static"]=[{"mac":"52:54:00:00:00:08","ip":"10.20.0.8","hostname":"tv"}]
+c["shaping"]["down_kbit"]=50000; c["shaping"]["qdisc"]="fq_codel"
 open(sys.argv[2],"w").write(json.dumps(c))' "$WORK/cfg.json" "$WORK/new.json"
+status uptime_s >/dev/null; up0="$(json "$WORK/status" uptime_s)"
 check "JSON save -> 200" 200 "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/new.json" "$URL/api/config")"
-check "JSON save: no trial for a DNS/reservation change" false "$(json "$WORK/resp" trial)"
-BOOTS=2; up 2 || true
-check "rebooted into the saved config" "stored (slot B, seq 2), lan 10.20.0.1/24, dhcp 10.20.0.100–10.20.0.199, 1 reservation(s)" "$(config_line 2)"
+check "JSON save: no trial, applied live" "false true" "$(json "$WORK/resp" trial) $(json "$WORK/resp" applied)"
+sleep 3
+check "no reboot (same boot, uptime went on)" "1 1" "$(count "$CFG_LINE") $([[ "$(status uptime_s)" -ge "$up0" ]] && echo 1 || echo 0)"
+check "status: new config source" "stored (slot B, seq 2)" "$(status config)"
+check "download shaper changed live" 50000 "$(json "$WORK/status" interfaces.1.qdisc.shaped_kbit)"
+check "  ... upload shaper untouched" null "$(json "$WORK/status" interfaces.0.qdisc.shaped_kbit)"
+check "qdisc rebuilt as FQ-CoDel" 1 "$(count 'qos lan0       : now shaped 50000 kbit/s, overhead 0 B, FQ-CoDel')"
+check "DHCP and DNS reconfigured (1 reservation, cache 1000)" 1 "$(count 'lan services    : reconfigured: .*(1 static, 0 lease(s) dropped).*cache 1000')"
 curl -s -m 10 -o "$WORK/cfg.json" "$URL/api/config.json" || true
 check "saved values read back" "1000 tv" "$(json "$WORK/cfg.json" dns.cache_entries) $(json "$WORK/cfg.json" lan.dhcp.static.0.hostname)"
 check "no trial after a harmless save" "0 null" "$(count 'config          : trial (') $(status trial)"
 check "kernel stored canonical TOML (defaults written out)" 1 "$("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c '^cache_entries = 1000' || true)"
+# Rate only: the queue is kept.
+python3 -I -c 'import json,sys
+c=json.load(open(sys.argv[1])); c["shaping"]["down_kbit"]=60000
+open(sys.argv[1],"w").write(json.dumps(c))' "$WORK/cfg.json"
+check "rate-only change -> 200, applied" "200 true" "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/cfg.json" "$URL/api/config") $(json "$WORK/resp" applied)"
+check "  ... queue kept, new rate" "1 60000" "$(count 'qos lan0       : now shaped 60000 kbit/s, overhead 0 B, queue kept') $(status interfaces.1.qdisc.shaped_kbit)"
 
 echo "== trials"
 check "LAN change -> 200" 200 "$(save_toml "$WORK/lan.toml")"
 check "LAN change is saved as a trial" "true 20 10.30.0.1" "$(json "$WORK/resp" trial) $(json "$WORK/resp" confirm_within_s) $(json "$WORK/resp" lan)"
-up 3 || true
-check "boots the trial" 1 "$(count 'config          : trial (slot A, seq 3)')"
-check "rebooted into the trial config" "stored (slot A, seq 3), lan 10.30.0.1/24" "$(config_line 3 | sed 's/, dhcp.*//')"
-check "status shows the trial" 3 "$(status trial.seq)"
-check "store marks it booted" "A 3 3" "$(slot)"
+up 2 || true
+check "boots the trial" 1 "$(count 'config          : trial (slot B, seq 4)')"
+check "rebooted into the trial config" "stored (slot B, seq 4), lan 10.30.0.1/24" "$(config_line 2 | sed 's/, dhcp.*//')"
+check "status shows the trial" 4 "$(status trial.seq)"
+check "store marks it booted" "B 4 3" "$(slot)"
 check "save during a trial -> 409" 409 "$(save_toml "$WORK/a.toml")"
 check "confirm without password -> 401" 401 "$(code -X POST "$URL/api/config/confirm")"
 check "confirm -> 200" 200 "$(code -u admin:test -X POST "$URL/api/config/confirm")"
-check "confirmed: no trial, flags cleared" "null A 3 0" "$(status trial) $(slot)"
+check "confirmed: no trial, flags cleared" "null B 4 0" "$(status trial) $(slot)"
 check "confirm again -> 409" 409 "$(code -u admin:test -X POST "$URL/api/config/confirm")"
 check "reboot -> 200" 200 "$(code -u admin:test -X POST "$URL/api/reboot")"
-up 4 || true
-check "confirmed config kept across a reboot" "stored (slot A, seq 3), lan 10.30.0.1/24" "$(config_line 4 | sed 's/, dhcp.*//')"
+up 3 || true
+check "confirmed config kept across a reboot" "stored (slot B, seq 4), lan 10.30.0.1/24" "$(config_line 3 | sed 's/, dhcp.*//')"
 check "  ... and not as a trial" "1 null" "$(count 'config          : trial (') $(status trial)"
 
 lan_toml 10.40.0.1
 check "control, no confirm: trial saved" "200 true" "$(save_toml "$WORK/lan.toml") $(json "$WORK/resp" trial)"
-up 5 || true
-check "  ... boots as a trial" "stored (slot B, seq 4), lan 10.40.0.1/24" "$(config_line 5 | sed 's/, dhcp.*//')"
+up 4 || true
+check "  ... boots as a trial" "stored (slot A, seq 5), lan 10.40.0.1/24" "$(config_line 4 | sed 's/, dhcp.*//')"
 ok=0; wait_for 1 "not confirmed within 20 s: reverting" 40 && ok=1
 check "  ... reverted after 20 s" 1 "$ok"
-up 6 || true
-check "  ... back on the confirmed config" "stored (slot A, seq 3), lan 10.30.0.1/24" "$(config_line 6 | sed 's/, dhcp.*//')"
-check "  ... trial record erased" 1 "$("$RRSTORE" show "$IMG" | grep '^  config' | grep -c 'B: empty' || true)"
+up 5 || true
+check "  ... back on the confirmed config" "stored (slot B, seq 4), lan 10.30.0.1/24" "$(config_line 5 | sed 's/, dhcp.*//')"
+check "  ... trial record erased" 1 "$("$RRSTORE" show "$IMG" | grep '^  config' | grep -c 'A: empty' || true)"
 
 lan_toml 10.50.0.1
 check "control, revert now: trial saved" 200 "$(save_toml "$WORK/lan.toml")"
-up 7 || true
-check "  ... boots as a trial" "stored (slot B, seq 4), lan 10.50.0.1/24" "$(config_line 7 | sed 's/, dhcp.*//')"
+up 6 || true
+check "  ... boots as a trial" "stored (slot A, seq 5), lan 10.50.0.1/24" "$(config_line 6 | sed 's/, dhcp.*//')"
 check "  ... revert -> 200" 200 "$(code -u admin:test -X POST "$URL/api/config/revert")"
-up 8 || true
-check "  ... back on the confirmed config" "stored (slot A, seq 3), lan 10.30.0.1/24" "$(config_line 8 | sed 's/, dhcp.*//')"
+up 7 || true
+check "  ... back on the confirmed config" "stored (slot B, seq 4), lan 10.30.0.1/24" "$(config_line 7 | sed 's/, dhcp.*//')"
 
 lan_toml 10.60.0.1
 check "control, killed during the trial: trial saved" 200 "$(save_toml "$WORK/lan.toml")"
-wait_for 9 "$CFG_LINE" 120 || true
-check "  ... boots as a trial" "stored (slot B, seq 4), lan 10.60.0.1/24" "$(config_line 9 | sed 's/, dhcp.*//')"
+wait_for 8 "$CFG_LINE" 120 || true
+check "  ... boots as a trial" "stored (slot A, seq 5), lan 10.60.0.1/24" "$(config_line 8 | sed 's/, dhcp.*//')"
 stop
 r="$(boot_config killed "")"
-check "  ... next boot reverts it" "stored (slot A, seq 3, trial seq 4 reverted), lan 10.30.0.1/24" "${r%%, dhcp*}"
-check "  ... trial record erased" "A 3 0" "$(slot)"
+check "  ... next boot reverts it" "stored (slot B, seq 4, trial seq 5 reverted), lan 10.30.0.1/24" "${r%%, dhcp*}"
+check "  ... trial record erased" "B 4 0" "$(slot)"
 
 echo "== negative controls"
-"$RRSTORE" put "$IMG" config "$WORK/a.toml" >/dev/null # B, seq 4: lan 10.20.0.1/24
-"$RRSTORE" corrupt "$IMG" config --slot B >/dev/null
-r="$(boot_config fallback "")"
-check "newest record corrupt -> previous record" "stored (slot A, seq 3), lan 10.30.0.1/24" "${r%%, dhcp*}"
+"$RRSTORE" put "$IMG" config "$WORK/a.toml" >/dev/null # A, seq 5: lan 10.20.0.1/24
 "$RRSTORE" corrupt "$IMG" config --slot A >/dev/null
+r="$(boot_config fallback "")"
+check "newest record corrupt -> previous record" "stored (slot B, seq 4), lan 10.30.0.1/24" "${r%%, dhcp*}"
+"$RRSTORE" corrupt "$IMG" config --slot B >/dev/null
 r="$(boot_config both "")"
 check "both records corrupt -> defaults" "defaults (store has no valid config)" "${r%%,*}"
 

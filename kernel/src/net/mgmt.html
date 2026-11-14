@@ -383,7 +383,8 @@ async function postConfig(body, type) {
       `open http://${j.lan}/ (renew your DHCP lease if needed) and press Confirm within ${j.confirm_within_s} s, ` +
       "or the router goes back to the previous configuration.");
   } else {
-    cfgSay(`${j.detail}. This page reconnects by itself.`);
+    cfgSay(`${j.detail}: in effect now, no reboot.`);
+    loadConfig(); refresh();
   }
 }
 // Boot arguments win over the stored config: say so at each field they

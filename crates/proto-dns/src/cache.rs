@@ -40,6 +40,18 @@ impl Cache {
         }
     }
 
+    /// Change the size limit; when it shrinks, the soonest-expiring
+    /// entries go first.
+    pub fn set_max_entries(&mut self, max_entries: usize) {
+        self.max_entries = max_entries.max(1);
+        while self.entries.len() > self.max_entries {
+            let Some(oldest) = self.by_expiry.pop_first() else {
+                break;
+            };
+            self.entries.remove(&oldest.1);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

@@ -386,6 +386,50 @@ impl Server {
         out.reply = Some(self.reply(msg, MessageType::Ack, ip, true));
     }
 
+    /// Change the configuration without a restart (the web interface's
+    /// Save). Leases that are still valid under `cfg` are kept, with their
+    /// expiry; a lease is dropped (a `Released` event for a bound one) when
+    /// its MAC now has a reservation for another address, or its address is
+    /// reserved for someone else, outside the new pool and not reserved, or
+    /// the server's own. Such a client keeps its address until it renews,
+    /// then gets a NAK and asks again. A reservation's new hostname is
+    /// reported as `Released` + `Bound`, so the DNS zone follows.
+    pub fn reconfigure(&mut self, now: u64, cfg: Config) -> Vec<Event> {
+        self.cfg = cfg;
+        let mut out = Output::default();
+        let macs: Vec<Mac> = self.leases.keys().copied().collect();
+        for mac in macs {
+            let l = &self.leases[&mac];
+            let keep = match self.static_for_mac(&mac) {
+                Some(st) => st.ip == l.ip,
+                None => self.in_subnet(l.ip) && self.available_for(l.ip, &mac, now),
+            };
+            if !keep {
+                self.drop_lease(&mac, &mut out);
+                continue;
+            }
+            let new_name = self.static_for_mac(&mac).and_then(|st| st.hostname.clone());
+            let l = &self.leases[&mac];
+            if new_name.is_some() && new_name != l.hostname && l.state == LeaseState::Bound {
+                let (ip, old) = (l.ip, l.hostname.clone());
+                if let Some(l) = self.leases.get_mut(&mac) {
+                    l.hostname = new_name.clone();
+                }
+                out.events.push(Event::Released {
+                    mac,
+                    ip,
+                    hostname: old,
+                });
+                out.events.push(Event::Bound {
+                    mac,
+                    ip,
+                    hostname: new_name,
+                });
+            }
+        }
+        out.events
+    }
+
     /// Drop expired leases and offers. Call every few seconds.
     pub fn expire(&mut self, now: u64) -> Vec<Event> {
         let expired: Vec<Mac> = self
@@ -667,5 +711,104 @@ mod tests {
         m.giaddr = Ipv4Addr::new(10, 1, 1, 1);
         assert!(s.handle(0, &m.emit()).reply.is_none());
         assert!(s.handle(0, b"junk").reply.is_none());
+    }
+}
+
+#[cfg(test)]
+mod reconfigure_tests {
+    use super::*;
+    use alloc::string::ToString;
+    use alloc::vec;
+
+    const SERVER: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
+
+    fn cfg(lo: u8, hi: u8, statics: Vec<StaticLease>) -> Config {
+        Config {
+            server_ip: SERVER,
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            router: Some(SERVER),
+            dns: vec![SERVER],
+            domain: Some("lan".to_string()),
+            range: (
+                Ipv4Addr::new(192, 168, 1, lo),
+                Ipv4Addr::new(192, 168, 1, hi),
+            ),
+            lease_secs: 3600,
+            statics,
+        }
+    }
+
+    fn ip(d: u8) -> Ipv4Addr {
+        Ipv4Addr::new(192, 168, 1, d)
+    }
+
+    fn bound(s: &mut Server, mac: Mac, d: u8, host: &str) {
+        s.leases.insert(
+            mac,
+            Lease {
+                mac,
+                ip: ip(d),
+                hostname: Some(host.to_string()),
+                state: LeaseState::Bound,
+                expires: 1000,
+            },
+        );
+    }
+
+    fn st(mac: Mac, d: u8, host: Option<&str>) -> StaticLease {
+        StaticLease {
+            mac,
+            ip: ip(d),
+            hostname: host.map(|h| h.to_string()),
+        }
+    }
+
+    #[test]
+    fn keeps_valid_leases_and_drops_the_rest() {
+        let (a, b, c, d, e) = ([1u8; 6], [2u8; 6], [3u8; 6], [4u8; 6], [5u8; 6]);
+        let mut s = Server::new(cfg(100, 199, vec![st(d, 20, Some("nas"))]));
+        bound(&mut s, a, 100, "a"); // stays in the pool
+        bound(&mut s, b, 150, "b"); // pool shrinks below it
+        bound(&mut s, c, 101, "c"); // its address becomes reserved for another MAC
+        bound(&mut s, d, 20, "nas"); // reservation kept, renamed
+        bound(&mut s, e, 102, "e"); // gets a reservation elsewhere
+        let ev = s.reconfigure(
+            10,
+            cfg(
+                100,
+                120,
+                vec![
+                    st(d, 20, Some("storage")),
+                    st(e, 30, None),
+                    st([9; 6], 101, None),
+                ],
+            ),
+        );
+        let left: Vec<_> = s.leases().map(|l| (l.mac, l.ip)).collect();
+        assert_eq!(left, vec![(a, ip(100)), (d, ip(20))]);
+        // Expiry untouched.
+        assert!(s.leases().all(|l| l.expires == 1000));
+        let released: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                Event::Released { mac, .. } => Some(*mac),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(released, vec![b, c, d, e]);
+        assert!(ev.contains(&Event::Bound {
+            mac: d,
+            ip: ip(20),
+            hostname: Some("storage".to_string())
+        }));
+        assert_eq!(s.config().range.1, ip(120));
+    }
+
+    #[test]
+    fn unchanged_config_changes_nothing() {
+        let mut s = Server::new(cfg(100, 199, vec![]));
+        bound(&mut s, [1; 6], 100, "a");
+        assert!(s.reconfigure(10, cfg(100, 199, vec![])).is_empty());
+        assert_eq!(s.leases().count(), 1);
     }
 }

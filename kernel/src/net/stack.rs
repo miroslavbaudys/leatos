@@ -263,6 +263,50 @@ pub struct Dir {
 /// and per port; see `net::datapath`).
 pub type SharedDatapath = &'static Datapath;
 
+/// Apply new shaping settings without a restart. Rate and overhead change
+/// in place (the queue is kept); another AQM, fairness mode or ECN setting
+/// rebuilds the port's qdisc, dropping the packets queued in it (a few
+/// milliseconds' worth when it is shaped).
+pub fn apply_qos(sh: &Shared, old: &crate::config::Qos, new: &crate::config::Qos) {
+    for (i, port) in sh.ports.iter().enumerate() {
+        let up = i == 0;
+        let rate = new.rate(if up { new.up_kbit } else { new.down_kbit });
+        let (ecn_old, ecn_new) = if up {
+            (old.ecn_up, new.ecn_up)
+        } else {
+            (old.ecn_down, new.ecn_down)
+        };
+        let rebuild = old.aqm != new.aqm || old.isolation != new.isolation || ecn_old != ecn_new;
+        let what = if rebuild {
+            let aqm = Aqm::new(
+                new,
+                ecn_new,
+                QDISC_PACKETS,
+                QDISC_BYTES,
+                timer::ticks() ^ mac_seed(&port.mac),
+            );
+            let desc = aqm.describe(ecn_new);
+            // The old qdisc and its packets drop here, under the lock.
+            *port.qdisc.lock() = PortQdisc::new(aqm, rate);
+            desc
+        } else {
+            port.qdisc.lock().set_rate(rate);
+            alloc::string::String::from("queue kept")
+        };
+        match rate {
+            Some(r) => println!(
+                "  qos {}       : now shaped {} kbit/s, overhead {} B, {what}",
+                port.name,
+                r.bits_per_sec / 1000,
+                r.overhead
+            ),
+            None => println!("  qos {}       : now unshaped, {what}", port.name),
+        }
+        // The datapath re-reads the shaper on its next pass.
+        sh.tx_kick[i].signal();
+    }
+}
+
 pub fn new_datapath(sh: &'static Shared) -> SharedDatapath {
     alloc::boxed::Box::leak(alloc::boxed::Box::new(Datapath::new(sh)))
 }

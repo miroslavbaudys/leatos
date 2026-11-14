@@ -41,6 +41,44 @@ fn udp_socket(datagrams: usize, bytes: usize) -> udp::Socket<'static> {
     udp::Socket::new(rx, tx)
 }
 
+fn dhcp_config(cfg: &config::Lan) -> dhcp::Config {
+    dhcp::Config {
+        server_ip: cfg.addr,
+        netmask: cfg.netmask(),
+        router: Some(cfg.addr),
+        dns: vec![cfg.addr],
+        domain: Some(cfg.domain.clone()),
+        range: cfg.dhcp_range,
+        lease_secs: cfg.lease_secs,
+        statics: cfg.statics.clone(),
+    }
+}
+
+fn resolver_config(d: &config::Dns) -> resolver::Config {
+    resolver::Config {
+        cache_entries: d.cache_entries,
+        rebind_protection: d.rebind_protection,
+        ..Default::default()
+    }
+}
+
+/// The local zone: the router, reservations with a hostname, and bound
+/// DHCP leases with a hostname.
+fn build_zone<'a>(cfg: &config::Lan, leases: impl Iterator<Item = &'a dhcp::Lease>) -> Zone {
+    let mut zone = Zone::new(&cfg.domain, cfg.addr, (cfg.addr, cfg.prefix));
+    for s in &cfg.statics {
+        if let Some(h) = &s.hostname {
+            zone.add(h, s.ip, Source::Static);
+        }
+    }
+    for l in leases.filter(|l| l.state == dhcp::LeaseState::Bound) {
+        if let Some(h) = &l.hostname {
+            zone.add(h, l.ip, Source::Dhcp);
+        }
+    }
+    zone
+}
+
 fn now_ms() -> u64 {
     timer::uptime().as_millis() as u64
 }
@@ -54,31 +92,9 @@ impl LanServices {
         let cfg = config::lan();
         let dns_cfg = config::dns();
 
-        let dhcp_cfg = dhcp::Config {
-            server_ip: cfg.addr,
-            netmask: cfg.netmask(),
-            router: Some(cfg.addr),
-            dns: vec![cfg.addr],
-            domain: Some(cfg.domain.into()),
-            range: cfg.dhcp_range,
-            lease_secs: cfg.lease_secs,
-            statics: cfg.statics.clone(),
-        };
-        let mut zone = Zone::new(cfg.domain, cfg.addr, (cfg.addr, cfg.prefix));
-        for s in &cfg.statics {
-            if let Some(h) = &s.hostname {
-                zone.add(h, s.ip, Source::Static);
-            }
-        }
-        let dns = Resolver::new(
-            resolver::Config {
-                cache_entries: dns_cfg.cache_entries,
-                rebind_protection: dns_cfg.rebind_protection,
-                ..Default::default()
-            },
-            zone,
-            timer::ticks() as u32,
-        );
+        let dhcp_cfg = dhcp_config(&cfg);
+        let zone = build_zone(&cfg, core::iter::empty());
+        let dns = Resolver::new(resolver_config(&dns_cfg), zone, timer::ticks() as u32);
 
         let mut s = udp_socket(8, 8 * 600);
         s.bind(SERVER_PORT).expect("bind :67");
@@ -110,6 +126,33 @@ impl LanServices {
             upstream_sock,
             next_expire: 0,
         }
+    }
+
+    /// Apply the current config (`config::apply`) without a restart:
+    /// DHCP keeps the leases that are still valid, the DNS zone is rebuilt
+    /// from the reservations and the bound leases, the cache keeps what
+    /// fits. The LAN address itself never changes here (that is a trial
+    /// and reboots).
+    pub fn reconfigure(&mut self) {
+        let cfg = config::lan();
+        let dns_cfg = config::dns();
+        let dropped = self
+            .dhcp
+            .reconfigure(now_secs(), dhcp_config(&cfg))
+            .iter()
+            .filter(|e| matches!(e, DhcpEvent::Released { .. }))
+            .count();
+        *self.dns.zone_mut() = build_zone(&cfg, self.dhcp.leases());
+        self.dns.reconfigure(resolver_config(&dns_cfg));
+        println!(
+            "  lan services    : reconfigured: dhcp {}..{} ({} static, {} lease(s) dropped), domain .{}, cache {}",
+            cfg.dhcp_range.0,
+            cfg.dhcp_range.1,
+            cfg.statics.len(),
+            dropped,
+            cfg.domain,
+            dns_cfg.cache_entries
+        );
     }
 
     /// Current DHCP leases (status page).

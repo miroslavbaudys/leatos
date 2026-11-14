@@ -235,12 +235,17 @@ fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
     }
 }
 
-/// Carry out a management request on the store's `config` area.
-async fn store_op(st: &mut crate::store::Store, op: &StoreOp) -> Result<String, String> {
+/// Carry out a management request on the store's `config` area. Returns
+/// a detail for the answer and, for a save, where the config now comes
+/// from (`config::source`).
+async fn store_op(
+    st: &mut crate::store::Store,
+    op: &StoreOp,
+) -> Result<(String, Option<String>), String> {
     use crate::config::schema;
     let e = |e: crate::store::Error| alloc::format!("{e}");
     match op {
-        StoreOp::Save { toml, flags } => {
+        StoreOp::Save { toml, flags, .. } => {
             let (slot, h) = st
                 .write_record(
                     "config",
@@ -251,22 +256,21 @@ async fn store_op(st: &mut crate::store::Store, op: &StoreOp) -> Result<String, 
                 )
                 .await
                 .map_err(e)?;
-            Ok(alloc::format!(
-                "slot {}, seq {}, {} bytes",
-                crate::store::slot_name(slot),
-                h.seq,
-                h.len
+            let slot = crate::store::slot_name(slot);
+            Ok((
+                alloc::format!("slot {slot}, seq {}, {} bytes", h.seq, h.len),
+                Some(alloc::format!("stored (slot {slot}, seq {})", h.seq)),
             ))
         }
         StoreOp::Confirm(slot, h) => st
             .rewrite_header("config", *slot, *h)
             .await
-            .map(|()| String::from("confirmed"))
+            .map(|()| (String::from("confirmed"), None))
             .map_err(e),
         StoreOp::Revert(slot) => st
             .erase("config", *slot)
             .await
-            .map(|()| String::from("erased"))
+            .map(|()| (String::from("erased"), None))
             .map_err(e),
     }
 }
@@ -309,7 +313,16 @@ pub async fn run(
         {
             // Yields while the disk works: the datapath keeps running.
             let r = store_op(st, &op).await;
-            mgmt.op_done(conn, &op, r);
+            if let (Ok((_, Some(source))), StoreOp::Save { flags: 0, cfg, .. }) = (&r, &op) {
+                // Saved without a trial: run it now, no reboot.
+                let old = crate::config::qos();
+                crate::config::apply((**cfg).clone(), source.clone());
+                stack::apply_qos(sh, &old, &crate::config::qos());
+                if let Some(svc) = services.as_mut() {
+                    svc.reconfigure();
+                }
+            }
+            mgmt.op_done(conn, &op, r.map(|(detail, _)| detail));
         }
         if let Some(action) = action {
             // The datapath stops the NICs and acts; nothing left to do here.

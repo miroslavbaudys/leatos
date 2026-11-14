@@ -18,8 +18,8 @@
 //!   `Content-Type: application/json`; parsed and validated
 //!   (`crates/config`; 422 with the message and, for inconsistencies, the
 //!   `issues` with their paths), saved to the store by the services task
-//!   (`crate::store`, canonical TOML from the parsed structs), then the
-//!   router reboots into it. 501 without a store.
+//!   (`crate::store`, canonical TOML from the parsed structs), then
+//!   applied live (`net::svc`); only a trial reboots. 501 without a store.
 //! - **Trials** (docs/config-and-storage.md §6): a save that changes the
 //!   LAN address or management settings (`Config::needs_trial`) is stored
 //!   as a trial. The next boot runs it; `POST /api/config/confirm` keeps it,
@@ -102,8 +102,13 @@ enum Route {
 /// must not block this state machine): [`Mgmt::take_op`], then
 /// [`Mgmt::op_done`].
 pub enum StoreOp {
-    /// Write a new `config` record (`flags`: trial or not).
-    Save { toml: String, flags: u32 },
+    /// Write a new `config` record (`flags`: trial or not); without a
+    /// trial, the services task then applies `cfg` live.
+    Save {
+        toml: String,
+        flags: u32,
+        cfg: alloc::boxed::Box<config::schema::Config>,
+    },
     /// Clear the trial flags of this boot's record.
     Confirm(Slot, RecordHeader),
     /// Erase this boot's trial record.
@@ -287,21 +292,26 @@ impl Mgmt {
         self.op_busy = false;
         let (status, body, reboot) = match (op, result) {
             (StoreOp::Save { flags, .. }, Ok(detail)) => {
+                // A trial must boot to be confirmed; everything else was
+                // applied live by the services task.
                 let trial = *flags != 0;
-                println!(
-                    "  mgmt            : config saved ({detail}{}), rebooting",
-                    if trial { ", trial" } else { "" }
-                );
+                let what = if trial {
+                    "saved as a trial, rebooting"
+                } else {
+                    "saved and applied"
+                };
+                println!("  mgmt            : config {what} ({detail})");
                 let lan = self.saved_lan.take().unwrap_or_default();
                 (
                     200,
                     format!(
-                        "{{\"ok\":true,\"detail\":{},\"trial\":{trial},\"confirm_within_s\":{},\"lan\":{}}}",
-                        json_str(&format!("saved ({detail}), rebooting")),
+                        "{{\"ok\":true,\"detail\":{},\"trial\":{trial},\"applied\":{},\"confirm_within_s\":{},\"lan\":{}}}",
+                        json_str(&format!("{what} ({detail})")),
+                        !trial,
                         if trial { config::trial_secs() } else { 0 },
                         json_str(&lan)
                     ),
-                    true,
+                    trial,
                 )
             }
             (StoreOp::Confirm(..), Ok(_)) => {
@@ -536,7 +546,7 @@ impl Mgmt {
                 );
             }
             Ok(cfg) => {
-                let flags = if cfg.needs_trial(config::base()) {
+                let flags = if cfg.needs_trial(&config::base()) {
                     config_store::FLAG_TRIAL
                 } else {
                     0
@@ -547,6 +557,7 @@ impl Mgmt {
                     StoreOp::Save {
                         toml: cfg.to_toml(),
                         flags,
+                        cfg: alloc::boxed::Box::new(cfg),
                     },
                 ));
                 self.op_busy = true;
@@ -784,7 +795,7 @@ fn status_json(
             "aarch64"
         }),
         json_str(&format!("{}", config::Redacted(config::bootargs()))),
-        json_str(config::source()),
+        json_str(&config::source()),
         config::overrides()
             .iter()
             .map(|(path, kv)| format!("{}:{}", json_str(path), json_str(kv)))

@@ -227,7 +227,8 @@ named by validation issues are highlighted.
   boot-argument overrides (what a save starts from). `GET
   /api/config.json`: the same as JSON (the form).
 - `POST /api/config` (Basic auth): TOML, or JSON with `Content-Type:
-  application/json` (the form). Validate, save, reboot. Errors: 422 with
+  application/json` (the form). Validate, save, apply live (a trial:
+  reboot). Errors: 422 with
   the parser or validation message (line and column) and, for
   inconsistencies, `issues: [{path, msg}]`; 409 while a trial is pending;
   501 without a store. The kernel stores the canonical TOML of the parsed
@@ -236,8 +237,21 @@ named by validation issues are highlighted.
 - `POST /api/config/confirm`, `POST /api/config/revert` (Basic auth; 409
   without a pending trial). `/api/status` has `config` (where it came
   from), `store` and `trial` (`{seq, remaining_s}` or `null`).
-- Shaper rates apply live; Save makes them persistent. (Not yet: a change
-  reboots.)
+- **Applied live:** a save without a trial takes effect at once, no
+  reboot (`config::apply`, then the services task reconfigures):
+  - shaping: rate and overhead change in place (queue kept); another
+    qdisc, fairness mode or ECN setting rebuilds the port's qdisc and
+    drops the packets queued in it;
+  - DHCP (`Server::reconfigure`): leases still valid under the new pool
+    and reservations are kept, with their expiry. The rest are dropped,
+    and their clients get a NAK at the next renewal. Until then such a
+    client keeps using its address, even if a new reservation gave it to
+    someone else;
+  - DNS: the zone is rebuilt from the reservations and bound leases; the
+    cache keeps what fits the new size.
+
+  Boot arguments still override (`overrides`). Trial changes (LAN
+  address, management) reboot, because a trial must boot to be confirmed.
 
 ### Confirm or revert
 A save that changes the LAN address or the management settings

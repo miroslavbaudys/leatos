@@ -14,6 +14,7 @@
 
 use crate::println;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::net::Ipv4Addr;
 use proto_dhcp::v4::server::StaticLease;
@@ -23,9 +24,11 @@ pub use ::config as schema;
 
 /// The kernel command line, stored once at boot ([`init`]).
 static BOOTARGS: spin::Once<&'static str> = spin::Once::new();
-static CONFIG: spin::Once<schema::Config> = spin::Once::new();
-static BASE: spin::Once<schema::Config> = spin::Once::new();
-static SOURCE: spin::Once<String> = spin::Once::new();
+// Replaced as a whole when a saved config is applied live ([`apply`]).
+// Readers take a snapshot (`Arc`), never hold the lock.
+static CONFIG: spin::Mutex<Option<Arc<schema::Config>>> = spin::Mutex::new(None);
+static BASE: spin::Mutex<Option<Arc<schema::Config>>> = spin::Mutex::new(None);
+static SOURCE: spin::Mutex<String> = spin::Mutex::new(String::new());
 static TRIAL: spin::Once<(config_store::Slot, config_store::RecordHeader)> = spin::Once::new();
 
 pub fn init(bootargs: &'static str) {
@@ -48,7 +51,7 @@ pub fn load(store: Option<&mut crate::store::Store>, virtual_machine: bool) {
     if !from_store && virtual_machine {
         add_lab_reservation(&mut c);
     }
-    BASE.call_once(|| c.clone());
+    *BASE.lock() = Some(Arc::new(c.clone()));
     apply_bootargs(&mut c, bootargs());
     println!(
         "  config          : {source}, lan {}, dhcp {}–{}, {} reservation(s)",
@@ -64,8 +67,8 @@ pub fn load(store: Option<&mut crate::store::Store>, virtual_machine: bool) {
             println!("  config          : warning: {i}");
         }
     }
-    SOURCE.call_once(|| source);
-    CONFIG.call_once(|| c);
+    *SOURCE.lock() = source;
+    *CONFIG.lock() = Some(Arc::new(c));
 }
 
 /// `config.toml` from the store's `config` area, and where the config came
@@ -177,18 +180,31 @@ pub fn trial_secs() -> u64 {
 }
 
 /// The config without boot-argument overrides ([`load`] must have run).
-pub fn base() -> &'static schema::Config {
-    BASE.get().expect("config::load not called")
+pub fn base() -> Arc<schema::Config> {
+    BASE.lock().clone().expect("config::load not called")
 }
 
 /// Where the config came from, e.g. `stored (slot B, seq 2)`.
-pub fn source() -> &'static str {
-    SOURCE.get().map(|s| s.as_str()).unwrap_or("")
+pub fn source() -> String {
+    SOURCE.lock().clone()
+}
+
+/// A saved config becomes the running one without a reboot: `stored` is
+/// the new base (what the store now holds); boot arguments still apply on
+/// top. The services re-read their views ([`lan`], [`dns`], [`qos`]) and
+/// reconfigure (`net::svc`). Not for trial changes (LAN address,
+/// management): those reboot.
+pub fn apply(stored: schema::Config, source: String) {
+    let mut c = stored.clone();
+    apply_bootargs(&mut c, bootargs());
+    *BASE.lock() = Some(Arc::new(stored));
+    *CONFIG.lock() = Some(Arc::new(c));
+    *SOURCE.lock() = source;
 }
 
 /// The configuration ([`load`] must have run).
-pub fn get() -> &'static schema::Config {
-    CONFIG.get().expect("config::load not called")
+pub fn get() -> Arc<schema::Config> {
+    CONFIG.lock().clone().expect("config::load not called")
 }
 
 /// Config fields a boot argument sets in this boot, as (field path, the
@@ -314,7 +330,7 @@ impl core::fmt::Display for Redacted<'_> {
 pub struct Lan {
     pub addr: Ipv4Addr,
     pub prefix: u8,
-    pub domain: &'static str,
+    pub domain: String,
     pub dhcp_range: (Ipv4Addr, Ipv4Addr),
     pub lease_secs: u32,
     pub statics: Vec<StaticLease>,
@@ -333,11 +349,12 @@ impl Lan {
 /// The LAN: `[lan]` (default 192.168.1.1/24, boot argument
 /// `lan=10.10.0.1/24`), pool `lan.dhcp.range` or hosts .100–.199.
 pub fn lan() -> Lan {
-    let l = &get().lan;
+    let c = get();
+    let l = &c.lan;
     Lan {
         addr: l.ipv4.addr,
         prefix: l.ipv4.prefix,
-        domain: &l.domain,
+        domain: l.domain.clone(),
         dhcp_range: l.dhcp_range(),
         lease_secs: l.dhcp.lease_secs,
         statics: l
@@ -359,7 +376,8 @@ pub struct Dns {
 }
 
 pub fn dns() -> Dns {
-    let d = &get().dns;
+    let c = get();
+    let d = &c.dns;
     Dns {
         cache_entries: d.cache_entries as usize,
         rebind_protection: d.rebind_protection,
@@ -439,7 +457,8 @@ pub struct Qos {
 }
 
 pub fn qos() -> Qos {
-    let s = &get().shaping;
+    let c = get();
+    let s = &c.shaping;
     Qos {
         up_kbit: s.up_kbit,
         down_kbit: s.down_kbit,
