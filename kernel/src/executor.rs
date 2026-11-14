@@ -65,6 +65,9 @@ struct CoreStats {
     /// Timer ticks spent in `wfi`/`hlt` (on x86_64 including the IRQ
     /// handlers, which run inside `sti; hlt`; on aarch64 they run after it).
     wait_ticks: AtomicU64,
+    /// When the current `wfi`/`hlt` began (0 = not waiting), so a long wait
+    /// counts as idle before it ends.
+    wait_since: AtomicU64,
     /// Timer ticks spent polling tasks, per priority class.
     poll_ticks: [AtomicU64; CLASSES],
 }
@@ -76,6 +79,7 @@ static STATS: [CoreStats; CORES] = [const {
         idle_spins: AtomicU64::new(0),
         spin_ticks: AtomicU64::new(0),
         wait_ticks: AtomicU64::new(0),
+        wait_since: AtomicU64::new(0),
         poll_ticks: [const { AtomicU64::new(0) }; CLASSES],
     }
 }; CORES];
@@ -102,9 +106,16 @@ pub fn task_ticks(mut f: impl FnMut(&'static str, usize, u64)) {
 /// CPU time of `core`.
 pub fn cpu_ticks(core: usize) -> CpuTicks {
     let s = &STATS[core];
+    let at = timer::ticks();
+    let since = s.wait_since.load(Ordering::Acquire);
+    let ongoing = if since != 0 {
+        at.saturating_sub(since)
+    } else {
+        0
+    };
     CpuTicks {
-        at: timer::ticks(),
-        idle: s.wait_ticks.load(Ordering::Relaxed) + s.spin_ticks.load(Ordering::Relaxed),
+        at,
+        idle: s.wait_ticks.load(Ordering::Relaxed) + s.spin_ticks.load(Ordering::Relaxed) + ongoing,
         datapath: s.poll_ticks[Priority::Datapath as usize].load(Ordering::Relaxed),
         service: s.poll_ticks[Priority::Service as usize].load(Ordering::Relaxed),
     }
@@ -241,7 +252,11 @@ pub fn run() -> ! {
             #[cfg(not(feature = "idle-poll"))]
             {
                 let t0 = timer::ticks();
+                s.wait_since.store(t0, Ordering::Release);
                 crate::arch::cpu::wait_for_interrupt();
+                // Clear first: a snapshot in between undercounts briefly
+                // rather than counting the wait twice.
+                s.wait_since.store(0, Ordering::Release);
                 s.wait_ticks
                     .fetch_add(timer::ticks() - t0, Ordering::Relaxed);
             }
