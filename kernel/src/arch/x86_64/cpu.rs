@@ -68,6 +68,11 @@ pub fn wait_for_interrupt() {
     unsafe { asm!("sti", "hlt", options(nomem, nostack)) };
 }
 
+/// Stop this core forever (as [`halt`]; the aarch64 one differs).
+pub fn park() -> ! {
+    halt()
+}
+
 pub fn halt() -> ! {
     loop {
         // SAFETY: stops the CPU; interrupts stay masked.

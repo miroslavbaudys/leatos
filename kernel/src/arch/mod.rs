@@ -4,7 +4,8 @@
 //!
 //! - `discover(boot_arg) -> Result<BootInfo, &str>`: firmware → platform info
 //! - `cpu`: `privilege_level`, `core_id` (this core's `smp` index), `irq_enable`,
-//!   `irq_disable`, `wait_for_interrupt`, `halt`,
+//!   `irq_disable`, `wait_for_interrupt`, `halt` (smoke builds: power off),
+//!   `park` (stop this core only),
 //!   `dma_barrier` (order descriptor accesses against device DMA and MMIO)
 //! - `console`: `init(base)`, `write_str`, `emergency_write_str`
 //! - `irqchip`: `init(&BootInfo)`, `enable(intid, Trigger)`, `disable(intid)`;
@@ -22,6 +23,9 @@
 //!   `leaf_desc`), `PLATFORM_MMIO`, `unsafe fn activate(root)`,
 //!   `sync_tables` (after adding entries to the live tables)
 //! - `power`: `init(PowerMethod)`, `off() -> !`, `reset() -> !`
+//! - `watchdog`: `probe(smbus_rev) -> Option<Box<dyn HwWatchdog>>`: a
+//!   chipset watchdog (x86_64: the AMD FCH's, given the revision of its
+//!   SMBus function; aarch64: none)
 //! - `kexec`: `SUPPORTED`, `SCRATCH_SIZE`, `exec(flat, dst, entry, cmdline, scratch) -> !`
 //!   (enter a new kernel in RAM; x86_64 only)
 //!

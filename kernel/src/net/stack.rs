@@ -407,7 +407,10 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
                     drop(port.dev.lock().take());
                 }
                 match action {
-                    Action::Reboot => arch::power::reset(),
+                    Action::Reboot => {
+                        crate::watchdog::stop();
+                        arch::power::reset()
+                    }
                     Action::Exec(staging, prepared, cmdline) => {
                         crate::upgrade::exec(staging, prepared, &cmdline)
                     }

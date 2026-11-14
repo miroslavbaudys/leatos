@@ -1,6 +1,7 @@
 //! IDT, TSS and the trap handler.
 //!
-//! - CPU exceptions (vectors 0-31) are fatal: decode, report, halt. #PF,
+//! - CPU exceptions (vectors 0-31) are fatal: decode, report, then
+//!   `crate::fatal::die` (reboot; `panic=halt` halts). #PF,
 //!   #DF, NMI and #MC run on IST1 = the dedicated exception stack, so a
 //!   kernel stack overflow into the guard page is still reported.
 //! - Vectors >= 32 are interrupts: dispatch to `crate::irq`, then EOI the
@@ -192,6 +193,7 @@ extern "C" fn x86_trap(f: &mut Frame) {
 }
 
 fn fatal(f: &Frame) -> ! {
+    crate::fatal::enter();
     fatal_println!(
         "\n!!! UNHANDLED EXCEPTION: {} (vector {})",
         NAMES[f.vector as usize & 31],
@@ -249,5 +251,5 @@ fn fatal(f: &Frame) -> ! {
             fatal_println!("    cause   : {what}");
         }
     }
-    cpu::halt()
+    crate::fatal::die()
 }

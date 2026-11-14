@@ -44,6 +44,7 @@ pub struct Config {
     pub dns: Dns,
     pub shaping: Shaping,
     pub mgmt: Mgmt,
+    pub time: Time,
 }
 
 impl Default for Config {
@@ -54,6 +55,7 @@ impl Default for Config {
             dns: Dns::default(),
             shaping: Shaping::default(),
             mgmt: Mgmt::default(),
+            time: Time::default(),
         }
     }
 }
@@ -214,6 +216,24 @@ impl Default for Shaping {
 pub struct Mgmt {
     /// Also serve the web interface on the WAN. Development only.
     pub on_wan: bool,
+}
+
+/// The wall clock: SNTP servers, asked over the WAN.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Time {
+    /// Host names (resolved through the router's DNS forwarder) or IPv4
+    /// addresses, in order of preference; empty = no SNTP. Same as the
+    /// boot argument `ntp=a,b`.
+    pub ntp_servers: Vec<String>,
+}
+
+impl Default for Time {
+    fn default() -> Self {
+        Time {
+            ntp_servers: alloc::vec!["pool.ntp.org".into()],
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

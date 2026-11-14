@@ -20,10 +20,15 @@ idle-poll = []
 # Deliberate crashes, used by scripts/smoke-test.sh to verify memory protection.
 fault-wx = ["smoke-test"]
 fault-stack = ["smoke-test"]
+# After "boot ok": hang in a task (watchdog tests: the cross-core check,
+# or with cores=1 the hardware timer), or panic (panic -> reboot).
+fault-hang = ["smoke-test"]
+fault-panic = ["smoke-test"]
 
 [dependencies]
 proto-dhcp.workspace = true
 proto-dns.workspace = true
+proto-sntp.workspace = true
 fwd.workspace = true
 qdisc.workspace = true
 boot-image.workspace = true

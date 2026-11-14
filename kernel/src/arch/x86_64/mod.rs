@@ -13,6 +13,7 @@ mod port;
 pub mod power;
 pub mod smp;
 pub mod timer;
+pub mod watchdog;
 
 use crate::platform::{BootInfo, IntxMap, IrqChipInfo, PcieInfo, PowerMethod, acpi, multiboot2, pvh};
 use core::sync::atomic::{AtomicU32, Ordering};

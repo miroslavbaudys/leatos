@@ -194,6 +194,10 @@ name = "proto-pppoe"
 version = "0.1.0"
 
 [[package]]
+name = "proto-sntp"
+version = "0.1.0"
+
+[[package]]
 name = "qdisc"
 version = "0.1.0"
 
@@ -220,6 +224,7 @@ dependencies = [
  "proto-dhcp",
  "proto-dns",
  "proto-http",
+ "proto-sntp",
  "qdisc",
  "safe-mmio",
  "smoltcp",

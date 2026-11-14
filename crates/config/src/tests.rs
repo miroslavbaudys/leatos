@@ -38,6 +38,9 @@ isolation = "dual-dsthost"
 
 [mgmt]
 on_wan = true
+
+[time]
+ntp_servers = ["ntp.isp.example", "192.0.2.123"]
 "#;
 
 fn ip(a: u8, b: u8, c: u8, d: u8) -> core::net::Ipv4Addr {
@@ -99,6 +102,7 @@ fn full_document_parses() {
         }
     );
     assert!(c.mgmt.on_wan);
+    assert_eq!(c.time.ntp_servers, ["ntp.isp.example", "192.0.2.123"]);
 }
 
 #[test]
@@ -140,6 +144,7 @@ fn defaults_are_valid_and_match_the_kernel() {
         }
     );
     assert!(!c.mgmt.on_wan);
+    assert_eq!(c.time.ntp_servers, ["pool.ntp.org"]);
 }
 
 #[test]
@@ -385,6 +390,22 @@ fn shaping_and_dns_checks() {
         (c.shaping.qdisc, c.shaping.isolation),
         (Qdisc::Codel, Isolation::Flows)
     );
+}
+
+#[test]
+fn time_checks() {
+    assert_eq!(
+        invalid(|c| c.time.ntp_servers = vec!["a.example".into(); 5]),
+        ["time.ntp_servers"]
+    );
+    assert_eq!(
+        invalid(|c| c.time.ntp_servers = vec!["ok.example".into(), "bad name".into(), "".into()]),
+        ["time.ntp_servers[1]", "time.ntp_servers[2]"]
+    );
+    // Empty: no SNTP.
+    let c = parse("[time]\nntp_servers = []\n").unwrap();
+    assert!(c.time.ntp_servers.is_empty());
+    assert!(!c.needs_trial(&Config::default()));
 }
 
 #[test]

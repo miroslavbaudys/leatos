@@ -7,6 +7,8 @@
 #   scripts/apu-upload.sh --host 192.168.1.156 --cmdline "mgmt=wan mgmt_pass=... shape_up=20000"
 #   scripts/apu-upload.sh --debug              # debug kernel (bigger, slower)
 #   scripts/apu-upload.sh --reboot             # only reboot the router
+#   scripts/apu-upload.sh --features fault-hang --cmdline "... cores=1"
+#                                              # test kernel (here: the FCH watchdog)
 #
 # Defaults: host from $RROUTER_HOST, password from $RROUTER_PASS or the
 # file target/apu4/mgmt-pass (written by scripts/apu-image.sh --mgmt-wan).
@@ -18,6 +20,7 @@ HOST="${RROUTER_HOST:-}"
 PASS="${RROUTER_PASS:-}"
 PROFILE=release
 CMDLINE=
+FEATURES=
 REBOOT=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,8 +28,9 @@ while [[ $# -gt 0 ]]; do
     --pass) PASS="$2"; shift ;;
     --cmdline) CMDLINE="$2"; shift ;;
     --debug) PROFILE=debug ;;
+    --features) FEATURES="$2"; shift ;;
     --reboot) REBOOT=1 ;;
-    -h | --help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -52,6 +56,7 @@ fi
 
 args=(build -p rrouter-kernel --target x86_64-unknown-none --quiet)
 [[ "$PROFILE" == release ]] && args+=(--release)
+[[ -n "$FEATURES" ]] && args+=(--features "$FEATURES")
 cargo "${args[@]}"
 ELF="target/x86_64-unknown-none/$PROFILE/rrouter"
 # Strip debug info (12 MiB -> < 1 MiB) when llvm-objcopy is available.
@@ -64,7 +69,8 @@ SIZE="$(wc -c <"$UPLOAD" | tr -d ' ')"
 
 hdr=(-H "X-Image-CRC32: $CRC")
 [[ -n "$CMDLINE" ]] && hdr+=(-H "X-Cmdline: $CMDLINE")
-echo "upload: $PROFILE kernel, $SIZE bytes, crc32 $CRC${CMDLINE:+, cmdline \"$CMDLINE\"}"
+SHOWN="$(echo "$CMDLINE" | sed 's/mgmt_pass=[^ ]*/mgmt_pass=***/')"
+echo "upload: $PROFILE kernel${FEATURES:+ ($FEATURES)}, $SIZE bytes, crc32 $CRC${CMDLINE:+, cmdline \"$SHOWN\"}"
 out="$(curl -s -m 120 -u "admin:$PASS" "${hdr[@]}" -X POST --data-binary @"$UPLOAD" "$URL/api/upgrade" -w '\n%{http_code}')"
 code="${out##*$'\n'}"
 echo "router: ${out%$'\n'*} (HTTP $code)"

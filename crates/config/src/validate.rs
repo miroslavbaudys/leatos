@@ -14,6 +14,8 @@ const MAX_LEASE_SECS: u32 = 30 * 86400;
 const MIN_RATE_KBIT: u64 = 64;
 const MAX_RATE_KBIT: u64 = 10_000_000;
 const MAX_OVERHEAD: u32 = 256;
+/// Most SNTP servers accepted.
+pub const MAX_NTP_SERVERS: usize = 4;
 
 /// One problem: where (`lan.dhcp.static[2].ip`, list indices from 0) and
 /// what.
@@ -68,6 +70,21 @@ pub(crate) fn check(c: &Config) -> Result<(), Vec<Issue>> {
             "shaping.overhead",
             format!("must be at most {MAX_OVERHEAD} bytes"),
         );
+    }
+    let ntp = &c.time.ntp_servers;
+    if ntp.len() > MAX_NTP_SERVERS {
+        x.add(
+            "time.ntp_servers",
+            format!("at most {MAX_NTP_SERVERS} servers"),
+        );
+    }
+    for (i, n) in ntp.iter().enumerate() {
+        if n.parse::<core::net::Ipv4Addr>().is_err() && !is_domain(n) {
+            x.add(
+                format!("time.ntp_servers[{i}]"),
+                "must be a host name or an IPv4 address",
+            );
+        }
     }
     if x.0.is_empty() { Ok(()) } else { Err(x.0) }
 }

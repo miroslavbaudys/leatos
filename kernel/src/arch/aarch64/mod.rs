@@ -9,6 +9,7 @@ pub mod mmu;
 pub mod power;
 pub mod smp;
 pub mod timer;
+pub mod watchdog;
 
 use crate::platform::BootInfo;
 

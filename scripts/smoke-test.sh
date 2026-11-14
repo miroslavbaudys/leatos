@@ -15,10 +15,18 @@
 #   boot         normal boot with 2 NICs: self-tests pass, WAN gets a DHCP lease, gateway answers ping
 #   fault-wx     writing to .text must raise a permission fault (W^X)
 #   fault-stack  unbounded recursion must hit the kernel stack guard page
+#   panic        a panic after boot must reboot the machine (second boot seen)
+#                negative control: QEMU_APPEND=panic=halt must fail it
+#   wdt-task     a task stuck in its poll on one core (2 cores): another core's
+#                watchdog check must notice, name it and reboot
+#                negative control: QEMU_APPEND=watchdog=0 must fail it
+#   wdt-hw       the same with cores=1: nothing in software can notice, the
+#                i6300esb hardware watchdog must reset (and report it on the next boot)
+#                negative control: QEMU_WDT=0 must fail it
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CASES="${SMOKE_CASES:-boot fault-wx fault-stack}"
+CASES="${SMOKE_CASES:-boot fault-wx fault-stack panic wdt-task wdt-hw}"
 BOOT_MODE="${RROUTER_BOOT:-kernel}"
 case "$BOOT_MODE" in kernel) ;; limine) RROUTER_ARCH=x86_64 ;; *) echo "RROUTER_BOOT must be kernel or limine" >&2; exit 2 ;; esac
 ARCH="${RROUTER_ARCH:-aarch64}"
@@ -32,9 +40,11 @@ IMG="$LOG.img"
 trap 'rm -f "$LOG" "$IMG"' EXIT
 FAILED=0
 
-boot() { # features
+boot() { # features [extra kernel arguments] [boots to wait for]
+  local args="${QEMU_APPEND:-}${2:+ $2}"
+  args="${args# }"
   if [[ "$BOOT_MODE" == limine ]]; then
-    scripts/apu-image.sh --debug --features "$1" --out "$IMG" >/dev/null
+    scripts/apu-image.sh --debug --features "$1" ${args:+--cmdline "$args"} --out "$IMG" >/dev/null
   else
     cargo build -p rrouter-kernel --target "$TARGET" --features "$1" --quiet
   fi
@@ -42,16 +52,26 @@ boot() { # features
   if [[ "$BOOT_MODE" == limine ]]; then
     QEMU_DISK="$IMG" QEMU_NET="${QEMU_NET:-user}" scripts/qemu-run.sh >"$LOG" 2>&1 &
   else
-    QEMU_NET="${QEMU_NET:-user}" scripts/qemu-run.sh "$KERNEL" >"$LOG" 2>&1 &
+    QEMU_APPEND="$args" QEMU_NET="${QEMU_NET:-user}" scripts/qemu-run.sh "$KERNEL" >"$LOG" 2>&1 &
   fi
   local qpid=$!
-  ( sleep "${SMOKE_TIMEOUT:-20}"; kill "$qpid" 2>/dev/null ) &
+  ( sleep "${CASE_TIMEOUT:-${SMOKE_TIMEOUT:-20}}"; kill "$qpid" 2>/dev/null ) &
   local wpid=$!
+  # Reboot cases: the machine never powers off; stop once enough boots are seen.
+  local upid=
+  if [[ -n "${3:-}" ]]; then
+    ( while [[ "$(boots)" -lt "$3" ]]; do sleep 1; done; sleep 1; kill "$qpid" 2>/dev/null ) &
+    upid=$!
+  fi
   wait "$qpid" || true
-  kill "$wpid" 2>/dev/null || true
+  kill "$wpid" ${upid:+"$upid"} 2>/dev/null || true
   wait "$wpid" 2>/dev/null || true
+  [[ -n "$upid" ]] && { wait "$upid" 2>/dev/null || true; }
   if [[ "${SMOKE_VERBOSE:-0}" == "1" ]]; then cat "$LOG"; fi
 }
+
+# Kernel banners in the log (each boot prints one).
+boots() { grep -c -- "— bare metal" "$LOG" 2>/dev/null || true; }
 
 has() { grep -q -- "$1" "$LOG"; }
 
@@ -80,16 +100,37 @@ for c in $CASES; do
       grep -E "sleep overshoot|executor  |net ping|net self-test|smp  " "$LOG" | sed 's/^/        /' || true
       ;;
     fault-wx)
-      boot fault-wx
+      boot fault-wx panic=halt
       ok=0
       if has "UNHANDLED EXCEPTION" && has "permission fault" && ! has "FAILED"; then ok=1; fi
       result "fault-wx (W^X: .text not writable)" "$ok"
       ;;
     fault-stack)
-      boot fault-stack
+      boot fault-stack panic=halt
       ok=0
       if has "kernel stack overflow (guard page)" && ! has "FAILED"; then ok=1; fi
       result "fault-stack (guard page catches overflow)" "$ok"
+      ;;
+    panic)
+      CASE_TIMEOUT=$(( ${SMOKE_TIMEOUT:-20} + 15 )) boot fault-panic "" 2
+      ok=0
+      if has "KERNEL PANIC" && has "deliberate panic" && has "rebooting in" && [[ "$(boots)" -ge 2 ]]; then ok=1; fi
+      result "panic (panic reboots the machine; $(boots) boot(s))" "$ok"
+      ;;
+    wdt-task)
+      smp="${QEMU_SMP:-1}"; [[ "$smp" -lt 2 ]] && smp=2
+      QEMU_SMP=$smp CASE_TIMEOUT=$(( ${SMOKE_TIMEOUT:-20} + 25 )) boot fault-hang "" 2
+      ok=0
+      if has "WATCHDOG: core $((smp - 1)) stalled" && has 'in task "hang"' && has "rebooting in" && [[ "$(boots)" -ge 2 ]]; then ok=1; fi
+      result "wdt-task (cross-core check catches a stuck task, $smp cores; $(boots) boot(s))" "$ok"
+      grep -E "WATCHDOG" "$LOG" | head -1 | sed 's/^/        /' || true
+      ;;
+    wdt-hw)
+      # 10 s hardware timeout; one core, so no software check can run.
+      CASE_TIMEOUT=$(( ${SMOKE_TIMEOUT:-20} * 2 + 15 )) boot fault-hang "cores=1 watchdog_secs=10" 2
+      ok=0
+      if has "watchdog        : i6300esb 10 s" && ! has "WATCHDOG:" && has "last reset: by the watchdog" && [[ "$(boots)" -ge 2 ]]; then ok=1; fi
+      result "wdt-hw (i6300esb resets a hung single core; $(boots) boot(s))" "$ok"
       ;;
     *)
       echo "unknown case: $c" >&2

@@ -1,0 +1,11 @@
+[package]
+name = "proto-sntp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SNTP client (RFC 4330 / RFC 5905 client mode): packets and a poll state machine, sans-IO."
+
+[dependencies]
+
+[lints]
+workspace = true

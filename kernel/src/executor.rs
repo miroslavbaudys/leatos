@@ -21,7 +21,7 @@ use alloc::sync::Arc;
 use alloc::task::Wake;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use spin::Mutex;
 
@@ -38,6 +38,8 @@ const CLASSES: usize = 2;
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 struct Task {
+    /// Index in `TASKS`.
+    id: usize,
     name: &'static str,
     prio: Priority,
     /// The core whose executor polls this task (`spawn_on`).
@@ -52,6 +54,9 @@ const CORES: usize = crate::smp::MAX_CORES;
 
 /// Every task ever spawned (for per-task CPU time).
 static TASKS: Mutex<alloc::vec::Vec<Arc<Task>>> = Mutex::new(alloc::vec::Vec::new());
+/// Per core: the `id` + 1 of the task being polled (0 = none), so the
+/// watchdog can name the task a stalled core is stuck in.
+static POLLING: [AtomicUsize; CORES] = [const { AtomicUsize::new(0) }; CORES];
 /// Run queues per core and priority class.
 static QUEUES: [[Mutex<VecDeque<Arc<Task>>>; CLASSES]; CORES] =
     [const { [const { Mutex::new(VecDeque::new()) }; CLASSES] }; CORES];
@@ -101,6 +106,13 @@ pub fn task_ticks(mut f: impl FnMut(&'static str, usize, u64)) {
     for t in TASKS.lock().iter() {
         f(t.name, t.core, t.busy.load(Ordering::Relaxed));
     }
+}
+
+/// The task `core` is polling right now, if any (fatal paths: never
+/// waits for the task list's lock).
+pub fn polling(core: usize) -> Option<&'static str> {
+    let id = POLLING[core].load(Ordering::Relaxed).checked_sub(1)?;
+    TASKS.try_lock()?.get(id).map(|t| t.name)
 }
 
 /// CPU time of `core`.
@@ -163,7 +175,9 @@ pub fn spawn_on(
         core < crate::smp::online(),
         "spawn_on: core {core} is not online"
     );
+    let mut tasks = TASKS.lock();
     let task = Arc::new(Task {
+        id: tasks.len(),
         name,
         prio,
         core,
@@ -171,7 +185,8 @@ pub fn spawn_on(
         queued: AtomicBool::new(true),
         future: Mutex::new(Some(Box::pin(fut))),
     });
-    TASKS.lock().push(task.clone());
+    tasks.push(task.clone());
+    drop(tasks);
     QUEUES[core][prio as usize].lock().push_back(task);
     crate::smp::wake(core);
 }
@@ -195,7 +210,9 @@ fn poll_task(core: usize, task: Arc<Task>) {
         let s = &STATS[core];
         s.polls.fetch_add(1, Ordering::Relaxed);
         let t0 = timer::ticks();
+        POLLING[core].store(task.id + 1, Ordering::Relaxed);
         let done = fut.as_mut().poll(&mut cx).is_ready();
+        POLLING[core].store(0, Ordering::Relaxed);
         let dt = timer::ticks() - t0;
         s.poll_ticks[task.prio as usize].fetch_add(dt, Ordering::Relaxed);
         task.busy.fetch_add(dt, Ordering::Relaxed);

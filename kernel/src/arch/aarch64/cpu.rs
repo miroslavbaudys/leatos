@@ -65,6 +65,15 @@ pub fn wait_for_interrupt() {
     aarch64_cpu::asm::wfi();
 }
 
+/// Stop this core forever, never powering off: a core stopped by another
+/// (`smp::stop_others`) while that one still reports and resets.
+pub fn park() -> ! {
+    irq_disable();
+    loop {
+        aarch64_cpu::asm::wfe();
+    }
+}
+
 /// Stop forever. With the `smoke-test` feature, power off instead so an
 /// automated QEMU run terminates.
 pub fn halt() -> ! {

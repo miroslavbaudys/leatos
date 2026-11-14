@@ -37,7 +37,9 @@ pub fn online() -> usize {
 /// IRQ context: a wake IPI only needs to end `wfi`; a stop IPI halts.
 fn on_ipi(_intid: u32) {
     if STOP.load(Ordering::Acquire) {
-        arch::cpu::halt();
+        // Not `halt`: in smoke builds that powers off, and the core that
+        // stopped us may still be reporting or about to reset.
+        arch::cpu::park();
     }
 }
 

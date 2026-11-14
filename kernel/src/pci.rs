@@ -56,6 +56,8 @@ impl PciDevice {
             (0x8086, 0x10c9) => "Intel 82576 (igb)",
             (0x8086, 0x1533 | 0x1536 | 0x1537 | 0x1538 | 0x157b) => "Intel i210 (igb)",
             (0x8086, 0x1539) => "Intel i211 (igb)",
+            (0x8086, 0x25ab) => "i6300esb watchdog",
+            (0x1022, 0x780b) => "AMD FCH SMBus (watchdog)",
             (0x8086, _) if self.info.class == 0x02 => "Intel NIC",
             _ if (self.info.class, self.info.subclass) == (0x08, 0x05) => "SD host (SDHCI)",
             _ => match self.info.class {
@@ -86,6 +88,8 @@ pub struct Pci {
     pub root: PciRoot<MmioCam<'static>>,
     /// Config access for registers `PciRoot` doesn't handle (capabilities).
     cfg: MmioCam<'static>,
+    /// ECAM base (bus 0), for byte-wide config writes.
+    ecam: usize,
     pub devices: Vec<PciDevice>,
 }
 
@@ -96,6 +100,22 @@ const MSIX_FUNCTION_MASK: u32 = 1 << 14;
 impl Pci {
     pub fn config_read(&self, df: DeviceFunction, offset: u8) -> u32 {
         self.cfg.read_word(df, offset)
+    }
+
+    /// Hand one dword of a function's device-specific config space
+    /// (offset ≥ 0x40) to a driver as a [`Region`], for registers that
+    /// need narrow accesses (the i6300esb's lock register only reacts to
+    /// byte writes; `PciRoot` does 32-bit ones). The caller must take each
+    /// dword once and is then its only user.
+    pub fn config_dword(&mut self, df: DeviceFunction, offset: u8) -> Region {
+        assert!(offset >= 0x40, "pci: config header is PciRoot's");
+        let func = (df.bus as usize) << 20 | (df.device as usize) << 15 | (df.function as usize) << 12;
+        let dword = self.ecam + func + (offset as usize & !3);
+        // SAFETY: one dword of this function's device-specific config
+        // space inside the ECAM window (mapped as device memory, see
+        // `init`). PciRoot and `cfg` only access the header and
+        // capabilities, never this register; callers take it once.
+        unsafe { Region::new(dword, 4) }
     }
 
     /// Offset of the first capability with `id`.
@@ -255,7 +275,12 @@ pub fn init(info: &PcieInfo) -> Pci {
             });
         }
     }
-    Pci { root, cfg, devices }
+    Pci {
+        root,
+        cfg,
+        ecam: info.ecam,
+        devices,
+    }
 }
 
 pub fn print(pci: &Pci) {

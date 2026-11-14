@@ -16,6 +16,7 @@ repository = ""
 proto-pppoe = { path = "crates/proto-pppoe" }
 proto-dhcp = { path = "crates/proto-dhcp" }
 proto-dns = { path = "crates/proto-dns" }
+proto-sntp = { path = "crates/proto-sntp" }
 fwd = { path = "crates/fwd" }
 qdisc = { path = "crates/qdisc" }
 boot-image = { path = "crates/boot-image" }

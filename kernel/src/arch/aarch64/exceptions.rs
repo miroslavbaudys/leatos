@@ -3,7 +3,8 @@
 //! - `rust_irq`: normal IRQ path (on SP_EL1, IRQs masked): acknowledge,
 //!   dispatch to `crate::irq`, EOI, until nothing is pending.
 //! - `rust_exception`: every other vector is fatal; decode and report, then
-//!   halt. Runs on the exception stack, so kernel stack overflows are reported.
+//!   `crate::fatal::die` (reboot; `panic=halt` halts). Runs on the exception
+//!   stack, so kernel stack overflows are reported.
 
 use super::irqchip;
 use crate::{fatal_println, mm};
@@ -83,6 +84,7 @@ fn fault_status(fsc: u64) -> &'static str {
 #[unsafe(no_mangle)]
 extern "C" fn rust_exception(vector: u64, esr: u64, elr: u64, far: u64) -> ! {
     let ec = (esr >> 26) & 0x3f;
+    crate::fatal::enter();
     fatal_println!(
         "\n!!! UNHANDLED EXCEPTION: {}",
         VECTORS[(vector & 0xf) as usize]
@@ -104,5 +106,5 @@ extern "C" fn rust_exception(vector: u64, esr: u64, elr: u64, far: u64) -> ! {
             fatal_println!("    cause   : {what}");
         }
     }
-    super::cpu::halt()
+    crate::fatal::die()
 }

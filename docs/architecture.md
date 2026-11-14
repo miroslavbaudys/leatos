@@ -15,7 +15,9 @@ A router appliance doesn't need processes, users, syscalls or a general
 filesystem. Everything runs at EL1 in one binary, with an async executor and a
 run-to-completion packet loop. That removes roughly half of the classic OS work.
 The trade-off is **no isolation**: a panic anywhere takes the router down, so
-we need a panic handler that reboots plus a watchdog (milestone M7).
+panics and unhandled exceptions reboot the machine, and a cross-core software
+watchdog backed by a hardware timer resets a stuck one (M8,
+`docs/watchdog-and-time.md`).
 
 ## Layers
 

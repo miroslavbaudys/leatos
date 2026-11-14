@@ -114,7 +114,9 @@ forward to the current upstream (the upstream list is swapped atomically on `Wan
 - NAT (masquerade on the WAN) and a stateful firewall: LAN→WAN allowed,
   WAN→LAN only established or related, input protection, an IPv6 firewall
   that blocks inbound by default, and port forwarding.
-- An SNTP client (QEMU provides a PL031 RTC; real boards often have none).
+- SNTP client ✅ (`crates/proto-sntp`, `docs/watchdog-and-time.md`): servers
+  from `time.ntp_servers` (default `pool.ntp.org`) resolved through the
+  router's DNS forwarder; no RTC is trusted. Open: serving NTP to the LAN.
 - Persistent config storage: raw store partition with A/B record slots (`docs/config-and-storage.md`); virtio-blk in QEMU, SD on the apu4.
 
 ## Target configuration UX

@@ -2,7 +2,8 @@
 # rrouter lab "ISP": PID 1 of the ISP VM, on the router's WAN link.
 #   eth0 203.0.113.1/24 — DHCP server (udhcpd) for the router's WAN,
 #   web server (httpd, with CGI helpers), DNS server (dnsd: isp.example),
-#   TCP byte sink on port 5001 (tcpsvd + wc).
+#   TCP byte sink on port 5001 (tcpsvd + wc), NTP server (busybox ntpd -l:
+#   without peers it serves its own clock, i.e. the host's, as stratum 1).
 bb=/usr/bin/busybox
 bx=/usr/bin/busybox-extras
 export PATH=/usr/bin:/usr/sbin:/bin:/sbin
@@ -24,5 +25,6 @@ $bx httpd -p 80 -h /www
 # Long single-connection upload sink (ECN/AQM check): replies with the byte count.
 $bx tcpsvd -E 0.0.0.0 5001 $bb wc -c &
 $bx dnsd -c /etc/dnsd.conf -i 203.0.113.1 &
+$bb ntpd -n -l &
 echo "LAB isp ready"
 while :; do $bb sleep 3600; done

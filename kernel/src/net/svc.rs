@@ -300,6 +300,7 @@ pub async fn run(
             mgmt.set_wan_lease(lease_json(&change));
             if let Some(svc) = services.as_mut() {
                 svc.set_upstreams(&change.dns);
+                svc.set_wan_up(change.addr.is_some());
             }
         }
         pinger.step(&mut hosts[0].sockets);

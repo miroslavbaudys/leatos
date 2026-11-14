@@ -40,6 +40,8 @@
 #                        SD images must be a power of two in size (rrstore create --mib 32)
 #   QEMU_NIC=virtio|igb  NIC model for WAN and LAN (default virtio): igb = QEMU's
 #                        Intel 82576, driven by the same igb driver as the apu4's i211
+#   QEMU_WDT=1|0         attach QEMU's i6300esb PCI watchdog (default 1; the
+#                        router's hardware watchdog in the lab, both arches)
 #   QEMU_APPEND="..."    kernel command line (DTB /chosen/bootargs), e.g.
 #                        "shape_up=42000 shape_down=50000 idle_spin_us=0"
 #   QEMU_EXTRA="..."     extra QEMU arguments
@@ -150,6 +152,11 @@ if [[ -n "${QEMU_STORE:-}" ]]; then
   esac
 fi
 
+# Last, so the slots of the NICs and the store stay the same. A watchdog
+# timeout resets the guest (QEMU's default action).
+WDT=()
+if [[ "${QEMU_WDT:-1}" == "1" ]]; then WDT=(-device i6300esb); fi
+
 GDB=()
 if [[ "${QEMU_GDB:-0}" == "1" ]]; then
   GDB=(-s -S)
@@ -173,6 +180,7 @@ exec "$BIN" \
   "${BOOT[@]}" \
   "${NET[@]}" \
   ${STORE[@]+"${STORE[@]}"} \
+  ${WDT[@]+"${WDT[@]}"} \
   ${GDB[@]+"${GDB[@]}"} \
   ${EXTRA[@]+"${EXTRA[@]}"} \
   "$@"

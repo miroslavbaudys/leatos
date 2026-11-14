@@ -222,6 +222,7 @@ pub fn overrides() -> Vec<(&'static str, &'static str)> {
         ("ecn", "shaping.ecn_down"),
         ("qdisc", "shaping.qdisc"),
         ("isolation", "shaping.isolation"),
+        ("ntp", "time.ntp_servers"),
     ];
     let args = bootargs();
     let mut v = Vec::new();
@@ -293,6 +294,14 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
     }
     if arg(args, "mgmt") == Some("wan") {
         c.mgmt.on_wan = true;
+    }
+    if let Some(list) = arg(args, "ntp") {
+        // `ntp=` alone (or `ntp=off`): no SNTP.
+        c.time.ntp_servers = list
+            .split(',')
+            .filter(|n| !n.is_empty() && *n != "off")
+            .map(String::from)
+            .collect();
     }
 }
 
@@ -400,6 +409,37 @@ pub fn mgmt() -> Mgmt {
         on_wan: get().mgmt.on_wan,
         password: arg(bootargs(), "mgmt_pass").filter(|p| !p.is_empty()),
     }
+}
+
+/// SNTP servers (`time.ntp_servers`, boot argument `ntp=a,b`).
+pub fn ntp_servers() -> Vec<String> {
+    get().time.ntp_servers.clone()
+}
+
+/// Watchdog settings (boot arguments only: platform and debugging knobs).
+#[derive(Clone, Copy, Debug)]
+pub struct Watchdog {
+    /// `watchdog=0` turns the software check and the hardware timer off
+    /// (debugging with gdb, where a stopped core looks hung).
+    pub enabled: bool,
+    /// Hardware timeout in seconds (`watchdog_secs=`, 10–600, default 30).
+    pub hw_secs: u32,
+}
+
+pub fn watchdog() -> Watchdog {
+    let args = bootargs();
+    Watchdog {
+        enabled: arg_u64(args, "watchdog") != Some(0),
+        hw_secs: arg_u64(args, "watchdog_secs")
+            .filter(|s| (10..=600).contains(s))
+            .map_or(30, |s| s as u32),
+    }
+}
+
+/// `panic=halt`: a panic or an unhandled exception halts (as before, for
+/// debugging) instead of rebooting the machine.
+pub fn panic_halts() -> bool {
+    arg(bootargs(), "panic") == Some("halt")
 }
 
 /// Boot argument `cores=N`: use at most N cores (default: all, up to

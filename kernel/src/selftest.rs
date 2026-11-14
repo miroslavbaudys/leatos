@@ -96,6 +96,31 @@ pub fn fault_tests() {
     }
 }
 
+/// After the boot report: a fault the machine must recover from by
+/// rebooting (scripts/smoke-test.sh counts the boots).
+#[cfg(any(feature = "fault-hang", feature = "fault-panic"))]
+async fn late_fault() {
+    // Let the watchdog settle (and pet the hardware timer once).
+    timer::sleep(Duration::from_secs(2)).await;
+    #[cfg(feature = "fault-panic")]
+    panic!("fault-test: deliberate panic (must reboot)");
+    #[cfg(feature = "fault-hang")]
+    {
+        // On the last core: the others' checkers must notice. With one
+        // core nothing can, and only the hardware timer resets.
+        let core = crate::smp::online() - 1;
+        println!("fault-test: hanging a task on core {core} (must reboot)");
+        executor::spawn_on(core, Priority::Service, "hang", async {
+            loop {
+                core::hint::spin_loop();
+            }
+        });
+        loop {
+            timer::sleep(Duration::from_secs(3600)).await;
+        }
+    }
+}
+
 pub fn spawn(has_net: bool) {
     // Spawned in "wrong" order on purpose: the datapath task must still run first.
     executor::spawn(Priority::Service, "selftest-a", async {
@@ -253,6 +278,9 @@ pub fn spawn(has_net: bool) {
         );
         println!("  uptime          : {} us", timer::uptime().as_micros());
         println!("rrouter: boot ok");
+
+        #[cfg(any(feature = "fault-hang", feature = "fault-panic"))]
+        late_fault().await;
 
         #[cfg(feature = "smoke-test")]
         crate::arch::power::off();

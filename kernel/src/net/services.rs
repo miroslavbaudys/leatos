@@ -1,4 +1,5 @@
-//! LAN services: DHCPv4 server and DNS forwarder.
+//! LAN services: DHCPv4 server and DNS forwarder, plus the SNTP client
+//! (`net::ntp`), which resolves its server names through the forwarder.
 //!
 //! Thin glue between smoltcp UDP sockets and the sans-IO crates
 //! (`proto_dhcp::v4::server`, `proto_dns::resolver`): receive datagrams, feed
@@ -9,6 +10,7 @@
 //! `:<random high port>` (queries to upstream servers).
 
 use crate::config;
+use crate::net::ntp::{self, Ntp};
 use crate::net::svc::HostIf;
 use crate::{println, timer};
 use alloc::vec;
@@ -33,6 +35,8 @@ pub struct LanServices {
     dns_sock: SocketHandle,
     upstream_sock: Option<SocketHandle>,
     next_expire: u64,
+    /// SNTP over the WAN (none without a WAN).
+    ntp: Option<Ntp>,
 }
 
 fn udp_socket(datagrams: usize, bytes: usize) -> udp::Socket<'static> {
@@ -102,12 +106,14 @@ impl LanServices {
         let mut s = udp_socket(32, 32 * 1024);
         s.bind(DNS_PORT).expect("bind :53");
         let dns_sock = lan.sockets.add(s);
-        let upstream_sock = wan.map(|wan| {
+        let mut wan = wan;
+        let upstream_sock = wan.as_deref_mut().map(|wan| {
             let port = 40_000 + (timer::ticks() % 20_000) as u16;
             let mut s = udp_socket(32, 32 * 4096);
             s.bind(port).expect("bind upstream port");
             wan.sockets.add(s)
         });
+        let ntp = wan.map(Ntp::new);
 
         println!(
             "  lan services    : dhcp {}..{} ({} static), dns {}:53 (.{}), cache {}",
@@ -125,6 +131,7 @@ impl LanServices {
             dns_sock,
             upstream_sock,
             next_expire: 0,
+            ntp,
         }
     }
 
@@ -144,6 +151,9 @@ impl LanServices {
             .count();
         *self.dns.zone_mut() = build_zone(&cfg, self.dhcp.leases());
         self.dns.reconfigure(resolver_config(&dns_cfg));
+        if let Some(n) = self.ntp.as_mut() {
+            n.reconfigure();
+        }
         println!(
             "  lan services    : reconfigured: dhcp {}..{} ({} static, {} lease(s) dropped), domain .{}, cache {}",
             cfg.dhcp_range.0,
@@ -163,6 +173,19 @@ impl LanServices {
     /// The WAN lease changed: new upstream DNS servers.
     pub fn set_upstreams(&mut self, servers: &[Ipv4Addr]) {
         self.dns.set_upstreams(servers);
+    }
+
+    /// The WAN got or lost its lease: SNTP starts or stops (IPv4 literals
+    /// work without DNS upstreams; names wait for them).
+    pub fn set_wan_up(&mut self, up: bool) {
+        if let Some(n) = self.ntp.as_mut() {
+            n.set_wan(up);
+        }
+    }
+
+    /// SNTP state (status page).
+    pub fn ntp_status(&self) -> Option<ntp::Status> {
+        self.ntp.as_ref().map(Ntp::status)
     }
 
     fn apply_dhcp_events(&mut self, events: Vec<DhcpEvent>) {
@@ -197,6 +220,11 @@ impl LanServices {
         let mut wan = wan;
         for a in actions {
             match a {
+                Action::Reply { to, data } if to == ntp::SELF_CLIENT => {
+                    if let Some(n) = self.ntp.as_mut() {
+                        n.dns_answer(&data, now_ms());
+                    }
+                }
                 Action::Reply { to, data } => {
                     let ep = IpEndpoint::new(to.ip().into(), to.port());
                     let _ = lan
@@ -261,6 +289,16 @@ impl LanServices {
                 self.send_dns(lan, None, actions);
             }
         }
+        // SNTP: our own name lookups, then the protocol.
+        let queries = self.ntp.as_mut().map(|n| n.lookups(now_ms())).unwrap_or_default();
+        for q in queries {
+            let actions = self.dns.handle_query(now_ms(), ntp::SELF_CLIENT, &q);
+            self.send_dns(lan, wan.as_deref_mut(), actions);
+        }
+        if let (Some(n), Some(w)) = (self.ntp.as_mut(), wan.as_deref_mut()) {
+            n.step(w);
+        }
+
         // DNS: retries / timeouts.
         let actions = self.dns.poll(now_ms());
         self.send_dns(lan, wan, actions);
@@ -271,7 +309,10 @@ impl LanServices {
         let ms_now = now_ms();
         let dns_in = self.dns.next_deadline().map(|d| d.saturating_sub(ms_now));
         let expire_in = self.next_expire.saturating_sub(now_secs()) * 1000;
-        let wait_ms = dns_in.map_or(expire_in, |d| d.min(expire_in));
+        let mut wait_ms = dns_in.map_or(expire_in, |d| d.min(expire_in));
+        if let Some(at) = self.ntp.as_ref().and_then(Ntp::next_deadline_ms) {
+            wait_ms = wait_ms.min(at.saturating_sub(ms_now));
+        }
         timer::Instant::now()
             .checked_add(core::time::Duration::from_millis(wait_ms))
             .expect("deadline overflow")

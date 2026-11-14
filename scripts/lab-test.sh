@@ -31,6 +31,11 @@
 #                        i.e. 0:1). Set it against the router's real setting
 #                        as a negative control, e.g. LAB_ROUTER_ARGS=ecn=1
 #                        with the default expectation.
+#
+# SNTP: the router syncs from the ISP's ntpd (ntp=ntp.isp.example: resolved
+# through the router's DNS forwarder) and its clock must then be within 5 s
+# of the host's. Negative control: LAB_ROUTER_ARGS=ntp=203.0.113.99
+# (nothing answers there) must fail the check.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -40,6 +45,8 @@ EXPECT_KBIT="${LAB_EXPECT_KBIT:-$SHAPE_KBIT}"
 ROUTER_ARGS=""
 [[ "$SHAPE_KBIT" != 0 ]] && ROUTER_ARGS="shape_up=$SHAPE_KBIT shape_down=$SHAPE_KBIT"
 ROUTER_ARGS="$ROUTER_ARGS ${LAB_ROUTER_ARGS:-}"
+# The first ntp= wins: only add the default when the caller sets none.
+[[ " ${LAB_ROUTER_ARGS:-} " == *" ntp="* ]] || ROUTER_ARGS="$ROUTER_ARGS ntp=ntp.isp.example"
 LAN_PORT="${LAB_LAN_PORT:-10003}"
 WAN_PORT="${LAB_WAN_PORT:-10005}"
 WORK=$(mktemp -d -t rrouter-lab)
@@ -69,6 +76,10 @@ QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" QEMU_PCAP_DIR="${
   scripts/qemu-run.sh "target/$ARCH-unknown-none/debug/rrouter" >"$WORK/router.log" 2>&1 &
 PIDS+=($!)
 wait_for "$WORK/router.log" "rrouter: boot ok" 40 || { echo "router did not boot:"; cat "$WORK/router.log"; exit 1; }
+# When the host sees the router's first SNTP sync (compared with the time
+# the router then reports).
+( wait_for "$WORK/router.log" "ntp  .*synced to" 90 && date -u +%s >"$WORK/ntp-seen" ) &
+PIDS+=($!)
 
 echo "== start client"
 linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT"
@@ -91,7 +102,7 @@ if [[ "${LAB_VERBOSE:-0}" == "1" ]]; then
 fi
 
 echo "== router"
-tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|net wan0 .*lease|net ping|qos |qdisc |cpu  " | sed 's/^/  /' || true
+tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|net wan0 .*lease|net ping|qos |qdisc |cpu  |ntp  |watchdog  " | sed 's/^/  /' || true
 echo "== results"
 tr -d '\r' <"$WORK/client.log" | grep -E "^LAB (PASS|FAIL|INFO|WARN)|^    \|" | sed 's/^/  /' || true
 
@@ -122,6 +133,23 @@ if [[ "$SHAPE_KBIT" != 0 ]]; then
       router_fails=$((router_fails + 1))
     fi
   done
+fi
+
+# SNTP: synced, and the time it then reported is the host's (±5 s; the
+# ISP VM's clock comes from the host's RTC).
+sync=$(tr -d '\r' <"$WORK/router.log" | grep "ntp  .*synced to" | head -1 || true)
+utc=$(echo "$sync" | sed -n 's/.*: \([0-9-]*T[0-9:]*Z\)$/\1/p')
+router_s=$( [[ -n "$utc" ]] && date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$utc" +%s 2>/dev/null || true)
+seen_s=$(cat "$WORK/ntp-seen" 2>/dev/null || true)
+if [[ -n "$router_s" && -n "$seen_s" ]]; then
+  skew=$((router_s - seen_s)); abs=${skew#-}
+  if [[ "$abs" -le 5 ]]; then
+    echo "  LAB PASS: ntp: ${sync##*ntp             : } (host clock difference ${skew} s)"
+  else
+    echo "  LAB FAIL: ntp: router says $utc, host $(date -u -r "$seen_s" +%Y-%m-%dT%H:%M:%SZ) (${skew} s)"; router_fails=$((router_fails + 1))
+  fi
+else
+  echo "  LAB FAIL: ntp: no sync (${sync:-no 'synced' line in the router log})"; router_fails=$((router_fails + 1))
 fi
 
 # CPU time per task (M11). Forwarding runs in the datapath tasks: dp_down

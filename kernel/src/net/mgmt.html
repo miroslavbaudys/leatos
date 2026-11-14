@@ -94,6 +94,9 @@
         <label>Cache entries<input data-path="dns.cache_entries" type="number" min="16" max="65536"></label>
         <label class="check"><input data-path="dns.rebind_protection" type="checkbox">Rebind protection (drop answers pointing into private ranges)</label>
       </fieldset>
+      <fieldset><legend>Time</legend>
+        <label>NTP servers (comma-separated names or addresses; empty = off)<input id="ntp" data-path="time.ntp_servers" placeholder="pool.ntp.org"></label>
+      </fieldset>
       <fieldset><legend>Shaping (CAKE)</legend>
         <label>Upload, kbit/s (empty = unshaped)<input data-path="shaping.up_kbit" data-opt type="number" min="64"></label>
         <label>Download, kbit/s (empty = unshaped)<input data-path="shaping.down_kbit" data-opt type="number" min="64"></label>
@@ -247,6 +250,11 @@ async function refresh() {
     ["Forwarded", n(st.forwarded)], ["Dropped", n(st.dropped)], ["Connections", n(st.conntrack)],
     ["Packet pool", `${n(st.pool.free)} free of ${n(st.pool.capacity)}` + (st.pool.alloc_failures ? `, ${n(st.pool.alloc_failures)} failures` : "")],
     ["Heap", `${n(Math.round(st.heap.used / 1024))} KiB used, ${n(Math.round(st.heap.free / 1048576))} MiB free`],
+    ["Time (UTC)", st.time?.utc ? `${esc(st.time.utc.replace("T", " ").replace("Z", ""))} · NTP ${esc(st.time.server ?? "?")}, stratum ${st.time.stratum}, delay ${st.time.delay_ms} ms, polling every ${dur(st.time.poll_s)}`
+      : `not synced${st.time?.servers?.length ? " (NTP: " + st.time.servers.map(esc).join(", ") + ")" : " (no NTP servers)"}`],
+    ["Watchdog", !st.watchdog ? "–" : !st.watchdog.enabled ? "off (watchdog=0)"
+      : (st.watchdog.hardware ? `${esc(st.watchdog.hardware)} ${st.watchdog.hw_secs} s` : "software only") + " + cross-core check" +
+        (st.watchdog.last_reset_by_watchdog ? ' · <span class="warn">last reset by the watchdog</span>' : "")],
     ["Command line", esc(st.cmdline || "–")],
     ["Config", esc(st.config) + (st.store ? "" : " · no store: changes cannot be saved")],
     ["Upgrade", st.mgmt.upgrade ? "enabled" : "disabled (boot with mgmt_pass=…)"]]);
@@ -297,7 +305,7 @@ const setp = (o, path, v) => {
   if (v === undefined) delete t[last]; else t[last] = v;
 };
 const cfgSay = (t, err) => { $("cfgmsg").textContent = t; $("cfgmsg").className = err ? "err" : ""; };
-const fields = () => [...document.querySelectorAll("#cfg [data-path]")].filter((e) => !e.closest("#statics") && e.id !== "rlo" && e.id !== "rhi" && e.id !== "lease");
+const fields = () => [...document.querySelectorAll("#cfg [data-path]")].filter((e) => !e.closest("#statics") && e.id !== "rlo" && e.id !== "rhi" && e.id !== "lease" && e.id !== "ntp");
 
 function staticRow(s = {}) {
   const i = $("statics").rows.length - 1;
@@ -327,6 +335,7 @@ function fillForm(c) {
   $("rlo").value = r ? r[0] : ""; $("rhi").value = r ? r[1] : "";
   const ls = c.lan?.dhcp?.lease_secs;
   $("lease").value = ls === undefined ? "" : +(ls / 3600).toFixed(4);
+  $("ntp").value = (c.time?.ntp_servers ?? []).join(", ");
   $("statics").innerHTML = "<tr><th>MAC</th><th>IP address</th><th>Hostname</th><th></th></tr>";
   (c.lan?.dhcp?.static ?? []).forEach((s) => staticRow(s));
 }
@@ -342,6 +351,7 @@ function readForm() {
   const lo = $("rlo").value.trim(), hi = $("rhi").value.trim();
   setp(c, "lan.dhcp.range", lo || hi ? [lo, hi] : undefined);
   setp(c, "lan.dhcp.lease_secs", Math.round(Number($("lease").value) * 3600));
+  setp(c, "time.ntp_servers", $("ntp").value.split(",").map((x) => x.trim()).filter((x) => x));
   const st = [...$("statics").rows].slice(1).map((tr) => {
     const o = {};
     tr.querySelectorAll("input").forEach((i) => { if (i.value.trim()) o[i.dataset.key] = i.value.trim(); });

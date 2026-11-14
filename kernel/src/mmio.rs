@@ -87,6 +87,39 @@ impl Region {
         let mut reg = unsafe { UniqueMmioPointer::new(ptr) };
         reg.write(value);
     }
+
+    /// Read a 16-bit register with one 16-bit access (`offset` 2-aligned),
+    /// for devices that decode the access width (the i6300esb watchdog).
+    pub fn read16(&mut self, offset: usize) -> u16 {
+        assert!(offset.is_multiple_of(2), "mmio: unaligned offset {offset:#x}");
+        let _ = self.reg(offset & !3); // bounds
+        let ptr = NonNull::new((self.base + offset) as *mut ReadOnly<u16>).expect("mmio: null");
+        // SAFETY: the 2 bytes lie inside this region (checked above), which
+        // the caller of `new` handed over exclusively as mapped device
+        // memory; `&mut self` keeps the access exclusive.
+        let mut reg = unsafe { UniqueMmioPointer::new(ptr) };
+        reg.read()
+    }
+
+    /// Write a 16-bit register with one 16-bit access (`offset` 2-aligned).
+    pub fn write16(&mut self, offset: usize, value: u16) {
+        assert!(offset.is_multiple_of(2), "mmio: unaligned offset {offset:#x}");
+        let _ = self.reg(offset & !3);
+        let ptr = NonNull::new((self.base + offset) as *mut WriteOnly<u16>).expect("mmio: null");
+        // SAFETY: as in `read16`.
+        let mut reg = unsafe { UniqueMmioPointer::new(ptr) };
+        reg.write(value);
+    }
+
+    /// Write one byte with one 8-bit access (PCI config registers that
+    /// only react to byte writes).
+    pub fn write8(&mut self, offset: usize, value: u8) {
+        let _ = self.reg(offset & !3);
+        let ptr = NonNull::new((self.base + offset) as *mut WriteOnly<u8>).expect("mmio: null");
+        // SAFETY: as in `read16`.
+        let mut reg = unsafe { UniqueMmioPointer::new(ptr) };
+        reg.write(value);
+    }
 }
 
 /// Like [`Region`], for devices whose registers must be accessed 16 bits at

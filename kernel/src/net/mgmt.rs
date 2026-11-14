@@ -877,6 +877,52 @@ fn status_json(
             );
         }
     }
-    s.push_str("]}");
+    s.push(']');
+    // Wall clock (SNTP) and watchdog.
+    let ntp = services.and_then(LanServices::ntp_status);
+    let _ = write!(
+        s,
+        ",\"time\":{{\"utc\":{},\"unix_s\":{},\"servers\":[{}],\"server\":{},\"offset_from_boot_ms\":{},\"delay_ms\":{},\"stratum\":{},\"poll_s\":{}}}",
+        crate::wallclock::now()
+            .map(|t| json_str(&format!("{t}")))
+            .unwrap_or_else(|| String::from("null")),
+        crate::wallclock::now()
+            .map(|t| format!("{}", t.secs()))
+            .unwrap_or_else(|| String::from("null")),
+        ntp.as_ref()
+            .map(|n| n.servers.iter().map(|x| json_str(x)).collect::<Vec<_>>().join(","))
+            .unwrap_or_default(),
+        ntp.as_ref()
+            .and_then(|n| n.server)
+            .map(|a| json_str(&format!("{a}")))
+            .unwrap_or_else(|| String::from("null")),
+        ntp.as_ref()
+            .and_then(|n| n.synced)
+            .map(|x| format!("{}", x.offset / 1_000_000))
+            .unwrap_or_else(|| String::from("null")),
+        ntp.as_ref()
+            .and_then(|n| n.synced)
+            .map(|x| format!("{:.1}", x.delay as f64 / 1e6))
+            .unwrap_or_else(|| String::from("null")),
+        ntp.as_ref()
+            .and_then(|n| n.synced)
+            .map(|x| format!("{}", x.stratum))
+            .unwrap_or_else(|| String::from("null")),
+        ntp.as_ref().map_or(0, |n| n.interval_s),
+    );
+    match crate::watchdog::status() {
+        Some(w) => {
+            let _ = write!(
+                s,
+                ",\"watchdog\":{{\"enabled\":{},\"hardware\":{},\"hw_secs\":{},\"last_reset_by_watchdog\":{}}}",
+                w.enabled,
+                w.hw.map(json_str).unwrap_or_else(|| String::from("null")),
+                w.hw_secs,
+                w.fired_last_boot
+            );
+        }
+        None => s.push_str(",\"watchdog\":null"),
+    }
+    s.push('}');
     s
 }

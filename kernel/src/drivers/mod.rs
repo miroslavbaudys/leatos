@@ -2,6 +2,8 @@
 //! stack uses for every NIC model, and [`Disk`], the one the store uses
 //! for every block device.
 
+#[allow(unsafe_code)] // the register window's constructor
+pub mod i6300esb;
 #[allow(unsafe_code)] // register window + DMA buffer hand-off (slot ownership)
 pub mod igb;
 #[allow(unsafe_code)] // the register window's constructor (PIO, no DMA)
@@ -10,6 +12,7 @@ pub mod sdhci;
 pub mod virtio_blk;
 #[allow(unsafe_code)] // DMA buffer hand-off (begin/complete pairs)
 pub mod virtio_net;
+pub mod watchdog;
 
 use crate::net::packet::PacketBuf;
 use crate::pci::{Pci, PciDevice};

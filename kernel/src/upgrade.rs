@@ -91,5 +91,6 @@ pub fn exec(staging: &'static mut [u8], p: Prepared, cmdline: &str) -> ! {
     // The other cores must not run while the kernel is overwritten.
     crate::smp::stop_others();
     arch::smp::park_others();
+    crate::watchdog::pet_now();
     arch::kexec::exec(flat, p.plan.lo, p.plan.entry, cmdline, scratch)
 }

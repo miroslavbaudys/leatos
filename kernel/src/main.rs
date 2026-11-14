@@ -23,6 +23,7 @@ mod console;
 mod cpuload;
 mod drivers;
 mod executor;
+mod fatal;
 mod irq;
 mod mm;
 #[allow(unsafe_code)] // the one constructor that turns an address into a device region
@@ -37,6 +38,8 @@ mod smp;
 mod store;
 mod timer;
 mod upgrade;
+mod wallclock;
+mod watchdog;
 
 use executor::Priority;
 
@@ -79,6 +82,9 @@ pub fn kmain(boot_arg: usize) -> ! {
     // above this line reads only boot arguments, never `config::get`.
     let mut store = pci.as_mut().and_then(store::open);
     config::load(store.as_mut(), info.virtual_machine);
+    // Found now, armed last (`watchdog::start`): probing stops a timer a
+    // previous kernel left running.
+    let hw_watchdog = pci.as_mut().and_then(drivers::watchdog::probe);
     let qos = config::qos();
     let net = pci.as_mut().and_then(|p| net::stack::bring_up(p, &qos));
     let has_net = net.is_some();
@@ -89,6 +95,7 @@ pub fn kmain(boot_arg: usize) -> ! {
     if let Some((ports, hosts, shared)) = net {
         spawn_net(ports, hosts, shared, store);
     }
+    watchdog::start(hw_watchdog);
     executor::run()
 }
 
@@ -129,7 +136,7 @@ fn net_pool_size() -> usize {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    fatal::enter();
     fatal_println!("\n!!! KERNEL PANIC (core {}): {info}", smp::current());
-    smp::stop_others();
-    arch::cpu::halt()
+    fatal::die()
 }
