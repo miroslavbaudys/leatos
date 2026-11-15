@@ -129,7 +129,7 @@ vlan_pcp = 0             # priority in the tag, 0–7
 mode = "pppoe"           # "dhcp" (default, not written) | "pppoe"
 
 [wan.pppoe]              # written only when not all defaults
-username = "user@isp.cz"
+username = "user@isp.cz"   # optional: empty = no authentication (O2 CZ)
 password = "secret"      # a secret: never shown by the API or CLI
 service = ""             # Service-Name; empty = any
 ac_name = ""             # only this access concentrator; empty = first

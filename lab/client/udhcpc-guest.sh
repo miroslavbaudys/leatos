@@ -6,7 +6,7 @@ bb=/usr/bin/busybox
 case "$1" in
   bound|renew)
     $bb ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.0}" up
-    echo "gip=$ip grouter=${router%% *} gdns=\"$dns\"" > /tmp/glease
+    echo "gip=$ip grouter=${router%% *} gdns=\"$dns\" gdomain=$domain" > /tmp/glease
     ;;
 esac
 exit 0

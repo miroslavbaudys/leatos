@@ -115,6 +115,10 @@ pub struct Network {
     pub ipv4: Cidr,
     #[serde(default = "zone_lan")]
     pub zone: String,
+    /// The DNS domain of this network's clients (`<hostname>.<domain>`,
+    /// DHCP option 15); `None` = `dns.domain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
     #[serde(default)]
     pub dhcp: Dhcp,
 }
@@ -143,12 +147,18 @@ impl Default for Network {
             vlan: 0,
             ipv4: Cidr::new(Ipv4Addr::new(192, 168, 1, 1), 24),
             zone: zone_lan(),
+            domain: None,
             dhcp: Dhcp::default(),
         }
     }
 }
 
 impl Network {
+    /// The network's DNS domain: its own, else `dns.domain`.
+    pub fn domain<'a>(&'a self, dns: &'a Dns) -> &'a str {
+        self.domain.as_deref().unwrap_or(&dns.domain)
+    }
+
     /// The dynamic pool: `dhcp.range` if set, else hosts .100–.199 of the
     /// subnet (subnets with fewer than 200 hosts: all hosts but the last).
     pub fn dhcp_range(&self) -> (Ipv4Addr, Ipv4Addr) {
@@ -846,6 +856,9 @@ impl Config {
             }
             if !n.dhcp.enabled {
                 add(p("dhcp.enabled"), "DHCP switched off");
+            }
+            if n.domain.is_some() {
+                add(p("domain"), "a network's own DNS domain");
             }
         }
         if !self.zones.is_empty() {

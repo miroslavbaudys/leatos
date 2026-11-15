@@ -428,7 +428,10 @@ fn pppoe_checks() {
         c.wan.mode = WanMode::Pppoe;
         c.wan.pppoe.username = "alice@isp.example".into();
     };
-    assert_eq!(invalid(|c| c.wan.mode = WanMode::Pppoe), ["wan.pppoe.username"]);
+    // No user name: valid (ISPs without PPPoE authentication).
+    let mut anon = Config::default();
+    anon.wan.mode = WanMode::Pppoe;
+    assert_eq!(parse(&anon.to_toml()).unwrap(), anon);
     assert_eq!(invalid(|c| {
         pppoe(c);
         c.wan.pppoe.mtu = 1500;
@@ -1292,4 +1295,32 @@ fn mdns_cli_paths() {
     assert_eq!(e.mdns.reflect.len(), 1);
     assert!(e.without("mdns").unwrap().mdns.is_empty());
     assert!(c.with_assignment(r#"mdns.reflect.iot-to-lan.to = ["dmz"]"#).unwrap().validate().is_err(), "checked on save");
+}
+
+// ---- per-network DNS domain ------------------------------------------------
+
+#[test]
+fn network_domain() {
+    let text = FULL_V2.replace("zone = \"guest\"\n\n[[network]]", "zone = \"guest\"\ndomain = \"guest.home\"\n\n[[network]]");
+    let c = parse(&text).unwrap();
+    assert_eq!(c.networks[0].domain, None);
+    assert_eq!(c.networks[0].domain(&c.dns), "home", "falls back to dns.domain");
+    assert_eq!(c.networks[1].domain.as_deref(), Some("guest.home"));
+    assert_eq!(c.networks[1].domain(&c.dns), "guest.home");
+    assert_eq!(parse(&c.to_toml()).unwrap(), c);
+    assert_eq!(parse_json(&c.to_json()).unwrap(), c);
+    // Not written when unset; needs version 2.
+    assert!(!Config::default().to_toml().contains("\ndomain = \"lan\"\n[[network"));
+    assert!(!parse(FULL_V2).unwrap().to_toml().contains("guest.home"));
+    let mut lan_only = Config::default();
+    lan_only.networks[0].domain = Some("home.arpa".into());
+    assert!(!lan_only.fits_v1());
+    assert!(lan_only.beyond_v1_paths().contains(&"network.lan.domain".into()));
+    // Validation and editing by path.
+    for bad in ["", "a b", "-x.home", "x..home", "x_y"] {
+        assert_eq!(invalid(|c| c.networks[0].domain = Some(bad.into())), ["network.lan.domain"], "{bad:?}");
+    }
+    let d = c.with_assignment(r#"network.iot.domain = "iot.home""#).unwrap();
+    assert_eq!(d.networks[2].domain(&d.dns), "iot.home");
+    assert_eq!(d.without("network.iot.domain").unwrap().networks[2].domain, None);
 }

@@ -258,12 +258,7 @@ impl Resolver {
         self.by_question.remove(&p.question);
 
         let mut data = response.to_vec();
-        let domain = self.zone.domain();
-        let name = p.question.name.as_str();
-        let in_local_domain = name == domain
-            || name
-                .strip_suffix(domain)
-                .is_some_and(|rest| rest.ends_with('.'));
+        let in_local_domain = self.zone.is_local_name(&p.question.name);
         if self.cfg.rebind_protection && !in_local_domain {
             let recs = wire::records(response).unwrap_or_default();
             if wire::answer_ipv4s(response, &recs)

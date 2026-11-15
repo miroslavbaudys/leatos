@@ -125,6 +125,7 @@ WAN, and it remains for development only.
 | `vlan` | `0` | 0 = untagged, 1–4094 = tagged |
 | `ipv4` | required | router address/prefix, prefix 8–29 as in v1 |
 | `zone` | `"lan"` | an existing `[[zone]]` or a built-in one |
+| `domain` | `dns.domain` | the network's own DNS domain (DHCP option 15, `<hostname>.<domain>`); version 2 only |
 | `dhcp` | enabled, pool derived as in v1 | v1's `[lan.dhcp]` fields plus `enabled` |
 
 Port membership comes from the networks, as with UniFi port profiles. On
@@ -198,10 +199,16 @@ Static A records in the local zone (`name` + `ip`), beside the DHCP-derived
 names. A name is relative to `dns.domain` unless it contains a dot.
 
 ### `[dns] domain`
-One local domain for all networks (version 1's `lan.domain`, default
-`lan`): DHCP clients of every network are `<hostname>.<domain>`. Host
-names are unique over all networks already (reservations), so one zone
-is enough, as on OpenWrt.
+The default local domain (version 1's `lan.domain`, default `lan`): DHCP
+clients of a network without its own `domain` are `<hostname>.<domain>`.
+A network with `domain` set (`iot.home.arpa`) serves that domain to its
+DHCP clients, and its reservations and leases resolve there only. Every
+domain in use is local (never forwarded, exempt from rebind protection)
+and has `router.<domain>` = the address of the first network using it.
+Domains may nest (`home.arpa`, `iot.home.arpa`): a name belongs to the
+longest local domain it ends in (`crates/proto-dns` `Zone`). Lab check:
+`LAB_GUEST=1 scripts/lab-test.sh` (guest network `guest.lan`; negative
+control `LAB_GUEST_DOMAIN=0`).
 
 ## 4. Validation (`crates/config`, one pass, paths for the UI)
 - Every key (`network.name`, `zone.name`, `rule.name`, `forward.name`) is

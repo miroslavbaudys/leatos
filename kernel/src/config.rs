@@ -404,7 +404,7 @@ pub struct Lan {
     pub vid: u16,
     pub addr: Ipv4Addr,
     pub prefix: u8,
-    /// The local DNS domain (`dns.domain`, one for all networks).
+    /// The network's DNS domain (its own `domain`, else `dns.domain`).
     pub domain: String,
     /// Serve DHCP.
     pub dhcp: bool,
@@ -460,7 +460,7 @@ pub fn networks() -> Vec<Lan> {
             vid: n.vlan,
             addr: n.ipv4.addr,
             prefix: n.ipv4.prefix,
-            domain: c.dns.domain.clone(),
+            domain: n.domain(&c.dns).into(),
             dhcp: n.dhcp.enabled,
             dhcp_range: n.dhcp_range(),
             lease_secs: n.dhcp.lease_secs,

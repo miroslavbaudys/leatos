@@ -52,7 +52,7 @@ impl Pppoe {
         println!(
             "  pppoe {}     : user {}, {}mtu {}",
             port.name,
-            cfg.username,
+            if cfg.username.is_empty() { "(none)" } else { cfg.username.as_str() },
             if cfg.service.is_empty() {
                 String::new()
             } else {

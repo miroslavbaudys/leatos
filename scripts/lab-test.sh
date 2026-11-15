@@ -40,7 +40,7 @@
 #                        (1473 = negative control: fragmented, dropped).
 #                        With PPPoE the default is 1464 (MTU 1492; 1465 =
 #                        negative control: too big for the session, dropped).
-#   LAB_PPPOE=pap|chap   the ISP is a PPPoE access concentrator only (no
+#   LAB_PPPOE=pap|chap|none  the ISP is a PPPoE access concentrator only (no
 #                        DHCP; pppoe-server from the pinned packages, needs
 #                        modloop) requiring PAP or CHAP; the router gets
 #                        wan_mode=pppoe pppoe_user=rrouter pppoe_pass=lab-secret
@@ -51,6 +51,11 @@
 #                        (no session, everything fails), LAB_PPPOE_KICK=stop
 #                        (the ISP's server is stopped too: no reconnect).
 #                        Combines with LAB_VLAN=N (PPPoE on the VLAN).
+#                        none: the ISP asks for no authentication and the
+#                        router has no user name (wan_mode=pppoe only);
+#                        negative control: LAB_PPPOE=pap
+#                        LAB_PPPOE_ANON=1 (no user name against an ISP
+#                        requiring PAP: no session).
 #   LAB_GUEST=1          the router boots from a store (tools/rrstore) with a
 #                        second network: VLAN 20 on lan0, 10.20.0.1/24, zone
 #                        "guest" (input: DHCP, DNS, ping; forwards to the
@@ -72,6 +77,12 @@
 #                        with hairpin; the ISP fetches through it and the
 #                        client through the WAN address. Negative control:
 #                        LAB_FORWARD=0 (no forward: both fail).
+#                        DNS domain: the guest network has its own,
+#                        guest.lan (nested in the LAN's lan); checks: the
+#                        guest lease's domain, labguest.guest.lan and
+#                        router.guest.lan resolve, labclient.guest.lan is
+#                        NXDOMAIN. Negative control: LAB_GUEST_DOMAIN=0
+#                        (no domain line: the first three fail).
 #   LAB_MDNS=1           (implies LAB_GUEST=1) mDNS across networks
 #                        (docs/mdns.md): the guest zone allows "mdns" and
 #                        the rule guest-printers reflects _ipp._tcp from
@@ -111,7 +122,12 @@ ISP_PPPOE="${LAB_PPPOE:-}"
 [[ "$ISP_PPPOE" == 1 ]] && ISP_PPPOE=pap
 BIG_PING="${LAB_BIG_PING:-1472}"
 if [[ -n "$ISP_PPPOE" ]]; then
-  ROUTER_ARGS="$ROUTER_ARGS wan_mode=pppoe pppoe_user=rrouter pppoe_pass=lab-secret"
+  # No user name with LAB_PPPOE=none (or the LAB_PPPOE_ANON=1 control).
+  if [[ "$ISP_PPPOE" == none || -n "${LAB_PPPOE_ANON:-}" ]]; then
+    ROUTER_ARGS="$ROUTER_ARGS wan_mode=pppoe"
+  else
+    ROUTER_ARGS="$ROUTER_ARGS wan_mode=pppoe pppoe_user=rrouter pppoe_pass=lab-secret"
+  fi
   BIG_PING="${LAB_BIG_PING:-1464}"
 fi
 GUEST="${LAB_GUEST:-}"
@@ -123,6 +139,7 @@ MDNS_RULES="${LAB_MDNS_RULES:-1}"
 GUEST_ZONE="${LAB_GUEST_ZONE:-guest}"
 GUEST_RULES="${LAB_GUEST_RULES:-1}"
 FORWARD="${LAB_FORWARD:-1}"
+GUEST_DOMAIN="${LAB_GUEST_DOMAIN:-1}"
 LAN_PORT="${LAB_LAN_PORT:-10003}"
 WAN_PORT="${LAB_WAN_PORT:-10005}"
 WORK=$(mktemp -d -t rrouter-lab)
@@ -175,6 +192,7 @@ name = "guest"
 vlan = 20
 ipv4 = "10.20.0.1/24"
 zone = "$GUEST_ZONE"
+$([[ "$GUEST_DOMAIN" == 1 ]] && echo 'domain = "guest.lan"')
 
 [[zone]]
 name = "guest"
@@ -233,7 +251,7 @@ CFG
     CLIENT_INITRD="$WORK/client-initrd.img"
   fi
   ROUTER_STORE="$WORK/store.img"
-  echo "== router config${GUEST_LIVE:+ (added live by the client)}: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")$([[ -n "$MDNS" ]] && echo ", mdns reflect (enabled: $MDNS_RULES)")"
+  echo "== router config${GUEST_LIVE:+ (added live by the client)}: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")$([[ "$GUEST_DOMAIN" == 1 ]] && echo ", domain guest.lan")$([[ -n "$MDNS" ]] && echo ", mdns reflect (enabled: $MDNS_RULES)")"
 fi
 
 echo "== start rrouter${ROUTER_ARGS:+ ($(echo "$ROUTER_ARGS" | sed 's/pppoe_pass=[^ ]*/pppoe_pass=***/'))}"
@@ -248,7 +266,7 @@ PIDS+=($!)
 
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so

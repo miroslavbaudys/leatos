@@ -233,10 +233,9 @@ fn mgmt(c: &Config, x: &mut Issues) {
 }
 
 fn pppoe(c: &Config, x: &mut Issues) {
+    // The user name is optional: some ISPs (O2 CZ on VLAN 848) ask for no
+    // authentication at all.
     let p = &c.wan.pppoe;
-    if c.wan.mode == WanMode::Pppoe && p.username.is_empty() {
-        x.add("wan.pppoe.username", "required for wan.mode = \"pppoe\"");
-    }
     let fields = [
         ("wan.pppoe.username", p.username.as_str()),
         ("wan.pppoe.password", p.password.as_deref().unwrap_or("")),
@@ -323,6 +322,12 @@ fn networks(c: &Config, x: &mut Issues) {
             x.add(format!("{p}.zone"), "a network cannot be in the wan zone");
         } else if c.zone(&n.zone).is_none() {
             x.add(format!("{p}.zone"), format!("no zone \"{}\"", n.zone));
+        }
+        if n.domain.as_deref().is_some_and(|d| !is_domain(d)) {
+            x.add(
+                format!("{p}.domain"),
+                "must be a DNS name (letters, digits, '-', labels separated by '.')",
+            );
         }
         address(n, p, x);
     }

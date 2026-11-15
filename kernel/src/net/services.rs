@@ -82,24 +82,29 @@ fn resolver_config(d: &config::Dns) -> resolver::Config {
     }
 }
 
-/// The local zone: the router (its first network's address), reservations
-/// with a hostname, and bound DHCP leases with a hostname, of every
-/// network; reverse lookups for all their subnets.
-fn build_zone<'a>(nets: &[config::Lan], leases: impl Iterator<Item = &'a dhcp::Lease>) -> Zone {
+/// The local zone: every network's domain with `router.<domain>` (the
+/// address of the first network using that domain), reservations with a
+/// hostname, and bound DHCP leases with a hostname, each in its network's
+/// domain; reverse lookups for all their subnets.
+fn build_zone<'a>(nets: &[config::Lan], leases: impl Iterator<Item = (&'a str, &'a dhcp::Lease)>) -> Zone {
     let first = &nets[0];
     let mut zone = Zone::new(&first.domain, first.addr, (first.addr, first.prefix));
     for n in &nets[1..] {
+        zone.add_domain(&n.domain, n.addr);
         zone.add_subnet((n.addr, n.prefix));
     }
-    for s in nets.iter().flat_map(|n| &n.statics) {
-        if let Some(h) = &s.hostname {
-            zone.add(h, s.ip, Source::Static);
+    for n in nets {
+        for s in &n.statics {
+            if let Some(h) = &s.hostname {
+                zone.add_in(&n.domain, h, s.ip, Source::Static);
+            }
         }
     }
-    for l in leases.filter(|l| l.state == dhcp::LeaseState::Bound) {
-        if let Some(h) = &l.hostname {
-            zone.add(h, l.ip, Source::Dhcp);
-        }
+    for (net, l) in leases.filter(|(_, l)| l.state == dhcp::LeaseState::Bound) {
+        let (Some(h), Some(n)) = (&l.hostname, nets.iter().find(|n| n.name == net)) else {
+            continue;
+        };
+        zone.add_in(&n.domain, h, l.ip, Source::Dhcp);
     }
     zone
 }
@@ -236,7 +241,7 @@ impl LanServices {
             sockets.remove(net.dns_sock);
             println!("  lan services    : {}: removed", net.cfg.name);
         }
-        *self.dns.zone_mut() = build_zone(&cfgs, self.leases());
+        *self.dns.zone_mut() = build_zone(&cfgs, self.leases_by_network());
         self.dns.reconfigure(resolver_config(&dns_cfg));
         if let Some(n) = self.ntp.as_mut() {
             n.reconfigure();
@@ -301,12 +306,12 @@ impl LanServices {
                         hostname.as_deref().unwrap_or("-")
                     );
                     if let Some(h) = hostname {
-                        dns.zone_mut().add(&h, ip, Source::Dhcp);
+                        dns.zone_mut().add_in(domain, &h, ip, Source::Dhcp);
                     }
                 }
                 DhcpEvent::Released { ip, hostname, .. } => {
                     if let Some(h) = hostname {
-                        dns.zone_mut().remove_dhcp(&h, ip);
+                        dns.zone_mut().remove_dhcp_in(domain, &h, ip);
                     }
                 }
             }

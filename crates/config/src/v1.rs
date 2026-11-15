@@ -88,6 +88,7 @@ impl From<Config> for crate::Config {
                 vlan: 0,
                 ipv4: o.lan.ipv4,
                 zone: ZONE_LAN.into(),
+                domain: None,
                 dhcp: o.lan.dhcp,
             }],
             shaping: o.shaping,

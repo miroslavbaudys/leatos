@@ -8,11 +8,11 @@
 #   all of this on eth0.N, an 802.1Q-tagged link, as ISPs that require a
 #   VLAN; eth0 itself gets no address, so untagged frames reach nothing.
 #   8021q comes from modloop-virt, attached as the VM's disk.
-# lab_pppoe=pap|chap (scripts/lab-test.sh LAB_PPPOE=…): the WAN is a PPPoE
+# lab_pppoe=pap|chap|none (scripts/lab-test.sh LAB_PPPOE=…): the WAN is a PPPoE
 #   access concentrator instead (pppoe-server, AC "isp-ac", service
 #   "internet", rp-pppoe's user mode (pppd over a pty, async HDLC:
 #   ppp_async from modloop-virt, which has no pppoe module); user rrouter,
-#   password lab-secret, PAP or CHAP required), the session gets
+#   password lab-secret, PAP or CHAP required, or none), the session gets
 #   203.0.113.50 and DNS 203.0.113.1; no DHCP server, so a router not
 #   speaking PPPoE gets no address.
 bb=/usr/bin/busybox
@@ -64,7 +64,8 @@ if [ -n "$pppoe" ]; then
   $bb touch /tmp/pppd.log /tmp/messages
   $bb syslogd -O /tmp/messages
   $bb tail -F /tmp/pppd.log /tmp/messages 2>/dev/null | while IFS= read -r l; do echo "isp-ppp: $l"; done &
-  { $bb cat /etc/ppp/pppoe-server-options; echo "require-$pppoe"; } >/tmp/pppoe-server-options
+  # none: no authentication (ISPs such as O2 CZ); the router has no user name.
+  { $bb cat /etc/ppp/pppoe-server-options; if [ "$pppoe" = none ]; then echo noauth; else echo "require-$pppoe"; fi; } >/tmp/pppoe-server-options
   # The session's ISP end shares eth0's address (point to point: the
   # peer gets a /32 route over ppp0).
   /usr/sbin/pppoe-server -I "$IF" -q /usr/sbin/lab-pppd -L 203.0.113.1 -R 203.0.113.50 -N 4 \

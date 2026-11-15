@@ -227,6 +227,13 @@ if [ -n "$guest" ]; then
     out=$($bb nslookup isp.example 10.20.0.1 2>&1)
     if echo "$out" | $bb grep -q "203.0.113.80"; then pass "guest: dns via 10.20.0.1 (allowed)"; else fail "guest: dns via 10.20.0.1"; echo "$out" | $bb sed 's/^/    | /'; fi
     if $bb ping -c 1 -W 2 10.20.0.1 >/dev/null 2>&1; then pass "guest: ping router (allowed)"; else fail "guest: ping 10.20.0.1"; fi
+    # The guest network's own DNS domain (lab_guest_domain=1: guest.lan,
+    # nested in the LAN's lan); lab_guest_domain=0 is the negative control.
+    gl() { $bb nslookup "$1" 10.20.0.1 2>&1; }
+    if [ "$gdomain" = guest.lan ]; then pass "guest: lease domain guest.lan"; else fail "guest: lease domain '$gdomain', expected guest.lan"; fi
+    if gl labguest.guest.lan | $bb grep -q "$gip"; then pass "guest: dns labguest.guest.lan -> $gip"; else fail "guest: dns labguest.guest.lan"; gl labguest.guest.lan | $bb sed 's/^/    | /'; fi
+    if gl router.guest.lan | $bb grep -v "^Server" | $bb grep -q "10.20.0.1$"; then pass "guest: dns router.guest.lan -> 10.20.0.1"; else fail "guest: dns router.guest.lan"; gl router.guest.lan | $bb sed 's/^/    | /'; fi
+    if gl labclient.guest.lan | $bb grep -q "NXDOMAIN\|can't find"; then pass "guest: dns labclient.guest.lan -> NXDOMAIN (lan host, other domain)"; else fail "guest: labclient.guest.lan resolved"; gl labclient.guest.lan | $bb sed 's/^/    | /'; fi
     if $bb wget -q -T 3 -O /dev/null "http://10.20.0.1/" 2>/dev/null; then
       fail "guest: router web interface reachable from the guest network"
     else
