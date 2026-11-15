@@ -12,8 +12,8 @@
 use crate::mmio::Region;
 use crate::pci::Pci;
 
-/// Queue mask (CCPv3 `Q_MASK_REG`): read only for the diagnosis (a live
-/// coprocessor shows its queues, an absent one 0xffffffff).
+/// Queue mask (CCPv3 `Q_MASK_REG`): the queues the PSP enabled; 0 = the
+/// firmware left the coprocessor off (the TRNG then never answers).
 const Q_MASK: usize = 0x00;
 const TRNG_OUT: usize = 0x0c;
 /// The first value may take a while after power-up.
@@ -49,6 +49,17 @@ pub fn probe(pci: &mut Pci) -> Option<CcpTrng> {
         words: 0,
         failed: None,
     };
+    // The PSP assigns the CCP's queues at boot; firmware without the PSP
+    // blob (all PC Engines coreboot releases) leaves the mask at 0, and
+    // the TRNG never produces a value (Linux then skips the device too).
+    let qmask = t.regs.read32(Q_MASK);
+    if qmask == 0 {
+        t.failed = Some(alloc::format!(
+            "queue mask 0: the firmware has not enabled the CCP (needs AMD PSP firmware, which PC Engines coreboot does not include); BAR2 {:#x}",
+            bar.addr
+        ));
+        return Some(t);
+    }
     // Wait for the first value (busy: early boot, no tasks yet).
     let start = crate::timer::uptime();
     let mut first = 0;
@@ -56,21 +67,10 @@ pub fn probe(pci: &mut Pci) -> Option<CcpTrng> {
         first = t.regs.read32(TRNG_OUT);
     }
     if first == 0 {
-        let qmask = t.regs.read32(Q_MASK);
-        // Queue mask 0: the firmware left the CCP disabled (Linux: "you
-        // might be running a broken BIOS"); PC Engines coreboot v4.16.0.1
-        // and newer enable it.
-        t.failed = Some(if qmask == 0 {
-            alloc::format!(
-                "queue mask 0: the firmware has not enabled the CCP (PC Engines coreboot v4.16.0.1 or newer enables it); BAR2 {:#x}",
-                bar.addr
-            )
-        } else {
-            alloc::format!(
-                "always 0 for {FIRST_VALUE_MS} ms; BAR2 {:#x}+{:#x}, queue mask {qmask:#010x}",
-                bar.addr, bar.size
-            )
-        });
+        t.failed = Some(alloc::format!(
+            "always 0 for {FIRST_VALUE_MS} ms; BAR2 {:#x}+{:#x}, queue mask {qmask:#010x}",
+            bar.addr, bar.size
+        ));
         return Some(t);
     }
     let mut seen = alloc::vec::Vec::with_capacity(STARTUP_WORDS);

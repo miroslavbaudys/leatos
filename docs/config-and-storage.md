@@ -254,9 +254,11 @@ rollbacks.
   mixed in, never used alone, and health-checked: 0, 0xffffffff, repeats
   and a startup test switch it off (Jaguar's RDRAND is not used: AMD
   family 15h/16h hardware RNGs have returned constants). `/api/status`
-  `entropy` and the System page say which sources are in use. The apu4's
-  current firmware leaves the CCP disabled (queue mask 0); PC Engines
-  coreboot v4.16.0.1 or newer enables it.
+  `entropy` and the System page say which sources are in use. On the
+  apu4 the CCP stays disabled (queue mask 0): its queues are assigned by
+  the AMD PSP, and no PC Engines coreboot release (up to the last,
+  v4.19.0.1) includes the PSP firmware, so the apu4 has timing sources
+  only. The driver checks the mask first and costs nothing then.
 - Secrets that must be usable in clear (PPPoE password) are stored as
   is, like on other SOHO routers.
 - `GET /api/config` and the TOML export omit secret fields; an upload
