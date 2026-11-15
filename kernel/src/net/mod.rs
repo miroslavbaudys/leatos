@@ -6,6 +6,7 @@ pub mod device;
 pub mod mgmt;
 pub mod ntp;
 pub mod packet;
+pub mod pppoe;
 pub mod services;
 pub mod shared;
 pub mod stack;

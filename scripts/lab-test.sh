@@ -38,6 +38,19 @@
 #                        (untagged) or another VLAN must fail (no WAN lease).
 #   LAB_BIG_PING=1472    ICMP data size of the client's full-size ping
 #                        (1473 = negative control: fragmented, dropped).
+#                        With PPPoE the default is 1464 (MTU 1492; 1465 =
+#                        negative control: too big for the session, dropped).
+#   LAB_PPPOE=pap|chap   the ISP is a PPPoE access concentrator only (no
+#                        DHCP; pppoe-server from the pinned packages, needs
+#                        modloop) requiring PAP or CHAP; the router gets
+#                        wan_mode=pppoe pppoe_user=rrouter pppoe_pass=lab-secret
+#                        (LAB_ROUTER_ARGS win). Checks: session up (router
+#                        log), all client checks through it, and a reconnect
+#                        after the ISP ends the session. Negative controls:
+#                        LAB_ROUTER_ARGS=pppoe_pass=wrong or wan_mode=dhcp
+#                        (no session, everything fails), LAB_PPPOE_KICK=stop
+#                        (the ISP's server is stopped too: no reconnect).
+#                        Combines with LAB_VLAN=N (PPPoE on the VLAN).
 #
 # SNTP: the router syncs from the ISP's ntpd (ntp=ntp.isp.example: resolved
 # through the router's DNS forwarder) and its clock must then be within 5 s
@@ -57,6 +70,13 @@ ROUTER_ARGS="$ROUTER_ARGS ${LAB_ROUTER_ARGS:-}"
 ISP_VLAN="${LAB_VLAN:-}"
 # The router takes the first occurrence of an argument: LAB_ROUTER_ARGS wins.
 [[ -n "$ISP_VLAN" ]] && ROUTER_ARGS="$ROUTER_ARGS wan_vlan=$ISP_VLAN"
+ISP_PPPOE="${LAB_PPPOE:-}"
+[[ "$ISP_PPPOE" == 1 ]] && ISP_PPPOE=pap
+BIG_PING="${LAB_BIG_PING:-1472}"
+if [[ -n "$ISP_PPPOE" ]]; then
+  ROUTER_ARGS="$ROUTER_ARGS wan_mode=pppoe pppoe_user=rrouter pppoe_pass=lab-secret"
+  BIG_PING="${LAB_BIG_PING:-1464}"
+fi
 LAN_PORT="${LAB_LAN_PORT:-10003}"
 WAN_PORT="${LAB_WAN_PORT:-10005}"
 WORK=$(mktemp -d -t rrouter-lab)
@@ -74,14 +94,16 @@ lab_cpu_flags
 echo "== build"
 ARCH="${RROUTER_ARCH:-aarch64}"
 cargo build -q -p rrouter-kernel --target "$ARCH-unknown-none"
-ALPINE_DIR=$(scripts/lab/fetch-alpine.sh ${ISP_VLAN:+modloop} | tail -1)
+MODLOOP=""
+[[ -n "$ISP_VLAN$ISP_PPPOE" ]] && MODLOOP=modloop
+ALPINE_DIR=$(scripts/lab/fetch-alpine.sh $MODLOOP | tail -1)
 ISP_INITRD=$(scripts/lab/build-initrd.sh isp | tail -1)
 CLIENT_INITRD=$(scripts/lab/build-initrd.sh client | tail -1)
 
-echo "== start ISP (203.0.113.1${ISP_VLAN:+ on VLAN $ISP_VLAN})"
+echo "== start ISP (203.0.113.1${ISP_VLAN:+ on VLAN $ISP_VLAN}${ISP_PPPOE:+, PPPoE $ISP_PPPOE})"
 start_isp "$WAN_PORT" "$WORK/isp.log" || exit 1
 
-echo "== start rrouter${ROUTER_ARGS:+ ($ROUTER_ARGS)}"
+echo "== start rrouter${ROUTER_ARGS:+ ($(echo "$ROUTER_ARGS" | sed 's/pppoe_pass=[^ ]*/pppoe_pass=***/'))}"
 QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" QEMU_PCAP_DIR="${LAB_PCAP_DIR:-}" QEMU_ACCEL="$QEMU_ACCEL" QEMU_APPEND="$ROUTER_ARGS" \
   scripts/qemu-run.sh "target/$ARCH-unknown-none/debug/rrouter" >"$WORK/router.log" 2>&1 &
 PIDS+=($!)
@@ -92,7 +114,7 @@ wait_for "$WORK/router.log" "rrouter: boot ok" 40 || { echo "router did not boot
 PIDS+=($!)
 
 echo "== start client"
-linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=${LAB_BIG_PING:-1472}"
+linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so
@@ -112,7 +134,7 @@ if [[ "${LAB_VERBOSE:-0}" == "1" ]]; then
 fi
 
 echo "== router"
-tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|net wan0 .*(lease|vlan)|net ping|qos |qdisc |cpu  |ntp  |watchdog  |vlan  " | sed 's/^/  /' || true
+tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|net wan0 .*(lease|vlan|PPPoE)|pppoe |net ping|qos |qdisc |cpu  |ntp  |watchdog  |vlan  " | sed 's/^/  /' || true
 echo "== results"
 tr -d '\r' <"$WORK/client.log" | grep -E "^LAB (PASS|FAIL|INFO|WARN)|^    \|" | sed 's/^/  /' || true
 
@@ -143,6 +165,19 @@ if [[ "$SHAPE_KBIT" != 0 ]]; then
       router_fails=$((router_fails + 1))
     fi
   done
+fi
+
+# PPPoE: the session came up (MTU 1492, DNS from IPCP) before the client
+# ran; the reconnect is the client's check.
+if [[ -n "$ISP_PPPOE" ]]; then
+  up=$(tr -d '\r' <"$WORK/router.log" | grep "pppoe wan0 .*: up," | head -1 || true)
+  if echo "$up" | grep -q "203.0.113.50 peer 203.0.113.1 dns \[203.0.113.1\] mtu 1492 (AC isp-ac)"; then
+    echo "  LAB PASS: pppoe ($ISP_PPPOE): ${up##*: }"
+  else
+    echo "  LAB FAIL: pppoe ($ISP_PPPOE): no session (${up:-no 'up' line in the router log})"
+    tr -d '\r' <"$WORK/router.log" | grep "pppoe " | tail -3 | sed 's/^/    | /'
+    router_fails=$((router_fails + 1))
+  fi
 fi
 
 # SNTP: synced, and the time it then reported is the host's (±5 s; the

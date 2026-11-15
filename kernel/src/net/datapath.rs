@@ -14,6 +14,14 @@
 //! forwarder, ARP, the neighbor tables, smoltcp and the qdiscs see untagged
 //! frames; the WAN shaper adds the tag's 4 bytes (`config::Qos::port_rate`).
 //!
+//! PPPoE (a port in PPPoE mode, [`PortShared::is_pppoe`]) works the same
+//! way, inside the VLAN tag: IPv4 of the current session is decapsulated
+//! right after the tag is removed and encapsulated right before it is
+//! added (`proto_pppoe::wire`), so everything in between sees Ethernet/IPv4
+//! with the access concentrator's MAC as the only neighbor (no ARP).
+//! Discovery and PPP control frames go to the PPPoE client in svc through
+//! [`PortShared::ctrl_rx`]; other frames are dropped ([`PPPOE_DROPS`]).
+//!
 //! The qdisc is the only place packets wait; the neighbor table holds at
 //! most 3 packets per unresolved next hop.
 //!
@@ -30,7 +38,7 @@ use crate::config;
 use crate::drivers::Nic;
 use crate::net::packet::{PacketBuf, PacketMeta};
 use crate::net::shared::PortShared;
-use crate::net::shared::{LOCAL_RX_MAX, Shared};
+use crate::net::shared::{CTRL_RX_MAX, LOCAL_RX_MAX, Shared};
 use crate::timer;
 use alloc::vec::Vec;
 use core::net::Ipv4Addr;
@@ -57,6 +65,70 @@ pub static FORWARDED: AtomicU64 = AtomicU64::new(0);
 pub static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Received frames with the wrong VLAN tag for their port (or none).
 pub static VLAN_DROPS: AtomicU64 = AtomicU64::new(0);
+/// On a PPPoE port: received frames that are not PPPoE, control frames
+/// that found the client's queue full, and IPv4 to send while there is no
+/// session.
+pub static PPPOE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// What a PPPoE port does with a received frame.
+enum PppoeRx {
+    /// IPv4 of the session, now a plain Ethernet/IPv4 frame.
+    Ipv4,
+    /// For the PPPoE client.
+    Control,
+    Drop,
+}
+
+/// Decapsulate session IPv4 in place, or say where the frame goes.
+fn pppoe_rx(pkt: &mut PacketBuf, session: Option<proto_pppoe::Session>) -> PppoeRx {
+    use proto_pppoe::wire::{self as pw, SessionRx};
+    match wire::ethertype(pkt.data()) {
+        Some(pw::ETHERTYPE_DISCOVERY) => PppoeRx::Control,
+        Some(pw::ETHERTYPE_SESSION) => match pw::classify_session(pkt.data(), session) {
+            SessionRx::Ipv4 { len } => {
+                pw::decap_ipv4(pkt.data_mut());
+                pkt.pull_front(pw::SESSION_OVERHEAD);
+                pkt.set_len(pw::ETH_HDR + len);
+                PppoeRx::Ipv4
+            }
+            SessionRx::Control => PppoeRx::Control,
+        },
+        _ => PppoeRx::Drop,
+    }
+}
+
+/// Encapsulate for a PPPoE port: IPv4 goes into the session (none: `false`,
+/// drop it); the client's own PPPoE frames go as they are; anything else
+/// (no ARP on PPPoE) is dropped.
+fn pppoe_tx(pkt: &mut PacketBuf, session: Option<proto_pppoe::Session>, mac: wire::Mac) -> bool {
+    use proto_pppoe::wire as pw;
+    match wire::ethertype(pkt.data()) {
+        Some(pw::ETHERTYPE_DISCOVERY | pw::ETHERTYPE_SESSION) => true,
+        Some(wire::ETHERTYPE_IPV4) => match session {
+            Some(s) => {
+                pkt.push_front(pw::SESSION_OVERHEAD);
+                pw::encap_ipv4(pkt.data_mut(), s, mac);
+                true
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// A PADT for the port's PPPoE session, if there is one (sent directly at
+/// shutdown, so the ISP does not keep a stale session).
+pub fn padt(port: &PortShared) -> Option<PacketBuf> {
+    let s = port.pppoe_session()?;
+    let mut pkt = PacketBuf::alloc()?;
+    pkt.set_len(proto_pppoe::wire::MIN_FRAME);
+    let n = proto_pppoe::wire::write_padt(pkt.data_mut(), s, port.mac);
+    pkt.set_len(n);
+    if let Some(tci) = port.vlan() {
+        pkt.push_vlan(tci);
+    }
+    Some(pkt)
+}
 
 /// Bookkeeping only the primary direction task touches.
 struct Hk {
@@ -178,10 +250,11 @@ impl Datapath {
     }
 
     /// The WAN lease changed: every shard, and the WAN address copy.
-    pub fn set_wan(&self, addr: Option<(Ipv4Addr, u8)>, gateway: Option<Ipv4Addr>) {
+    pub fn set_wan(&self, addr: Option<(Ipv4Addr, u8)>, gateway: Option<Ipv4Addr>, mtu: u16) {
         for s in &self.shards {
             let mut f = s.lock();
             f.set_addr(WAN, addr);
+            f.set_mtu(WAN, mtu);
             f.set_default_route(gateway.filter(|_| addr.is_some()).map(|gw| (WAN, gw)));
         }
         *self.addrs[WAN as usize].lock() = addr;
@@ -285,7 +358,10 @@ impl Datapath {
     pub fn rx_batch(&self, ifx: IfIndex, batch: &mut Vec<PacketBuf>, touched: &mut [bool; 2]) {
         let now = now_ms();
         let role = if ifx == WAN { Role::Wan } else { Role::Lan };
-        let want_vid = self.sh.ports[ifx as usize].vlan().map(|tci| tci & 0x0fff);
+        let port = &self.sh.ports[ifx as usize];
+        let want_vid = port.vlan().map(|tci| tci & 0x0fff);
+        let pppoe = port.is_pppoe();
+        let session = port.pppoe_session();
         let mut local = false;
         for mut pkt in batch.drain(..) {
             match wire::vlan_rx(pkt.data(), want_vid) {
@@ -294,6 +370,25 @@ impl Datapath {
                 wire::VlanRx::Drop => {
                     VLAN_DROPS.fetch_add(1, Ordering::Relaxed);
                     continue;
+                }
+            }
+            if pppoe {
+                match pppoe_rx(&mut pkt, session) {
+                    PppoeRx::Ipv4 => {}
+                    PppoeRx::Control => {
+                        let mut q = port.ctrl_rx.lock();
+                        if q.len() < CTRL_RX_MAX {
+                            q.push_back(pkt);
+                            local = true;
+                        } else {
+                            PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
+                    PppoeRx::Drop => {
+                        PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                 }
             }
             if wire::ethertype(pkt.data()) == Some(wire::ETHERTYPE_ARP) {
@@ -325,6 +420,18 @@ impl Datapath {
                     self.observe_ecn(ifx, pkt.data());
                     pkt.meta = meta_from(&class, ifx, len, now_ns());
                     FORWARDED.fetch_add(1, Ordering::Relaxed);
+                    let out = &self.sh.ports[egress as usize];
+                    if out.is_pppoe() {
+                        // Point to point: the access concentrator is the
+                        // only neighbor.
+                        match out.pppoe_session() {
+                            Some(s) => self.send_resolved(egress, s.peer, pkt, touched),
+                            None => {
+                                PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        continue;
+                    }
                     let r = self.neigh[egress as usize]
                         .lock()
                         .resolve(egress, next_hop, pkt, now);
@@ -484,10 +591,16 @@ pub fn flush_port(port: &PortShared, dev: &mut Nic) -> FlushResult {
     let mut r = FlushResult::default();
     dev.reap_tx();
     let tag = port.vlan();
+    let pppoe = port.is_pppoe();
+    let session = port.pppoe_session();
     let mut qdisc = port.qdisc.lock();
     while dev.can_transmit() {
         match qdisc.dequeue(now) {
             Dequeue::Packet(mut p) => {
+                if pppoe && !pppoe_tx(&mut p, session, port.mac) {
+                    PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 if let Some(tci) = tag {
                     p.push_vlan(tci);
                 }

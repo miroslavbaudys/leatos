@@ -5,6 +5,8 @@
 //!  datapath ── Verdict::Local ──► PortShared::local_rx ──► svc (smoltcp)   + svc_kick
 //!  svc (smoltcp TX) ─────────────► PortShared::qdisc (locked) ──► datapath + dp_kick
 //!  svc ── Control (WAN lease, reboot/exec) ──────────────────► datapath   + dp_kick
+//!  datapath ── PPPoE discovery/LCP/auth/IPCP ► PortShared::ctrl_rx ► svc + svc_kick
+//!  svc ── PPPoE session (id, peer MAC) ► PortShared::pppoe_session ► datapath
 //!  datapath ── PortSnap, conntrack count ────────────────────► svc (status page)
 //! ```
 //!
@@ -21,11 +23,13 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::net::Ipv4Addr;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
 /// Bound on frames waiting for the router stack.
 pub const LOCAL_RX_MAX: usize = 64;
+/// Bound on PPPoE control frames waiting for the client.
+pub const CTRL_RX_MAX: usize = 16;
 
 /// What the datapath publishes about a port for the status page.
 #[derive(Clone, Copy, Debug, Default)]
@@ -48,6 +52,19 @@ pub struct PortShared {
     /// untagged. The datapath removes it on RX and adds it on TX; svc
     /// changes it when a saved config changes `[wan]`.
     pub vlan: AtomicU32,
+    /// The port runs PPPoE (`wan.mode = "pppoe"`): only PPPoE frames are
+    /// accepted, IPv4 travels in the session, and the router stack's
+    /// interface is IP-only (no ARP). Changed by svc together with that
+    /// interface.
+    pub pppoe_mode: AtomicBool,
+    /// The PPPoE session ([`proto_pppoe::Session::pack`], 0 = none): the
+    /// datapath decapsulates its IPv4 and encapsulates outgoing IPv4.
+    pub pppoe_session: AtomicU64,
+    /// Largest IP packet the router stack sends on this port.
+    pub mtu: AtomicU32,
+    /// PPPoE control frames (discovery and PPP other than IPv4) for the
+    /// client in svc, filled by the datapath.
+    pub ctrl_rx: Mutex<VecDeque<PacketBuf>>,
 }
 
 const VLAN_SET: u32 = 1 << 16;
@@ -67,6 +84,23 @@ impl PortShared {
     pub fn vlan_atomic(tci: Option<u16>) -> AtomicU32 {
         AtomicU32::new(tci.map_or(0, |t| VLAN_SET | u32::from(t)))
     }
+
+    pub fn is_pppoe(&self) -> bool {
+        self.pppoe_mode.load(Ordering::Relaxed)
+    }
+
+    pub fn pppoe_session(&self) -> Option<proto_pppoe::Session> {
+        proto_pppoe::Session::unpack(self.pppoe_session.load(Ordering::Relaxed))
+    }
+
+    pub fn set_pppoe_session(&self, s: Option<proto_pppoe::Session>) {
+        self.pppoe_session
+            .store(s.map_or(0, |s| s.pack()), Ordering::Relaxed);
+    }
+
+    pub fn mtu(&self) -> u16 {
+        self.mtu.load(Ordering::Relaxed) as u16
+    }
 }
 
 /// A WAN lease change for the forwarder: address/prefix and gateway.
@@ -74,6 +108,8 @@ impl PortShared {
 pub struct WanChange {
     pub addr: Option<(Ipv4Addr, u8)>,
     pub gateway: Option<Ipv4Addr>,
+    /// Largest IP packet the WAN carries (PPPoE: the session's MTU).
+    pub mtu: u16,
 }
 
 #[derive(Default)]

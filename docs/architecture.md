@@ -78,6 +78,31 @@ untagged lengths, the WAN shaper adds the tag's 4 bytes to its overhead
 (`config::Qos::port_rate`). LAN VLANs (M10) will reuse the same two
 hooks, with one interface per (port, VID).
 
+**PPPoE (implemented for the WAN, `wan.mode = "pppoe"`):** the same two
+hooks, inside the VLAN tag. On a PPPoE port (`PortShared::pppoe_mode`)
+`rx_batch` decapsulates the current session's IPv4 in place
+(`proto_pppoe::wire::decap_ipv4`: an 8-byte move, the PPP protocol field
+becomes EtherType 0x0800) and hands discovery and PPP control frames
+(LCP, PAP/CHAP, IPCP, IPv6CP, …) to the client through
+`PortShared::ctrl_rx`; anything else is dropped (`PPPOE_DROPS`).
+`flush_port` encapsulates IPv4 for the session (`encap_ipv4`, from the
+headroom) and passes the client's own PPPoE frames unchanged. The session
+(ID + access concentrator MAC) is one atomic (`pppoe_session`), written
+by svc on PADS. In between, everything sees Ethernet/IPv4: forwarded
+packets to the WAN skip ARP (the AC is the only neighbor), the router
+stack's WAN interface is IP-only (`Medium::Ip`, rebuilt when the mode
+changes), and the WAN shaper adds 8 bytes of overhead. The forwarder
+knows the WAN's MTU (1492): larger packets get ICMP "fragmentation needed"
+(DF) or are dropped (no fragmentation), and TCP SYNs in both directions
+have their MSS clamped to the smaller MTU (`wire::clamp_mss`).
+
+```text
+ svc: proto_pppoe::Client ◄── ctrl_rx ──┐            ┌── qdisc ◄── Client frames
+      Event::Session ─► pppoe_session ──┼────────────┤
+                                        │            ▼
+ NIC RX ─► VLAN ─► PPPoE decap ─► forwarder ─► qdisc ─► PPPoE encap ─► VLAN ─► NIC TX
+```
+
 ### Forwarding plane
 smoltcp is a *host* stack: it has no forwarding, NAT, conntrack, bridging or
 PPPoE. The `fwd` crate provides these. It is the largest and riskiest part of

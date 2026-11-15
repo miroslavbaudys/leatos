@@ -245,6 +245,11 @@ impl Ipv4View {
     pub fn tos(&self, f: &[u8]) -> u8 {
         f[self.ip + 1]
     }
+    /// Don't Fragment set: too large for the next link means an ICMP
+    /// "fragmentation needed" back to the sender (RFC 1191).
+    pub fn dont_fragment(&self, f: &[u8]) -> bool {
+        f[self.ip + 6] & 0x40 != 0
+    }
     fn ip_csum(&self, f: &[u8]) -> u16 {
         get16(f, self.ip + 10)
     }
@@ -313,6 +318,59 @@ impl Ipv4View {
             }
         }
     }
+}
+
+/// TCP option: maximum segment size.
+const TCP_OPT_MSS: u8 = 2;
+
+/// Lower the MSS option of a TCP SYN to at most `max` (RFC 879: the
+/// largest segment the sender of the SYN accepts), updating the TCP
+/// checksum. Returns whether it changed. Segments without an MSS option
+/// are left alone (their default, 536, is already small).
+pub fn clamp_mss(f: &mut [u8], v: &Ipv4View, max: u16) -> bool {
+    if v.proto != PROTO_TCP || v.l4_len < 20 {
+        return false;
+    }
+    let doff = ((f[v.l4 + 12] >> 4) as usize) * 4;
+    if doff < 20 || doff > v.l4_len {
+        return false;
+    }
+    let (mut i, end) = (v.l4 + 20, v.l4 + doff);
+    while i < end {
+        match f[i] {
+            0 => break,
+            1 => i += 1,
+            kind => {
+                let Some(&len) = f.get(i + 1).filter(|_| i + 1 < end) else {
+                    break;
+                };
+                let len = len as usize;
+                if len < 2 || i + len > end {
+                    break;
+                }
+                if kind == TCP_OPT_MSS && len == 4 {
+                    let old = get16(f, i + 2);
+                    if old <= max {
+                        return false;
+                    }
+                    put16(f, i + 2, max);
+                    // At an odd offset from the segment start the field
+                    // straddles two checksum words: its bytes count
+                    // swapped (RFC 1071 byte-order independence).
+                    let (o, n) = if (i + 2 - v.l4).is_multiple_of(2) {
+                        (old, max)
+                    } else {
+                        (old.swap_bytes(), max.swap_bytes())
+                    };
+                    let c = csum_update16(get16(f, v.l4 + 16), o, n);
+                    put16(f, v.l4 + 16, c);
+                    return true;
+                }
+                i += len;
+            }
+        }
+    }
+    false
 }
 
 // ---- ARP ----------------------------------------------------------------------------

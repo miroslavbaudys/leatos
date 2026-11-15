@@ -111,7 +111,8 @@ fn full_document_parses() {
         c.wan,
         Wan {
             vlan: Some(848),
-            vlan_pcp: 1
+            vlan_pcp: 1,
+            ..Wan::default()
         }
     );
 }
@@ -415,6 +416,86 @@ fn wan_checks() {
     }
     assert!(parse("[wan]\nvlan = 70000\n").is_err(), "beyond u16");
     assert!(parse("[wan]\nvlan_id = 848\n").is_err(), "unknown field");
+}
+
+#[test]
+fn pppoe_checks() {
+    let pppoe = |c: &mut Config| {
+        c.wan.mode = WanMode::Pppoe;
+        c.wan.pppoe.username = "alice@isp.example".into();
+    };
+    assert_eq!(invalid(|c| c.wan.mode = WanMode::Pppoe), ["wan.pppoe.username"]);
+    assert_eq!(invalid(|c| {
+        pppoe(c);
+        c.wan.pppoe.mtu = 1500;
+    }), ["wan.pppoe.mtu"]);
+    assert_eq!(invalid(|c| {
+        pppoe(c);
+        c.wan.pppoe.password = Some("x".repeat(256));
+    }), ["wan.pppoe.password"]);
+    assert_eq!(invalid(|c| {
+        pppoe(c);
+        c.wan.pppoe.service = "a\nb".into();
+    }), ["wan.pppoe.service"]);
+    assert_eq!(invalid(|c| {
+        pppoe(c);
+        c.wan.pppoe.lcp_echo_failure = 0;
+    }), ["wan.pppoe.lcp_echo_failure"]);
+    let text = r#"
+[wan]
+vlan = 848
+mode = "pppoe"
+
+[wan.pppoe]
+username = "alice@isp.example"
+password = "s3cret"
+"#;
+    let c = parse(text).unwrap();
+    assert_eq!(c.wan.mode, WanMode::Pppoe);
+    assert_eq!(c.wan.pppoe.password.as_deref(), Some("s3cret"));
+    assert_eq!((c.wan.pppoe.mtu, c.wan.pppoe.lcp_echo_interval, c.wan.pppoe.lcp_echo_failure), (1492, 10, 5));
+    assert_eq!(parse(&c.to_toml()).unwrap(), c, "the store keeps the password");
+    assert!(parse("[wan]\nmode = \"static\"\n").is_err(), "not implemented");
+    assert!(parse("[wan.pppoe]\nuser = \"x\"\n").is_err(), "unknown field");
+}
+
+#[test]
+fn pppoe_password_is_a_secret() {
+    let mut c = Config::default();
+    c.wan.mode = WanMode::Pppoe;
+    c.wan.pppoe.username = "alice".into();
+    c.wan.pppoe.password = Some("s3cret".into());
+    let shown = c.without_secrets();
+    for text in [shown.to_toml(), shown.to_json(), flat_lines(&shown).join("\n")] {
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(text.contains("alice"));
+    }
+    assert!(diff_lines(&Config::default(), &shown).iter().all(|l| !l.contains("s3cret")));
+    // The form sends the config back without it: the password stays.
+    let mut back = parse_json(&shown.to_json()).unwrap();
+    back.keep_secrets(&c);
+    assert_eq!(back, c);
+    // An explicit empty one clears it.
+    let mut cleared = shown.with_assignment(r#"wan.pppoe.password = """#).unwrap();
+    cleared.keep_secrets(&c);
+    assert_eq!(cleared.wan.pppoe.password.as_deref(), Some(""));
+}
+
+#[test]
+fn dhcp_wan_leaves_pppoe_out_of_the_canonical_form() {
+    // Kernels from before PPPoE know [wan] with vlan/vlan_pcp only.
+    let mut c = Config::default();
+    c.wan.vlan = Some(848);
+    let t = c.to_toml();
+    assert!(!t.contains("mode") && !t.contains("pppoe"), "{t}");
+    let p = c.with_assignment(r#"wan.mode = "pppoe""#).unwrap();
+    assert!(p.to_toml().contains("mode = \"pppoe\""));
+    assert_eq!(p.without("wan.mode").unwrap(), c);
+    assert_eq!(c.without("wan.pppoe.mtu").unwrap(), c);
+    let u = c.with_assignment(r#"wan.pppoe.username = "bob""#).unwrap();
+    assert_eq!(u.wan.pppoe.username, "bob");
+    assert_eq!(u.without("wan.pppoe.username").unwrap(), c);
+    assert_eq!(u.without("wan.pppoe").unwrap(), c);
 }
 
 #[test]

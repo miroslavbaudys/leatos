@@ -223,6 +223,7 @@ pub struct Mgmt {
     password: Option<&'static str>,
     on_wan: bool,
     wan_lease: String,
+    wan_pppoe: Option<String>,
     /// A store exists: `POST /api/config` can save.
     has_store: bool,
     /// Store work waiting for the services task, and for which connection
@@ -310,6 +311,7 @@ impl Mgmt {
             password: cfg.password,
             on_wan: cfg.on_wan,
             wan_lease: String::from("null"),
+            wan_pppoe: None,
             has_store,
             op: None,
             op_busy: false,
@@ -429,6 +431,12 @@ impl Mgmt {
     /// The WAN lease for the status page (already JSON).
     pub fn set_wan_lease(&mut self, json: String) {
         self.wan_lease = json;
+    }
+
+    /// The PPPoE client's state for the status page (JSON), `None` in
+    /// DHCP mode.
+    pub fn set_wan_pppoe(&mut self, json: Option<String>) {
+        self.wan_pppoe = json;
     }
 
     fn authorized(&self, head: &Head) -> Result<(), (u16, &'static str)> {
@@ -570,19 +578,19 @@ impl Mgmt {
             }
             Route::Upgrade | Route::UpgradePersist => self.finish_upload(i, route),
             Route::ConfigGet => {
-                let toml = config::base().to_toml();
+                let toml = config::base().without_secrets().to_toml();
                 self.conns[i].respond(200, "application/toml", &[], toml.as_bytes());
             }
             Route::ConfigJson => {
-                let json = config::base().to_json();
+                let json = config::base().without_secrets().to_json();
                 self.conns[i].respond_json(200, &json);
             }
             Route::EffectiveGet => {
-                let toml = config::get().to_toml();
+                let toml = config::get().without_secrets().to_toml();
                 self.conns[i].respond(200, "application/toml", &[], toml.as_bytes());
             }
             Route::EffectiveJson => {
-                let json = config::get().to_json();
+                let json = config::get().without_secrets().to_json();
                 self.conns[i].respond_json(200, &json);
             }
             Route::ConfigPut => self.check_config(i),
@@ -645,7 +653,9 @@ impl Mgmt {
                     ),
                 );
             }
-            Ok(cfg) => {
+            Ok(mut cfg) => {
+                // What GET returned has no secrets: keep the stored ones.
+                cfg.keep_secrets(&config::base());
                 let flags = if cfg.needs_trial(&config::base()) {
                     config_store::FLAG_TRIAL
                 } else {
@@ -908,7 +918,7 @@ fn status_json(
         s,
         "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"vlan_drops\":{},\"conntrack\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
-         \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"wan_lease\":{wan_lease},\
+         \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
          \"mgmt\":{{\"on_wan\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
         json_str(env!("CARGO_PKG_VERSION")),
         json_str(env!("RROUTER_BUILD")),
@@ -936,6 +946,8 @@ fn status_json(
         datapath::DROPPED.load(Ordering::Relaxed),
         datapath::VLAN_DROPS.load(Ordering::Relaxed),
         sh.conntrack(),
+        mgmt.wan_pppoe.as_deref().unwrap_or("null"),
+        datapath::PPPOE_DROPS.load(Ordering::Relaxed),
         mgmt.on_wan,
         mgmt.password.is_some() && (mgmt.staging.is_some() || mgmt.uploader.is_some()),
         mgmt.password.is_some()

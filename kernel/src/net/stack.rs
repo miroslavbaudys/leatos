@@ -19,7 +19,7 @@ use crate::irq::{self, IrqEvent, Trigger};
 use crate::net::datapath::{self, Datapath};
 use crate::net::device::{Aqm, PortDevice, PortQdisc};
 use crate::net::mgmt::Action;
-use crate::net::shared::{self, LOCAL_RX_MAX, PortShared, PortSnap, Shared};
+use crate::net::shared::{self, CTRL_RX_MAX, LOCAL_RX_MAX, PortShared, PortSnap, Shared};
 use crate::net::svc::HostIf;
 use crate::pci::Pci;
 use crate::{arch, println, timer};
@@ -27,6 +27,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use smoltcp::iface::{Config, Interface, SocketSet};
@@ -160,6 +161,7 @@ pub fn bring_up(
             ),
             None => println!("  qos {name}       : unshaped, {desc}"),
         }
+        let pppoe = i == 0 && crate::config::pppoe().is_some();
         let port = PortShared {
             name,
             model: dev.model(),
@@ -168,19 +170,17 @@ pub fn bring_up(
             local_rx: Mutex::new(VecDeque::with_capacity(LOCAL_RX_MAX)),
             snap: Mutex::new(PortSnap::default()),
             vlan: PortShared::vlan_atomic(if i == 0 { crate::config::wan_tci() } else { None }),
+            pppoe_mode: AtomicBool::new(pppoe),
+            pppoe_session: AtomicU64::new(0),
+            mtu: AtomicU32::new(u32::from(fwd::forwarder::DEFAULT_MTU)),
+            ctrl_rx: Mutex::new(VecDeque::with_capacity(CTRL_RX_MAX)),
         };
-        let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
-        config.random_seed = timer::ticks();
-        let mut queued = 0;
-        let mut device = PortDevice {
-            port: &port,
-            now_ns: datapath::now_ns(),
-            queued: &mut queued,
-        };
-        let mut iface = Interface::new(config, &mut device, now());
+        let mut iface = new_iface(&port);
         let mut sockets = SocketSet::new(Vec::new());
         if i == 0 {
-            sockets.add(dhcpv4::Socket::new());
+            if !pppoe {
+                sockets.add(dhcpv4::Socket::new());
+            }
         } else {
             iface.update_ip_addrs(|a| a.push(IpCidr::Ipv4(lan_cidr())).expect("lan addr"));
         }
@@ -215,6 +215,9 @@ pub fn bring_up(
         if let Some(tci) = port.vlan() {
             println!("  net {name}       : {}", vlan_text(tci));
         }
+        if pppoe {
+            println!("  net {name}       : PPPoE");
+        }
         ports.push(Port {
             name,
             dev: Mutex::new(Some(dev)),
@@ -232,6 +235,25 @@ pub fn bring_up(
         hosts,
         shared::init(shared_ports),
     ))
+}
+
+/// The router stack's interface for a port: Ethernet, or IP-only on a
+/// PPPoE port ([`PortShared::is_pppoe`], set before calling).
+pub fn new_iface(port: &PortShared) -> Interface {
+    let hw = if port.is_pppoe() {
+        HardwareAddress::Ip
+    } else {
+        HardwareAddress::Ethernet(EthernetAddress(port.mac))
+    };
+    let mut config = Config::new(hw);
+    config.random_seed = timer::ticks();
+    let mut queued = 0;
+    let mut device = PortDevice {
+        port,
+        now_ns: datapath::now_ns(),
+        queued: &mut queued,
+    };
+    Interface::new(config, &mut device, now())
 }
 
 /// Wait until any of `events` fires or the sleep ends.
@@ -410,6 +432,16 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
                 (c.wan.take(), c.action.take())
             };
             if let Some(action) = action {
+                // End the PPPoE session first, so the ISP does not keep
+                // (and bill, or refuse a new login for) a stale one.
+                if let Some(pkt) = sh.ports.first().and_then(datapath::padt) {
+                    if let Some(dev) = ports[0].dev.lock().as_mut() {
+                        dev.reap_tx();
+                        let _ = dev.transmit(pkt);
+                    }
+                    timer::sleep(Duration::from_millis(20)).await;
+                    println!("  net {}       : PPPoE session ended (PADT)", ports[0].name);
+                }
                 // Quiesce: dropping the NICs resets them (no more DMA); the
                 // other direction then parks.
                 for port in ports {
@@ -426,7 +458,7 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
                 }
             }
             if let Some(w) = wan {
-                dp.set_wan(w.addr, w.gateway);
+                dp.set_wan(w.addr, w.gateway, w.mtu);
             }
             dp.housekeeping(&mut touched);
             next_hk = dp.next_housekeeping();

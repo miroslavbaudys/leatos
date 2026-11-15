@@ -222,7 +222,9 @@ impl Default for Shaping {
 }
 
 /// The WAN link. Same settings as the boot arguments `wan_vlan=`,
-/// `wan_pcp=`.
+/// `wan_pcp=`, `wan_mode=`, `pppoe_user=`, `pppoe_pass=`, … Fields at
+/// their defaults are left out of the canonical form, so a config that
+/// does not use them stays readable by older kernels (rollback).
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Wan {
@@ -232,11 +234,76 @@ pub struct Wan {
     pub vlan: Option<u16>,
     /// Priority (PCP, 0–7) in the tag of frames sent on the WAN VLAN.
     pub vlan_pcp: u8,
+    /// How the WAN gets its address.
+    #[serde(skip_serializing_if = "WanMode::is_dhcp")]
+    pub mode: WanMode,
+    #[serde(skip_serializing_if = "Pppoe::is_default")]
+    pub pppoe: Pppoe,
 }
 
 impl Wan {
     pub fn is_default(&self) -> bool {
         *self == Wan::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum WanMode {
+    /// DHCPv4 client on the WAN Ethernet.
+    #[default]
+    #[serde(rename = "dhcp")]
+    Dhcp,
+    /// PPPoE session (`[wan.pppoe]`); DHCP is not used.
+    #[serde(rename = "pppoe")]
+    Pppoe,
+}
+
+impl WanMode {
+    pub fn is_dhcp(&self) -> bool {
+        *self == WanMode::Dhcp
+    }
+}
+
+/// PPPoE credentials and link settings (`wan.mode = "pppoe"`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Pppoe {
+    pub username: String,
+    /// A secret: stored in clear (PAP and CHAP need it), but left out of
+    /// what the web interface and the CLI show ([`Config::without_secrets`]);
+    /// a save without it keeps the current one ([`Config::keep_secrets`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// Service-Name to ask the access concentrator for; empty = any.
+    pub service: String,
+    /// Only use the access concentrator with this name; empty = the first
+    /// that answers.
+    pub ac_name: String,
+    /// MRU asked for and largest IP packet sent (1280–1492).
+    pub mtu: u16,
+    /// Seconds between LCP echo requests (0 = no keepalive).
+    pub lcp_echo_interval: u32,
+    /// Unanswered echo requests before the session is restarted.
+    pub lcp_echo_failure: u32,
+}
+
+impl Default for Pppoe {
+    fn default() -> Self {
+        Pppoe {
+            username: String::new(),
+            password: None,
+            service: String::new(),
+            ac_name: String::new(),
+            mtu: 1492,
+            lcp_echo_interval: 10,
+            lcp_echo_failure: 5,
+        }
+    }
+}
+
+impl Pppoe {
+    pub fn is_default(&self) -> bool {
+        *self == Pppoe::default()
     }
 }
 
@@ -372,6 +439,23 @@ impl Config {
         self.lan.ipv4 != old.lan.ipv4
             || self.mgmt != old.mgmt
             || (self.wan != old.wan && (self.mgmt.on_wan || old.mgmt.on_wan))
+    }
+
+    /// This config without secrets (the PPPoE password): what the web
+    /// interface and the CLI show and export.
+    pub fn without_secrets(&self) -> Config {
+        let mut c = self.clone();
+        c.wan.pppoe.password = None;
+        c
+    }
+
+    /// A submitted config left secrets out (it came from
+    /// [`Self::without_secrets`]): keep `current`'s. An empty string
+    /// clears one.
+    pub fn keep_secrets(&mut self, current: &Config) {
+        if self.wan.pppoe.password.is_none() {
+            self.wan.pppoe.password = current.wan.pppoe.password.clone();
+        }
     }
 
     /// Cross-field checks; every problem found, not just the first.

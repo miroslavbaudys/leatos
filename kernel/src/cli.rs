@@ -183,7 +183,8 @@ impl Cli {
                             Which::Pending => "pending edit (config save to apply)",
                         };
                         println!("# {what}");
-                        print!("{}", c.to_toml());
+                        // Secrets stay off the console (and its logs).
+                        print!("{}", c.without_secrets().to_toml());
                     }
                     None => println!("no pending edit"),
                 }
@@ -198,7 +199,11 @@ impl Cli {
                         println!("no changes");
                     }
                     for l in d {
-                        println!("{l}");
+                        if l[2..].starts_with("wan.pppoe.password") {
+                            println!("{} wan.pppoe.password = (secret)", &l[..1]);
+                        } else {
+                            println!("{l}");
+                        }
                     }
                 }
             },

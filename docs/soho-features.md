@@ -5,7 +5,24 @@ analysis. Each protocol is implemented as a sans-IO `no_std` crate (see
 architecture.md).
 
 ## PPPoE
-Crate: `crates/proto-pppoe`. Status: not started.
+Crate: `crates/proto-pppoe`. Status: **implemented (M5, QEMU lab)**:
+discovery with Service-Name/AC-Name filtering, Host-Uniq, AC-Cookie and
+Relay-Session-Id echo, PADS errors, PADT both ways (sent at shutdown and
+when a session is torn down); LCP (RFC 1661 automaton shared with IPCP:
+MRU 1492, magic numbers with loopback check, auth protocol: PAP or
+CHAP-MD5, other methods naked to CHAP; PFC/ACFC and unknown options
+rejected; Protocol-Reject for IPv6CP and other unsupported protocols;
+echo keepalive, `lcp_echo_interval` / `lcp_echo_failure`); PAP and CHAP-MD5
+(`md-5`, RustCrypto); IPCP with DNS (RFC 1877), DNS servers feed the
+forwarder. Reconnect with exponential backoff (1 s doubling to 64 s, at
+least 10 s after an authentication failure, reset once a session is up).
+Kernel: `net::pppoe` (svc) + the datapath hooks (architecture.md). MSS
+clamping and ICMP "fragmentation needed" in `crates/fwd`. Lab:
+`LAB_PPPOE=pap|chap scripts/lab-test.sh` (rp-pppoe's `pppoe-server` in the
+ISP VM, also with `LAB_VLAN=848`), `scripts/pppoe-test.sh` (live switch
+between DHCP and PPPoE). Open: IPv6CP + DHCPv6-PD over the session (M7),
+RFC 4638, IPv4 fragmentation of non-DF packets above the MTU (dropped
+today), PPPoE on real hardware.
 
 | Stage | Details |
 |---|---|
@@ -22,7 +39,7 @@ Pitfalls:
 - **ISP VLAN:** many ISPs require PPPoE on a VLAN tag (some Czech ISPs, for
   example O2 with VLAN 848; verify per ISP). `wan.vlan` (+ `wan.vlan_pcp`)
   is implemented (software tag in `net::datapath`; boot argument
-  `wan_vlan=`); PPPoE on top of it comes with M5.
+  `wan_vlan=`); PPPoE runs inside it (lab: `LAB_PPPOE=pap LAB_VLAN=848`).
 - RFC 4638 (MTU 1500 over PPPoE) is optional and only works if the ISP supports it.
 - Reconnect with exponential backoff. Send PADT on shutdown so the ISP
   doesn't keep a stale session. Handle forced daily disconnects.

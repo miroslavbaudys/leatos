@@ -215,6 +215,12 @@ pub fn overrides() -> Vec<(&'static str, &'static str)> {
         ("lan", "lan.ipv4"),
         ("wan_vlan", "wan.vlan"),
         ("wan_pcp", "wan.vlan_pcp"),
+        ("wan_mode", "wan.mode"),
+        ("pppoe_user", "wan.pppoe.username"),
+        ("pppoe_pass", "wan.pppoe.password"),
+        ("pppoe_service", "wan.pppoe.service"),
+        ("pppoe_ac", "wan.pppoe.ac_name"),
+        ("pppoe_mtu", "wan.pppoe.mtu"),
         ("shape_up", "shaping.up_kbit"),
         ("shape_down", "shaping.down_kbit"),
         ("shape_overhead", "shaping.overhead"),
@@ -234,7 +240,7 @@ pub fn overrides() -> Vec<(&'static str, &'static str)> {
             // ecn= only where no ecn_up= / ecn_down= takes precedence.
             let shadowed = k == "ecn" && arg(args, path.trim_start_matches("shaping.")).is_some();
             if k == key && !shadowed && !v.iter().any(|&(p, _)| p == path) {
-                v.push((path, kv));
+                v.push((path, if k == "pppoe_pass" { "pppoe_pass=***" } else { kv }));
             }
         }
     }
@@ -272,6 +278,27 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
     }
     if let Some(p) = arg_u64(args, "wan_pcp").filter(|&p| p <= 7) {
         c.wan.vlan_pcp = p as u8;
+    }
+    match arg(args, "wan_mode") {
+        Some("pppoe") => c.wan.mode = schema::WanMode::Pppoe,
+        Some("dhcp") => c.wan.mode = schema::WanMode::Dhcp,
+        _ => {}
+    }
+    let p = &mut c.wan.pppoe;
+    if let Some(u) = arg(args, "pppoe_user") {
+        p.username = String::from(u);
+    }
+    if let Some(pw) = arg(args, "pppoe_pass") {
+        p.password = Some(String::from(pw));
+    }
+    if let Some(v) = arg(args, "pppoe_service") {
+        p.service = String::from(v);
+    }
+    if let Some(v) = arg(args, "pppoe_ac") {
+        p.ac_name = String::from(v);
+    }
+    if let Some(m) = arg_u64(args, "pppoe_mtu").filter(|m| (1280..=1492).contains(m)) {
+        p.mtu = m as u16;
     }
     let s = &mut c.shaping;
     if let Some(r) = arg_u64(args, "shape_up") {
@@ -328,7 +355,7 @@ fn add_lab_reservation(c: &mut schema::Config) {
     }
 }
 
-/// A command line for logs, `mgmt_pass=` values masked. Formats without
+/// A command line for logs, `mgmt_pass=` and `pppoe_pass=` values masked. Formats without
 /// allocating (the boot report prints it before the heap exists).
 pub struct Redacted<'a>(pub &'a str);
 
@@ -337,6 +364,8 @@ impl core::fmt::Display for Redacted<'_> {
         for (i, kv) in self.0.split_whitespace().enumerate() {
             let kv = if kv.starts_with("mgmt_pass=") {
                 "mgmt_pass=***"
+            } else if kv.starts_with("pppoe_pass=") {
+                "pppoe_pass=***"
             } else {
                 kv
             };
@@ -397,6 +426,26 @@ pub fn wan_tci() -> Option<u16> {
     c.wan
         .vlan
         .map(|v| fwd::wire::vlan_tci_of(v, c.wan.vlan_pcp))
+}
+
+/// The PPPoE client's settings when `wan.mode = "pppoe"` (boot argument
+/// `wan_mode=pppoe`, credentials `pppoe_user=` / `pppoe_pass=`), else
+/// `None` (DHCP on the WAN).
+pub fn pppoe() -> Option<proto_pppoe::Config> {
+    let c = get();
+    if c.wan.mode != schema::WanMode::Pppoe {
+        return None;
+    }
+    let p = &c.wan.pppoe;
+    Some(proto_pppoe::Config {
+        username: p.username.clone(),
+        password: p.password.clone().unwrap_or_default(),
+        service: p.service.clone(),
+        ac_name: p.ac_name.clone(),
+        mtu: p.mtu,
+        echo_interval_secs: p.lcp_echo_interval,
+        echo_failures: p.lcp_echo_failure,
+    })
 }
 
 pub struct Dns {
@@ -524,6 +573,9 @@ pub struct Qos {
     /// `datapath::flush_port`), so the upload shaper adds them to
     /// `overhead`. `shape_overhead` must not include the tag.
     pub wan_vlan: bool,
+    /// The WAN runs PPPoE: 8 more bytes per frame (PPPoE header and PPP
+    /// protocol, added in `datapath::flush_port`), likewise added.
+    pub wan_pppoe: bool,
 }
 
 pub fn qos() -> Qos {
@@ -547,6 +599,7 @@ pub fn qos() -> Qos {
             schema::Isolation::Flows => qdisc::cake::Isolation::Flows,
         },
         wan_vlan: c.wan.vlan.is_some(),
+        wan_pppoe: c.wan.mode == schema::WanMode::Pppoe,
     }
 }
 
@@ -555,11 +608,13 @@ impl Qos {
     /// egress at the download rate; unset = not shaped.
     pub fn port_rate(&self, up: bool) -> Option<qdisc::shaper::Rate> {
         let kbit = if up { self.up_kbit } else { self.down_kbit };
-        let tag = if up && self.wan_vlan {
-            fwd::wire::VLAN_HDR as u32
-        } else {
-            0
-        };
+        let mut tag = 0;
+        if up && self.wan_vlan {
+            tag += fwd::wire::VLAN_HDR as u32;
+        }
+        if up && self.wan_pppoe {
+            tag += proto_pppoe::wire::SESSION_OVERHEAD as u32;
+        }
         kbit.map(|k| qdisc::shaper::Rate {
             overhead: self.overhead + tag,
             ..qdisc::shaper::Rate::kbit(k)

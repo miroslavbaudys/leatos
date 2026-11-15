@@ -12,8 +12,11 @@
 //!            ▼
 //!        TTL ≤ 1 ? ─► ICMP time exceeded, built in place, back to the sender
 //!            │
+//!        larger than the egress MTU ? ─► DF: ICMP fragmentation needed
+//!            │                            (else dropped: no fragmentation)
 //!            ▼
-//!        TTL−1, NAT rewrite (incremental checksums), conntrack update,
+//!        TTL−1, NAT rewrite (incremental checksums), TCP SYN: MSS clamped
+//!        to the smaller MTU, conntrack update,
 //!        classification for CAKE ─► Forward { egress, next_hop, … }
 //! ```
 //!
@@ -24,7 +27,8 @@ use crate::IfIndex;
 use crate::conntrack::{Conn, Conntrack, Dir, Tuple};
 use crate::route::{Route, RouteTable};
 use crate::wire::{
-    self, ETH_HDR, ETHERTYPE_ARP, ETHERTYPE_IPV4, Ipv4View, Mac, PROTO_ICMP, PROTO_TCP, PROTO_UDP,
+    self, ETH_HDR, ETHERTYPE_ARP, ETHERTYPE_IPV4, ICMP_DEST_UNREACH, ICMP_TIME_EXCEEDED, Ipv4View,
+    Mac, PROTO_ICMP, PROTO_TCP, PROTO_UDP,
 };
 use alloc::vec::Vec;
 use core::net::Ipv4Addr;
@@ -66,9 +70,11 @@ pub enum DropReason {
     Hairpin,
     IcmpRateLimit,
     Unsupported,
+    /// Larger than the egress MTU without DF (fragmentation is not done).
+    TooBig,
 }
 
-pub const DROP_REASONS: usize = 10;
+pub const DROP_REASONS: usize = 11;
 
 impl DropReason {
     pub fn index(self) -> usize {
@@ -86,6 +92,7 @@ impl DropReason {
             Self::Hairpin => "hairpin",
             Self::IcmpRateLimit => "icmp-ratelimit",
             Self::Unsupported => "unsupported",
+            Self::TooBig => "too-big",
         }
     }
     pub fn all() -> [DropReason; DROP_REASONS] {
@@ -101,6 +108,7 @@ impl DropReason {
             Hairpin,
             IcmpRateLimit,
             Unsupported,
+            TooBig,
         ]
     }
 }
@@ -145,8 +153,13 @@ enum Key {
 const ICMP_RATE_PER_SEC: u64 = 50;
 const ICMP_BURST: u64 = 20;
 
+/// Interface MTU unless [`Forwarder::set_mtu`] says otherwise.
+pub const DEFAULT_MTU: u16 = 1500;
+
 pub struct Forwarder {
     ifs: Vec<Interface>,
+    /// Per interface: largest IP packet it sends (PPPoE: 1492).
+    mtus: Vec<u16>,
     pub routes: RouteTable,
     pub ct: Conntrack,
     pub stats: Stats,
@@ -300,6 +313,7 @@ impl Forwarder {
     pub fn new_shard(max_conns: usize, hash_key: u64, shards: u16, shard: u16) -> Self {
         Self {
             ifs: Vec::new(),
+            mtus: Vec::new(),
             routes: RouteTable::new(),
             ct: Conntrack::new_shard(max_conns, hash_key, shards, shard),
             stats: Stats::default(),
@@ -310,6 +324,7 @@ impl Forwarder {
 
     pub fn add_interface(&mut self, iface: Interface) -> IfIndex {
         self.ifs.push(iface);
+        self.mtus.push(DEFAULT_MTU);
         let ifx = (self.ifs.len() - 1) as IfIndex;
         if let Some(a) = iface.addr {
             self.set_addr(ifx, Some(a));
@@ -339,6 +354,17 @@ impl Forwarder {
         if self.ifs[ifx as usize].role == Role::Wan && old.map(|o| o.0) != addr.map(|a| a.0) {
             self.ct.flush_nat();
         }
+    }
+
+    /// Largest IP packet `ifx` sends; bigger forwarded packets get ICMP
+    /// "fragmentation needed" (DF) or are dropped, and TCP SYNs through
+    /// it have their MSS clamped to fit.
+    pub fn set_mtu(&mut self, ifx: IfIndex, mtu: u16) {
+        self.mtus[ifx as usize] = mtu.max(576);
+    }
+
+    pub fn mtu(&self, ifx: IfIndex) -> u16 {
+        self.mtus[ifx as usize]
     }
 
     pub fn set_default_route(&mut self, via: Option<(IfIndex, Ipv4Addr)>) {
@@ -487,7 +513,19 @@ impl Forwarder {
             if !self.take_icmp_token(now) {
                 return self.drop(DropReason::IcmpRateLimit);
             }
-            return self.time_exceeded(ingress, my_ip, buf, len, &v);
+            return self.icmp_error(ingress, my_ip, buf, len, &v, ICMP_TIME_EXCEEDED, 0, 0);
+        }
+
+        // MTU (RFC 1191): no fragmentation, so DF or not, it cannot go as is.
+        let mtu = self.mtus[route.egress as usize];
+        if v.total_len > mtu as usize {
+            if !v.dont_fragment(f) || matches!(key, Key::Related { .. }) {
+                return self.drop(DropReason::TooBig);
+            }
+            if !self.take_icmp_token(now) {
+                return self.drop(DropReason::IcmpRateLimit);
+            }
+            return self.icmp_error(ingress, my_ip, buf, len, &v, ICMP_DEST_UNREACH, 4, mtu);
         }
 
         let tcp_flags = if let Key::Flow(_, fl) = key { fl } else { 0 };
@@ -516,6 +554,12 @@ impl Forwarder {
                 Key::Other => {}
             }
         }
+        if tcp_flags & wire::TCP_SYN != 0 {
+            // Both ways: the SYN-ACK tells the LAN host what the server
+            // may send.
+            let path_mtu = mtu.min(self.mtus[ingress as usize]);
+            wire::clamp_mss(buf, &v, path_mtu.saturating_sub(40));
+        }
         self.ct.update(now, id, dir, tcp_flags, v.total_len);
 
         let f = &buf[..len];
@@ -543,14 +587,20 @@ impl Forwarder {
         }
     }
 
-    /// Replace the frame with an ICMP time-exceeded message to its sender.
-    fn time_exceeded(
+    /// Replace the frame with an ICMP error to its sender: time exceeded,
+    /// or destination unreachable code 4 (fragmentation needed) with the
+    /// next hop's MTU.
+    #[allow(clippy::too_many_arguments)]
+    fn icmp_error(
         &mut self,
         ingress: IfIndex,
         my_ip: Ipv4Addr,
         buf: &mut [u8],
         len: usize,
         v: &Ipv4View,
+        kind: u8,
+        code: u8,
+        next_hop_mtu: u16,
     ) -> Verdict {
         let orig_src = v.src(&buf[..len]);
         let quote_len = (v.ihl + 8).min(v.total_len);
@@ -577,9 +627,10 @@ impl Forwarder {
         let c = wire::checksum(&ip[..20]);
         wire::put16(ip, 10, c);
         let icmp = &mut ip[20..];
-        icmp[0] = wire::ICMP_TIME_EXCEEDED;
-        icmp[1] = 0;
-        icmp[2..8].fill(0);
+        icmp[0] = kind;
+        icmp[1] = code;
+        icmp[2..6].fill(0);
+        wire::put16(icmp, 6, next_hop_mtu);
         icmp[8..8 + quote_len].copy_from_slice(&quote[..quote_len]);
         let c = wire::checksum(icmp);
         wire::put16(icmp, 2, c);
@@ -1180,5 +1231,135 @@ mod tests {
         let mut fw = router();
         assert_eq!(fw.ct.shard(), (1, 0));
         syn_out(&mut fw);
+    }
+
+    /// A TCP segment with options (padded to 4 bytes).
+    fn tcp_with_options(src: Ipv4Addr, dst: Ipv4Addr, flags: u8, opts: &[u8]) -> Vec<u8> {
+        let mut o = opts.to_vec();
+        while !o.len().is_multiple_of(4) {
+            o.push(0);
+        }
+        let mut s = vec![0u8; 20];
+        wire::put16(&mut s, 0, 40001);
+        wire::put16(&mut s, 2, 80);
+        s[12] = (((20 + o.len()) / 4) << 4) as u8;
+        s[13] = flags;
+        wire::put16(&mut s, 14, 65535);
+        s.extend_from_slice(&o);
+        let c = wire::l4_checksum(src, dst, PROTO_TCP, &s);
+        wire::put16(&mut s, 16, c);
+        s
+    }
+
+    fn mss_of(f: &[u8], at: usize) -> u16 {
+        wire::get16(f, view(f).l4 + at)
+    }
+
+    #[test]
+    fn mss_clamped_to_the_pppoe_mtu() {
+        let mut fw = router();
+        fw.set_mtu(WAN, 1492);
+        // MSS 1460 at an even offset, then (after a NOP) at an odd one.
+        for (opts, at) in [
+            (&[2u8, 4, 0x05, 0xb4][..], 22),
+            (&[1u8, 2, 4, 0x05, 0xb4][..], 23),
+        ] {
+            let seg = tcp_with_options(HOST, SERVER, TCP_SYN, opts);
+            let mut f = to(LAN_MAC, ipv4_frame(HOST, SERVER, PROTO_TCP, 64, &seg));
+            let Verdict::Forward { len, .. } = run(&mut fw, 0, LAN, &mut f) else {
+                panic!()
+            };
+            let f = &f[..len];
+            assert_eq!(mss_of(f, at), 1452);
+            assert!(checksums_ok(f), "checksum after clamping at offset {at}");
+            fw.ct = crate::conntrack::Conntrack::new(100, 42);
+        }
+        // Already small enough: untouched.
+        let seg = tcp_with_options(HOST, SERVER, TCP_SYN, &[2, 4, 0x05, 0x00]);
+        let mut f = to(LAN_MAC, ipv4_frame(HOST, SERVER, PROTO_TCP, 64, &seg));
+        let Verdict::Forward { len, .. } = run(&mut fw, 0, LAN, &mut f) else {
+            panic!()
+        };
+        assert_eq!(mss_of(&f[..len], 22), 1280);
+    }
+
+    #[test]
+    fn mss_clamped_on_the_syn_ack_too() {
+        let mut fw = router();
+        fw.set_mtu(WAN, 1492);
+        let port = syn_out(&mut fw);
+        let mut seg = tcp_with_options(SERVER, ROUTER_WAN, TCP_SYN | TCP_ACK, &[2, 4, 0x05, 0xb4]);
+        wire::put16(&mut seg, 0, 80);
+        wire::put16(&mut seg, 2, port);
+        wire::put16(&mut seg, 16, 0);
+        let c = wire::l4_checksum(SERVER, ROUTER_WAN, PROTO_TCP, &seg);
+        wire::put16(&mut seg, 16, c);
+        let mut f = to(WAN_MAC, ipv4_frame(SERVER, ROUTER_WAN, PROTO_TCP, 50, &seg));
+        let Verdict::Forward { egress, len, .. } = run(&mut fw, 1, WAN, &mut f) else {
+            panic!()
+        };
+        assert_eq!(egress, LAN);
+        assert_eq!(mss_of(&f[..len], 22), 1452);
+        assert!(checksums_ok(&f[..len]));
+    }
+
+    #[test]
+    fn without_pppoe_a_standard_mss_is_left_alone() {
+        let mut fw = router();
+        let seg = tcp_with_options(HOST, SERVER, TCP_SYN, &[2, 4, 0x05, 0xb4]);
+        let mut f = to(LAN_MAC, ipv4_frame(HOST, SERVER, PROTO_TCP, 64, &seg));
+        let Verdict::Forward { len, .. } = run(&mut fw, 0, LAN, &mut f) else {
+            panic!()
+        };
+        assert_eq!(mss_of(&f[..len], 22), 1460);
+        assert!(checksums_ok(&f[..len]));
+    }
+
+    /// A LAN host's UDP datagram of `ip_len` bytes, DF set or not.
+    fn udp_out(ip_len: usize, df: bool) -> Vec<u8> {
+        let payload = vec![0x5a; ip_len - 28];
+        let seg = udp_datagram(HOST, SERVER, 5000, 53, &payload);
+        let mut f = ipv4_frame(HOST, SERVER, PROTO_UDP, 64, &seg);
+        if !df {
+            f[ETH_HDR + 6] = 0;
+            wire::put16(&mut f, ETH_HDR + 10, 0);
+            let c = wire::checksum(&f[ETH_HDR..ETH_HDR + 20]);
+            wire::put16(&mut f, ETH_HDR + 10, c);
+        }
+        to(LAN_MAC, f)
+    }
+
+    #[test]
+    fn too_big_for_the_wan_mtu() {
+        let mut fw = router();
+        fw.set_mtu(WAN, 1492);
+        // Fits exactly.
+        let mut f = udp_out(1492, true);
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward { egress: WAN, .. }));
+        // One byte more with DF: ICMP fragmentation needed, MTU 1492, back
+        // to the host from the router's LAN address.
+        let mut f = udp_out(1493, true);
+        let Verdict::Forward {
+            egress,
+            next_hop,
+            len,
+            ..
+        } = run(&mut fw, 1, LAN, &mut f)
+        else {
+            panic!("no ICMP error")
+        };
+        assert_eq!((egress, next_hop), (LAN, HOST));
+        let f = &f[..len];
+        let v = view(f);
+        assert_eq!((v.src(f), v.dst(f), v.proto), (ROUTER_LAN, HOST, PROTO_ICMP));
+        assert_eq!((f[v.l4], f[v.l4 + 1]), (wire::ICMP_DEST_UNREACH, 4));
+        assert_eq!(wire::get16(f, v.l4 + 6), 1492);
+        assert_eq!(wire::checksum(&f[v.l4..v.l4 + v.l4_len]), 0);
+        // The quoted header is the host's original one.
+        assert_eq!(wire::get_ip(f, v.l4 + 8 + 12), HOST);
+        // Without DF: dropped (no fragmentation).
+        let mut f = udp_out(1493, false);
+        assert_eq!(run(&mut fw, 2, LAN, &mut f), Verdict::Drop(DropReason::TooBig));
+        assert_eq!(fw.stats.drops[DropReason::TooBig.index()], 1);
     }
 }

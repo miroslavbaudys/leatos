@@ -33,11 +33,13 @@ linux_vm() { # initrd mac local_port remote_port log [extra kernel args]
 }
 
 # Start the ISP VM (203.0.113.1) on the router's WAN link and wait until ready.
-# With ISP_VLAN=N it serves on VLAN N (needs ALPINE_DIR from
+# With ISP_VLAN=N it serves on VLAN N, with ISP_PPPOE=pap|chap it is a
+# PPPoE access concentrator (both need ALPINE_DIR from
 # `fetch-alpine.sh modloop`).
 start_isp() { # wan_port log
-  if [[ -n "${ISP_VLAN:-}" ]]; then
-    VM_DISK="$ALPINE_DIR/modloop-virt" linux_vm "$ISP_INITRD" 52:54:00:00:01:01 $(($1 + 1)) "$1" "$2" "lab_vlan=$ISP_VLAN"
+  local args="${ISP_VLAN:+lab_vlan=$ISP_VLAN} ${ISP_PPPOE:+lab_pppoe=$ISP_PPPOE}"
+  if [[ -n "${ISP_VLAN:-}${ISP_PPPOE:-}" ]]; then
+    VM_DISK="$ALPINE_DIR/modloop-virt" linux_vm "$ISP_INITRD" 52:54:00:00:01:01 $(($1 + 1)) "$1" "$2" "$args"
   else
     linux_vm "$ISP_INITRD" 52:54:00:00:01:01 $(($1 + 1)) "$1" "$2"
   fi

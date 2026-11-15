@@ -29,6 +29,7 @@ fault-panic = ["smoke-test"]
 proto-dhcp.workspace = true
 proto-dns.workspace = true
 proto-sntp.workspace = true
+proto-pppoe.workspace = true
 fwd.workspace = true
 qdisc.workspace = true
 boot-image.workspace = true
@@ -41,7 +42,7 @@ spin = { version = "0.9", default-features = false, features = ["spin_mutex", "o
 virtio-drivers = { version = "0.13", default-features = false }
 safe-mmio = "0.3"
 smoltcp = { version = "0.14", default-features = false, features = [
-    "alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6",
+    "alloc", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6",
     "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "socket-dns",
     "auto-icmp-echo-reply", # the router answers pings on its own addresses
 ] }

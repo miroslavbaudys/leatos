@@ -99,6 +99,15 @@ fn optional_known(path: &str) -> bool {
             | "wan"
             | "wan.vlan"
             | "wan.vlan_pcp"
+            | "wan.mode"
+            | "wan.pppoe"
+            | "wan.pppoe.username"
+            | "wan.pppoe.password"
+            | "wan.pppoe.service"
+            | "wan.pppoe.ac_name"
+            | "wan.pppoe.mtu"
+            | "wan.pppoe.lcp_echo_interval"
+            | "wan.pppoe.lcp_echo_failure"
     )
 }
 

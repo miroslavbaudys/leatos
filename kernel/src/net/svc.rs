@@ -1,7 +1,8 @@
 //! The services task (`Priority::Service`): the router's own IP stack
 //! (smoltcp, one interface per port) and everything on top of it:
 //!
-//! - WAN: DHCPv4 client (smoltcp socket); after a lease, ICMP echo to the
+//! - WAN: DHCPv4 client (smoltcp socket), or the PPPoE client
+//!   (`net::pppoe`, `wan.mode = "pppoe"`); once up, ICMP echo to the
 //!   gateway (boot self-test).
 //! - LAN: DHCP server and DNS forwarder (`net::services`).
 //! - Management web interface (`net::mgmt`).
@@ -16,6 +17,7 @@ use crate::cli::{Cli, CliAction, Ctx};
 use crate::net::datapath;
 use crate::net::device::PortDevice;
 use crate::net::mgmt::{Mgmt, StoreOp};
+use crate::net::pppoe::Pppoe;
 use crate::net::services::LanServices;
 use crate::net::shared::{Shared, WanChange};
 use crate::net::stack::{self, WaitAny};
@@ -30,7 +32,8 @@ use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::{dhcpv4, icmp};
 use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address};
 
-/// Set once the WAN has a DHCP lease (read by the boot self-test).
+/// Set once the WAN has an address: a DHCP lease or a PPPoE link (read by
+/// the boot self-test).
 pub static DHCP_OK: AtomicBool = AtomicBool::new(false);
 /// Set once the gateway answered a ping.
 pub static PING_OK: AtomicBool = AtomicBool::new(false);
@@ -117,10 +120,26 @@ impl Pinger {
 }
 
 /// A WAN lease change: (address/prefix, gateway, DNS servers); `None` fields = lost.
-struct LeaseChange {
-    addr: Option<(Ipv4Address, u8)>,
-    gateway: Option<Ipv4Address>,
-    dns: Vec<Ipv4Address>,
+pub struct LeaseChange {
+    pub addr: Option<(Ipv4Address, u8)>,
+    pub gateway: Option<Ipv4Address>,
+    pub dns: Vec<Ipv4Address>,
+    /// Largest IP packet on the WAN.
+    pub mtu: u16,
+    /// How the address came (PPPoE session) for the status output; `None` = DHCP.
+    pub via: Option<String>,
+}
+
+impl LeaseChange {
+    pub fn lost() -> Self {
+        LeaseChange {
+            addr: None,
+            gateway: None,
+            dns: Vec::new(),
+            mtu: fwd::forwarder::DEFAULT_MTU,
+            via: None,
+        }
+    }
 }
 
 fn handle_dhcp(name: &str, host: &mut HostIf, pinger: &mut Pinger) -> Option<LeaseChange> {
@@ -177,6 +196,8 @@ fn handle_dhcp(name: &str, host: &mut HostIf, pinger: &mut Pinger) -> Option<Lea
                 addr: Some((cfg.address.address(), cfg.address.prefix_len())),
                 gateway: cfg.router,
                 dns: cfg.dns_servers.iter().copied().collect(),
+                mtu: fwd::forwarder::DEFAULT_MTU,
+                via: None,
             })
         }
         Some(dhcpv4::Event::Deconfigured) => {
@@ -187,11 +208,7 @@ fn handle_dhcp(name: &str, host: &mut HostIf, pinger: &mut Pinger) -> Option<Lea
             host.iface.routes_mut().remove_default_ipv4_route();
             DHCP_OK.store(false, Ordering::Release);
             pinger.target = None;
-            Some(LeaseChange {
-                addr: None,
-                gateway: None,
-                dns: Vec::new(),
-            })
+            Some(LeaseChange::lost())
         }
         None => None,
     }
@@ -208,12 +225,14 @@ fn lease_json(c: &LeaseChange) -> alloc::string::String {
         .map(|d| json_str(&alloc::format!("{d}")))
         .collect();
     alloc::format!(
-        "{{\"addr\":{},\"gateway\":{},\"dns\":[{}]}}",
+        "{{\"addr\":{},\"gateway\":{},\"dns\":[{}],\"mtu\":{},\"via\":{}}}",
         json_str(&alloc::format!("{addr}/{prefix}")),
         c.gateway
             .map(|g| json_str(&alloc::format!("{g}")))
             .unwrap_or_else(|| "null".into()),
-        dns.join(",")
+        dns.join(","),
+        c.mtu,
+        c.via.as_deref().map(json_str).unwrap_or_else(|| "null".into())
     )
 }
 
@@ -223,49 +242,130 @@ fn lease_text(c: &LeaseChange) -> String {
     };
     let dns: Vec<_> = c.dns.iter().map(|d| alloc::format!("{d}")).collect();
     alloc::format!(
-        "{addr}/{prefix}, gateway {}, dns {}",
+        "{addr}/{prefix}, gateway {}, dns {}{}",
         c.gateway.map(|g| alloc::format!("{g}")).unwrap_or_else(|| "-".into()),
-        if dns.is_empty() { String::from("-") } else { dns.join(", ") }
+        if dns.is_empty() { String::from("-") } else { dns.join(", ") },
+        c.via
+            .as_deref()
+            .map(|v| alloc::format!(", {v}, mtu {}", c.mtu))
+            .unwrap_or_default()
     )
 }
 
-/// A saved config becomes the running one (no trial): shaping, DHCP and
-/// DNS are reconfigured in place.
+fn dhcp_socket(host: &HostIf) -> Option<SocketHandle> {
+    host.sockets
+        .iter()
+        .find(|(_, s)| matches!(s, smoltcp::socket::Socket::Dhcpv4(_)))
+        .map(|(h, _)| h)
+}
+
+/// Restart the WAN on new link settings: end a PPPoE session, switch the
+/// port and its router-stack interface between DHCP (Ethernet) and PPPoE
+/// (IP only), and start the client for `new` (`None` = DHCP). Returns the
+/// lost address, except when DHCP stays: then the DHCP client's
+/// `Deconfigured` event reports it.
+fn restart_wan(
+    sh: &Shared,
+    wan: &mut HostIf,
+    pppoe: &mut Option<Pppoe>,
+    new: Option<proto_pppoe::Config>,
+) -> Option<LeaseChange> {
+    let port = &sh.ports[0];
+    if let Some(mut p) = pppoe.take()
+        && p.stop(port, wan)
+    {
+        sh.tx_kick[0].signal();
+    }
+    let want = new.is_some();
+    if !want && !port.is_pppoe() {
+        // The lease belongs to the old link: ask again on the new one.
+        if let Some(h) = dhcp_socket(wan) {
+            wan.sockets.get_mut::<dhcpv4::Socket>(h).reset();
+        }
+        return None;
+    }
+    if port.is_pppoe() != want {
+        port.pppoe_mode.store(want, Ordering::Relaxed);
+        let mtu = new.as_ref().map_or(fwd::forwarder::DEFAULT_MTU, |c| c.mtu);
+        port.mtu.store(u32::from(mtu), Ordering::Relaxed);
+        // Another medium: a new interface (the sockets stay).
+        wan.iface = stack::new_iface(port);
+        match (want, dhcp_socket(wan)) {
+            (true, Some(h)) => {
+                wan.sockets.remove(h);
+            }
+            (false, None) => {
+                wan.sockets.add(dhcpv4::Socket::new());
+            }
+            _ => {}
+        }
+    }
+    wan.iface.update_ip_addrs(|a| a.clear());
+    wan.iface.routes_mut().remove_default_ipv4_route();
+    DHCP_OK.store(false, Ordering::Release);
+    *pppoe = new.map(|c| Pppoe::new(c, port));
+    if pppoe.is_none() {
+        println!("  net {}       : DHCP", port.name);
+    }
+    Some(LeaseChange::lost())
+}
+
+/// A saved config becomes the running one (no trial): shaping, DHCP,
+/// PPPoE and DNS are reconfigured in place. Returns the WAN change when
+/// the WAN link was restarted.
 fn apply_saved(
     cfg: crate::config::schema::Config,
     source: String,
     sh: &Shared,
     wan: &mut HostIf,
+    pppoe: &mut Option<Pppoe>,
     services: Option<&mut LanServices>,
-) {
+) -> Option<LeaseChange> {
     let old = crate::config::qos();
     let old_tag = crate::config::wan_tci();
+    let old_pppoe = crate::config::pppoe();
     crate::config::apply(cfg, source);
     let tag = crate::config::wan_tci();
-    if tag != old_tag
-        && let Some(port) = sh.ports.first()
+    let new_pppoe = crate::config::pppoe();
+    let mut change = None;
+    if let Some(port) = sh.ports.first()
+        && (tag != old_tag || new_pppoe != old_pppoe)
     {
         port.set_vlan(tag);
         println!(
-            "  net {}       : now {}, restarting DHCP",
+            "  net {}       : now {}, restarting {}",
             port.name,
-            tag.map_or(String::from("untagged"), stack::vlan_text)
+            tag.map_or(String::from("untagged"), stack::vlan_text),
+            if new_pppoe.is_some() { "PPPoE" } else { "DHCP" }
         );
-        // The lease belongs to the old link: ask again on the new one
-        // (the `Deconfigured` event clears the WAN address meanwhile).
-        let dhcp = wan
-            .sockets
-            .iter()
-            .find(|(_, s)| matches!(s, smoltcp::socket::Socket::Dhcpv4(_)))
-            .map(|(h, _)| h);
-        if let Some(h) = dhcp {
-            wan.sockets.get_mut::<dhcpv4::Socket>(h).reset();
-        }
+        change = restart_wan(sh, wan, pppoe, new_pppoe);
     }
-    // Also picks up the WAN tag's 4 bytes of shaper overhead.
+    // Also picks up the WAN tag's 4 bytes and PPPoE's 8 of shaper overhead.
     stack::apply_qos(sh, &old, &crate::config::qos());
     if let Some(svc) = services {
         svc.reconfigure();
+    }
+    change
+}
+
+/// Tell everyone who depends on the WAN address about a change.
+fn publish_wan(
+    change: &LeaseChange,
+    sh: &Shared,
+    mgmt: &mut Mgmt,
+    cli: &mut Cli,
+    services: Option<&mut LanServices>,
+) {
+    sh.post_wan(WanChange {
+        addr: change.addr,
+        gateway: change.gateway,
+        mtu: change.mtu,
+    });
+    mgmt.set_wan_lease(lease_json(change));
+    cli.set_wan(lease_text(change));
+    if let Some(svc) = services {
+        svc.set_upstreams(&change.dns);
+        svc.set_wan_up(change.addr.is_some());
     }
 }
 
@@ -358,22 +458,37 @@ pub async fn run(
     });
     let mut mgmt = Mgmt::new(&mut hosts, store.is_some());
     let mut cli = Cli::new(store.is_some());
+    let mut pppoe = crate::config::pppoe().map(|c| Pppoe::new(c, &sh.ports[0]));
     let events = [sh.svc_kick];
 
     loop {
         sh.svc_kick.take();
         poll_stacks(&mut hosts, sh);
-        if let Some(change) = handle_dhcp(sh.ports[0].name, &mut hosts[0], &mut pinger) {
-            sh.post_wan(WanChange {
-                addr: change.addr,
-                gateway: change.gateway,
-            });
-            mgmt.set_wan_lease(lease_json(&change));
-            cli.set_wan(lease_text(&change));
-            if let Some(svc) = services.as_mut() {
-                svc.set_upstreams(&change.dns);
-                svc.set_wan_up(change.addr.is_some());
+        let change = match pppoe.as_mut() {
+            Some(p) => {
+                let (change, queued) = p.step(&sh.ports[0], &mut hosts[0]);
+                if queued {
+                    sh.tx_kick[0].signal();
+                }
+                if let Some(c) = &change {
+                    DHCP_OK.store(c.addr.is_some(), Ordering::Release);
+                    pinger.target = c.gateway;
+                }
+                if p.status_changed() || change.is_some() {
+                    mgmt.set_wan_pppoe(Some(p.status_json()));
+                    if change.is_none() && !DHCP_OK.load(Ordering::Acquire) {
+                        cli.set_wan(p.status_text());
+                    }
+                }
+                change
             }
+            None => {
+                mgmt.set_wan_pppoe(None);
+                handle_dhcp(sh.ports[0].name, &mut hosts[0], &mut pinger)
+            }
+        };
+        if let Some(change) = change {
+            publish_wan(&change, sh, &mut mgmt, &mut cli, services.as_mut());
         }
         pinger.step(&mut hosts[0].sockets);
         if let Some(svc) = services.as_mut() {
@@ -388,7 +503,11 @@ pub async fn run(
             let r = store_op(st, &op).await;
             if let (Ok((_, Some(source))), StoreOp::Save { flags: 0, cfg, .. }) = (&r, &op) {
                 // Saved without a trial: run it now, no reboot.
-                apply_saved((**cfg).clone(), source.clone(), sh, &mut hosts[0], services.as_mut());
+                let (wan, svc) = (&mut hosts[0], services.as_mut());
+                let cfg = (**cfg).clone();
+                if let Some(c) = apply_saved(cfg, source.clone(), sh, wan, &mut pppoe, svc) {
+                    publish_wan(&c, sh, &mut mgmt, &mut cli, services.as_mut());
+                }
             }
             mgmt.op_done(conn, &op, r.map(|(detail, _)| detail));
         }
@@ -421,7 +540,10 @@ pub async fn run(
                             if reboot {
                                 action = Some(crate::net::mgmt::Action::Reboot);
                             } else if let Some(source) = source {
-                                apply_saved(*cfg, source, sh, &mut hosts[0], services.as_mut());
+                                let (wan, svc) = (&mut hosts[0], services.as_mut());
+                                if let Some(c) = apply_saved(*cfg, source, sh, wan, &mut pppoe, svc) {
+                                    publish_wan(&c, sh, &mut mgmt, &mut cli, services.as_mut());
+                                }
                             }
                             cli.save_done(Ok(detail), reboot);
                         }
@@ -462,6 +584,9 @@ pub async fn run(
             );
         }
         if let Some(at) = pinger.deadline() {
+            delay = delay.min(at.saturating_duration_since(timer::Instant::now()));
+        }
+        if let Some(at) = pppoe.as_ref().and_then(Pppoe::wake_at) {
             delay = delay.min(at.saturating_duration_since(timer::Instant::now()));
         }
         delay = delay.min(cli.wake_at().saturating_duration_since(timer::Instant::now()));

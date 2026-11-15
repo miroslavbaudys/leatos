@@ -6,6 +6,11 @@
 //!   the same queue as forwarded traffic, so CAKE sees all egress traffic.
 //!   smoltcp only gets a TX token while the qdisc has room.
 //!
+//! On a PPPoE port the device is IP-only (`Medium::Ip`: no ARP, the
+//! session is point to point): RX hands smoltcp the IP packet of the
+//! decapsulated Ethernet frame, TX puts an Ethernet header in front, which
+//! the datapath turns into the session's headers (`datapath::flush_port`).
+//!
 //! The device is used by the services task (`net::svc`); queue and qdisc
 //! are the port's shared, locked ones (`net::shared::PortShared`). Each
 //! frame takes the lock briefly; `queued` counts frames put into the qdisc
@@ -144,11 +149,12 @@ pub struct PortDevice<'a> {
     pub queued: &'a mut u32,
 }
 
-pub struct RxToken(PacketBuf);
+/// A received frame; `skip` = 14 on an IP-only port (the Ethernet header).
+pub struct RxToken(PacketBuf, usize);
 
 impl phy::RxToken for RxToken {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
-        f(self.0.data())
+        f(self.0.data().get(self.1..).unwrap_or(&[]))
     }
 }
 
@@ -161,6 +167,24 @@ pub struct TxToken<'a> {
 impl phy::TxToken for TxToken<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         match PacketBuf::alloc() {
+            Some(mut pkt) if self.port.is_pppoe() => {
+                // IP only: an Ethernet header for the datapath to replace.
+                let eth = fwd::wire::ETH_HDR;
+                pkt.set_len(eth + len);
+                let d = pkt.data_mut();
+                d[..12].fill(0);
+                fwd::wire::put16(d, 12, fwd::wire::ETHERTYPE_IPV4);
+                let r = f(&mut d[eth..]);
+                let len = eth + len;
+                pkt.meta.wire_len = len as u32;
+                pkt.meta.enqueue_ts = self.now_ns;
+                if self.port.qdisc.lock().enqueue(pkt, self.now_ns).is_err() {
+                    TX_DROPS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    *self.queued += 1;
+                }
+                r
+            }
             Some(mut pkt) => {
                 pkt.set_len(len);
                 let r = f(pkt.data_mut());
@@ -195,8 +219,13 @@ impl Device for PortDevice<'_> {
 
     fn receive(&mut self, _ts: Instant) -> Option<(RxToken, TxToken<'_>)> {
         let pkt = self.port.local_rx.lock().pop_front()?;
+        let skip = if self.port.is_pppoe() {
+            fwd::wire::ETH_HDR
+        } else {
+            0
+        };
         Some((
-            RxToken(pkt),
+            RxToken(pkt, skip),
             TxToken {
                 port: self.port,
                 now_ns: self.now_ns,
@@ -217,8 +246,13 @@ impl Device for PortDevice<'_> {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = 1514;
+        if self.port.is_pppoe() {
+            caps.medium = Medium::Ip;
+            caps.max_transmission_unit = self.port.mtu() as usize;
+        } else {
+            caps.medium = Medium::Ethernet;
+            caps.max_transmission_unit = 1514;
+        }
         caps.max_burst_size = Some(1);
         caps
     }

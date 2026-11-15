@@ -158,5 +158,24 @@ if [ -n "$want" ] && [ "$want" != 0 ]; then
   if [ -n "$avg" ] && [ "$avg" -lt 3 ]; then pass "latency under shaped load: avg ${avg} ms ($($bb grep -o 'min/avg/max = [^ ]*' /tmp/ping-load))"; else fail "latency under shaped load: avg '${avg}' ms"; $bb tail -2 /tmp/ping-load | $bb sed 's/^/    | /'; fi
 fi
 
+# --- PPPoE (M5): the session ends on the ISP side, the router reconnects --------------
+kick=$($bb sed -n 's/.*lab_pppoe_kick=\([a-z]*\).*/\1/p' /proc/cmdline)
+if [ -n "$kick" ]; then
+  before=$($bb wget -q -T 5 -O - "http://$ISP/cgi-bin/pppoe?sessions" 2>&1)
+  r=$($bb wget -q -T 5 -O - "http://$ISP/cgi-bin/pppoe?$kick" 2>&1)
+  $bb sleep 3   # killed after 1 s; the router waits 1 s before discovery
+  back=""
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
+    if $bb ping -c 1 -W 1 "$ISP" >/dev/null 2>&1; then back=$i; break; fi
+  done
+  after=$($bb wget -q -T 5 -O - "http://$ISP/cgi-bin/pppoe?sessions" 2>&1)
+  if [ -n "$back" ] && [ "${before#sessions=}" -ge 1 ] 2>/dev/null \
+     && [ "${after#sessions=}" -gt "${before#sessions=}" ] 2>/dev/null; then
+    pass "pppoe: reconnected after the ISP ended the session ($r; $before -> $after, ISP reachable after ~$((3 + back)) s)"
+  else
+    fail "pppoe: no reconnect after the ISP ended the session ($r; $before -> ${after:-?}, ping ${back:-never})"
+  fi
+fi
+
 echo "LAB DONE fails=$fails"
 $bb poweroff -f

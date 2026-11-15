@@ -1,0 +1,17 @@
+#!/usr/bin/busybox sh
+# PPPoE lab helpers (scripts/lab-test.sh LAB_PPPOE=…):
+#   ?sessions  sessions pppd brought up so far (from its log)
+#   ?kick      end the session from the ISP side a second from now (pppd
+#              sends LCP Terminate-Request, the plugin a PADT): the router
+#              must reconnect
+#   ?stop      the same, and stop pppoe-server first (negative control:
+#              no reconnect possible)
+bb=/usr/bin/busybox
+echo "Content-Type: text/plain"
+echo
+case "$QUERY_STRING" in
+  sessions) echo "sessions=$($bb grep -c 'local  IP address' /tmp/pppd.log 2>/dev/null)" ;;
+  kick) ( $bb sleep 1; $bb killall pppd ) >/dev/null 2>&1 </dev/null & echo "kick=OK" ;;
+  stop) ( $bb sleep 1; $bb killall pppoe-server; $bb killall pppd ) >/dev/null 2>&1 </dev/null & echo "stop=OK" ;;
+  *) echo "unknown" ;;
+esac

@@ -1,0 +1,5 @@
+#!/usr/bin/busybox sh
+# pppd for pppoe-server -q: its command line and errors go to the log the
+# ISP's /init shows on the console.
+echo "pppd $*" >>/tmp/pppd.log
+exec /usr/sbin/pppd "$@" 2>>/tmp/pppd.log

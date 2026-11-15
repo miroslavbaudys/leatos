@@ -1,6 +1,6 @@
 //! Cross-field checks of a parsed [`Config`].
 
-use crate::{Config, VERSION};
+use crate::{Config, VERSION, WanMode};
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -16,6 +16,8 @@ const MAX_RATE_KBIT: u64 = 10_000_000;
 const MAX_OVERHEAD: u32 = 256;
 /// Highest usable 802.1Q VLAN ID (4095 is reserved, 0 means untagged).
 pub const MAX_VLAN_ID: u16 = 4094;
+/// Longest PPPoE user name, password, service or AC name.
+pub const MAX_PPPOE_STRING: usize = 255;
 /// Most SNTP servers accepted.
 pub const MAX_NTP_SERVERS: usize = 4;
 
@@ -60,6 +62,7 @@ pub(crate) fn check(c: &Config) -> Result<(), Vec<Issue>> {
     if c.wan.vlan_pcp > 7 {
         x.add("wan.vlan_pcp", "must be 0–7");
     }
+    pppoe(c, &mut x);
     lan(c, &mut x);
     if !(16..=65536).contains(&c.dns.cache_entries) {
         x.add("dns.cache_entries", "must be 16–65536");
@@ -100,6 +103,37 @@ pub(crate) fn check(c: &Config) -> Result<(), Vec<Issue>> {
         }
     }
     if x.0.is_empty() { Ok(()) } else { Err(x.0) }
+}
+
+fn pppoe(c: &Config, x: &mut Issues) {
+    let p = &c.wan.pppoe;
+    if c.wan.mode == WanMode::Pppoe && p.username.is_empty() {
+        x.add("wan.pppoe.username", "required for wan.mode = \"pppoe\"");
+    }
+    let fields = [
+        ("wan.pppoe.username", p.username.as_str()),
+        ("wan.pppoe.password", p.password.as_deref().unwrap_or("")),
+        ("wan.pppoe.service", p.service.as_str()),
+        ("wan.pppoe.ac_name", p.ac_name.as_str()),
+    ];
+    for (path, v) in fields {
+        // PAP carries them with one length byte.
+        if v.len() > MAX_PPPOE_STRING {
+            x.add(path, format!("at most {MAX_PPPOE_STRING} bytes"));
+        }
+        if v.chars().any(char::is_control) {
+            x.add(path, "must not contain control characters");
+        }
+    }
+    if !(1280..=1492).contains(&p.mtu) {
+        x.add("wan.pppoe.mtu", "must be 1280–1492");
+    }
+    if p.lcp_echo_interval > 3600 {
+        x.add("wan.pppoe.lcp_echo_interval", "must be 0–3600 seconds (0 = off)");
+    }
+    if !(1..=100).contains(&p.lcp_echo_failure) {
+        x.add("wan.pppoe.lcp_echo_failure", "must be 1–100");
+    }
 }
 
 fn lan(c: &Config, x: &mut Issues) {

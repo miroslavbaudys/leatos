@@ -126,6 +126,16 @@ version = 1
 [wan]                    # optional; written only when set
 vlan = 848               # 802.1Q VLAN ID 1–4094; unset = untagged
 vlan_pcp = 0             # priority in the tag, 0–7
+mode = "pppoe"           # "dhcp" (default, not written) | "pppoe"
+
+[wan.pppoe]              # written only when not all defaults
+username = "user@isp.cz"
+password = "secret"      # a secret: never shown by the API or CLI
+service = ""             # Service-Name; empty = any
+ac_name = ""             # only this access concentrator; empty = first
+mtu = 1492               # 1280–1492
+lcp_echo_interval = 10   # seconds, 0 = no keepalive
+lcp_echo_failure = 5     # unanswered echoes before reconnecting
 
 [lan]
 ipv4 = "10.10.0.1/24"
@@ -162,7 +172,10 @@ has a default, so a file may set only what it changes. `[wan]` was added
 within version 1: it is left out of the canonical form while it holds only
 defaults, so a config that doesn't use it stays readable by older kernels
 (which reject unknown sections), e.g. after a persistent upgrade rolls
-back. Later versions add the rest of `[wan]` (mode, PPPoE), `[firewall]`
+back. The same holds inside `[wan]`: `mode` is written only when it is
+not `dhcp` and `[wan.pppoe]` only when it differs from the defaults, so a
+config with just a VLAN stays readable by the kernel that introduced
+`[wan]`. Later versions add `[firewall]`
 (rules, `[[firewall.forward]]`), LAN VLANs and the management password
 hash, as the kernel implements them:
 
@@ -218,7 +231,11 @@ rollbacks.
 - Secrets that must be usable in clear (PPPoE password) are stored as
   is, like on other SOHO routers.
 - `GET /api/config` and the TOML export omit secret fields; an upload
-  without a secret field keeps the current value.
+  without a secret field keeps the current value
+  (`Config::without_secrets`, `Config::keep_secrets`); an empty string
+  clears it. The CLI's `config show` omits them too, and `config diff`
+  prints `wan.pppoe.password = (secret)`. Boot arguments with secrets
+  (`mgmt_pass=`, `pppoe_pass=`) are masked in logs and `/api/status`.
 
 ### Comments
 The web interface writes the document from the parsed structs, so

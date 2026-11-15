@@ -82,7 +82,7 @@
     <details><summary>Last 10 seconds as a table</summary><table id="cputab"></table></details>
   </section>
   <section class="wide"><h2>Interfaces</h2><table id="ifs"></table></section>
-  <section><h2>WAN lease</h2><table id="wan"></table></section>
+  <section><h2>WAN</h2><table id="wan"></table></section>
   <section><h2>System</h2><table id="sys"></table></section>
   <section class="wide"><h2>DHCP leases</h2><table id="leases"></table></section>
   <section class="wide"><h2>Configuration</h2>
@@ -91,7 +91,16 @@
       <fieldset><legend>WAN</legend>
         <label>VLAN ID (empty = untagged)<input data-path="wan.vlan" data-opt type="number" min="1" max="4094" placeholder="e.g. 848"></label>
         <label>VLAN priority (PCP 0–7)<input data-path="wan.vlan_pcp" data-opt type="number" min="0" max="7" placeholder="0"></label>
-        <p class="hint">Only if the ISP requires a tagged link. A change restarts the WAN DHCP client.</p>
+        <p class="hint">Only if the ISP requires a tagged link.</p>
+        <label>Connection<select data-path="wan.mode"><option value="dhcp">DHCP</option><option value="pppoe">PPPoE</option></select></label>
+        <label>PPPoE user name<input data-path="wan.pppoe.username" placeholder="user@isp" autocomplete="off"></label>
+        <label>PPPoE password<input data-path="wan.pppoe.password" data-secret type="password" placeholder="empty = keep the stored one" autocomplete="new-password"></label>
+        <label>Service name (empty = any)<input data-path="wan.pppoe.service"></label>
+        <label>Access concentrator (empty = first to answer)<input data-path="wan.pppoe.ac_name"></label>
+        <label>PPPoE MTU<input data-path="wan.pppoe.mtu" data-opt type="number" min="1280" max="1492" placeholder="1492"></label>
+        <label>LCP echo interval, s (0 = off)<input data-path="wan.pppoe.lcp_echo_interval" data-opt type="number" min="0" max="3600" placeholder="10"></label>
+        <label>LCP echo failures before reconnecting<input data-path="wan.pppoe.lcp_echo_failure" data-opt type="number" min="1" max="100" placeholder="5"></label>
+        <p class="hint">A change restarts the WAN (DHCP client or PPPoE session). The password is never shown.</p>
       </fieldset>
       <fieldset><legend>LAN</legend>
         <label>Router address / prefix<input data-path="lan.ipv4" placeholder="192.168.1.1/24"></label>
@@ -254,10 +263,13 @@ async function refresh() {
       `<td>${i.addrs.map(esc).join("<br>") || "–"}</td><td>${n(i.rx_packets)}</td><td>${n(i.tx_packets)}</td>` +
       `<td>${i.qdisc.shaped_kbit === null ? "unshaped" : n(i.qdisc.shaped_kbit) + " kbit/s"}</td>` +
       `<td>${n(i.qdisc.sent)} / ${n(i.qdisc.dropped)} / ${n(i.qdisc.ecn_marked)} / ${n(i.qdisc.backlog_packets)}</td></tr>`).join("");
-  const l = st.wan_lease;
-  $("wan").innerHTML = l ? rows([["Address", esc(l.addr)], ["Gateway", esc(l.gateway ?? "–")], ["DNS", l.dns.map(esc).join(", ") || "–"]]) : rows([["Lease", "none"]]);
+  const l = st.wan_lease, p = st.pppoe;
+  const ppp = p ? [["PPPoE", esc(p.state) + (p.sessions ? ` · ${n(p.sessions)} session(s)` : "") + (p.last_error ? ` · last: ${esc(p.last_error)}` : "")]] : [];
+  $("wan").innerHTML = l ? rows([["Address", esc(l.addr)], ["Gateway", esc(l.gateway ?? "–")], ["DNS", l.dns.map(esc).join(", ") || "–"],
+      ...(l.via ? [["Link", `${esc(l.via)}, MTU ${l.mtu}`]] : []), ...ppp])
+    : rows([["Lease", "none"], ...ppp]);
   $("sys").innerHTML = rows([
-    ["Forwarded", n(st.forwarded)], ["Dropped", n(st.dropped) + (st.vlan_drops ? ` (+ ${n(st.vlan_drops)} wrong VLAN tag)` : "")], ["Connections", n(st.conntrack)],
+    ["Forwarded", n(st.forwarded)], ["Dropped", n(st.dropped) + (st.vlan_drops ? ` (+ ${n(st.vlan_drops)} wrong VLAN tag)` : "") + (st.pppoe_drops ? ` (+ ${n(st.pppoe_drops)} PPPoE)` : "")], ["Connections", n(st.conntrack)],
     ["Packet pool", `${n(st.pool.free)} free of ${n(st.pool.capacity)}` + (st.pool.alloc_failures ? `, ${n(st.pool.alloc_failures)} failures` : "")],
     ["Heap", `${n(Math.round(st.heap.used / 1024))} KiB used, ${n(Math.round(st.heap.free / 1048576))} MiB free`],
     ["Time (UTC)", st.time?.utc ? `${esc(st.time.utc.replace("T", " ").replace("Z", ""))} · NTP ${esc(st.time.server ?? "?")}, stratum ${st.time.stratum}, delay ${st.time.delay_ms} ms, polling every ${dur(st.time.poll_s)}`
@@ -343,7 +355,9 @@ function renumber() {
 function fillForm(c) {
   for (const e of fields()) {
     const v = getp(c, e.dataset.path);
-    if (e.type === "checkbox") e.checked = !!v; else e.value = v ?? "";
+    if (e.type === "checkbox") e.checked = !!v;
+    else if (e.tagName === "SELECT") e.value = v ?? e.options[0].value; // left out = the default (first)
+    else e.value = v ?? "";
   }
   const r = c.lan?.dhcp?.range;
   $("rlo").value = r ? r[0] : ""; $("rhi").value = r ? r[1] : "";
@@ -359,6 +373,7 @@ function readForm() {
     let v;
     if (e.type === "checkbox") v = e.checked;
     else if (e.type === "number") v = e.value.trim() === "" ? (e.hasAttribute("data-opt") ? undefined : NaN) : Number(e.value);
+    else if (e.hasAttribute("data-secret")) v = e.value === "" ? undefined : e.value; // left out: the router keeps it
     else v = e.value.trim();
     setp(c, e.dataset.path, v);
   }

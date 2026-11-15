@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build a lab VM initramfs: Alpine's initramfs-virt (kernel modules,
-# busybox) plus an overlay archive with lab/<role>/ and busybox-extras.
+# busybox) plus an overlay archive with lab/<role>/ and busybox-extras
+# (the ISP also gets pppoe-server, pppd and their libraries).
 # Linux unpacks concatenated cpio archives in order, so the overlay's
 # /init replaces Alpine's.   Usage: build-initrd.sh client|isp  (prints path)
 set -euo pipefail
@@ -13,6 +14,12 @@ OUT="lab/cache/$ROLE-initrd.img"
 STAGE=$(mktemp -d -t rrouter-initrd)
 trap 'rm -rf "$STAGE"' EXIT
 
+# Packages first, so lab/<role>/ (e.g. /etc/ppp) overrides their files.
+if [[ "$ROLE" == isp ]]; then
+  for apk in rp-pppoe ppp-daemon libpcap libssl3 libcrypto3; do
+    tar -xzf "$ALPINE_DIR/$apk"-[0-9]*.apk -C "$STAGE" --exclude '.*' 2>/dev/null
+  done
+fi
 cp -R "lab/$ROLE/." "$STAGE/"
 mkdir -p "$STAGE/usr/bin"
 tar -xzf "$ALPINE_DIR"/busybox-extras-*.apk -C "$STAGE/usr" bin/busybox-extras 2>/dev/null

@@ -1,0 +1,14 @@
+# pppd options for the lab ISP's PPPoE sessions (pppoe-server -O). The
+# ISP's /init adds require-pap or require-chap (lab_pppoe=pap|chap).
+lcp-echo-interval 10
+lcp-echo-failure 3
+ms-dns 203.0.113.1
+mtu 1492
+mru 1492
+noccp
+novj
+nodefaultroute
+# Offer IPv6CP too: rrouter answers with an LCP Protocol-Reject.
++ipv6
+debug
+logfile /tmp/pppd.log
