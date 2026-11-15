@@ -17,5 +17,6 @@ tcp() { # host port -> OPEN | REFUSED | SILENT (busybox wget's messages)
 echo "control=$(tcp 127.0.0.1 22)"
 echo "tcp22=$(tcp "$addr" 22)"
 echo "tcp80=$(tcp "$addr" 80)"
+echo "tcp61000=$(tcp "$addr" 61000)"   # the router's UDP client range: not open for TCP
 if $bb ping -c 1 -W 2 "$addr" >/dev/null 2>&1; then echo "ping=REPLY"; else echo "ping=SILENT"; fi
 echo "addr=$addr"

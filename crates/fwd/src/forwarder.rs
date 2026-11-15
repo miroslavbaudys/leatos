@@ -666,13 +666,15 @@ impl Forwarder {
     /// Replies to the router's own clients (ports from
     /// [`ROUTER_CLIENT_PORTS`], the DHCP client's 68, ICMP other than echo
     /// requests) always pass: rules and zone input are about what reaches
-    /// the router's services.
+    /// the router's services. The router's clients are all UDP (DNS
+    /// upstream, SNTP, DHCP), so TCP gets no such pass: a TCP client would
+    /// need it here first.
     fn input(&mut self, ingress: IfIndex, f: &[u8], v: &Ipv4View) -> Verdict {
         let zone = self.ifs[ingress as usize].zone;
         let dport = (v.l4_len >= 4 && !v.is_fragment).then(|| wire::get16(f, v.l4 + 2));
         let icmp_type = (v.proto == PROTO_ICMP && v.l4_len >= 1 && !v.is_fragment).then(|| f[v.l4]);
         let reply = match v.proto {
-            PROTO_TCP | PROTO_UDP => dport.is_some_and(|d| d >= ROUTER_CLIENT_PORTS || (v.proto == PROTO_UDP && d == 68)),
+            PROTO_UDP => dport.is_some_and(|d| d >= ROUTER_CLIENT_PORTS || d == 68),
             PROTO_ICMP => icmp_type.is_some_and(|t| t != wire::ICMP_ECHO_REQUEST),
             _ => false,
         };
@@ -1859,6 +1861,34 @@ mod tests {
         // The LAN zone accepts everything.
         let mut f = tcp_frame(LAN_MAC, HOST, ROUTER_LAN, 5000, 80, TCP_SYN);
         assert_eq!(run(&mut fw, 0, LAN, &mut f), Verdict::Local);
+    }
+
+    #[test]
+    fn wan_input_drops_all_but_replies_to_router_clients() {
+        let mut fw = router();
+        zoned(&mut fw);
+        let mut p = fw.policy.clone().unwrap();
+        p.input[0] = Some(0); // the kernel's WAN zone: nothing for the router
+        fw.set_policy(Some(p));
+        let udp = |dport| {
+            let d = udp_datagram(SERVER, ROUTER_WAN, 53, dport, b"a");
+            to(WAN_MAC, ipv4_frame(SERVER, ROUTER_WAN, PROTO_UDP, 64, &d))
+        };
+        assert_eq!(run(&mut fw, 0, WAN, &mut udp(65_100)), Verdict::Local, "DNS upstream reply");
+        assert_eq!(run(&mut fw, 0, WAN, &mut udp(60_000)), Verdict::Local, "SNTP reply");
+        assert_eq!(run(&mut fw, 0, WAN, &mut udp(68)), Verdict::Local, "DHCP client");
+        assert_eq!(run(&mut fw, 0, WAN, &mut udp(53)), Verdict::Drop(DropReason::Input), "no DNS service");
+        // TCP: no router clients, so the client range is not a way in.
+        for dport in [22, 80, 60_000, 65_535] {
+            let mut f = tcp_frame(WAN_MAC, SERVER, ROUTER_WAN, 40_000, dport, TCP_SYN);
+            assert_eq!(run(&mut fw, 0, WAN, &mut f), Verdict::Drop(DropReason::Input), "tcp {dport}");
+        }
+        let echo = icmp_echo(ICMP_ECHO_REQUEST, 7, 1);
+        let mut f = to(WAN_MAC, ipv4_frame(SERVER, ROUTER_WAN, PROTO_ICMP, 64, &echo));
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), Verdict::Drop(DropReason::Input), "ping");
+        let reply = icmp_echo(0, 7, 1);
+        let mut f = to(WAN_MAC, ipv4_frame(SERVER, ROUTER_WAN, PROTO_ICMP, 64, &reply));
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), Verdict::Local, "echo reply");
     }
 
     #[test]

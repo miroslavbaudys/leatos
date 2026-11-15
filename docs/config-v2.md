@@ -120,7 +120,7 @@ router's own clients (DHCP, DNS upstream, SNTP, ICMP errors) pass before
 the policy. Its policy can be changed only through rules (`from = "wan"`,
 `to = "router"`) and forwards. `[mgmt] on_wan` stays the only way to open
 management on the WAN, and it remains for development only. Lab check:
-"wan input" in `scripts/lab-test.sh` (the ISP probes TCP 22/80 and ping;
+"wan input" in `scripts/lab-test.sh` (the ISP probes TCP 22, 80, 61000 and ping;
 negative controls `LAB_ROUTER_ARGS=mgmt=wan`, `LAB_WAN_OPEN=1`).
 
 ### `[[network]]`
