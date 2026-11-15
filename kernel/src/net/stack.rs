@@ -19,7 +19,7 @@ use crate::irq::{self, IrqEvent, Trigger};
 use crate::net::datapath::{self, Datapath};
 use crate::net::device::{Aqm, PortDevice, PortQdisc};
 use crate::net::mgmt::Action;
-use crate::net::shared::{self, CTRL_RX_MAX, LOCAL_RX_MAX, PortShared, PortSnap, Shared};
+use crate::net::shared::{self, CTRL_RX_MAX, LinkShared, PortShared, PortSnap, Shared};
 use crate::net::svc::HostIf;
 use crate::pci::Pci;
 use crate::{arch, println, timer};
@@ -42,9 +42,8 @@ use spin::Mutex;
 const QDISC_PACKETS: usize = 384;
 const QDISC_BYTES: usize = 384 * 1514;
 
-pub fn lan_cidr() -> Ipv4Cidr {
-    let lan = crate::config::lan();
-    Ipv4Cidr::new(lan.addr, lan.prefix)
+fn cidr(n: &crate::config::Lan) -> Ipv4Cidr {
+    Ipv4Cidr::new(n.addr, n.prefix)
 }
 
 /// Per-port variation for the AQM's random seed.
@@ -113,8 +112,9 @@ pub fn layout(ports: usize, cores: usize) -> Layout {
 
 /// Bring up the first two supported NICs: first = WAN, second = LAN.
 /// WAN egress is shaped at the upload rate, LAN egress at the download rate.
-/// Returns the datapath's ports, the services' router-stack interfaces and
-/// the shared state (`None` without NICs).
+/// Links: the WAN on the first, one per network (`config::networks`) on
+/// the second. Returns the datapath's ports, the services' router-stack
+/// interfaces (one per link) and the shared state (`None` without NICs).
 pub fn bring_up(
     pci: &mut Pci,
     qos: &crate::config::Qos,
@@ -127,7 +127,9 @@ pub fn bring_up(
         .collect();
     let mut ports = Vec::new();
     let mut shared_ports = Vec::new();
+    let mut links = Vec::new();
     let mut hosts = Vec::new();
+    let nets = crate::config::networks();
     let lay = layout(devs.len().min(2), crate::smp::online());
     for (i, d) in devs.iter().enumerate().take(2) {
         // Interrupts go to the core of the task that receives on this port.
@@ -167,7 +169,6 @@ pub fn bring_up(
             model: dev.model(),
             mac,
             qdisc: Mutex::new(qdisc),
-            local_rx: Mutex::new(VecDeque::with_capacity(LOCAL_RX_MAX)),
             snap: Mutex::new(PortSnap::default()),
             vlan: PortShared::vlan_atomic(if i == 0 { crate::config::wan_tci() } else { None }),
             pppoe_mode: AtomicBool::new(pppoe),
@@ -175,14 +176,28 @@ pub fn bring_up(
             mtu: AtomicU32::new(u32::from(fwd::forwarder::DEFAULT_MTU)),
             ctrl_rx: Mutex::new(VecDeque::with_capacity(CTRL_RX_MAX)),
         };
-        let mut iface = new_iface(&port);
-        let mut sockets = SocketSet::new(Vec::new());
+        // The port's links, each with its router-stack interface.
+        let port_ix = shared_ports.len();
         if i == 0 {
+            let link = LinkShared::new(port_ix, 0);
+            let iface = new_iface(&port);
+            let mut sockets = SocketSet::new(Vec::new());
             if !pppoe {
                 sockets.add(dhcpv4::Socket::new());
             }
+            hosts.push(HostIf { iface, sockets });
+            links.push(link);
         } else {
-            iface.update_ip_addrs(|a| a.push(IpCidr::Ipv4(lan_cidr())).expect("lan addr"));
+            for n in &nets {
+                let link = LinkShared::new(port_ix, n.vid);
+                let mut iface = new_iface(&port);
+                iface.update_ip_addrs(|a| a.push(IpCidr::Ipv4(cidr(n))).expect("network addr"));
+                hosts.push(HostIf {
+                    iface,
+                    sockets: SocketSet::new(Vec::new()),
+                });
+                links.push(link);
+            }
         }
         // Legacy INTx where the platform routes it (aarch64 DTB), otherwise
         // MSI-X (x86_64: INTx routing would need ACPI AML).
@@ -210,7 +225,19 @@ pub fn bring_up(
             }
         );
         if i == 1 {
-            println!("  net {name}       : {} (static)", lan_cidr());
+            for n in &nets {
+                println!(
+                    "  net {name}       : {} {} ({}, zone {})",
+                    n.name,
+                    cidr(n),
+                    if n.vid == 0 {
+                        alloc::string::String::from("untagged")
+                    } else {
+                        alloc::format!("vlan {}", n.vid)
+                    },
+                    n.zone
+                );
+            }
         }
         if let Some(tci) = port.vlan() {
             println!("  net {name}       : {}", vlan_text(tci));
@@ -225,7 +252,6 @@ pub fn bring_up(
             link: Mutex::new(None),
         });
         shared_ports.push(port);
-        hosts.push(HostIf { iface, sockets });
     }
     if ports.is_empty() {
         return None;
@@ -233,13 +259,15 @@ pub fn bring_up(
     Some((
         alloc::boxed::Box::leak(ports.into_boxed_slice()),
         hosts,
-        shared::init(shared_ports),
+        shared::init(shared_ports, links),
     ))
 }
 
-/// The router stack's interface for a port: Ethernet, or IP-only on a
-/// PPPoE port ([`PortShared::is_pppoe`], set before calling).
+/// The router stack's interface for a link on `port`: Ethernet, or
+/// IP-only on a PPPoE port ([`PortShared::is_pppoe`], set before calling).
+/// smoltcp only reads the device's capabilities here.
 pub fn new_iface(port: &PortShared) -> Interface {
+    let link = &LinkShared::detached();
     let hw = if port.is_pppoe() {
         HardwareAddress::Ip
     } else {
@@ -249,6 +277,7 @@ pub fn new_iface(port: &PortShared) -> Interface {
     config.random_seed = timer::ticks();
     let mut queued = 0;
     let mut device = PortDevice {
+        link,
         port,
         now_ns: datapath::now_ns(),
         queued: &mut queued,
@@ -421,16 +450,19 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
         };
         let mut touched = [false; 2];
         if !batch.is_empty() {
-            dp.rx_batch(d.rx as fwd::IfIndex, &mut batch, &mut touched);
+            dp.rx_batch(d.rx, &mut batch, &mut touched);
         }
 
         // Step 3 (primary): control messages, housekeeping, status.
         let mut next_hk = u64::MAX;
         if d.primary {
-            let (wan, action) = {
+            let (wan, policy, action) = {
                 let mut c = sh.control.lock();
-                (c.wan.take(), c.action.take())
+                (c.wan.take(), c.policy.take(), c.action.take())
             };
+            if let Some(p) = policy {
+                dp.set_policy(p);
+            }
             if let Some(action) = action {
                 // End the PPPoE session first, so the ISP does not keep
                 // (and bill, or refuse a new login for) a stale one.

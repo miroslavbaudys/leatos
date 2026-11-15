@@ -8,11 +8,17 @@
 //!  port qdisc ─► (pull, while the NIC has room) ─► VLAN ─► NIC TX
 //! ```
 //!
-//! 802.1Q tags (the port's [`PortShared::vlan`]) exist only at the two
-//! ends: removed first thing on RX (`wire::vlan_rx`: wrong or missing tags
-//! are dropped and counted in [`VLAN_DROPS`]), added last on TX. The
-//! forwarder, ARP, the neighbor tables, smoltcp and the qdiscs see untagged
-//! frames; the WAN shaper adds the tag's 4 bytes (`config::Qos::port_rate`).
+//! Links (`net::shared::LinkShared`) are the forwarder's interfaces: link
+//! 0 is the WAN on port 0, links 1.. the networks on port 1 (`lan0`),
+//! untagged or on a VLAN. On RX a `lan0` frame's VID picks its link (no
+//! link for it: dropped, [`VLAN_DROPS`]); a frame for a network on a VLAN
+//! gets its tag when it is queued on the port (forwarded, ARP, or from
+//! smoltcp), so the qdisc holds tagged frames and counts the 4 bytes.
+//!
+//! The WAN's 802.1Q tag (the port's [`PortShared::vlan`]) exists only at
+//! the two ends: removed first thing on RX (`wire::vlan_rx`: wrong or
+//! missing tags are dropped and counted in [`VLAN_DROPS`]), added last on
+//! TX; the WAN shaper adds the tag's 4 bytes (`config::Qos::port_rate`).
 //!
 //! PPPoE (a port in PPPoE mode, [`PortShared::is_pppoe`]) works the same
 //! way, inside the VLAN tag: IPv4 of the current session is decapsulated
@@ -43,7 +49,7 @@ use crate::timer;
 use alloc::vec::Vec;
 use core::net::Ipv4Addr;
 use core::sync::atomic::{AtomicU64, Ordering};
-use fwd::forwarder::{Classification, Forwarder, Interface, Role, Verdict, shard_of};
+use fwd::forwarder::{Classification, Forwarder, Interface, Policy, Role, Verdict, shard_of};
 use fwd::neigh::{NeighTable, Resolve};
 use fwd::{IfIndex, wire};
 use qdisc::{Dequeue, Qdisc};
@@ -56,9 +62,8 @@ pub const SHARDS: usize = 16;
 const MAX_CONNS: usize = 16_384;
 const HOUSEKEEPING_MS: u64 = 1_000;
 
+/// The WAN link (on port 0); the networks are links 1.. on port 1.
 pub const WAN: IfIndex = 0;
-#[allow(dead_code)] // documents the port layout; used by tests and stats
-pub const LAN: IfIndex = 1;
 
 /// Counters for diagnostics (read by the self-test / stats output).
 pub static FORWARDED: AtomicU64 = AtomicU64::new(0);
@@ -147,10 +152,14 @@ pub struct Datapath {
     sh: &'static Shared,
     hash_key: u64,
     shards: Vec<Mutex<Forwarder>>,
-    /// Per port: neighbors on that port.
+    /// Per link: neighbors on that link.
     neigh: Vec<Mutex<NeighTable<PacketBuf>>>,
-    /// Per port: the interface address (the WAN one changes with the lease).
+    /// Per link: the interface address (the WAN one changes with the lease).
     addrs: Vec<Mutex<Option<(Ipv4Addr, u8)>>>,
+    /// Per port: (VID, link) of the links on it (VID 0 = untagged).
+    port_links: Vec<Vec<(u16, IfIndex)>>,
+    /// The networks' prefixes (`shard_of`: flows between them).
+    internal: Vec<(Ipv4Addr, u8)>,
     hk: Mutex<Hk>,
     local_rx_drops: AtomicU64,
     /// Per ingress port: forwarded IPv4 packets by ECN codepoint
@@ -199,26 +208,42 @@ fn relaxed(a: &AtomicU64) -> u64 {
 }
 
 impl Datapath {
-    /// `sh.ports[0]` is the WAN, `sh.ports[1]` the LAN.
+    /// `sh.links[0]` is the WAN, the others are `config::networks()` in
+    /// order.
     pub fn new(sh: &'static Shared) -> Self {
         let hash_key = timer::ticks() ^ 0x9e37_79b9_7f4a_7c15;
+        let nets = config::networks();
         let ifaces: Vec<Interface> = sh
-            .ports
+            .links
             .iter()
             .enumerate()
-            .map(|(i, port)| {
-                let (role, addr) = if i as IfIndex == WAN {
-                    (Role::Wan, None)
-                } else {
-                    let lan = config::lan();
-                    (Role::Lan, Some((lan.addr, lan.prefix)))
-                };
-                Interface {
-                    mac: port.mac,
-                    addr,
-                    role,
+            .map(|(i, link)| {
+                let mac = sh.ports[link.port].mac;
+                match i.checked_sub(1).and_then(|n| nets.get(n)) {
+                    None => Interface {
+                        mac,
+                        addr: None,
+                        role: Role::Wan,
+                        zone: 0,
+                    },
+                    Some(n) => Interface {
+                        mac,
+                        addr: Some((n.addr, n.prefix)),
+                        role: Role::Lan,
+                        zone: n.zone,
+                    },
                 }
             })
+            .collect();
+        let policy = config::firewall();
+        let mut port_links = alloc::vec![Vec::new(); sh.ports.len()];
+        for (i, link) in sh.links.iter().enumerate() {
+            port_links[link.port].push((link.vid, i as IfIndex));
+        }
+        let internal = ifaces
+            .iter()
+            .filter(|i| i.role == Role::Lan)
+            .filter_map(|i| i.addr)
             .collect();
         let shards = (0..SHARDS)
             .map(|k| {
@@ -227,6 +252,7 @@ impl Datapath {
                 for iface in &ifaces {
                     f.add_interface(*iface);
                 }
+                f.set_policy(Some(policy.clone()));
                 Mutex::new(f)
             })
             .collect();
@@ -239,6 +265,8 @@ impl Datapath {
                 .map(|_| Mutex::new(NeighTable::new()))
                 .collect(),
             addrs: ifaces.iter().map(|i| Mutex::new(i.addr)).collect(),
+            port_links,
+            internal,
             hk: Mutex::new(Hk {
                 next_housekeeping: 0,
                 next_stats: STATS_MS,
@@ -264,12 +292,25 @@ impl Datapath {
         *self.addrs[WAN as usize].lock() = addr;
     }
 
-    fn enqueue(&self, egress: IfIndex, pkt: PacketBuf, touched: &mut [bool; 2]) {
+    /// A saved config's zone firewall: every shard, for new flows.
+    pub fn set_policy(&self, policy: Policy) {
+        for s in &self.shards {
+            s.lock().set_policy(Some(policy.clone()));
+        }
+    }
+
+    /// Into the qdisc of the link's port, with the link's VLAN tag.
+    fn enqueue(&self, egress: IfIndex, mut pkt: PacketBuf, touched: &mut [bool; 2]) {
         let now = now_ns();
-        if let Some(t) = touched.get_mut(egress as usize) {
+        let link = &self.sh.links[egress as usize];
+        if let Some(tci) = link.tci() {
+            pkt.push_vlan(tci);
+            pkt.meta.wire_len += wire::VLAN_HDR as u32;
+        }
+        if let Some(t) = touched.get_mut(link.port) {
             *t = true;
         }
-        if self.sh.ports[egress as usize]
+        if self.sh.ports[link.port]
             .qdisc
             .lock()
             .enqueue(pkt, now)
@@ -287,7 +328,7 @@ impl Datapath {
         mut pkt: PacketBuf,
         touched: &mut [bool; 2],
     ) {
-        let src = self.sh.ports[egress as usize].mac;
+        let src = self.sh.ports[self.sh.links[egress as usize].port].mac;
         wire::set_macs(pkt.data_mut(), mac, src);
         self.enqueue(egress, pkt, touched);
     }
@@ -299,19 +340,21 @@ impl Datapath {
         };
         pkt.set_len(60); // minimum Ethernet frame
         pkt.data_mut().fill(0);
+        pkt.meta.wire_len = 60;
         wire::build_arp_request(
             pkt.data_mut(),
-            self.sh.ports[ifx as usize].mac,
+            self.sh.ports[self.sh.links[ifx as usize].port].mac,
             my_ip,
             target,
         );
         self.enqueue(ifx, pkt, touched);
     }
 
-    /// ECN diagnostics on a forwarded frame (before NAT/egress): codepoint
-    /// counts, and the TCP ECE (receiver saw CE) / CWR (sender reacted) flags.
-    fn observe_ecn(&self, ingress: IfIndex, frame: &[u8]) {
-        let i = ingress as usize;
+    /// ECN diagnostics on a forwarded frame (before NAT/egress), by
+    /// ingress port: codepoint counts, and the TCP ECE (receiver saw CE) /
+    /// CWR (sender reacted) flags.
+    fn observe_ecn(&self, port: usize, frame: &[u8]) {
+        let i = port;
         if i >= 2 {
             return;
         }
@@ -356,18 +399,37 @@ impl Datapath {
         }
     }
 
+    /// The link a frame received on `port` belongs to, and its VID to
+    /// strip: the port's own tag (the WAN), or the VID naming a network.
+    fn link_of(&self, port: usize, frame: &[u8]) -> Option<(IfIndex, Option<u16>)> {
+        let links = &self.port_links[port];
+        if let [(0, ifx)] = links.as_slice()
+            && let Some(tci) = self.sh.ports[port].vlan()
+        {
+            return Some((*ifx, Some(tci & 0x0fff)));
+        }
+        let vid = wire::vlan_tci(frame).map_or(0, |t| t & 0x0fff);
+        links
+            .iter()
+            .find(|(v, _)| *v == vid)
+            .map(|&(v, ifx)| (ifx, (v != 0).then_some(v)))
+    }
+
     /// Run one port's received frames (taken from its NIC by the caller,
     /// at most [`RX_BUDGET`]) through the forwarder. Drains `batch`; marks
     /// in `touched` the egress ports whose qdisc got packets.
-    pub fn rx_batch(&self, ifx: IfIndex, batch: &mut Vec<PacketBuf>, touched: &mut [bool; 2]) {
+    pub fn rx_batch(&self, port_ix: usize, batch: &mut Vec<PacketBuf>, touched: &mut [bool; 2]) {
         let now = now_ms();
-        let role = if ifx == WAN { Role::Wan } else { Role::Lan };
-        let port = &self.sh.ports[ifx as usize];
-        let want_vid = port.vlan().map(|tci| tci & 0x0fff);
+        let port = &self.sh.ports[port_ix];
         let pppoe = port.is_pppoe();
         let session = port.pppoe_session();
         let mut local = false;
         for mut pkt in batch.drain(..) {
+            let Some((ifx, want_vid)) = self.link_of(port_ix, pkt.data()) else {
+                VLAN_DROPS.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let role = if ifx == WAN { Role::Wan } else { Role::Lan };
             match wire::vlan_rx(pkt.data(), want_vid) {
                 wire::VlanRx::Accept { strip: false } => {}
                 wire::VlanRx::Accept { strip: true } => pkt.pop_vlan(),
@@ -399,14 +461,14 @@ impl Datapath {
                 self.snoop_arp(ifx, pkt.data(), now, touched);
             }
             let len = pkt.len();
-            let k = shard_of(role, pkt.data(), SHARDS, self.hash_key);
+            let k = shard_of(role, pkt.data(), SHARDS, self.hash_key, &self.internal);
             let verdict =
                 self.shards[k]
                     .lock()
                     .process(now, ifx, pkt.data_with_tailroom_mut(), len);
             match verdict {
                 Verdict::Local => {
-                    let mut q = self.sh.ports[ifx as usize].local_rx.lock();
+                    let mut q = self.sh.links[ifx as usize].local_rx.lock();
                     if q.len() < LOCAL_RX_MAX {
                         q.push_back(pkt);
                         local = true;
@@ -421,10 +483,10 @@ impl Datapath {
                     class,
                 } => {
                     pkt.set_len(len);
-                    self.observe_ecn(ifx, pkt.data());
+                    self.observe_ecn(port_ix, pkt.data());
                     pkt.meta = meta_from(&class, ifx, len, now_ns());
                     FORWARDED.fetch_add(1, Ordering::Relaxed);
-                    let out = &self.sh.ports[egress as usize];
+                    let out = &self.sh.ports[self.sh.links[egress as usize].port];
                     if out.is_pppoe() {
                         // Point to point: the access concentrator is the
                         // only neighbor.

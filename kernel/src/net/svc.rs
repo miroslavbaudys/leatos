@@ -179,16 +179,18 @@ fn handle_dhcp(name: &str, host: &mut HostIf, pinger: &mut Pinger) -> Option<Lea
                     .unwrap_or_else(|| "-".into()),
                 dns.join(", ")
             );
-            let lan = stack::lan_cidr();
-            let shorter = cfg.address.prefix_len().min(lan.prefix_len());
-            let net = |a: Ipv4Address| {
-                u32::from(a) & (u32::MAX.checked_shl(32 - shorter as u32).unwrap_or(0))
-            };
-            if net(cfg.address.address()) == net(lan.address()) {
-                println!(
-                    "  net WARNING     : WAN {} overlaps LAN {lan}: forwarding between them breaks; boot with e.g. lan=10.10.0.1/24",
-                    cfg.address
-                );
+            for n in crate::config::networks() {
+                let lan = smoltcp::wire::Ipv4Cidr::new(n.addr, n.prefix);
+                let shorter = cfg.address.prefix_len().min(lan.prefix_len());
+                let net = |a: Ipv4Address| {
+                    u32::from(a) & (u32::MAX.checked_shl(32 - shorter as u32).unwrap_or(0))
+                };
+                if net(cfg.address.address()) == net(lan.address()) {
+                    println!(
+                        "  net WARNING     : WAN {} overlaps network {} {lan}: forwarding between them breaks; boot with e.g. lan=10.10.0.1/24",
+                        cfg.address, n.name
+                    );
+                }
             }
             DHCP_OK.store(true, Ordering::Release);
             pinger.target = cfg.router;
@@ -342,6 +344,9 @@ fn apply_saved(
     }
     // Also picks up the WAN tag's 4 bytes and PPPoE's 8 of shaper overhead.
     stack::apply_qos(sh, &old, &crate::config::qos());
+    // Zone policies (new flows; the zones themselves only change by a
+    // reboot, `Config::needs_reboot`).
+    sh.post_policy(crate::config::firewall());
     if let Some(svc) = services {
         svc.reconfigure();
     }
@@ -369,14 +374,17 @@ fn publish_wan(
     }
 }
 
-/// Poll every router-stack interface; wake the TX task of each port that
-/// got frames in its qdisc.
+/// Poll every router-stack interface (one per link); wake the TX task of
+/// each port that got frames in its qdisc.
 fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
     let t = stack::now();
     let now_ns = datapath::now_ns();
-    for (i, (host, port)) in hosts.iter_mut().zip(&sh.ports).enumerate() {
+    for (host, link) in hosts.iter_mut().zip(&sh.links) {
+        let i = link.port;
+        let port = &sh.ports[i];
         let mut queued = 0;
         let mut dev = PortDevice {
+            link,
             port,
             now_ns,
             queued: &mut queued,
@@ -399,7 +407,7 @@ async fn store_op(
     use crate::config::schema;
     let e = |e: crate::store::Error| alloc::format!("{e}");
     match op {
-        StoreOp::Save { toml, flags, cfg } => {
+        StoreOp::Save { toml, flags, cfg, .. } => {
             // The header names the document's version (1 while the config
             // fits it): an older kernel skips a version 2 record and keeps
             // the one before it.
@@ -455,10 +463,7 @@ pub async fn run(
     mut store: Option<crate::store::Store>,
 ) {
     let mut pinger = Pinger::new(&mut hosts[0].sockets);
-    let mut services = (hosts.len() >= 2).then(|| {
-        let (wan, lan) = hosts.split_at_mut(1);
-        LanServices::new(&mut lan[0], Some(&mut wan[0]))
-    });
+    let mut services = LanServices::new(&mut hosts);
     let mut mgmt = Mgmt::new(&mut hosts, store.is_some());
     let mut cli = Cli::new(store.is_some());
     let mut pppoe = crate::config::pppoe().map(|c| Pppoe::new(c, &sh.ports[0]));
@@ -501,8 +506,7 @@ pub async fn run(
         }
         pinger.step(&mut hosts[0].sockets);
         if let Some(svc) = services.as_mut() {
-            let (wan, lan) = hosts.split_at_mut(1);
-            svc.step(&mut lan[0].sockets, Some(&mut wan[0].sockets));
+            svc.step(&mut hosts);
         }
         let action = mgmt.step(&mut hosts, sh, services.as_ref());
         if let Some((conn, op)) = mgmt.take_op()
@@ -510,7 +514,16 @@ pub async fn run(
         {
             // Yields while the disk works: the datapath keeps running.
             let r = store_op(st, &op).await;
-            if let (Ok((_, Some(source))), StoreOp::Save { flags: 0, cfg, .. }) = (&r, &op) {
+            if let (
+                Ok((_, Some(source))),
+                StoreOp::Save {
+                    flags: 0,
+                    reboot: false,
+                    cfg,
+                    ..
+                },
+            ) = (&r, &op)
+            {
                 // Saved without a trial: run it now, no reboot.
                 let (wan, svc) = (&mut hosts[0], services.as_mut());
                 let cfg = (**cfg).clone();
@@ -536,10 +549,12 @@ pub async fn run(
             ),
             Some(CliAction::Save(cfg)) => match store.as_mut() {
                 Some(st) => {
-                    let reboot = cfg.needs_trial(&crate::config::base());
+                    let base = crate::config::base();
+                    let reboot = cfg.needs_trial(&base) || cfg.needs_reboot(&base);
                     let op = StoreOp::Save {
                         toml: cfg.to_toml(),
                         flags: 0,
+                        reboot,
                         cfg,
                     };
                     let r = store_op(st, &op).await;
@@ -575,7 +590,7 @@ pub async fn run(
 
         // More frames arrived while we worked: go round again, after
         // letting the datapath run.
-        if cli.more() || sh.ports.iter().any(|p| !p.local_rx.lock().is_empty()) {
+        if cli.more() || sh.links.iter().any(|l| !l.local_rx.lock().is_empty()) {
             crate::executor::yield_now().await;
             continue;
         }

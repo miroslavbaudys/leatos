@@ -61,7 +61,8 @@ check "upload without password -> 401" 401 "$(code -X POST --data-binary @"$WORK
 check "upload with wrong password -> 401" 401 "$(code -u admin:wrong -X POST --data-binary @"$WORK/new.elf" "$URL/api/upgrade")"
 head -c 100000 /dev/urandom >"$WORK/garbage"
 check "garbage upload -> 422" 422 "$(code -u admin:test -X POST --data-binary @"$WORK/garbage" "$URL/api/upgrade")"
-check "wrong CRC -> 422" 422 "$(code -u admin:test -H 'X-Image-CRC32: deadbeef' -X POST --data-binary @"$WORK/new.elf" "$URL/api/upgrade")"
+# A whole kernel: as long as a real upload (the CRC is checked at the end).
+check "wrong CRC -> 422" 422 "$(code -m 120 -u admin:test -H 'X-Image-CRC32: deadbeef' -X POST --data-binary @"$WORK/new.elf" "$URL/api/upgrade")"
 check "refused uploads did not restart the kernel" 1 "$(grep -ac 'rrouter 0.1.0' "$LOG")"
 
 for gen in 2 3; do

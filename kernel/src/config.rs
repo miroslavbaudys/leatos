@@ -395,13 +395,27 @@ impl core::fmt::Display for Redacted<'_> {
     }
 }
 
+/// One network as the datapath and the services use it
+/// (docs/config-v2.md): the first is version 1's LAN.
+#[derive(Clone)]
 pub struct Lan {
+    pub name: String,
+    /// 802.1Q VLAN ID on `lan0`, 0 = untagged.
+    pub vid: u16,
     pub addr: Ipv4Addr,
     pub prefix: u8,
+    /// The local DNS domain (`dns.domain`, one for all networks).
     pub domain: String,
+    /// Serve DHCP.
+    pub dhcp: bool,
     pub dhcp_range: (Ipv4Addr, Ipv4Addr),
     pub lease_secs: u32,
     pub statics: Vec<StaticLease>,
+    /// Firewall zone index ([`firewall`]) and name.
+    pub zone: u8,
+    pub zone_name: String,
+    /// The web interface is reachable from this network's zone.
+    pub mgmt: bool,
 }
 
 impl Lan {
@@ -412,33 +426,98 @@ impl Lan {
             u32::MAX << (32 - self.prefix as u32)
         })
     }
+
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        let m = u32::from(self.netmask());
+        u32::from(ip) & m == u32::from(self.addr) & m
+    }
 }
 
-/// The LAN: the first network (version 1's `[lan]`; default
-/// 192.168.1.1/24, boot argument `lan=10.10.0.1/24`), pool
-/// `dhcp.range` or hosts .100–.199, domain `dns.domain`.
-pub fn lan() -> Lan {
-    let c = get();
-    // A checked config has a network; a stored one without is refused.
-    let fallback = schema::Network::default();
-    let l = c.lan().unwrap_or(&fallback);
-    Lan {
-        addr: l.ipv4.addr,
-        prefix: l.ipv4.prefix,
-        domain: c.dns.domain.clone(),
-        dhcp_range: l.dhcp_range(),
-        lease_secs: l.dhcp.lease_secs,
-        statics: l
-            .dhcp
-            .statics
-            .iter()
-            .map(|s| StaticLease {
-                mac: s.mac.0,
-                ip: s.ip,
-                hostname: s.hostname.clone(),
-            })
-            .collect(),
+/// Zone names by index: `wan` is 0, then `lan` (built in or defined), then
+/// the other defined zones in their order.
+fn zone_names(c: &schema::Config) -> Vec<String> {
+    let mut v = alloc::vec![String::from(schema::ZONE_WAN), String::from(schema::ZONE_LAN)];
+    for z in &c.zones {
+        if !v.contains(&z.name) {
+            v.push(z.name.clone());
+        }
     }
+    v
+}
+
+fn zone_index(names: &[String], name: &str) -> u8 {
+    names.iter().position(|n| n == name).unwrap_or(1) as u8
+}
+
+/// The networks, in config order (the first is the LAN of version 1).
+pub fn networks() -> Vec<Lan> {
+    let c = get();
+    let names = zone_names(&c);
+    c.networks
+        .iter()
+        .map(|n| Lan {
+            name: n.name.clone(),
+            vid: n.vlan,
+            addr: n.ipv4.addr,
+            prefix: n.ipv4.prefix,
+            domain: c.dns.domain.clone(),
+            dhcp: n.dhcp.enabled,
+            dhcp_range: n.dhcp_range(),
+            lease_secs: n.dhcp.lease_secs,
+            statics: n
+                .dhcp
+                .statics
+                .iter()
+                .map(|s| StaticLease {
+                    mac: s.mac.0,
+                    ip: s.ip,
+                    hostname: s.hostname.clone(),
+                })
+                .collect(),
+            zone: zone_index(&names, &n.zone),
+            zone_name: n.zone.clone(),
+            mgmt: c.zone(&n.zone).is_some_and(|z| z.reaches_mgmt()),
+        })
+        .collect()
+}
+
+/// The zone firewall for the forwarder (docs/config-v2.md §6): zone
+/// indices as in [`networks`]. The WAN zone's input stays open: what
+/// arrives there for the router is the replies its own clients (DHCP,
+/// PPPoE, DNS upstream, SNTP) wait for, and smoltcp answers only on
+/// ports it listens on. `reject` drops (no RST / port unreachable yet).
+pub fn firewall() -> fwd::forwarder::Policy {
+    use fwd::forwarder::svc;
+    let c = get();
+    let names = zone_names(&c);
+    let mut forward = Vec::new();
+    let mut input = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let z = c.zone(name).unwrap_or_else(schema::Zone::builtin_lan);
+        forward.push(
+            z.forward_to
+                .iter()
+                .map(|t| 1u32 << zone_index(&names, t))
+                .fold(0, |a, b| a | b),
+        );
+        input.push(match z.input {
+            _ if i == 0 => None,
+            schema::Policy::Accept => None,
+            schema::Policy::Drop | schema::Policy::Reject => Some(
+                z.allow
+                    .iter()
+                    .map(|s| match s {
+                        schema::Service::Dhcp => svc::DHCP,
+                        schema::Service::Dns => svc::DNS,
+                        schema::Service::Ntp => svc::NTP,
+                        schema::Service::Ping => svc::PING,
+                        schema::Service::Mgmt => svc::MGMT,
+                    })
+                    .fold(0, |a, b| a | b),
+            ),
+        });
+    }
+    fwd::forwarder::Policy { forward, input }
 }
 
 /// The WAN's 802.1Q tag (TCI: VLAN ID + priority), `None` = untagged:

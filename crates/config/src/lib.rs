@@ -823,16 +823,54 @@ impl Config {
     }
 
     /// Settings this kernel does not implement yet (docs/config-v2.md §9):
-    /// a save or a stored config with them is refused. Today that is
-    /// everything beyond version 1.
+    /// a save or a stored config with them is refused. Implemented:
+    /// networks on `lan0` (untagged or VLANs), zones, DHCP per network.
+    /// Not yet: other ports (bridging), rules, port forwards, DNS hosts,
+    /// another WAN port, a static WAN.
     pub fn unsupported(&self) -> Vec<Issue> {
-        self.beyond_v1()
-            .into_iter()
-            .map(|(path, what)| Issue {
+        let mut out = Vec::new();
+        let mut add = |path: String, what: &str| {
+            out.push(Issue {
                 path,
                 msg: alloc::format!("{what}: not supported by this kernel yet"),
             })
-            .collect()
+        };
+        for n in &self.networks {
+            if n.ports.len() != 1 || n.ports[0] != PORT_LAN {
+                add(alloc::format!("network.{}.ports", n.name), "ports other than lan0");
+            }
+        }
+        if !self.firewall.rules.is_empty() {
+            add("firewall.rule".into(), "firewall rules");
+        }
+        if !self.firewall.forwards.is_empty() {
+            add("firewall.forward".into(), "port forwards");
+        }
+        if !self.dns.hosts.is_empty() {
+            add("dns.host".into(), "local DNS records");
+        }
+        if self.wan.port != PORT_WAN {
+            add("wan.port".into(), "a WAN port other than wan0");
+        }
+        if self.wan.mode == WanMode::Static || self.wan.static_ip.is_some() {
+            add("wan.static".into(), "a static WAN address");
+        }
+        out
+    }
+
+    /// The kernel builds its interfaces at boot: a change to the networks
+    /// (added, removed, renamed, another VLAN, address, port or zone) or to
+    /// the set of zone names is applied by rebooting into the saved config.
+    /// Zone policies, DHCP settings and everything else apply live.
+    pub fn needs_reboot(&self, old: &Config) -> bool {
+        let layout = |c: &Config| -> Vec<(String, Vec<String>, u16, Cidr, String)> {
+            c.networks
+                .iter()
+                .map(|n| (n.name.clone(), n.ports.clone(), n.vlan, n.ipv4, n.zone.clone()))
+                .collect()
+        };
+        let zones = |c: &Config| -> Vec<String> { c.zones.iter().map(|z| z.name.clone()).collect() };
+        layout(self) != layout(old) || zones(self) != zones(old)
     }
 
     /// The first network: version 1's `[lan]`, where boot argument `lan=`

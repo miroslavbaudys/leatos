@@ -137,13 +137,13 @@ check "invalid TOML -> 422" 422 "$(save_toml "$WORK/bad.toml")"
 printf 'version = 1\n\n[lan]\nipv4 = "10.30.0.1/24"\n\n[lan.dhcp]\nrange = ["10.40.0.100", "10.40.0.199"]\n' >"$WORK/incons.toml"
 check "inconsistent config -> 422" 422 "$(save_toml "$WORK/incons.toml")"
 check "422 names the field" "network.lan.dhcp.range" "$(json "$WORK/resp" issues.0.path | cut -d'[' -f1)"
-# Valid, but beyond what this kernel implements (a second network): refused.
+# Valid, but beyond what this kernel implements (a firewall rule): refused.
 python3 -I -c 'import json,sys
 c=json.load(open(sys.argv[1]))
-c["network"].append({"name":"guest","vlan":20,"ipv4":"10.99.0.1/24"})
+c["firewall"]={"rule":[{"name":"ssh","from":"lan","to":"router","proto":"tcp","dst_port":22,"action":"drop"}]}
 open(sys.argv[2],"w").write(json.dumps(c))' "$WORK/cfg.json" "$WORK/v2.json"
-check "unsupported setting (second network) -> 422" 422 "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/v2.json" "$URL/api/config")"
-check "  ... names it" "network" "$(json "$WORK/resp" issues.0.path)"
+check "unsupported setting (firewall rule) -> 422" 422 "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/v2.json" "$URL/api/config")"
+check "  ... names it" "firewall.rule" "$(json "$WORK/resp" issues.0.path)"
 check "refused saves left the store unchanged" "A 1 0" "$(slot)"
 
 # A change without a trial, sent as JSON the way the page does: saved and
@@ -230,6 +230,23 @@ check "newest record corrupt -> previous record" "stored (slot B, seq 4), lan 10
 "$RRSTORE" corrupt "$IMG" config --slot B >/dev/null
 r="$(boot_config both "")"
 check "both records corrupt -> defaults" "defaults (store has no valid config)" "${r%%,*}"
+
+echo "== a new network: saved, then rebooted into (docs/config-v2.md §7)"
+"$RRSTORE" create "$IMG" --mib "$STORE_MIB" >/dev/null
+boot net "mgmt=wan mgmt_pass=test" QEMU_NET=user QEMU_WAN_HOSTFWD="tcp:127.0.0.1:$PORT-:80"
+up 1 || true
+curl -s -m 10 -o "$WORK/cfg.json" "$URL/api/config.json" || true
+python3 -I -c 'import json,sys
+c=json.load(open(sys.argv[1]))
+c["network"].append({"name":"guest","vlan":20,"ipv4":"10.20.0.1/24","zone":"guest"})
+c["zone"]=[{"name":"guest","input":"drop","allow":["dhcp","dns"]}]
+open(sys.argv[2],"w").write(json.dumps(c))' "$WORK/cfg.json" "$WORK/net.json"
+check "network added -> 200, reboot, no trial" "200 true false" "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/net.json" "$URL/api/config") $(json "$WORK/resp" reboot) $(json "$WORK/resp" trial)"
+check "  ... stored as version 2" "1 1" "$("$RRSTORE" show "$IMG" 2>/dev/null | grep -c 'seq 1 version 2 ' || true) $("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c -e '^version = 2$' || true)"
+up 2 || true
+check "  ... rebooted with both networks" "lan guest 20 guest" "$(status networks.0.name) $(status networks.1.name) $(status networks.1.vlan) $(status networks.1.zone)"
+check "  ... guest network up on VLAN 20" 1 "$(count 'net lan0       : guest 10.20.0.1/24 (vlan 20, zone 2)')"
+stop
 
 WHAT="$ARCH, ${QEMU_STORE_BUS:-virtio}, $STORE_MIB MiB"
 if [[ "$FAILED" == 0 ]]; then echo "STORE TEST ($WHAT): PASS"; else echo "STORE TEST ($WHAT): FAIL"; exit 1; fi

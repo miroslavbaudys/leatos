@@ -402,7 +402,7 @@ fn status(ctx: &Ctx, wan: &str) {
         if console::logging_to_ram() { "in RAM (log)" } else { "on the console" }
     );
     println!("wan      : {wan}");
-    for (host, p) in ctx.hosts.iter().zip(&ctx.sh.ports) {
+    for (pi, p) in ctx.sh.ports.iter().enumerate() {
         let snap = *p.snap.lock();
         let (q, rate) = {
             let q = p.qdisc.lock();
@@ -413,7 +413,23 @@ fn status(ctx: &Ctx, wan: &str) {
             Some((false, ..)) => String::from("down"),
             None => String::from("link -"),
         };
-        let addrs: Vec<String> = host.iface.ip_addrs().iter().map(|a| alloc::format!("{a}")).collect();
+        // Every link on the port: the WAN, or the networks on lan0.
+        let addrs: Vec<String> = ctx
+            .hosts
+            .iter()
+            .zip(&ctx.sh.links)
+            .filter(|(_, l)| l.port == pi)
+            .flat_map(|(h, l)| {
+                h.iface
+                    .ip_addrs()
+                    .iter()
+                    .map(|a| match l.vid {
+                        0 => alloc::format!("{a}"),
+                        v => alloc::format!("{a} (vlan {v})"),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         println!(
             "{:<9}: {} {link}, {}, rx {} / tx {} pkts, {}, qdisc sent {} drops {} ecn {} backlog {}",
             p.name,

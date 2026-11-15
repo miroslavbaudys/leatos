@@ -8,7 +8,7 @@
 //!            │
 //!            ▼
 //!        route (on the de-NATed destination) ─► firewall for new flows
-//!            │                                   (LAN→WAN only, TCP needs SYN)
+//!            │                (zone policy: [`Policy`], TCP needs SYN)
 //!            ▼
 //!        TTL ≤ 1 ? ─► ICMP time exceeded, built in place, back to the sender
 //!            │
@@ -44,7 +44,49 @@ pub struct Interface {
     pub mac: Mac,
     /// Address and prefix length, once configured.
     pub addr: Option<(Ipv4Addr, u8)>,
+    /// `Wan`: new flows out of it are masqueraded (NAPT); `Lan`: not.
     pub role: Role,
+    /// Firewall zone (an index into [`Policy`]).
+    pub zone: u8,
+}
+
+/// Router services a zone may reach when its input is restricted
+/// ([`Policy::input`]): bits of a mask.
+pub mod svc {
+    pub const DHCP: u8 = 1;
+    pub const DNS: u8 = 2;
+    pub const NTP: u8 = 4;
+    pub const PING: u8 = 8;
+    /// The web interface (TCP 80).
+    pub const MGMT: u8 = 16;
+}
+
+/// The zone firewall (docs/config-v2.md §6), checked for new flows only.
+/// Without one ([`Forwarder::set_policy`] never called) the old fixed
+/// policy applies: new flows only from `Role::Lan` to `Role::Wan`, all
+/// input accepted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Policy {
+    /// `forward[z]`: bit `j` set = zone `z` may open new flows to zone `j`.
+    /// Interfaces of one zone always reach each other.
+    pub forward: Vec<u32>,
+    /// `input[z]`: what zone `z` may send to the router itself: `None` =
+    /// everything, `Some(mask)` = only these [`svc`] services (ARP always).
+    pub input: Vec<Option<u8>>,
+}
+
+impl Policy {
+    fn may_forward(&self, from: u8, to: u8) -> bool {
+        from == to
+            || self
+                .forward
+                .get(from as usize)
+                .is_some_and(|m| to < 32 && m & (1 << to) != 0)
+    }
+
+    fn input(&self, zone: u8) -> Option<u8> {
+        self.input.get(zone as usize).copied().flatten()
+    }
 }
 
 /// Per-packet metadata for the qdisc (CAKE), from pre-NAT addresses.
@@ -72,9 +114,11 @@ pub enum DropReason {
     Unsupported,
     /// Larger than the egress MTU without DF (fragmentation is not done).
     TooBig,
+    /// To the router itself, from a zone whose input policy refuses it.
+    Input,
 }
 
-pub const DROP_REASONS: usize = 11;
+pub const DROP_REASONS: usize = 12;
 
 impl DropReason {
     pub fn index(self) -> usize {
@@ -93,6 +137,7 @@ impl DropReason {
             Self::IcmpRateLimit => "icmp-ratelimit",
             Self::Unsupported => "unsupported",
             Self::TooBig => "too-big",
+            Self::Input => "input",
         }
     }
     pub fn all() -> [DropReason; DROP_REASONS] {
@@ -109,6 +154,7 @@ impl DropReason {
             IcmpRateLimit,
             Unsupported,
             TooBig,
+            Input,
         ]
     }
 }
@@ -165,6 +211,7 @@ pub struct Forwarder {
     pub stats: Stats,
     icmp_tokens: u64,
     icmp_refill_ms: u64,
+    policy: Option<Policy>,
 }
 
 fn broadcast_of(addr: Ipv4Addr, len: u8) -> Ipv4Addr {
@@ -260,6 +307,16 @@ fn extract_key(f: &[u8], v: &Ipv4View) -> Key {
     }
 }
 
+/// Shard of a connection between two internal endpoints (network to
+/// network, no NAT): the same from either side.
+fn pair_shard(t: &Tuple, shards: usize, hash_key: u64) -> usize {
+    let a = (u32::from(t.src) as u64) << 16 | t.sport as u64;
+    let b = (u32::from(t.dst) as u64) << 16 | t.dport as u64;
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let v = lo.rotate_left(29) ^ hi ^ (t.proto as u64) << 56;
+    (crate::conntrack::mix(hash_key ^ 0x7061_6972, v) % shards as u64) as usize
+}
+
 /// Shard of the internal endpoint `(proto, ip, port)`: every connection
 /// of one endpoint (EIM shares its NAT port) lives in the same shard.
 pub fn endpoint_shard(proto: u8, ip: Ipv4Addr, port: u16, shards: usize, hash_key: u64) -> usize {
@@ -279,9 +336,19 @@ pub fn endpoint_shard(proto: u8, ip: Ipv4Addr, port: u16, shards: usize, hash_ke
 ///   its residue class: destination port (for an ICMP error, the embedded
 ///   packet's source port) `% shards`
 ///
+/// - LAN ingress to another internal network (`internal`: the prefixes of
+///   the `Lan` interfaces): no NAT, so the endpoint pair, the same from
+///   both sides
+///
 /// Everything else (ARP, non-IPv4, fragments, untracked protocols) → 0;
 /// those frames are local, dropped, or never tracked.
-pub fn shard_of(role: Role, frame: &[u8], shards: usize, hash_key: u64) -> usize {
+pub fn shard_of(
+    role: Role,
+    frame: &[u8],
+    shards: usize,
+    hash_key: u64,
+    internal: &[(Ipv4Addr, u8)],
+) -> usize {
     if shards <= 1 || wire::ethertype(frame) != Some(ETHERTYPE_IPV4) {
         return 0;
     }
@@ -291,7 +358,16 @@ pub fn shard_of(role: Role, frame: &[u8], shards: usize, hash_key: u64) -> usize
     if v.is_fragment {
         return 0;
     }
+    let inside = |ip: Ipv4Addr| {
+        internal
+            .iter()
+            .any(|&(a, l)| broadcast_of(a, l) == broadcast_of(ip, l))
+    };
     match (role, extract_key(frame, &v)) {
+        (Role::Lan, Key::Flow(t, _)) if inside(t.dst) => pair_shard(&t, shards, hash_key),
+        (Role::Lan, Key::Related { inner, .. }) if inside(inner.src) => {
+            pair_shard(&inner, shards, hash_key)
+        }
         (Role::Lan, Key::Flow(t, _)) => endpoint_shard(t.proto, t.src, t.sport, shards, hash_key),
         (Role::Lan, Key::Related { inner, .. }) => {
             endpoint_shard(inner.proto, inner.dst, inner.dport, shards, hash_key)
@@ -319,6 +395,7 @@ impl Forwarder {
             stats: Stats::default(),
             icmp_tokens: ICMP_BURST,
             icmp_refill_ms: 0,
+            policy: None,
         }
     }
 
@@ -376,6 +453,35 @@ impl Forwarder {
                 gateway: Some(gw),
             }),
             None => self.routes.remove(Ipv4Addr::UNSPECIFIED, 0),
+        }
+    }
+
+    /// Use the zone firewall (`None`: the fixed LAN → WAN policy). Applies
+    /// to new flows; tracked ones keep going.
+    pub fn set_policy(&mut self, policy: Option<Policy>) {
+        self.policy = policy;
+    }
+
+    /// Traffic for the router from `ingress`: accepted, or dropped by the
+    /// zone's input policy. ARP and non-IPv4 never get here.
+    fn input(&mut self, ingress: IfIndex, f: &[u8], v: &Ipv4View) -> Verdict {
+        let zone = self.ifs[ingress as usize].zone;
+        let Some(allowed) = self.policy.as_ref().and_then(|p| p.input(zone)) else {
+            return self.local();
+        };
+        let dport = (v.l4_len >= 4 && !v.is_fragment).then(|| wire::get16(f, v.l4 + 2));
+        let service = match (v.proto, dport) {
+            (PROTO_UDP, Some(67)) => svc::DHCP,
+            (PROTO_UDP | PROTO_TCP, Some(53)) => svc::DNS,
+            (PROTO_UDP, Some(123)) => svc::NTP,
+            (PROTO_TCP, Some(80)) => svc::MGMT,
+            (PROTO_ICMP, _) if v.l4_len >= 1 && f[v.l4] == wire::ICMP_ECHO_REQUEST => svc::PING,
+            _ => 0,
+        };
+        if service & allowed != 0 {
+            self.local()
+        } else {
+            self.drop(DropReason::Input)
         }
     }
 
@@ -440,7 +546,7 @@ impl Forwarder {
 
         if v.is_fragment {
             return if to_us {
-                self.local()
+                self.input(ingress, f, &v)
             } else {
                 self.drop(DropReason::Fragment)
             };
@@ -456,7 +562,7 @@ impl Forwarder {
         let nat_reply = hit
             .is_some_and(|(id, dir)| dir == Dir::Reply && self.ct.get(id).is_some_and(|c| c.nat));
         if to_us && !nat_reply {
-            return self.local();
+            return self.input(ingress, f, &v);
         }
 
         // Route on the destination after de-NAT.
@@ -484,7 +590,11 @@ impl Forwarder {
                         DropReason::Unsupported
                     });
                 };
-                if !(iface.role == Role::Lan && egress_if.role == Role::Wan) {
+                let allowed = match &self.policy {
+                    Some(p) => p.may_forward(iface.zone, egress_if.zone),
+                    None => iface.role == Role::Lan && egress_if.role == Role::Wan,
+                };
+                if !allowed {
                     return self.drop(DropReason::Firewall);
                 }
                 let new_ok = match t.proto {
@@ -497,7 +607,12 @@ impl Forwarder {
                 if !new_ok {
                     return self.drop(DropReason::Invalid);
                 }
-                let nat_ip = egress_if.addr.map(|(a, _)| a);
+                // Masquerade towards the WAN only; between networks
+                // addresses stay as they are.
+                let nat_ip = match egress_if.role {
+                    Role::Wan => egress_if.addr.map(|(a, _)| a),
+                    Role::Lan => None,
+                };
                 match self.ct.create(now, t, nat_ip, flags) {
                     Some(id) => (id, Dir::Original),
                     None => return self.drop(DropReason::TableFull),
@@ -709,11 +824,13 @@ mod tests {
             mac: WAN_MAC,
             addr: Some((ROUTER_WAN, 24)),
             role: Role::Wan,
+            zone: 0,
         });
         fw.add_interface(Interface {
             mac: LAN_MAC,
             addr: Some((ROUTER_LAN, 24)),
             role: Role::Lan,
+            zone: 1,
         });
         fw.set_default_route(Some((WAN, GW)));
         fw
@@ -1087,11 +1204,13 @@ mod tests {
                     mac: WAN_MAC,
                     addr: Some((ROUTER_WAN, 24)),
                     role: Role::Wan,
+            zone: 0,
                 });
                 fw.add_interface(Interface {
                     mac: LAN_MAC,
                     addr: Some((ROUTER_LAN, 24)),
                     role: Role::Lan,
+            zone: 1,
                 });
                 fw.set_default_route(Some((WAN, GW)));
                 fw
@@ -1114,7 +1233,7 @@ mod tests {
         };
         let mut f = to(LAN_MAC, ipv4_frame(host, server, proto, 64, &l4));
         let len = f.len() - 64;
-        let k = shard_of(Role::Lan, &f[..len], SHARDS, 42);
+        let k = shard_of(Role::Lan, &f[..len], SHARDS, 42, &[]);
         let Verdict::Forward { len, .. } = fws[k].process(0, LAN, &mut f, len) else {
             panic!("outbound {proto} {host}:{sport} not forwarded")
         };
@@ -1150,7 +1269,7 @@ mod tests {
             let mut r = to(WAN_MAC, ipv4_frame(SERVER, ROUTER_WAN, proto, 50, &l4));
             let len = r.len() - 64;
             assert_eq!(
-                shard_of(Role::Wan, &r[..len], SHARDS, 42),
+                shard_of(Role::Wan, &r[..len], SHARDS, 42, &[]),
                 k,
                 "reply maps to another shard"
             );
@@ -1215,7 +1334,7 @@ mod tests {
         );
         let len = e.len() - 64;
         assert_eq!(wire::get16(&out, view(&out).l4), port);
-        assert_eq!(shard_of(Role::Wan, &e[..len], SHARDS, 42), k);
+        assert_eq!(shard_of(Role::Wan, &e[..len], SHARDS, 42, &[]), k);
         let Verdict::Forward {
             egress, next_hop, ..
         } = fws[k].process(2, WAN, &mut e, len)
@@ -1227,7 +1346,7 @@ mod tests {
 
     #[test]
     fn unsharded_is_unchanged() {
-        assert_eq!(shard_of(Role::Lan, &[0u8; 60], 1, 42), 0);
+        assert_eq!(shard_of(Role::Lan, &[0u8; 60], 1, 42, &[]), 0);
         let mut fw = router();
         assert_eq!(fw.ct.shard(), (1, 0));
         syn_out(&mut fw);
@@ -1361,5 +1480,116 @@ mod tests {
         let mut f = udp_out(1493, false);
         assert_eq!(run(&mut fw, 2, LAN, &mut f), Verdict::Drop(DropReason::TooBig));
         assert_eq!(fw.stats.drops[DropReason::TooBig.index()], 1);
+    }
+
+    // ---- zones (docs/config-v2.md §6) ----------------------------------
+
+    const GUEST_MAC: Mac = [2, 0, 0, 0, 0, 3];
+    const ROUTER_GUEST: Ipv4Addr = Ipv4Addr::new(10, 20, 0, 1);
+    const GUEST_HOST: Ipv4Addr = Ipv4Addr::new(10, 20, 0, 100);
+    const GUEST: IfIndex = 2;
+
+    /// WAN (zone 0), LAN (zone 1), guest (zone 2): LAN may go anywhere,
+    /// guest only to the WAN; guest input only DHCP + DNS.
+    fn zoned(fw: &mut Forwarder) {
+        fw.add_interface(Interface {
+            mac: GUEST_MAC,
+            addr: Some((ROUTER_GUEST, 24)),
+            role: Role::Lan,
+            zone: 2,
+        });
+        fw.set_policy(Some(Policy {
+            forward: vec![0, 0b101, 0b001],
+            input: vec![None, None, Some(svc::DHCP | svc::DNS)],
+        }));
+    }
+
+    fn tcp_frame(mac: Mac, src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, flags: u8) -> Vec<u8> {
+        let seg = tcp_segment(src, dst, sport, dport, flags, b"");
+        to(mac, ipv4_frame(src, dst, PROTO_TCP, 64, &seg))
+    }
+
+    #[test]
+    fn zones_decide_new_flows_and_networks_are_not_natted() {
+        let mut fw = router();
+        zoned(&mut fw);
+        // Guest → LAN: refused.
+        let mut f = tcp_frame(GUEST_MAC, GUEST_HOST, HOST, 5000, 22, TCP_SYN);
+        assert_eq!(run(&mut fw, 0, GUEST, &mut f), Verdict::Drop(DropReason::Firewall));
+        // LAN → guest: allowed, addresses untouched (no NAT between networks).
+        let mut f = tcp_frame(LAN_MAC, HOST, GUEST_HOST, 6000, 80, TCP_SYN);
+        let Verdict::Forward { egress, next_hop, len, .. } = run(&mut fw, 0, LAN, &mut f) else {
+            panic!("LAN → guest")
+        };
+        assert_eq!((egress, next_hop), (GUEST, GUEST_HOST));
+        let v = view(&f[..len]);
+        assert_eq!((v.src(&f), wire::get16(&f, v.l4)), (HOST, 6000));
+        assert!(checksums_ok(&f[..len]));
+        // ... and its reply comes back (tracked), though guest → LAN is refused.
+        let mut r = tcp_frame(GUEST_MAC, GUEST_HOST, HOST, 80, 6000, TCP_SYN | TCP_ACK);
+        assert!(matches!(run(&mut fw, 1, GUEST, &mut r), Verdict::Forward { egress: LAN, .. }));
+        // Guest → WAN: masqueraded as before.
+        let mut f = tcp_frame(GUEST_MAC, GUEST_HOST, SERVER, 7000, 443, TCP_SYN);
+        let Verdict::Forward { egress: WAN, len, .. } = run(&mut fw, 0, GUEST, &mut f) else {
+            panic!("guest → WAN")
+        };
+        assert_eq!(view(&f[..len]).src(&f), ROUTER_WAN);
+        // WAN → anything new: refused (the WAN zone forwards nowhere).
+        let mut f = tcp_frame(WAN_MAC, SERVER, HOST, 443, 9000, TCP_SYN);
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), Verdict::Drop(DropReason::Firewall));
+        // Two interfaces of one zone reach each other without a forward bit.
+        fw.set_policy(Some(Policy { forward: vec![0, 0b001, 0b001], input: vec![] }));
+        fw.ifs[GUEST as usize].zone = 1;
+        let mut f = tcp_frame(GUEST_MAC, GUEST_HOST, HOST, 5001, 22, TCP_SYN);
+        assert!(matches!(run(&mut fw, 0, GUEST, &mut f), Verdict::Forward { egress: LAN, .. }));
+    }
+
+    #[test]
+    fn input_policy_limits_what_a_zone_reaches_on_the_router() {
+        let mut fw = router();
+        zoned(&mut fw);
+        let udp = |dport| {
+            let d = udp_datagram(GUEST_HOST, ROUTER_GUEST, 5353, dport, b"q");
+            to(GUEST_MAC, ipv4_frame(GUEST_HOST, ROUTER_GUEST, PROTO_UDP, 64, &d))
+        };
+        assert_eq!(run(&mut fw, 0, GUEST, &mut udp(53)), Verdict::Local, "DNS allowed");
+        assert_eq!(run(&mut fw, 0, GUEST, &mut udp(123)), Verdict::Drop(DropReason::Input), "NTP not");
+        // DHCP to the broadcast address.
+        let d = udp_datagram(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, 68, 67, b"discover");
+        let mut f = to([0xff; 6], ipv4_frame(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, PROTO_UDP, 64, &d));
+        assert_eq!(run(&mut fw, 0, GUEST, &mut f), Verdict::Local, "DHCP allowed");
+        // The web interface, on the guest address or on the LAN address.
+        for dst in [ROUTER_GUEST, ROUTER_LAN] {
+            let mut f = tcp_frame(GUEST_MAC, GUEST_HOST, dst, 5000, 80, TCP_SYN);
+            assert_eq!(run(&mut fw, 0, GUEST, &mut f), Verdict::Drop(DropReason::Input), "{dst}");
+        }
+        let echo = icmp_echo(ICMP_ECHO_REQUEST, 7, 1);
+        let mut f = to(GUEST_MAC, ipv4_frame(GUEST_HOST, ROUTER_GUEST, PROTO_ICMP, 64, &echo));
+        assert_eq!(run(&mut fw, 0, GUEST, &mut f), Verdict::Drop(DropReason::Input), "ping");
+        assert_eq!(fw.stats.drops[DropReason::Input.index()], 4);
+        // The LAN zone accepts everything.
+        let mut f = tcp_frame(LAN_MAC, HOST, ROUTER_LAN, 5000, 80, TCP_SYN);
+        assert_eq!(run(&mut fw, 0, LAN, &mut f), Verdict::Local);
+    }
+
+    #[test]
+    fn flows_between_networks_keep_one_shard() {
+        let internal = [(ROUTER_LAN, 24), (ROUTER_GUEST, 24)];
+        let mut fws: Vec<Forwarder> = shards();
+        for fw in &mut fws {
+            zoned(fw);
+        }
+        for i in 0..64u16 {
+            let host = Ipv4Addr::new(192, 168, 1, 100 + (i % 20) as u8);
+            let mut f = tcp_frame(LAN_MAC, host, GUEST_HOST, 30_000 + i, 80, TCP_SYN);
+            let len = f.len() - 64;
+            let k = shard_of(Role::Lan, &f[..len], SHARDS, 42, &internal);
+            assert!(matches!(fws[k].process(0, LAN, &mut f, len), Verdict::Forward { egress: GUEST, .. }));
+            let mut r = tcp_frame(GUEST_MAC, GUEST_HOST, host, 80, 30_000 + i, TCP_SYN | TCP_ACK);
+            let len = r.len() - 64;
+            let kr = shard_of(Role::Lan, &r[..len], SHARDS, 42, &internal);
+            assert_eq!(kr, k, "reply of flow {i} in another shard");
+            assert!(matches!(fws[kr].process(1, GUEST, &mut r, len), Verdict::Forward { egress: LAN, .. }));
+        }
     }
 }

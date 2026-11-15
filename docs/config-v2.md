@@ -2,8 +2,11 @@
 
 Status (2026-11-15): **the schema is implemented** in `crates/config`
 (types, validation, migration, the v1-compatible writer, CLI editing by
-name). The kernel runs on it but implements only what version 1 could
-express: anything more is refused as unsupported (§5, §9). Schema v1 is
+name). The kernel implements networks on `lan0` (untagged or VLANs, a
+DHCP server each), zones (forwarding between them, input policy) and the
+web interface's Networks and Firewall pages (§9 steps 1–3). Rules, port
+forwards, DNS hosts, more ports and a static WAN are refused as
+unsupported (`Config::unsupported`). Schema v1 is
 in `docs/config-and-storage.md` §5. v2 is the data model the multipage
 web interface is built against (Networks and Firewall pages). It also covers
 the kernel work listed for M10 in `docs/roadmap.md`: one router interface
@@ -255,24 +258,37 @@ is enough, as on OpenWrt.
   `ipv4`. `wan_*`/`pppoe_*` are unchanged.
 
 ## 6. Datapath and services mapping (kernel work)
-- **Interfaces.** The forwarder gets one interface per network plus the
-  WAN (`fwd::Interface` gains `zone: u8`, and `Role` goes away). On RX the
-  datapath maps (port, VID) to an interface; on TX it pushes the
-  network's tag. This reuses the WAN's `push_vlan`/`pop_vlan` in packet
-  headroom.
+- **Interfaces** ✅. A *port* is a NIC with its egress qdisc; a *link*
+  (`net::shared::LinkShared`) is a router interface on a port: link 0 is
+  the WAN on `wan0`, links 1.. the networks on `lan0`. Forwarder
+  interfaces, ARP tables, smoltcp interfaces and `local_rx` queues are per
+  link. On RX the datapath maps the frame's VID on `lan0` to a link (none:
+  dropped, `vlan_drops`); a frame for a network on a VLAN gets its tag
+  when it is queued (forwarded, ARP, smoltcp), so the qdisc holds tagged
+  frames and shapes the 4 bytes too. `fwd::Interface` gained `zone: u8`;
+  `Role` stays and now only means "masquerade towards it" (`Wan`), so
+  traffic between networks is not NATed. `shard_of` hashes a flow
+  between two networks by the endpoint pair, so both directions meet in
+  one conntrack shard.
   - The two-port, two-direction core layout stays: all LAN networks share
     `lan0`, so they share one LAN qdisc. CAKE's host isolation then spans
     every network, and the download shaper covers them all (the roadmap
     requires this).
-- **Firewall.**
-  - A zone-pair matrix (`[[bool; Z]; Z]`) plus the compiled rule list
-    (ranges as integers, CIDRs as mask/value), held by each forwarder
-    shard and swapped on apply.
+- **Firewall** (zones ✅, rules later).
+  - `fwd::forwarder::Policy`: per zone a bitmask of zones it may forward
+    to, and its input (`None` = all, or a mask of `svc::*` services),
+    compiled from the config by `config::firewall` (zone 0 = wan, 1 = lan,
+    then the defined zones), set on every shard, replaced live on a save
+    (`Control::policy`). The rule list comes with step 4.
   - Checked only on a conntrack miss, so per-packet cost is unchanged for
     tracked flows.
-  - Input policy: `to_us` packets from a zone with `input = drop` are
-    dropped in the forwarder unless their port matches an `allow`ed
-    service. smoltcp never sees them.
+  - Input policy: packets for the router from a zone with `input = drop`
+    are dropped in the forwarder (`drop_reasons.input`) unless they are
+    an `allow`ed service (DHCP UDP 67, DNS 53, NTP UDP 123, ping, web TCP
+    80). smoltcp never sees them. `reject` drops for now (no RST / port
+    unreachable yet). The WAN zone's input stays open in the kernel: what
+    reaches the router there is the replies its own clients wait for, and
+    smoltcp answers only on ports it listens on.
 - **DNAT.** A conntrack entry gets a destination translation next to the
   source one. A forward is a static lookup (proto, WAN port) → target, done
   before routing on a conntrack miss from the WAN. Hairpin: the same
@@ -282,16 +298,25 @@ is enough, as on OpenWrt.
   connections that the new policy would refuse are removed. This is a
   pass over each shard, at most 16384 entries in total, run in the
   datapath's housekeeping.
-- **Services.** One DHCP server instance (`proto-dhcp`) and one DNS zone
-  per network, each with its own smoltcp interface address. The DNS
-  forwarder listens on every network whose zone allows `dns`.
-- **Status API.** `/api/status` grows `networks[]` (name, vlan, address,
-  counters, lease count), per-reason drop counters (`drop_reasons`, already
-  there from the UI work) and per-rule hit counters.
+- **Services** ✅. One DHCP server (`proto-dhcp`) per network with DHCP
+  on, and a DNS socket on every network's address (the input policy
+  decides who reaches it); one resolver and one local zone
+  (`dns.domain`), with reverse lookups for every network's subnet. The
+  web interface listens on the networks whose zone reaches it.
+- **Status API** ✅. `/api/status` has `networks[]` (name, vlan, ipv4,
+  zone, dhcp, mgmt, bound leases), leases name their network, and
+  `drop_reasons` has `firewall` and `input`. Per-rule hit counters come
+  with rules.
 
 ## 7. Live apply and trials
-- **Live:** shaping, DNS, DHCP pools and reservations, rules, forwards,
-  new networks, and the removal of networks not used to reach management.
+- **Live:** shaping, DNS, DHCP pools and reservations, zone policies
+  (`input`, `allow`, `forward_to`; new flows only), later rules and
+  forwards.
+- **Reboot** (`Config::needs_reboot`, implemented): the interfaces are
+  built at boot, so a change to the networks (added, removed, renamed,
+  VLAN, address, ports, zone) or to the set of zone names is saved and
+  then rebooted into (`reboot: true` in the save response; the CLI
+  reboots too). Live network changes can follow later.
 - **Trial** (`Config::needs_trial`): any change to the network or zone
   that serves management, i.e. its address, VLAN, ports or zone. Also
   `input`/`allow` of a zone that can reach management, rules with
@@ -319,10 +344,15 @@ pointing at the right row while the user edits.
    v1-compatible writer + CLI editing by name (33 host tests); the kernel,
    web form, `rrstore` and the test scripts on it; unsupported settings
    refused.
-3. LAN VLAN networks on `lan0` and per-network DHCP/DNS. Lab: a guest
-   client on VLAN 20 gets a lease, reaches the ISP, and can't reach the
-   main LAN (negative control: put both in one zone and it can).
-4. Zones, input policy, rules. Lab: a rule opens one port, with a
+3. ✅ (2026-11-15) Networks on `lan0` (untagged + VLANs), zones with
+   forwarding and input policy, per-network DHCP, Networks and Firewall
+   pages. `LAB_GUEST=1 scripts/lab-test.sh`: the client adds VLAN 20 and
+   gets a guest lease, reaches the ISP, DNS and ping to the router work,
+   the router's web interface is blocked and new connections to the main
+   LAN are refused (router firewall drop counter); negative control
+   `LAB_GUEST_ZONE=lan` (both isolation checks fail). `store-test`: a
+   network added through the web API is saved and rebooted into.
+4. Rules (`[[firewall.rule]]`). Lab: a rule opens one port, with a
    negative control.
 5. Port forwards + hairpin. Lab: the ISP VM reaches a client's HTTP
    server through a forward, and doesn't without it.

@@ -51,6 +51,16 @@
 #                        (no session, everything fails), LAB_PPPOE_KICK=stop
 #                        (the ISP's server is stopped too: no reconnect).
 #                        Combines with LAB_VLAN=N (PPPoE on the VLAN).
+#   LAB_GUEST=1          the router boots from a store (tools/rrstore) with a
+#                        second network: VLAN 20 on lan0, 10.20.0.1/24, zone
+#                        "guest" (input: DHCP, DNS, ping; forwards to the
+#                        WAN only). The client adds eth0.20 (8021q from
+#                        modloop) and checks: guest lease, guest -> ISP,
+#                        DNS + ping to the router allowed, the router's web
+#                        interface blocked, new connections to the main LAN
+#                        refused (router firewall drop counter). Negative
+#                        control: LAB_GUEST_ZONE=lan puts the network in the
+#                        main zone, so the last two checks must fail.
 #
 # SNTP: the router syncs from the ISP's ntpd (ntp=ntp.isp.example: resolved
 # through the router's DNS forwarder) and its clock must then be within 5 s
@@ -77,6 +87,8 @@ if [[ -n "$ISP_PPPOE" ]]; then
   ROUTER_ARGS="$ROUTER_ARGS wan_mode=pppoe pppoe_user=rrouter pppoe_pass=lab-secret"
   BIG_PING="${LAB_BIG_PING:-1464}"
 fi
+GUEST="${LAB_GUEST:-}"
+GUEST_ZONE="${LAB_GUEST_ZONE:-guest}"
 LAN_PORT="${LAB_LAN_PORT:-10003}"
 WAN_PORT="${LAB_WAN_PORT:-10005}"
 WORK=$(mktemp -d -t rrouter-lab)
@@ -95,7 +107,7 @@ echo "== build"
 ARCH="${RROUTER_ARCH:-aarch64}"
 cargo build -q -p rrouter-kernel --target "$ARCH-unknown-none"
 MODLOOP=""
-[[ -n "$ISP_VLAN$ISP_PPPOE" ]] && MODLOOP=modloop
+[[ -n "$ISP_VLAN$ISP_PPPOE$GUEST" ]] && MODLOOP=modloop
 ALPINE_DIR=$(scripts/lab/fetch-alpine.sh $MODLOOP | tail -1)
 ISP_INITRD=$(scripts/lab/build-initrd.sh isp | tail -1)
 CLIENT_INITRD=$(scripts/lab/build-initrd.sh client | tail -1)
@@ -103,8 +115,42 @@ CLIENT_INITRD=$(scripts/lab/build-initrd.sh client | tail -1)
 echo "== start ISP (203.0.113.1${ISP_VLAN:+ on VLAN $ISP_VLAN}${ISP_PPPOE:+, PPPoE $ISP_PPPOE})"
 start_isp "$WAN_PORT" "$WORK/isp.log" || exit 1
 
+ROUTER_STORE=""
+if [[ -n "$GUEST" ]]; then
+  # Two networks; the stored config replaces the VM fixtures, so the nas
+  # reservation the client resolves is listed here.
+  cat >"$WORK/config.toml" <<CFG
+version = 2
+
+[[network]]
+name = "lan"
+ipv4 = "192.168.1.1/24"
+[[network.dhcp.static]]
+mac = "52:54:00:00:00:05"
+ip = "192.168.1.10"
+hostname = "nas"
+
+[[network]]
+name = "guest"
+vlan = 20
+ipv4 = "10.20.0.1/24"
+zone = "$GUEST_ZONE"
+
+[[zone]]
+name = "guest"
+input = "drop"
+allow = ["dhcp", "dns", "ping"]
+forward_to = ["wan"]
+CFG
+  cargo build -q -p rrstore --release
+  target/release/rrstore create "$WORK/store.img" --mib 32 >/dev/null
+  target/release/rrstore put "$WORK/store.img" config "$WORK/config.toml" >/dev/null
+  ROUTER_STORE="$WORK/store.img"
+  echo "== router config: networks lan + guest (VLAN 20, zone $GUEST_ZONE)"
+fi
+
 echo "== start rrouter${ROUTER_ARGS:+ ($(echo "$ROUTER_ARGS" | sed 's/pppoe_pass=[^ ]*/pppoe_pass=***/'))}"
-QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" QEMU_PCAP_DIR="${LAB_PCAP_DIR:-}" QEMU_ACCEL="$QEMU_ACCEL" QEMU_APPEND="$ROUTER_ARGS" \
+QEMU_STORE="$ROUTER_STORE" QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" QEMU_PCAP_DIR="${LAB_PCAP_DIR:-}" QEMU_ACCEL="$QEMU_ACCEL" QEMU_APPEND="$ROUTER_ARGS" \
   scripts/qemu-run.sh "target/$ARCH-unknown-none/debug/rrouter" >"$WORK/router.log" 2>&1 &
 PIDS+=($!)
 wait_for "$WORK/router.log" "rrouter: boot ok" 40 || { echo "router did not boot:"; cat "$WORK/router.log"; exit 1; }
@@ -114,7 +160,8 @@ wait_for "$WORK/router.log" "rrouter: boot ok" 40 || { echo "router did not boot
 PIDS+=($!)
 
 echo "== start client"
-linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}"
+VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so
@@ -134,7 +181,7 @@ if [[ "${LAB_VERBOSE:-0}" == "1" ]]; then
 fi
 
 echo "== router"
-tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|net wan0 .*(lease|vlan|PPPoE)|pppoe |net ping|qos |qdisc |cpu  |ntp  |watchdog  |vlan  " | sed 's/^/  /' || true
+tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|net lan0  |net wan0 .*(lease|vlan|PPPoE)|pppoe |net ping|qos |qdisc |cpu  |ntp  |watchdog  |vlan  " | sed 's/^/  /' || true
 echo "== results"
 tr -d '\r' <"$WORK/client.log" | grep -E "^LAB (PASS|FAIL|INFO|WARN)|^    \|" | sed 's/^/  /' || true
 

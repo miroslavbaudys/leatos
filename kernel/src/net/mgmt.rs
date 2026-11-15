@@ -131,6 +131,9 @@ pub enum StoreOp {
     Save {
         toml: String,
         flags: u32,
+        /// Reboot into it instead of applying it live: a trial, or a
+        /// change to the networks (`Config::needs_reboot`).
+        reboot: bool,
         cfg: alloc::boxed::Box<config::schema::Config>,
     },
     /// Write a kernel ELF to the `images` area as a trial (then reboot).
@@ -294,11 +297,18 @@ impl Mgmt {
     /// `hosts[0]` = WAN, `hosts[1]` = LAN.
     pub fn new(ifs: &mut [HostIf], has_store: bool) -> Self {
         let cfg = config::mgmt();
+        let nets = config::networks();
         let mut conns = Vec::new();
-        for (ifx, nif) in ifs.iter_mut().enumerate().take(2) {
-            let n = match ifx {
-                1 => LAN_SOCKETS,
-                _ if cfg.on_wan => WAN_SOCKETS,
+        let mut on = Vec::new();
+        for (ifx, nif) in ifs.iter_mut().enumerate() {
+            // The WAN only with mgmt=wan; a network if its zone lets the
+            // web interface be reached (the forwarder enforces it too).
+            let n = match ifx.checked_sub(1).map(|i| nets.get(i)) {
+                None if cfg.on_wan => WAN_SOCKETS,
+                Some(Some(net)) if net.mgmt => {
+                    on.push(net.name.clone());
+                    LAN_SOCKETS
+                }
                 _ => 0,
             };
             for _ in 0..n {
@@ -307,11 +317,12 @@ impl Mgmt {
         }
         let staging = crate::mm::heap::take_staging();
         println!(
-            "  mgmt            : http :{PORT} on {}, upgrade {}",
+            "  mgmt            : http :{PORT} on {}{}, upgrade {}",
+            on.join(" + "),
             if cfg.on_wan {
-                "lan + WAN (mgmt=wan: development only!)"
+                " + WAN (mgmt=wan: development only!)"
             } else {
-                "lan"
+                ""
             },
             match (&staging, cfg.password) {
                 (None, _) => "unavailable (no staging area on this platform)",
@@ -348,12 +359,16 @@ impl Mgmt {
     pub fn op_done(&mut self, conn: Option<usize>, op: &StoreOp, result: Result<String, String>) {
         self.op_busy = false;
         let (status, body, reboot) = match (op, result) {
-            (StoreOp::Save { flags, .. }, Ok(detail)) => {
-                // A trial must boot to be confirmed; everything else was
-                // applied live by the services task.
+            (StoreOp::Save { flags, reboot, .. }, Ok(detail)) => {
+                // A trial must boot to be confirmed, a new network layout
+                // is built at boot; everything else was applied live by
+                // the services task.
                 let trial = *flags != 0;
+                let reboot = *reboot || trial;
                 let what = if trial {
                     "saved as a trial, rebooting"
+                } else if reboot {
+                    "saved, rebooting into the new networks"
                 } else {
                     "saved and applied"
                 };
@@ -362,13 +377,13 @@ impl Mgmt {
                 (
                     200,
                     format!(
-                        "{{\"ok\":true,\"detail\":{},\"trial\":{trial},\"applied\":{},\"confirm_within_s\":{},\"lan\":{}}}",
+                        "{{\"ok\":true,\"detail\":{},\"trial\":{trial},\"reboot\":{reboot},\"applied\":{},\"confirm_within_s\":{},\"lan\":{}}}",
                         json_str(&format!("{what} ({detail})")),
-                        !trial,
+                        !reboot,
                         if trial { config::trial_secs() } else { 0 },
                         json_str(&lan)
                     ),
-                    trial,
+                    reboot,
                 )
             }
             (StoreOp::SaveImage(_), Ok(detail)) => {
@@ -699,6 +714,7 @@ impl Mgmt {
                     StoreOp::Save {
                         toml: cfg.to_toml(),
                         flags,
+                        reboot: cfg.needs_reboot(&config::base()),
                         cfg: alloc::boxed::Box::new(cfg),
                     },
                 ));
@@ -882,7 +898,15 @@ impl Mgmt {
             let early = flushed && !c.parser.is_done();
             let lingering = flushed && c.responded_at.is_some_and(|t| t.elapsed() > LINGER);
             let lingering = lingering || early;
-            if lingering || c.since.is_some_and(|t| t.elapsed() > limit) {
+            // The request gets `limit` to arrive; once answered, the answer
+            // gets REQUEST_TIMEOUT to be delivered, counted from the answer
+            // (a rejected upload releases the upload slot, but its 422 must
+            // still go out after a long body).
+            let timed_out = match c.responded_at {
+                None => c.since.is_some_and(|t| t.elapsed() > limit),
+                Some(t) => t.elapsed() > REQUEST_TIMEOUT,
+            };
+            if lingering || timed_out {
                 sock.abort();
             }
             if !sock.is_open() {
@@ -996,7 +1020,7 @@ fn status_json(
             && mgmt.has_store
             && (mgmt.staging.is_some() || mgmt.uploader.is_some()),
     );
-    for (n, (host, nif)) in ifs.iter().zip(&sh.ports).enumerate() {
+    for (n, nif) in sh.ports.iter().enumerate() {
         let snap = *nif.snap.lock();
         let st = snap.stats;
         let (q, rate) = {
@@ -1009,11 +1033,12 @@ fn status_json(
             }
             None => String::from("null"),
         };
-        let addrs: Vec<String> = host
-            .iface
-            .ip_addrs()
+        // The addresses of every link on the port.
+        let addrs: Vec<String> = ifs
             .iter()
-            .map(|a| json_str(&format!("{a}")))
+            .zip(&sh.links)
+            .filter(|(_, l)| l.port == n)
+            .flat_map(|(h, _)| h.iface.ip_addrs().iter().map(|a| json_str(&format!("{a}"))).collect::<Vec<_>>())
             .collect();
         let vlan = nif
             .vlan()
@@ -1046,11 +1071,12 @@ fn status_json(
     s.push_str("],\"dhcp_leases\":[");
     if let Some(svc) = services {
         let now = timer::uptime().as_secs();
-        for (n, l) in svc.leases().enumerate() {
+        for (n, (net, l)) in svc.leases_by_network().enumerate() {
             let _ = write!(
                 s,
-                "{}{{\"mac\":{},\"ip\":{},\"hostname\":{},\"bound\":{},\"expires_in_s\":{}}}",
+                "{}{{\"network\":{},\"mac\":{},\"ip\":{},\"hostname\":{},\"bound\":{},\"expires_in_s\":{}}}",
                 if n > 0 { "," } else { "" },
+                json_str(net),
                 json_str(&format!("{}", smoltcp::wire::EthernetAddress(l.mac))),
                 json_str(&format!("{}", l.ip)),
                 l.hostname
@@ -1061,6 +1087,27 @@ fn status_json(
                 l.expires.saturating_sub(now),
             );
         }
+    }
+    s.push(']');
+    // The networks: router interfaces on lan0 (docs/config-v2.md).
+    s.push_str(",\"networks\":[");
+    for (n, net) in config::networks().iter().enumerate() {
+        let leases = services.map_or(0, |svc| {
+            svc.leases_by_network()
+                .filter(|(name, l)| *name == net.name && l.state == proto_dhcp::v4::server::LeaseState::Bound)
+                .count()
+        });
+        let _ = write!(
+            s,
+            "{}{{\"name\":{},\"vlan\":{},\"ipv4\":{},\"zone\":{},\"dhcp\":{},\"mgmt\":{},\"leases\":{leases}}}",
+            if n > 0 { "," } else { "" },
+            json_str(&net.name),
+            net.vid,
+            json_str(&format!("{}/{}", net.addr, net.prefix)),
+            json_str(&net.zone_name),
+            net.dhcp,
+            net.mgmt,
+        );
     }
     s.push(']');
     // Wall clock (SNTP) and watchdog.

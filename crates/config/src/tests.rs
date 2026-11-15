@@ -885,7 +885,7 @@ fn written_as_version_1_while_it_fits() {
     for (path, f) in cases {
         let mut d = Config::default();
         f(&mut d);
-        assert!(d.unsupported().iter().any(|i| i.path.starts_with(path)), "{path}: {:?}", d.unsupported());
+        assert!(!d.fits_v1(), "{path}");
         let t = d.to_toml();
         assert!(t.starts_with("version = 2"), "{path}: {t}");
         assert_eq!(parse(&t), Ok(d), "{path}");
@@ -1095,4 +1095,41 @@ fn v2_value_types() {
     assert_eq!("10.0.0.0/8".parse::<Net>().unwrap().to_string(), "10.0.0.0/8");
     assert!(!"10.0.0.1/8".parse::<Net>().unwrap().is_network());
     assert!(Proto::TcpUdp.overlaps(&Proto::Udp) && !Proto::Tcp.overlaps(&Proto::Udp));
+}
+
+#[test]
+fn what_the_kernel_supports() {
+    // Networks on lan0, VLANs, zones, DHCP off: supported.
+    let mut c = parse(FULL_V2).unwrap();
+    c.firewall = Firewall::default();
+    c.dns.hosts.clear();
+    assert_eq!(c.unsupported(), vec![]);
+    // Not yet: rules, forwards, DNS hosts, other ports, static WAN.
+    let p = parse(FULL_V2).unwrap().unsupported().into_iter().map(|i| i.path).collect::<Vec<_>>();
+    assert_eq!(p, ["firewall.rule", "firewall.forward", "dns.host"]);
+    let mut d = c.clone();
+    d.networks[1].ports = vec!["lan1".into()];
+    assert_eq!(d.unsupported()[0].path, "network.guest.ports");
+    d.wan.mode = WanMode::Static;
+    assert!(d.unsupported().iter().any(|i| i.path == "wan.static"));
+}
+
+#[test]
+fn network_layout_changes_reboot() {
+    let old = parse(FULL_V2).unwrap();
+    let r = |f: fn(&mut Config)| {
+        let mut c = old.clone();
+        f(&mut c);
+        c.needs_reboot(&old)
+    };
+    assert!(!r(|_| {}));
+    assert!(!r(|c| c.networks[1].dhcp.lease_secs = 600), "DHCP: live");
+    assert!(!r(|c| c.zones[0].allow.push(Service::Ntp)), "zone policy: live");
+    assert!(!r(|c| c.zones[1].forward_to = vec!["wan".into()]));
+    assert!(!r(|c| c.dns.cache_entries = 100));
+    assert!(r(|c| c.networks[1].vlan = 21));
+    assert!(r(|c| c.networks[1].ipv4.prefix = 16));
+    assert!(r(|c| c.networks[1].zone = "lan".into()));
+    assert!(r(|c| { c.networks.pop(); }));
+    assert!(r(|c| c.zones.push(Zone { name: "lab".into(), ..Zone::builtin_lan() })));
 }

@@ -1,10 +1,12 @@
-//! smoltcp `Device` for one port, sitting **behind the datapath**:
+//! smoltcp `Device` for one link (the WAN, or a network on `lan0`),
+//! sitting **behind the datapath**:
 //!
 //! - RX: frames the forwarder classified as `Local` (addressed to the
-//!   router), from the port's small bounded `local_rx` queue.
+//!   router), from the link's small bounded `local_rx` queue.
 //! - TX: frames from the router's own stack go into the port's **qdisc**,
-//!   the same queue as forwarded traffic, so CAKE sees all egress traffic.
-//!   smoltcp only gets a TX token while the qdisc has room.
+//!   the same queue as forwarded traffic, so CAKE sees all egress traffic;
+//!   a network on a VLAN gets its tag first. smoltcp only gets a TX token
+//!   while the qdisc has room.
 //!
 //! On a PPPoE port the device is IP-only (`Medium::Ip`: no ARP, the
 //! session is point to point): RX hands smoltcp the IP packet of the
@@ -18,7 +20,7 @@
 
 use crate::config::{AqmKind, Qos};
 use crate::net::packet::PacketBuf;
-use crate::net::shared::PortShared;
+use crate::net::shared::{LinkShared, PortShared};
 use alloc::format;
 use alloc::string::String;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -143,6 +145,7 @@ impl Qdisc<PacketBuf> for Aqm {
 }
 
 pub struct PortDevice<'a> {
+    pub link: &'a LinkShared,
     pub port: &'a PortShared,
     pub now_ns: u64,
     /// Frames put into the qdisc (the datapath must be woken to send them).
@@ -159,9 +162,26 @@ impl phy::RxToken for RxToken {
 }
 
 pub struct TxToken<'a> {
+    link: &'a LinkShared,
     port: &'a PortShared,
     now_ns: u64,
     queued: &'a mut u32,
+}
+
+impl TxToken<'_> {
+    /// Into the port's qdisc, with the link's VLAN tag.
+    fn enqueue(self, mut pkt: PacketBuf) {
+        if let Some(tci) = self.link.tci() {
+            pkt.push_vlan(tci);
+        }
+        pkt.meta.wire_len = pkt.len() as u32;
+        pkt.meta.enqueue_ts = self.now_ns;
+        if self.port.qdisc.lock().enqueue(pkt, self.now_ns).is_err() {
+            TX_DROPS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            *self.queued += 1;
+        }
+    }
 }
 
 impl phy::TxToken for TxToken<'_> {
@@ -175,26 +195,13 @@ impl phy::TxToken for TxToken<'_> {
                 d[..12].fill(0);
                 fwd::wire::put16(d, 12, fwd::wire::ETHERTYPE_IPV4);
                 let r = f(&mut d[eth..]);
-                let len = eth + len;
-                pkt.meta.wire_len = len as u32;
-                pkt.meta.enqueue_ts = self.now_ns;
-                if self.port.qdisc.lock().enqueue(pkt, self.now_ns).is_err() {
-                    TX_DROPS.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    *self.queued += 1;
-                }
+                self.enqueue(pkt);
                 r
             }
             Some(mut pkt) => {
                 pkt.set_len(len);
                 let r = f(pkt.data_mut());
-                pkt.meta.wire_len = len as u32;
-                pkt.meta.enqueue_ts = self.now_ns;
-                if self.port.qdisc.lock().enqueue(pkt, self.now_ns).is_err() {
-                    TX_DROPS.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    *self.queued += 1;
-                }
+                self.enqueue(pkt);
                 r
             }
             None => {
@@ -218,7 +225,7 @@ impl Device for PortDevice<'_> {
         Self: 'a;
 
     fn receive(&mut self, _ts: Instant) -> Option<(RxToken, TxToken<'_>)> {
-        let pkt = self.port.local_rx.lock().pop_front()?;
+        let pkt = self.link.local_rx.lock().pop_front()?;
         let skip = if self.port.is_pppoe() {
             fwd::wire::ETH_HDR
         } else {
@@ -227,6 +234,7 @@ impl Device for PortDevice<'_> {
         Some((
             RxToken(pkt, skip),
             TxToken {
+                link: self.link,
                 port: self.port,
                 now_ns: self.now_ns,
                 queued: self.queued,
@@ -238,6 +246,7 @@ impl Device for PortDevice<'_> {
         let now_ns = self.now_ns;
         let room = self.port.qdisc.lock().has_room();
         room.then_some(TxToken {
+            link: self.link,
             port: self.port,
             now_ns,
             queued: self.queued,

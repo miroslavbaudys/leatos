@@ -124,6 +124,7 @@
   <a href="#/clients">Clients</a>
   <div class="grp">Network</div>
   <a href="#/wan">WAN</a>
+  <a href="#/networks">Networks</a>
   <a href="#/lan">LAN &amp; DHCP</a>
   <a href="#/dns">DNS</a>
   <a href="#/firewall">Firewall</a>
@@ -174,8 +175,8 @@
     <div class="card"><h3>Ports</h3><div class="tw"><table id="ifs"></table></div></div>
     <div class="card"><h3>Egress queues</h3><div class="tw"><table id="qdiscs"></table></div>
       <p class="hint">Each port's transmit side has its own queue (CAKE by default); settings under <a href="#/shaping">Traffic shaping</a>.</p></div>
-    <div class="card"><h3>VLAN interfaces</h3>
-      <p class="hint">Today the router has one LAN network and an optional VLAN tag on the WAN (<a href="#/wan">WAN</a>). Extra networks (for example a guest VLAN with its own subnet, DHCP pool and firewall zone) come with configuration schema v2.</p></div>
+    <div class="card"><h3>Networks on the LAN port</h3><div class="tw"><table id="ifnets"></table></div>
+      <p class="hint">Router interfaces on lan0, untagged or on a VLAN: configured under <a href="#/networks">Networks</a>.</p></div>
   </section>
 
   <!-- ================= Clients ================= -->
@@ -186,6 +187,18 @@
       <div class="row"><input id="clientq" placeholder="Filter by name, IP or MAC" style="flex:1; min-width:180px"></div>
       <div class="tw"><table id="leases"></table></div>
     </div>
+  </section>
+
+  <!-- ================= Networks ================= -->
+  <section class="page" data-page="networks" data-title="Networks" hidden>
+    <h2>Networks</h2>
+    <p class="lead">Each network is a subnet on the LAN port, untagged or on its own VLAN, with its own DHCP pool and a firewall zone (for example a guest or IoT network).</p>
+    <form class="card cfg" autocomplete="off" id="netsform"><h3>Networks</h3>
+      <div class="tw"><table id="nets"></table></div>
+      <div class="row"><button type="button" id="addnet" class="plain">Add network</button>
+        <span class="hint">The first network is the main LAN: edit it under <a href="#/lan">LAN &amp; DHCP</a>.</span></div>
+      <p class="hint">Adding, removing or changing a network (VLAN, address, zone) reboots the router into the new layout when saved. A VLAN needs a switch or access point that tags it on the LAN cable.</p>
+    </form>
   </section>
 
   <!-- ================= WAN ================= -->
@@ -259,14 +272,16 @@
   <section class="page" data-page="firewall" data-title="Firewall" hidden>
     <h2>Firewall</h2>
     <p class="lead">Stateful: replies to tracked connections always pass; new connections follow the policy below.</p>
-    <div class="card"><h3>Policy in effect</h3>
-      <div class="tw"><table>
-        <tr><th>From \ to</th><th>WAN (internet)</th><th>LAN</th><th>Router itself</th></tr>
-        <tr><th>LAN</th><td><span class="pill ok">allow</span> masqueraded (NAT)</td><td class="muted">same network</td><td><span class="pill ok">allow</span> DHCP, DNS, web interface</td></tr>
-        <tr><th>WAN</th><td class="muted">–</td><td><span class="pill bad">drop</span> unless a reply</td><td><span class="pill bad">drop</span> except the WAN's own services <span id="fwmgmt"></span></td></tr>
-      </table></div>
-      <p class="hint">New TCP connections must start with a SYN; other protocols than TCP, UDP and ICMP are dropped for new flows. Rules, port forwards and zones for extra networks come with configuration schema v2.</p>
+    <div class="card"><h3>Zones in effect</h3>
+      <div class="tw"><table id="zmatrix"></table></div>
+      <p class="hint">Rows: where a new connection starts; columns: where it goes. Networks of one zone always reach each other. New TCP connections must start with a SYN; protocols other than TCP, UDP and ICMP are dropped for new flows. The WAN zone is fixed: nothing new comes in from the internet (port forwards come later).</p>
     </div>
+    <form class="card cfg" autocomplete="off" id="zonesform"><h3>Zones</h3>
+      <div class="tw"><table id="zones"></table></div>
+      <div class="row"><button type="button" id="addzone" class="plain">Add zone</button>
+        <span class="hint">Built in: <b>wan</b>, and <b>lan</b> (everything to the router, forwards to the WAN) until you define a zone named lan.</span></div>
+      <p class="hint">"To the router: drop" refuses everything from that zone except the services ticked (DHCP is needed for clients to get an address). Policy changes apply to new connections at once; adding or removing a zone reboots the router.</p>
+    </form>
     <div class="card"><h3>Dropped packets by reason</h3><div class="tw"><table id="drops"></table></div>
       <p class="hint">Counted since boot by the forwarding plane (packets the router forwards, not its own).</p></div>
   </section>
@@ -399,8 +414,8 @@ function route() {
 }
 window.addEventListener("hashchange", route);
 // Config path → the page that edits it (validation issues link there).
-const pageOf = (path) => path === "dns.domain" ? "lan"
-  : ({ wan: "wan", network: "lan", dns: "dns", shaping: "shaping", time: "system", mgmt: "system" })[path.split(/[.[]/)[0]] ?? "";
+const pageOf = (path) => path === "dns.domain" || path.startsWith(`network.${lanName}.`) ? "lan"
+  : ({ wan: "wan", network: "networks", zone: "firewall", firewall: "firewall", dns: "dns", shaping: "shaping", time: "system", mgmt: "system" })[path.split(/[.[]/)[0]] ?? "";
 
 // ================= Dialogs =================
 function ask(title, text, ok = "OK", danger = false) {
@@ -627,6 +642,7 @@ const DROP_TEXT = {
   "unsupported": "new flow with a protocol other than TCP, UDP or ICMP",
   "too-big": "larger than the outgoing MTU without DF (no fragmentation)",
 };
+let savedReboot = false;
 let st = null, lastUptime = null, failures = 0;
 async function refresh() {
   try { st = await (await fetch("/api/status", { cache: "no-store" })).json(); }
@@ -687,7 +703,6 @@ async function refresh() {
     ["Local names", `DHCP host names and reservations, as <i>name</i>.${esc(cfgOrig?.dns?.domain ?? "lan")}`]]);
 
   // Firewall
-  $("fwmgmt").textContent = st.mgmt.on_wan ? "and the web interface (open on the WAN)" : "";
   const dr = st.drop_reasons ?? {};
   const drs = Object.entries(dr).sort((a, b) => b[1] - a[1]);
   $("drops").innerHTML = "<tr><th>Reason</th><th class=num>Packets</th><th>Meaning</th></tr>" +
@@ -719,9 +734,18 @@ async function refresh() {
   if (kt) { $("ktrialleft").textContent = kt.remaining_s; $("ksrc").textContent = st.image.source; }
   updatePending();
   // A reboot (uptime went back): reload the forms, unless edits are pending.
-  if (lastUptime !== null && st.uptime_s < lastUptime) { if (!changes().length) loadConfig(); prevIfs = null; }
+  // After a save that rebooted, the saved config is what the router runs.
+  if (lastUptime !== null && st.uptime_s < lastUptime) {
+    if (savedReboot || !changes().length) { savedReboot = false; loadConfig(); if (!$("pmsg").className.includes("err")) pSay(""); }
+    prevIfs = null;
+  }
   lastUptime = st.uptime_s;
   showLeases();
+  const nets = st.networks ?? [];
+  $("ifnets").innerHTML = nets.length ? "<tr><th>Network</th><th>VLAN</th><th>Address</th><th>Zone</th><th class=num>Clients</th></tr>" +
+    nets.map((n) => `<tr><td>${esc(n.name)}</td><td>${n.vlan || "untagged"}</td><td>${esc(n.ipv4)}</td><td>${esc(n.zone)}</td><td class=num>${n.dhcp ? n.leases : "no DHCP"}</td></tr>`).join("")
+    : rows([["Networks", "none"]]);
+  renderNetStatus();
 }
 
 // ================= Clients =================
@@ -731,9 +755,9 @@ function showLeases() {
   const reserved = new Set(readStatics().map((s) => (s.mac ?? "").toLowerCase()));
   const ls = st.dhcp_leases.filter((d) => !q || [d.hostname, d.ip, d.mac].some((v) => (v ?? "").toLowerCase().includes(q)));
   $("leases").innerHTML = st.dhcp_leases.length
-    ? "<tr><th>Name</th><th>IP address</th><th>MAC</th><th>State</th><th>Expires in</th><th></th></tr>" + ls.map((d) =>
-        `<tr><td>${esc(d.hostname ?? "–")}</td><td>${esc(d.ip)}</td><td>${esc(d.mac)}</td><td>${d.bound ? "bound" : "offered"}</td><td>${dur(d.expires_in_s)}</td>` +
-        `<td>${reserved.has(d.mac.toLowerCase()) ? '<span class="pill">reserved</span>' : `<button class="plain" data-reserve="${esc(d.mac)}">Reserve</button>`}</td></tr>`).join("")
+    ? "<tr><th>Name</th><th>IP address</th><th>Network</th><th>MAC</th><th>State</th><th>Expires in</th><th></th></tr>" + ls.map((d) =>
+        `<tr><td>${esc(d.hostname ?? "–")}</td><td>${esc(d.ip)}</td><td>${esc(d.network ?? "")}</td><td>${esc(d.mac)}</td><td>${d.bound ? "bound" : "offered"}</td><td>${dur(d.expires_in_s)}</td>` +
+        `<td>${reserved.has(d.mac.toLowerCase()) ? '<span class="pill">reserved</span>' : (d.network ?? lanName) === lanName ? `<button class="plain" data-reserve="${esc(d.mac)}">Reserve</button>` : ""}</td></tr>`).join("")
     : rows([["Leases", "none"]]);
 }
 $("clientq").oninput = showLeases;
@@ -821,9 +845,17 @@ function fillForm(c) {
   staticHead();
   (getp(c, lanPath("dhcp.static")) ?? []).forEach((s) => staticRow(s));
   pppoeVisibility();
+  renderZones(c.zone ?? []);
+  renderNets(c.network ?? []);
 }
 function readForm() {
   const c = structuredClone(cfgOrig);
+  // Lists edited on the Networks and Firewall pages first; the LAN page's
+  // fields then apply to the first network.
+  const nets = readNets();
+  if (nets) c.network = [c.network[0], ...nets];
+  const zones = readZones();
+  if (zones.length) c.zone = zones; else delete c.zone;
   for (const e of fields()) {
     let v;
     if (e.type === "checkbox") v = e.checked;
@@ -840,6 +872,163 @@ function readForm() {
   setp(c, lanPath("dhcp.static"), sts.length ? sts : undefined);
   return c;
 }
+// ---- Networks (docs/config-v2.md): the extra networks, one row each. The
+// first network is the LAN page's. Row inputs carry data-key (not read
+// generically) and a data-path for validation highlights.
+const SERVICES = ["dhcp", "dns", "ntp", "ping", "mgmt"];
+const el = (tag, { dataset, style, ...props } = {}, kids = []) => {
+  const e = Object.assign(document.createElement(tag), props);
+  if (dataset) Object.assign(e.dataset, dataset);
+  if (style) e.style.cssText = style;
+  e.append(...kids);
+  return e;
+};
+let netOrig = [];   // per row: the network as loaded (fields the page does not edit)
+function zoneNames(zones = readZones()) {
+  const v = ["lan", ...zones.map((z) => z.name).filter((n) => n && n !== "lan")];
+  return v;
+}
+function renderNets(list) {
+  const t = $("nets");
+  t.replaceChildren(el("tr", {}, ["Name", "VLAN", "Router address / prefix", "Zone", "DHCP", "Clients", ""].map((h) => el("th", { textContent: h }))));
+  const first = list[0];
+  if (first) {
+    t.append(el("tr", {}, [el("td", { textContent: first.name }), el("td", { textContent: first.vlan ? first.vlan : "untagged" }),
+      el("td", { textContent: first.ipv4 }), el("td", { textContent: first.zone ?? "lan" }), el("td", { textContent: first.dhcp?.enabled === false ? "off" : "on" }),
+      el("td", { className: "num", dataset: { leases: first.name } }), el("td", {}, [el("a", { href: "#/lan", textContent: "Edit" })])]));
+  }
+  netOrig = list.slice(1).map((n) => structuredClone(n));
+  list.slice(1).forEach((n, i) => netRow(n, i));
+  renderNetStatus();
+}
+function netRow(n = {}, i = netOrig.length) {
+  const tr = el("tr", { dataset: { orig: String(i) } });
+  const inp = (key, props) => el("td", {}, [el("input", { value: n[key] ?? "", ...props, dataset: { key } })]);
+  const zone = el("select", { dataset: { key: "zone" } });
+  for (const z of zoneNames()) zone.append(el("option", { value: z, textContent: z }));
+  if (n.zone && !zoneNames().includes(n.zone)) zone.append(el("option", { value: n.zone, textContent: n.zone }));
+  zone.value = n.zone ?? "lan";
+  const dhcp = el("input", { type: "checkbox", checked: n.dhcp?.enabled !== false, dataset: { key: "dhcp" } });
+  const rm = el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); netPaths(); updatePending(); } });
+  tr.append(inp("name", { placeholder: "guest", size: 10 }), inp("vlan", { type: "number", min: 1, max: 4094, placeholder: "20", size: 5 }),
+    inp("ipv4", { placeholder: "10.20.0.1/24", size: 15 }), el("td", {}, [zone]), el("td", {}, [dhcp]),
+    el("td", { className: "num", dataset: { leases: n.name ?? "" } }), el("td", {}, [rm]));
+  $("nets").append(tr);
+  netPaths();
+}
+// Validation paths of the row inputs follow the names typed.
+function netPaths() {
+  for (const tr of [...$("nets").rows].slice(2)) {
+    const name = tr.querySelector('[data-key="name"]').value.trim();
+    for (const e of tr.querySelectorAll("[data-key]")) e.dataset.path = `network.${name}.${e.dataset.key === "dhcp" ? "dhcp.enabled" : e.dataset.key}`;
+  }
+}
+function readNets() {
+  if (!$("nets").rows.length) return null;
+  return [...$("nets").rows].slice(2).map((tr) => {
+    const o = structuredClone(netOrig[Number(tr.dataset.orig)] ?? {});
+    const v = (k) => tr.querySelector(`[data-key="${k}"]`);
+    o.name = v("name").value.trim();
+    const vlan = v("vlan").value.trim();
+    if (vlan === "" || Number(vlan) === 0) delete o.vlan; else o.vlan = Number(vlan);
+    o.ipv4 = v("ipv4").value.trim();
+    o.zone = v("zone").value;
+    o.dhcp = { ...(o.dhcp ?? {}) };
+    if (v("dhcp").checked) delete o.dhcp.enabled; else o.dhcp.enabled = false;
+    if (!Object.keys(o.dhcp).length) delete o.dhcp;
+    return o;
+  });
+}
+function renderNetStatus() {
+  const by = Object.fromEntries((st?.networks ?? []).map((n) => [n.name, n]));
+  for (const td of document.querySelectorAll("#nets [data-leases]")) {
+    const n = by[td.dataset.leases];
+    td.textContent = !n ? "–" : n.dhcp ? String(n.leases) : "no DHCP";
+  }
+}
+$("addnet").onclick = () => {
+  const used = new Set([...(cfgOrig?.network ?? []).map((n) => n.vlan), ...(readNets() ?? []).map((n) => n.vlan)]);
+  let vid = 20; while (used.has(vid)) vid += 10;
+  netRow({ name: "", vlan: vid, ipv4: `10.${vid}.0.1/24`, zone: zoneNames().includes("guest") ? "guest" : "lan" });
+  $("nets").rows[$("nets").rows.length - 1].querySelector('[data-key="name"]').focus();
+  updatePending();
+};
+$("nets").addEventListener("input", netPaths);
+
+// ---- Zones: the defined ones, editable; lan and wan are built in.
+let zoneOrig = [];
+function renderZones(list) {
+  zoneOrig = list.map((z) => structuredClone(z));
+  const t = $("zones");
+  t.replaceChildren(el("tr", {}, ["Name", "To the router", "Still allowed", "May open connections to", ""].map((h) => el("th", { textContent: h }))));
+  list.forEach((z, i) => zoneRow(z, i, list));
+}
+function zoneRow(z, i, list) {
+  const all = ["wan", ...zoneNames(list)];
+  const tr = el("tr", { dataset: { orig: String(i) } });
+  const name = el("input", { value: z.name ?? "", size: 10, placeholder: "guest", dataset: { key: "name" } });
+  const input = el("select", { dataset: { key: "input" } }, ["accept", "drop", "reject"].map((p) => el("option", { value: p, textContent: p })));
+  input.value = z.input ?? "accept";
+  const boxes = (key, opts, on) => el("td", { dataset: { key } }, opts.map((o) =>
+    el("label", { className: "check", style: "display:inline-flex;margin:0 8px 0 0" }, [el("input", { type: "checkbox", value: o, checked: on.includes(o) }), o])));
+  const rm = el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); rezone(); } });
+  tr.append(el("td", {}, [name]), el("td", {}, [input]), boxes("allow", SERVICES, z.allow ?? []),
+    boxes("forward_to", all.filter((n) => n !== z.name), z.forward_to ?? ["wan"]), el("td", {}, [rm]));
+  $("zones").append(tr);
+  for (const e of tr.querySelectorAll("[data-key]")) e.dataset.path = `zone.${z.name}.${e.dataset.key}`;
+}
+function readZones() {
+  if (!$("zones").rows.length) return cfgOrig?.zone ?? [];
+  return [...$("zones").rows].slice(1).map((tr) => {
+    const o = structuredClone(zoneOrig[Number(tr.dataset.orig)] ?? {});
+    const q = (k) => tr.querySelector(`[data-key="${k}"]`);
+    o.name = q("name").value.trim();
+    o.input = q("input").value;
+    const ticked = (k) => [...q(k).querySelectorAll("input:checked")].map((b) => b.value);
+    o.allow = ticked("allow");
+    if (!o.allow.length) delete o.allow;
+    o.forward_to = ticked("forward_to");
+    return o;
+  });
+}
+// Zone names changed: rebuild the zone rows and the networks' zone menus.
+function rezone() {
+  const zs = readZones(), ns = readNets();
+  renderZones(zs);
+  if (ns) renderNets([cfgOrig.network[0], ...ns]);
+  updatePending();
+}
+$("addzone").onclick = () => {
+  const zs = readZones();
+  zs.push({ name: zs.some((z) => z.name === "guest") ? "" : "guest", input: "drop", allow: ["dhcp", "dns"], forward_to: ["wan"] });
+  renderZones(zs);
+  updatePending();
+};
+$("zones").addEventListener("change", (ev) => { if (ev.target.dataset.key === "name") rezone(); });
+
+// Zone matrix of the working copy: who may open connections to whom.
+function renderMatrix(c) {
+  const defs = c.zone ?? [];
+  const zone = (n) => n === "wan" ? { name: "wan", input: "drop", forward_to: [] }
+    : defs.find((z) => z.name === n) ?? (n === "lan" ? { name: "lan", input: "accept", forward_to: ["wan"] } : null);
+  const names = ["wan", ...zoneNames(defs)];
+  const used = (n) => n === "wan" || (c.network ?? []).some((x) => (x.zone ?? "lan") === n);
+  const head = el("tr", {}, [el("th", { textContent: "From \\ to" }), ...names.map((n) => el("th", { textContent: n })), el("th", { textContent: "Router itself" })]);
+  const body = names.map((from) => {
+    const z = zone(from) ?? { forward_to: [] };
+    const cells = names.map((to) => {
+      if (from === to) return el("td", { className: "muted", textContent: from === "wan" ? "–" : "same zone" });
+      const ok = (z.forward_to ?? ["wan"]).includes(to);
+      return el("td", {}, [el("span", { className: "pill " + (ok ? "ok" : "bad"), textContent: ok ? "allow" : "drop" }), to === "wan" && ok ? " NAT" : ""]);
+    });
+    const inp = from === "wan" ? "replies to the router's own clients"
+      : (z.input ?? "accept") === "accept" ? "everything" : (z.allow?.length ? "only " + z.allow.join(", ") : "nothing");
+    const nets = (c.network ?? []).filter((x) => (x.zone ?? "lan") === from).map((x) => x.name);
+    return el("tr", { className: used(from) ? "" : "muted" }, [el("th", { textContent: from + (nets.length ? ` (${nets.join(", ")})` : from === "wan" ? "" : " (no network)") }), ...cells, el("td", { textContent: inp })]);
+  });
+  $("zmatrix").replaceChildren(head, ...body);
+}
+
 // path → shown value; arrays of plain values stay one entry, entries with
 // a name are named by it (as in the router's validation messages).
 const KEYED = ["network", "zone", "firewall.rule", "firewall.forward"];
@@ -864,6 +1053,7 @@ function changes() {
 }
 function updatePending() {
   const ch = changes();
+  if (cfgOrig) renderMatrix(readForm());
   $("pending").hidden = !ch.length && !$("pmsg").textContent;
   $("pcount").textContent = ch.length ? `${ch.length} unsaved change${ch.length > 1 ? "s" : ""}` : "";
   const blocked = !st?.store ? "no store: changes cannot be saved" : st?.trial ? "confirm or revert the trial first"
@@ -939,7 +1129,10 @@ async function postConfig(body, type) {
     else pSay(`Not saved (${r.status}): ${j.error}`, true);
     return false;
   }
-  if (j.trial) {
+  if (j.reboot) savedReboot = true;
+  if (j.reboot && !j.trial) {
+    pSay(`${j.detail}. The networks change: the router is back in a few seconds.`);
+  } else if (j.trial) {
     pSay(`${j.detail}. This change boots as a trial. The router's LAN address is now ${j.lan}: ` +
       `open http://${j.lan}/ (renew your DHCP lease if needed) and press Confirm within ${j.confirm_within_s} s, ` +
       "or the router goes back to the previous configuration.");

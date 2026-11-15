@@ -2,13 +2,18 @@
 //! services task (`net::svc::run`), docs/architecture.md "Tasks".
 //!
 //! ```text
-//!  datapath ── Verdict::Local ──► PortShared::local_rx ──► svc (smoltcp)   + svc_kick
+//!  datapath ── Verdict::Local ──► LinkShared::local_rx ──► svc (smoltcp)   + svc_kick
 //!  svc (smoltcp TX) ─────────────► PortShared::qdisc (locked) ──► datapath + dp_kick
 //!  svc ── Control (WAN lease, reboot/exec) ──────────────────► datapath   + dp_kick
 //!  datapath ── PPPoE discovery/LCP/auth/IPCP ► PortShared::ctrl_rx ► svc + svc_kick
 //!  svc ── PPPoE session (id, peer MAC) ► PortShared::pppoe_session ► datapath
 //!  datapath ── PortSnap, conntrack count ────────────────────► svc (status page)
 //! ```
+//!
+//! A **port** is a NIC with its egress qdisc; a **link** is a router
+//! interface on a port: the WAN on `wan0`, and one per network on `lan0`
+//! (untagged, or a VLAN). The forwarder, ARP, smoltcp and the services
+//! work per link; tags exist only between the link and its port.
 //!
 //! Forwarded packets never leave the datapath; the qdisc stays the only
 //! place they wait. Everything here is `spin::Mutex` or atomics, so the two
@@ -43,10 +48,9 @@ pub struct PortShared {
     pub name: &'static str,
     pub model: &'static str,
     pub mac: [u8; 6],
-    /// Egress queue: forwarded traffic and the router's own traffic.
+    /// Egress queue: forwarded traffic and the router's own traffic, of
+    /// every link on the port.
     pub qdisc: Mutex<PortQdisc>,
-    /// Frames for the router stack, filled by the datapath.
-    pub local_rx: Mutex<VecDeque<PacketBuf>>,
     pub snap: Mutex<PortSnap>,
     /// 802.1Q tag of the port ([`Self::vlan`]): `VLAN_SET | TCI`, 0 =
     /// untagged. The datapath removes it on RX and adds it on TX; svc
@@ -103,6 +107,44 @@ impl PortShared {
     }
 }
 
+/// A router interface: the WAN, or a network (docs/config-v2.md). Its
+/// index is the forwarder's `IfIndex` and the services' `HostIf` index.
+pub struct LinkShared {
+    /// Index into [`Shared::ports`].
+    pub port: usize,
+    /// 802.1Q VLAN ID on the port (networks), 0 = untagged. The WAN's tag
+    /// is the port's own ([`PortShared::vlan`]).
+    pub vid: u16,
+    /// Frames for the router stack, filled by the datapath.
+    pub local_rx: Mutex<VecDeque<PacketBuf>>,
+}
+
+impl LinkShared {
+    pub fn new(port: usize, vid: u16) -> Self {
+        LinkShared {
+            port,
+            vid,
+            local_rx: Mutex::new(VecDeque::with_capacity(LOCAL_RX_MAX)),
+        }
+    }
+
+    /// A placeholder (smoltcp reads only a device's capabilities when an
+    /// interface is made).
+    pub fn detached() -> Self {
+        LinkShared {
+            port: 0,
+            vid: 0,
+            local_rx: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// The tag frames of this link carry on its port (`None`: untagged,
+    /// or the port's own tag applies).
+    pub fn tci(&self) -> Option<u16> {
+        (self.vid != 0).then(|| fwd::wire::vlan_tci_of(self.vid, 0))
+    }
+}
+
 /// A WAN lease change for the forwarder: address/prefix and gateway.
 #[derive(Clone, Copy, Debug)]
 pub struct WanChange {
@@ -115,12 +157,16 @@ pub struct WanChange {
 #[derive(Default)]
 pub struct Control {
     pub wan: Option<WanChange>,
+    /// A new zone firewall (a saved config).
+    pub policy: Option<fwd::forwarder::Policy>,
     pub action: Option<Action>,
 }
 
 pub struct Shared {
     /// `ports[0]` = WAN, `ports[1]` = LAN.
     pub ports: Vec<PortShared>,
+    /// `links[0]` = the WAN (port 0), then the networks (port 1).
+    pub links: Vec<LinkShared>,
     /// Services → the primary datapath task: a control message.
     pub dp_kick: &'static IrqEvent,
     /// Per port: frames were queued for TX (wakes the task that transmits
@@ -136,11 +182,12 @@ pub struct Shared {
 static SHARED: Once<&'static Shared> = Once::new();
 
 /// Create the shared state once (at bring-up).
-pub fn init(ports: Vec<PortShared>) -> &'static Shared {
+pub fn init(ports: Vec<PortShared>, links: Vec<LinkShared>) -> &'static Shared {
     SHARED.call_once(|| {
         let tx_kick = ports.iter().map(|_| irq::new_event()).collect();
         Box::leak(Box::new(Shared {
             ports,
+            links,
             tx_kick,
             dp_kick: irq::new_event(),
             svc_kick: irq::new_event(),
@@ -154,6 +201,11 @@ impl Shared {
     /// Services → datapath.
     pub fn post_wan(&self, change: WanChange) {
         self.control.lock().wan = Some(change);
+        self.dp_kick.signal();
+    }
+
+    pub fn post_policy(&self, policy: fwd::forwarder::Policy) {
+        self.control.lock().policy = Some(policy);
         self.dp_kick.signal();
     }
 

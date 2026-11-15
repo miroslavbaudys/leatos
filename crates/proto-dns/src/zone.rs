@@ -18,8 +18,9 @@ pub enum Source {
 
 pub struct Zone {
     domain: String,
-    /// LAN subnet (address, prefix length): its reverse zone is local too.
-    subnet: (Ipv4Addr, u8),
+    /// The router's subnets (address, prefix length): their reverse zones
+    /// are local too.
+    subnets: Vec<(Ipv4Addr, u8)>,
     /// host label → (address, source)
     hosts: BTreeMap<String, (Ipv4Addr, Source)>,
 }
@@ -57,11 +58,16 @@ impl Zone {
     pub fn new(domain: &str, router_ip: Ipv4Addr, subnet: (Ipv4Addr, u8)) -> Self {
         let mut z = Self {
             domain: domain.trim_matches('.').to_ascii_lowercase(),
-            subnet,
+            subnets: alloc::vec![subnet],
             hosts: BTreeMap::new(),
         };
         z.add("router", router_ip, Source::Static);
         z
+    }
+
+    /// Another subnet whose reverse zone is local (a second network).
+    pub fn add_subnet(&mut self, subnet: (Ipv4Addr, u8)) {
+        self.subnets.push(subnet);
     }
 
     pub fn domain(&self) -> &str {
@@ -91,13 +97,14 @@ impl Zone {
     }
 
     fn in_subnet(&self, ip: Ipv4Addr) -> bool {
-        let (net, len) = self.subnet;
-        let mask = if len == 0 {
-            0
-        } else {
-            u32::MAX << (32 - len as u32)
-        };
-        u32::from(ip) & mask == u32::from(net) & mask
+        self.subnets.iter().any(|&(net, len)| {
+            let mask = if len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - len as u32)
+            };
+            u32::from(ip) & mask == u32::from(net) & mask
+        })
     }
 
     /// Resolve `name` (lowercase, no trailing dot) for `qtype`.
@@ -196,5 +203,18 @@ mod tests {
         assert!(matches!(z.lookup("pc.lan", TYPE_A), Lookup::A(_)));
         z.remove_dhcp("pc", Ipv4Addr::new(192, 168, 1, 101));
         assert!(matches!(z.lookup("pc.lan", TYPE_A), Lookup::NxDomain));
+    }
+
+    #[test]
+    fn reverse_zones_of_every_subnet_are_local() {
+        use crate::wire::TYPE_PTR;
+        let mut z = Zone::new("lan", Ipv4Addr::new(10, 10, 0, 1), (Ipv4Addr::new(10, 10, 0, 1), 24));
+        z.add("tv", Ipv4Addr::new(10, 20, 0, 5), Source::Dhcp);
+        let q = Zone::reverse_of(Ipv4Addr::new(10, 20, 0, 5));
+        assert!(matches!(z.lookup(&q, TYPE_PTR), Lookup::NotLocal));
+        z.add_subnet((Ipv4Addr::new(10, 20, 0, 1), 24));
+        assert!(matches!(z.lookup(&q, TYPE_PTR), Lookup::Ptr(_)));
+        let other = Zone::reverse_of(Ipv4Addr::new(10, 20, 0, 6));
+        assert!(matches!(z.lookup(&other, TYPE_PTR), Lookup::NxDomain));
     }
 }
