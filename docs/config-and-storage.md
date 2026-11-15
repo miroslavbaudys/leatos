@@ -167,7 +167,10 @@ isolation = "triple-isolate"
 on_wan = false
 ```
 
-Schema version 1 (`crates/config`) has the sections above. Every field
+Schema version 2 (`crates/config`, `docs/config-v2.md`) replaces `[lan]`
+with `[[network]]` entries (and moves `lan.domain` to `dns.domain`); it
+reads version 1 and writes version 1 while the config fits it. Schema
+version 1 has the sections above. Every field
 has a default, so a file may set only what it changes. `[wan]` was added
 within version 1: it is left out of the canonical form while it holds only
 defaults, so a config that doesn't use it stays readable by older kernels
@@ -386,7 +389,7 @@ For when the network is not an option: the console prompt `rrouter> `.
 | Step | Status |
 |---|---|
 | `crates/config-store`: layout, records, MBR lookup, write plans | ✅ host-tested |
-| `crates/config`: schema v1 (LAN, DHCP + reservations, DNS, shaping, mgmt), defaults, validation, TOML | ✅ host-tested |
+| `crates/config`: schema v1 (LAN, DHCP + reservations, DNS, shaping, mgmt), defaults, validation, TOML; schema v2 (networks, zones, rules, forwards; `docs/config-v2.md`) with v1 migration and v1-compatible writer | ✅ host-tested |
 | Kernel: one `Config` loaded at boot (refactor, no behaviour change) | ✅ `config::load()`; boot arguments overlay it |
 | virtio-blk + store partition in QEMU, lab check | ✅ `drivers::virtio_blk`, `store`, `tools/rrstore`, `GET`/`POST /api/config`, `scripts/store-test.sh` (aarch64 + x86_64) |
 | Web interface: config pages, save + reboot, confirm/revert | ✅ form + import/export on the status page, JSON API, trial records (flags), `scripts/store-test.sh` covers confirm, timeout, revert and a kill during the trial (aarch64 + x86_64) |

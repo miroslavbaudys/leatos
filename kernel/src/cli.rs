@@ -350,7 +350,12 @@ impl Cli {
             println!("no pending edit");
             return None;
         };
-        if let Err(issues) = p.validate() {
+        if let Err(issues) = p.validate().and_then(|()| {
+            config::supported(p).map_err(|e| match e {
+                schema::Error::Invalid(v) => v,
+                _ => alloc::vec::Vec::new(),
+            })
+        }) {
             println!("error: not saved:");
             for i in issues {
                 println!("  {i}");

@@ -208,11 +208,21 @@ fn show(path: &str) -> Result<()> {
 
 fn put(path: &str, area: &str, file: &str, raw: bool, version: Option<u32>) -> Result<()> {
     let payload = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
+    let mut doc_version = 1;
     if area == "config" && !raw {
         let text = std::str::from_utf8(&payload).map_err(|_| format!("{file}: not UTF-8"))?;
-        config::parse(text).map_err(|e| format!("{file}: {e}"))?;
+        let c = config::parse(text).map_err(|e| format!("{file}: {e}"))?;
+        // The kernel refuses a stored config with settings it does not
+        // implement yet: refuse it here already.
+        let unsupported = c.unsupported();
+        if !unsupported.is_empty() {
+            let list: Vec<String> = unsupported.iter().map(|i| i.to_string()).collect();
+            return Err(format!("{file}: {}", list.join("; ")));
+        }
+        // The header names the text's version, so older kernels skip it.
+        doc_version = config::document_version(text).map_err(|e| format!("{file}: {e}"))?;
     }
-    let version = version.unwrap_or(if area == "config" { config::VERSION } else { 1 });
+    let version = version.unwrap_or(doc_version);
     let mut img = Img::open(path)?;
     let layout = img.layout()?;
     let a = area_of(&layout, area)?;

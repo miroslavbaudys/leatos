@@ -1,15 +1,17 @@
 # Configuration schema v2: networks, zones, firewall
 
-Status: **design** (2026-11-15). Nothing in this document is implemented
-yet. Schema v1 (`docs/config-and-storage.md` §5, `crates/config`) is what
-the kernel reads and writes today. v2 is the data model the multipage web
-interface is built against (Networks and Firewall pages). It also covers
+Status (2026-11-15): **the schema is implemented** in `crates/config`
+(types, validation, migration, the v1-compatible writer, CLI editing by
+name). The kernel runs on it but implements only what version 1 could
+express: anything more is refused as unsupported (§5, §9). Schema v1 is
+in `docs/config-and-storage.md` §5. v2 is the data model the multipage
+web interface is built against (Networks and Firewall pages). It also covers
 the kernel work listed for M10 in `docs/roadmap.md`: one router interface
 per VLAN, firewall zones, port forwarding, and later the LAN bridge.
 
 ## 1. Goals and borrowed ideas
 - **Network = one object** (from UniFi). A network bundles a VLAN ID, a
-  subnet, a DHCP pool, a DNS domain and a zone. A guest network is one
+  subnet, a DHCP pool and a zone. A guest network is one
   entry, not four sections that have to agree.
 - **Zone firewall** (from OpenWrt). Each network belongs to a zone. A
   zone has a policy for traffic to the router (`input`) and a list of
@@ -44,7 +46,6 @@ ports = ["lan0"]            # physical ports; more than one = bridged (M10)
 vlan = 0                    # 0 / absent = untagged on its ports
 ipv4 = "10.10.0.1/24"
 zone = "lan"
-domain = "lan"
 [network.dhcp]              # v1's [lan.dhcp], per network
 enabled = true
 range = ["10.10.0.100", "10.10.0.199"]
@@ -60,7 +61,6 @@ ports = ["lan0"]
 vlan = 20                   # tagged on lan0 (trunk to the AP)
 ipv4 = "10.20.0.1/24"
 zone = "guest"
-domain = "guest.lan"
 
 [[zone]]
 name = "lan"
@@ -122,7 +122,6 @@ WAN, and it remains for development only.
 | `vlan` | `0` | 0 = untagged, 1–4094 = tagged |
 | `ipv4` | required | router address/prefix, prefix 8–29 as in v1 |
 | `zone` | `"lan"` | an existing `[[zone]]` or a built-in one |
-| `domain` | `"lan"` for the first network, `"<name>.lan"` for others | unique |
 | `dhcp` | enabled, pool derived as in v1 | v1's `[lan.dhcp]` fields plus `enabled` |
 
 Port membership comes from the networks, as with UniFi port profiles. On
@@ -189,14 +188,22 @@ ports:
 
 ### `[[dns.host]]`
 Static A records in the local zone (`name` + `ip`), beside the DHCP-derived
-names. A name is relative to the first network's domain unless it contains
-a dot.
+names. A name is relative to `dns.domain` unless it contains a dot.
+
+### `[dns] domain`
+One local domain for all networks (version 1's `lan.domain`, default
+`lan`): DHCP clients of every network are `<hostname>.<domain>`. Host
+names are unique over all networks already (reservations), so one zone
+is enough, as on OpenWrt.
 
 ## 4. Validation (`crates/config`, one pass, paths for the UI)
 - Every key (`network.name`, `zone.name`, `rule.name`, `forward.name`) is
   unique. References (`network.zone`, `forward_to`, rule `from`/`to`)
-  exist. An issue path uses the key, e.g. `network[guest].dhcp.range`,
-  so the UI can find the row after it is reordered.
+  exist. An issue path names an entry by its key, e.g.
+  `network.guest.dhcp.range[0]`, `firewall.rule.printer.dst_port`, so the
+  UI finds the row after it is reordered. An entry whose name is not a
+  valid unique key is named by its index (`network[2].name`).
+  Reservations and DNS hosts by index (`network.lan.dhcp.static[3].ip`).
 - Subnets of networks don't overlap with each other or with a static WAN.
 - Per port: (port, vlan) is unique, and at most one network is untagged.
 - DHCP pools and reservations lie inside their own network. Reservation
@@ -206,27 +213,44 @@ a dot.
 - Bounds: ≤ 16 networks (more makes no sense before hardware tag offload),
   ≤ 16 zones, ≤ 256 rules, ≤ 128 forwards, ≤ 1024 reservations in total,
   ≤ 256 DNS hosts.
-- Settings the running kernel does not implement yet (bridged `ports`
-  with more than one entry, before M10) are rejected as unsupported.
+- Settings the running kernel does not implement yet are rejected as
+  unsupported (`Config::unsupported`, separate from validation so the
+  crate accepts the whole schema): by a save (web, CLI), by `rrstore
+  put`, and a stored config with them is not used (defaults, as for any
+  rejected record). Today that is everything beyond version 1.
 
 ## 5. Migration and rollback
 - **v1 → v2 on load:**
   - `[lan]` becomes `network "lan"` (ports `["lan0"]`, untagged, zone `lan`).
-  - `[lan.dhcp]` moves into it.
+  - `[lan.dhcp]` moves into it; `lan.domain` becomes `dns.domain`.
+  - A document without `version` is version 1 if it has `[lan]`, else
+    version 2 (hand-written files).
   - Zones are the built-in `lan` and `wan`.
   - Everything else carries over unchanged.
-- **Writing: v1 form while the config fits it.** An older kernel rejects
-  `version = 2` (`NewerVersion`) and falls back to the defaults. That
-  could happen after a persistent-upgrade rollback or with `image=golden`,
-  and it would lose the LAN address. So the canonical writer emits a v1
-  document whenever the config is expressible in v1: exactly one network,
-  untagged on `lan0`, no zones, rules, forwards or DNS hosts, and WAN
-  mode `dhcp` or `pppoe`. This is how `[wan]` is already handled: it is
-  written only when set.
-- The first save that needs v2 is refused while a trial kernel runs (it
-  already is today: no config saves during a kernel trial). The UI warns:
-  "this configuration needs kernel ≥ X; rolling back to an older kernel
-  starts with the defaults".
+- **Writing: v1 form while the config fits it.** An older kernel cannot
+  read `version = 2`. That could happen after a persistent-upgrade
+  rollback or with `image=golden`. So the canonical writer
+  (`Config::to_toml`) emits a v1 document whenever the config is
+  expressible in v1 (`Config::fits_v1`): exactly one network named `lan`,
+  untagged on `lan0`, in zone `lan`, DHCP on; no zones, rules, forwards
+  or DNS hosts; WAN on `wan0` in mode `dhcp` or `pppoe`. This is how
+  `[wan]` is already handled: it is written only when set.
+- **The record header names the document's version**
+  (`Config::doc_version`; `rrstore put` uses the file's own). The store
+  picks the newest record whose version the reader understands, so an
+  older kernel skips a version 2 record and boots the record before it
+  (the last v1 config), not the defaults. The A/B slots keep exactly one
+  older record.
+- No config is saved while a trial kernel runs (as before), so a v2
+  record is only written by a confirmed kernel.
+- **JSON** (`/api/config.json`, the web form) is always version 2;
+  `POST /api/config` takes either version.
+- **Boot arguments** keep overriding: `lan=` sets the first network's
+  `ipv4`. `wan_*`/`pppoe_*` are unchanged.
+- **CLI** (`config set/unset`): entries by name, `network.guest.vlan = 20`,
+  `network.guest = { ipv4 = "10.20.0.1/24", vlan = 20 }` (new entries go
+  last), `config unset network.guest`; `lan.…` is the first network and
+  `lan.domain` is `dns.domain`, so version 1 commands keep working.
 - **Boot arguments** keep overriding: `lan=` sets the first network's
   `ipv4`. `wan_*`/`pppoe_*` are unchanged.
 
@@ -291,8 +315,10 @@ pointing at the right row while the user edits.
 ## 9. Order of work
 1. ✅ (2026-11-15) Multipage UI on schema v1 (pages, pending changes
    with a diff, login, logs, per-reason drop counters).
-2. `crates/config` v2 types + validation + migration + v1-compatible
-   writer; host tests.
+2. ✅ (2026-11-15) `crates/config` v2 types + validation + migration +
+   v1-compatible writer + CLI editing by name (33 host tests); the kernel,
+   web form, `rrstore` and the test scripts on it; unsupported settings
+   refused.
 3. LAN VLAN networks on `lan0` and per-network DHCP/DNS. Lab: a guest
    client on VLAN 20 gets a lease, reaches the ISP, and can't reach the
    main LAN (negative control: put both in one zone and it can).

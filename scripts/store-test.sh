@@ -124,26 +124,33 @@ lan_toml() { printf 'version = 1\n\n[lan]\nipv4 = "%s"\n\n[[lan.dhcp.static]]\nm
 
 check "GET /api/config shows the stored LAN" 1 "$(curl -s -m 10 "$URL/api/config" | grep -c '^ipv4 = "10.20.0.1/24"' || true)"
 curl -s -m 10 -o "$WORK/cfg.json" "$URL/api/config.json" || true
-check "GET /api/config.json shows the stored LAN" "10.20.0.1/24" "$(json "$WORK/cfg.json" lan.ipv4)"
+check "GET /api/config.json shows the stored LAN (schema v2)" "10.20.0.1/24" "$(json "$WORK/cfg.json" network.0.ipv4)"
 check "status reports the config source" "stored (slot A, seq 1)" "$(status config)"
 check "status: no trial" "null" "$(json "$WORK/status" trial)"
 check "status lists the boot-argument overrides (mgmt=wan only)" '{"mgmt.on_wan": "mgmt=wan"}' "$(json "$WORK/status" overrides)"
 curl -s -m 10 -o "$WORK/eff.json" "$URL/api/config/effective.json" || true
 check "effective config = stored + boot arguments (on_wan from mgmt=wan)" "10.20.0.1/24 true false" \
-  "$(json "$WORK/eff.json" lan.ipv4) $(json "$WORK/eff.json" mgmt.on_wan) $(json "$WORK/cfg.json" mgmt.on_wan)"
+  "$(json "$WORK/eff.json" network.0.ipv4) $(json "$WORK/eff.json" mgmt.on_wan) $(json "$WORK/cfg.json" mgmt.on_wan)"
 lan_toml 10.30.0.1
 check "save without password -> 401" 401 "$(code -X POST --data-binary @"$WORK/lan.toml" "$URL/api/config")"
 check "invalid TOML -> 422" 422 "$(save_toml "$WORK/bad.toml")"
 printf 'version = 1\n\n[lan]\nipv4 = "10.30.0.1/24"\n\n[lan.dhcp]\nrange = ["10.40.0.100", "10.40.0.199"]\n' >"$WORK/incons.toml"
 check "inconsistent config -> 422" 422 "$(save_toml "$WORK/incons.toml")"
-check "422 names the field" "lan.dhcp.range" "$(json "$WORK/resp" issues.0.path | cut -d'[' -f1)"
+check "422 names the field" "network.lan.dhcp.range" "$(json "$WORK/resp" issues.0.path | cut -d'[' -f1)"
+# Valid, but beyond what this kernel implements (a second network): refused.
+python3 -I -c 'import json,sys
+c=json.load(open(sys.argv[1]))
+c["network"].append({"name":"guest","vlan":20,"ipv4":"10.99.0.1/24"})
+open(sys.argv[2],"w").write(json.dumps(c))' "$WORK/cfg.json" "$WORK/v2.json"
+check "unsupported setting (second network) -> 422" 422 "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/v2.json" "$URL/api/config")"
+check "  ... names it" "network" "$(json "$WORK/resp" issues.0.path)"
 check "refused saves left the store unchanged" "A 1 0" "$(slot)"
 
 # A change without a trial, sent as JSON the way the page does: saved and
 # applied live, no reboot (DHCP reservation, DNS cache, shaping, qdisc).
 python3 -I -c 'import json,sys
 c=json.load(open(sys.argv[1])); c["dns"]["cache_entries"]=1000
-c["lan"]["dhcp"]["static"]=[{"mac":"52:54:00:00:00:08","ip":"10.20.0.8","hostname":"tv"}]
+c["network"][0]["dhcp"]["static"]=[{"mac":"52:54:00:00:00:08","ip":"10.20.0.8","hostname":"tv"}]
 c["shaping"]["down_kbit"]=50000; c["shaping"]["qdisc"]="fq_codel"
 open(sys.argv[2],"w").write(json.dumps(c))' "$WORK/cfg.json" "$WORK/new.json"
 status uptime_s >/dev/null; up0="$(json "$WORK/status" uptime_s)"
@@ -157,9 +164,12 @@ check "  ... upload shaper untouched" null "$(json "$WORK/status" interfaces.0.q
 check "qdisc rebuilt as FQ-CoDel" 1 "$(count 'qos lan0       : now shaped 50000 kbit/s, overhead 0 B, FQ-CoDel')"
 check "DHCP and DNS reconfigured (1 reservation, cache 1000)" 1 "$(count 'lan services    : reconfigured: .*(1 static, 0 lease(s) dropped).*cache 1000')"
 curl -s -m 10 -o "$WORK/cfg.json" "$URL/api/config.json" || true
-check "saved values read back" "1000 tv" "$(json "$WORK/cfg.json" dns.cache_entries) $(json "$WORK/cfg.json" lan.dhcp.static.0.hostname)"
+check "saved values read back" "1000 tv" "$(json "$WORK/cfg.json" dns.cache_entries) $(json "$WORK/cfg.json" network.0.dhcp.static.0.hostname)"
 check "no trial after a harmless save" "0 null" "$(count 'config          : trial (') $(status trial)"
 check "kernel stored canonical TOML (defaults written out)" 1 "$("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c '^cache_entries = 1000' || true)"
+# A config that fits schema v1 is stored as v1, header and text: kernels
+# that read only v1 still use it after a rollback (docs/config-v2.md §5).
+check "  ... as version 1 (header and text)" "1 1 1" "$("$RRSTORE" show "$IMG" 2>/dev/null | grep -c 'seq 2 version 1 ' || true) $("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c -e '^version = 1$' || true) $("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c '^\[lan\]$' || true)"
 # Rate only: the queue is kept.
 python3 -I -c 'import json,sys
 c=json.load(open(sys.argv[1])); c["shaping"]["down_kbit"]=60000

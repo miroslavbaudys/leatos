@@ -137,3 +137,162 @@ macro_rules! string_serde {
 
 string_serde!(Cidr);
 string_serde!(Mac);
+
+/// An address or subnet in a firewall rule: `10.10.0.20` (= /32) or
+/// `10.10.0.0/24`. Host bits must be zero (checked by validation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Net(pub Cidr);
+
+impl Net {
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        self.0.contains(ip)
+    }
+    /// No host bits set: `10.0.0.0/24`, not `10.0.0.5/24`.
+    pub fn is_network(&self) -> bool {
+        self.0.addr == self.0.network()
+    }
+}
+
+impl fmt::Display for Net {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.prefix == 32 {
+            write!(f, "{}", self.0.addr)
+        } else {
+            write!(f, "{}", self.0)
+        }
+    }
+}
+
+impl FromStr for Net {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.contains('/') {
+            return s.parse().map(Net);
+        }
+        let addr = s.parse().map_err(|_| "expected a.b.c.d or a.b.c.d/len")?;
+        Ok(Net(Cidr::new(addr, 32)))
+    }
+}
+
+/// A port or an inclusive range: `443`, `"443"`, `"8000-8100"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortRange {
+    pub lo: u16,
+    pub hi: u16,
+}
+
+impl PortRange {
+    pub const fn one(p: u16) -> Self {
+        PortRange { lo: p, hi: p }
+    }
+    pub fn contains(&self, p: u16) -> bool {
+        (self.lo..=self.hi).contains(&p)
+    }
+    pub fn overlaps(&self, o: &PortRange) -> bool {
+        self.lo <= o.hi && o.lo <= self.hi
+    }
+    /// Number of ports minus one.
+    pub fn span(&self) -> u16 {
+        self.hi.saturating_sub(self.lo)
+    }
+}
+
+impl fmt::Display for PortRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.lo == self.hi {
+            write!(f, "{}", self.lo)
+        } else {
+            write!(f, "{}-{}", self.lo, self.hi)
+        }
+    }
+}
+
+impl FromStr for PortRange {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let port = |x: &str| -> Result<u16, &'static str> {
+            match x.trim().parse::<u16>() {
+                Ok(p) if p > 0 => Ok(p),
+                _ => Err("ports are 1–65535"),
+            }
+        };
+        let (lo, hi) = match s.split_once('-') {
+            Some((a, b)) => (port(a)?, port(b)?),
+            None => (port(s)?, port(s)?),
+        };
+        if lo > hi {
+            return Err("range must go from low to high");
+        }
+        Ok(PortRange { lo, hi })
+    }
+}
+
+/// A forward's target: `10.10.0.10` (same ports) or `10.10.0.10:443`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub ip: Ipv4Addr,
+    pub port: Option<u16>,
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.port {
+            Some(p) => write!(f, "{}:{p}", self.ip),
+            None => write!(f, "{}", self.ip),
+        }
+    }
+}
+
+impl FromStr for Target {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (a, p) = match s.split_once(':') {
+            Some((a, p)) => (a, Some(p)),
+            None => (s, None),
+        };
+        let ip = a.parse().map_err(|_| "expected a.b.c.d or a.b.c.d:port")?;
+        let port = match p {
+            None => None,
+            Some(p) => match p.parse::<u16>() {
+                Ok(p) if p > 0 => Some(p),
+                _ => return Err("ports are 1–65535"),
+            },
+        };
+        Ok(Target { ip, port })
+    }
+}
+
+string_serde!(Net);
+string_serde!(Target);
+
+impl Serialize for PortRange {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+/// An integer (`wan_port = 8443`) or a string (`"8000-8100"`).
+impl<'de> Deserialize<'de> for PortRange {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = PortRange;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a port (1–65535) or a range \"lo-hi\"")
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<PortRange, E> {
+                match u16::try_from(v) {
+                    Ok(p) if p > 0 => Ok(PortRange::one(p)),
+                    _ => Err(E::custom("ports are 1–65535")),
+                }
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<PortRange, E> {
+                self.visit_i64(i64::try_from(v).unwrap_or(-1))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PortRange, E> {
+                v.parse().map_err(E::custom)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}

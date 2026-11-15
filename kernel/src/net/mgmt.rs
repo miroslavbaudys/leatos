@@ -657,7 +657,8 @@ impl Mgmt {
             Err(_) => Err(schema::Error::Syntax(String::from("not UTF-8"))),
             Ok(t) if json => schema::parse_json(t),
             Ok(t) => schema::parse(t),
-        };
+        }
+        .and_then(|cfg| config::supported(&cfg).map(|()| cfg));
         match parsed {
             Err(e) => {
                 let msg = format!("{e}");
@@ -692,7 +693,7 @@ impl Mgmt {
                 } else {
                     0
                 };
-                self.saved_lan = Some(format!("{}", cfg.lan.ipv4.addr));
+                self.saved_lan = cfg.lan().map(|n| format!("{}", n.ipv4.addr));
                 self.op = Some((
                     Some(i),
                     StoreOp::Save {

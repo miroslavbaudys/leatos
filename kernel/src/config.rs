@@ -53,13 +53,15 @@ pub fn load(store: Option<&mut crate::store::Store>, virtual_machine: bool) {
     }
     *BASE.lock() = Some(Arc::new(c.clone()));
     apply_bootargs(&mut c, bootargs());
-    println!(
-        "  config          : {source}, lan {}, dhcp {}–{}, {} reservation(s)",
-        c.lan.ipv4,
-        c.lan.dhcp_range().0,
-        c.lan.dhcp_range().1,
-        c.lan.dhcp.statics.len()
-    );
+    if let Some(n) = c.lan() {
+        println!(
+            "  config          : {source}, lan {}, dhcp {}–{}, {} reservation(s)",
+            n.ipv4,
+            n.dhcp_range().0,
+            n.dhcp_range().1,
+            n.dhcp.statics.len()
+        );
+    }
     // Boot arguments are a developer override: report what validation
     // would reject, but run with it.
     if let Err(issues) = c.validate() {
@@ -144,7 +146,11 @@ fn stored(store: Option<&mut crate::store::Store>) -> (Option<schema::Config>, S
     };
     let parsed = core::str::from_utf8(&rec.payload)
         .map_err(|_| String::from("not UTF-8"))
-        .and_then(|t| schema::parse(t).map_err(|e| alloc::format!("{e}")));
+        .and_then(|t| schema::parse(t).map_err(|e| alloc::format!("{e}")))
+        .and_then(|c| match supported(&c) {
+            Ok(()) => Ok(c),
+            Err(e) => Err(alloc::format!("{e}")),
+        });
     match parsed {
         Ok(c) => (
             Some(c),
@@ -163,6 +169,14 @@ fn stored(store: Option<&mut crate::store::Store>) -> (Option<schema::Config>, S
             ),
         ),
     }
+}
+
+/// Settings this kernel does not implement yet (`schema::Config::
+/// unsupported`) as an error: a save with them is refused, a stored config
+/// with them is not used.
+pub fn supported(c: &schema::Config) -> Result<(), schema::Error> {
+    let u = c.unsupported();
+    if u.is_empty() { Ok(()) } else { Err(schema::Error::Invalid(u)) }
 }
 
 /// The trial this boot runs (its slot and marked header), if the current
@@ -210,9 +224,9 @@ pub fn get() -> Arc<schema::Config> {
 /// Config fields a boot argument sets in this boot, as (field path, the
 /// argument): such a field ignores the stored value, so the web form must
 /// say so. Same keys as [`apply_bootargs`].
-pub fn overrides() -> Vec<(&'static str, &'static str)> {
+pub fn overrides() -> Vec<(String, &'static str)> {
     const MAP: &[(&str, &str)] = &[
-        ("lan", "lan.ipv4"),
+        ("lan", "network.*.ipv4"),
         ("wan_vlan", "wan.vlan"),
         ("wan_pcp", "wan.vlan_pcp"),
         ("wan_mode", "wan.mode"),
@@ -239,13 +253,18 @@ pub fn overrides() -> Vec<(&'static str, &'static str)> {
         for &(k, path) in MAP {
             // ecn= only where no ecn_up= / ecn_down= takes precedence.
             let shadowed = k == "ecn" && arg(args, path.trim_start_matches("shaping.")).is_some();
-            if k == key && !shadowed && !v.iter().any(|&(p, _)| p == path) {
+            // `lan=` sets the first network.
+            let path = match base().lan() {
+                Some(n) => path.replace('*', &n.name),
+                None => String::from(path),
+            };
+            if k == key && !shadowed && !v.iter().any(|(p, _)| *p == path) {
                 v.push((path, if k == "pppoe_pass" { "pppoe_pass=***" } else { kv }));
             }
         }
     }
     if arg(args, "mgmt") == Some("wan") {
-        v.push(("mgmt.on_wan", "mgmt=wan"));
+        v.push((String::from("mgmt.on_wan"), "mgmt=wan"));
     }
     v
 }
@@ -256,18 +275,18 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
     if let Some(net) = arg(args, "lan")
         .and_then(|v| v.parse::<schema::Cidr>().ok())
         .filter(|n| (8..=29).contains(&n.prefix))
+        && let Some(lan) = c.networks.first_mut()
     {
-        c.lan.ipv4 = net;
+        lan.ipv4 = net;
         // Settings tied to the old subnet would point outside the new one.
-        if c.lan
+        if lan
             .dhcp
             .range
             .is_some_and(|[lo, hi]| !net.is_host(lo) || !net.is_host(hi))
         {
-            c.lan.dhcp.range = None;
+            lan.dhcp.range = None;
         }
-        c.lan
-            .dhcp
+        lan.dhcp
             .statics
             .retain(|s| net.is_host(s.ip) && s.ip != net.addr);
     }
@@ -345,9 +364,10 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
 /// Without a stored config, on a virtual machine: the lab's `nas` reservation (host .10, MAC
 /// 52:54:00:00:00:05), which `scripts/lab-test.sh` resolves as `nas.lan`.
 fn add_lab_reservation(c: &mut schema::Config) {
-    let ip = c.lan.ipv4.host(10);
-    if c.lan.ipv4.is_host(ip) && ip != c.lan.ipv4.addr {
-        c.lan.dhcp.statics.push(schema::StaticLease {
+    let Some(lan) = c.networks.first_mut() else { return };
+    let ip = lan.ipv4.host(10);
+    if lan.ipv4.is_host(ip) && ip != lan.ipv4.addr {
+        lan.dhcp.statics.push(schema::StaticLease {
             mac: schema::Mac([0x52, 0x54, 0x00, 0x00, 0x00, 0x05]),
             ip,
             hostname: Some(String::from("nas")),
@@ -394,15 +414,18 @@ impl Lan {
     }
 }
 
-/// The LAN: `[lan]` (default 192.168.1.1/24, boot argument
-/// `lan=10.10.0.1/24`), pool `lan.dhcp.range` or hosts .100–.199.
+/// The LAN: the first network (version 1's `[lan]`; default
+/// 192.168.1.1/24, boot argument `lan=10.10.0.1/24`), pool
+/// `dhcp.range` or hosts .100–.199, domain `dns.domain`.
 pub fn lan() -> Lan {
     let c = get();
-    let l = &c.lan;
+    // A checked config has a network; a stored one without is refused.
+    let fallback = schema::Network::default();
+    let l = c.lan().unwrap_or(&fallback);
     Lan {
         addr: l.ipv4.addr,
         prefix: l.ipv4.prefix,
-        domain: l.domain.clone(),
+        domain: c.dns.domain.clone(),
         dhcp_range: l.dhcp_range(),
         lease_secs: l.dhcp.lease_secs,
         statics: l

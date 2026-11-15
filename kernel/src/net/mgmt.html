@@ -223,16 +223,16 @@
     <p class="lead">The local network, its DHCP server and fixed addresses.</p>
     <form class="card cfg" autocomplete="off"><h3>Network</h3>
       <div class="form">
-        <label>Router address / prefix<input data-path="lan.ipv4" placeholder="192.168.1.1/24"></label>
-        <label>Local domain<input data-path="lan.domain" placeholder="lan"></label>
+        <label>Router address / prefix<input data-net="ipv4" data-path="network.lan.ipv4" placeholder="192.168.1.1/24"></label>
+        <label>Local domain<input data-path="dns.domain" placeholder="lan"></label>
       </div>
       <p class="hint">Changing the router address boots as a trial: open the page at the new address and confirm, or the router goes back.</p>
     </form>
     <form class="card cfg" autocomplete="off"><h3>DHCP server</h3>
       <div class="form">
-        <label>Pool, first address (empty = automatic, .100–.199)<input id="rlo" data-x data-path="lan.dhcp.range" placeholder="automatic"></label>
-        <label>Pool, last address<input id="rhi" data-x data-path="lan.dhcp.range" placeholder="automatic"></label>
-        <label>Lease time, hours<input id="lease" data-x data-path="lan.dhcp.lease_secs" type="number" min="0.02" step="any"></label>
+        <label>Pool, first address (empty = automatic, .100–.199)<input id="rlo" data-x data-net="dhcp.range" data-path="network.lan.dhcp.range" placeholder="automatic"></label>
+        <label>Pool, last address<input id="rhi" data-x data-net="dhcp.range" data-path="network.lan.dhcp.range" placeholder="automatic"></label>
+        <label>Lease time, hours<input id="lease" data-x data-net="dhcp.lease_secs" data-path="network.lan.dhcp.lease_secs" type="number" min="0.02" step="any"></label>
       </div>
     </form>
     <form class="card cfg" autocomplete="off" id="reservations"><h3>Reservations</h3>
@@ -399,7 +399,8 @@ function route() {
 }
 window.addEventListener("hashchange", route);
 // Config path → the page that edits it (validation issues link there).
-const pageOf = (path) => ({ wan: "wan", lan: "lan", dns: "dns", shaping: "shaping", time: "system", mgmt: "system" })[path.split(/[.[]/)[0]] ?? "";
+const pageOf = (path) => path === "dns.domain" ? "lan"
+  : ({ wan: "wan", network: "lan", dns: "dns", shaping: "shaping", time: "system", mgmt: "system" })[path.split(/[.[]/)[0]] ?? "";
 
 // ================= Dialogs =================
 function ask(title, text, ok = "OK", danger = false) {
@@ -683,7 +684,7 @@ async function refresh() {
       ...(l.via ? [["Link", `${esc(l.via)}, MTU ${l.mtu}`]] : [])] : [["Lease", "none"]]), ...ppp,
     ...(st.pppoe_drops ? [["PPPoE drops", n(st.pppoe_drops)]] : [])]);
   $("dnsst").innerHTML = rows([["Upstream", l?.dns?.length ? l.dns.map(esc).join(", ") : "none (no WAN lease)"],
-    ["Local names", `DHCP host names and reservations, as <i>name</i>.${esc(cfgOrig?.lan?.domain ?? "lan")}`]]);
+    ["Local names", `DHCP host names and reservations, as <i>name</i>.${esc(cfgOrig?.dns?.domain ?? "lan")}`]]);
 
   // Firewall
   $("fwmgmt").textContent = st.mgmt.on_wan ? "and the web interface (open on the WAN)" : "";
@@ -751,12 +752,28 @@ $("leases").onclick = (ev) => {
 // issues name it. All pages' forms are one working copy; the bar at the
 // bottom shows how it differs from the saved config (cfgBase).
 let cfgOrig = null, cfgBase = null;
-const getp = (o, path) => path.split(".").reduce((x, k) => x == null ? x : x[k], o);
+// Paths as the router names them: list entries by name
+// (`network.lan.ipv4`) or index (`dhcp.static[2].ip`).
+const segs = (path) => path.replace(/\[(\d+)\]/g, ".$1").split(".");
+const isIdx = (k) => /^\d+$/.test(k);
+const step = (x, k) => Array.isArray(x) && !isIdx(k) ? x.find((e) => e?.name === k) : x?.[k];
+const getp = (o, path) => segs(path).reduce((x, k) => x == null ? x : step(x, k), o);
 const setp = (o, path, v) => {
-  const ks = path.split("."), last = ks.pop();
-  const t = ks.reduce((x, k) => (x[k] ??= {}), o);
+  const ks = segs(path), last = ks.pop();
+  let t = o;
+  for (const k of ks) {
+    let next = step(t, k);
+    if (next == null) {
+      next = {};
+      if (Array.isArray(t) && !isIdx(k)) { next.name = k; t.push(next); } else t[k] = next;
+    }
+    t = next;
+  }
   if (v === undefined) delete t[last]; else t[last] = v;
 };
+// The LAN page edits the first network (version 1's [lan]).
+let lanName = "lan";
+const lanPath = (rest) => `network.${lanName}.${rest}`;
 const cfgFields = () => [...document.querySelectorAll("form.cfg [data-path]")];
 const fields = () => cfgFields().filter((e) => !e.hasAttribute("data-x") && !e.dataset.key);
 
@@ -777,7 +794,7 @@ function staticRow(s = {}) {
 function staticHead() { $("statics").innerHTML = "<tr><th>MAC</th><th>IP address</th><th>Name</th><th></th></tr>"; }
 function renumber() {
   [...$("statics").rows].slice(1).forEach((tr, i) => tr.querySelectorAll("input").forEach((inp) => {
-    inp.dataset.path = `lan.dhcp.static[${i}].${inp.dataset.key}`;
+    inp.dataset.path = lanPath(`dhcp.static[${i}].${inp.dataset.key}`);
   }));
 }
 function readStatics() {
@@ -788,19 +805,21 @@ function readStatics() {
   }).filter((o) => Object.keys(o).length);
 }
 function fillForm(c) {
+  lanName = c.network?.[0]?.name ?? "lan";
+  for (const e of document.querySelectorAll("form.cfg [data-net]")) e.dataset.path = lanPath(e.dataset.net);
   for (const e of fields()) {
     const v = getp(c, e.dataset.path);
     if (e.type === "checkbox") e.checked = !!v;
     else if (e.tagName === "SELECT") e.value = v ?? e.options[0].value; // left out = the default (first)
     else e.value = v ?? "";
   }
-  const r = c.lan?.dhcp?.range;
+  const r = getp(c, lanPath("dhcp.range"));
   $("rlo").value = r ? r[0] : ""; $("rhi").value = r ? r[1] : "";
-  const ls = c.lan?.dhcp?.lease_secs;
+  const ls = getp(c, lanPath("dhcp.lease_secs"));
   $("lease").value = ls === undefined ? "" : +(ls / 3600).toFixed(4);
   $("ntp").value = (c.time?.ntp_servers ?? []).join(", ");
   staticHead();
-  (c.lan?.dhcp?.static ?? []).forEach((s) => staticRow(s));
+  (getp(c, lanPath("dhcp.static")) ?? []).forEach((s) => staticRow(s));
   pppoeVisibility();
 }
 function readForm() {
@@ -814,17 +833,23 @@ function readForm() {
     setp(c, e.dataset.path, v);
   }
   const lo = $("rlo").value.trim(), hi = $("rhi").value.trim();
-  setp(c, "lan.dhcp.range", lo || hi ? [lo, hi] : undefined);
-  setp(c, "lan.dhcp.lease_secs", Math.round(Number($("lease").value) * 3600));
+  setp(c, lanPath("dhcp.range"), lo || hi ? [lo, hi] : undefined);
+  setp(c, lanPath("dhcp.lease_secs"), Math.round(Number($("lease").value) * 3600));
   setp(c, "time.ntp_servers", $("ntp").value.split(",").map((x) => x.trim()).filter((x) => x));
   const sts = readStatics();
-  setp(c, "lan.dhcp.static", sts.length ? sts : undefined);
+  setp(c, lanPath("dhcp.static"), sts.length ? sts : undefined);
   return c;
 }
-// path → shown value; arrays of plain values stay one entry.
-function flatten(o, pre = "", out = {}) {
-  if (Array.isArray(o) && o.some((x) => x && typeof x === "object")) o.forEach((x, i) => flatten(x, `${pre}[${i}]`, out));
-  else if (o && typeof o === "object" && !Array.isArray(o)) for (const [k, v] of Object.entries(o)) flatten(v, pre ? `${pre}.${k}` : k, out);
+// path → shown value; arrays of plain values stay one entry, entries with
+// a name are named by it (as in the router's validation messages).
+const KEYED = ["network", "zone", "firewall.rule", "firewall.forward"];
+function flatten(o, pre = "", out = {}, named = false) {
+  if (Array.isArray(o) && o.some((x) => x && typeof x === "object")) {
+    const byName = KEYED.includes(pre);
+    o.forEach((x, i) => flatten(x, byName ? `${pre}.${x?.name}` : `${pre}[${i}]`, out, byName));
+  } else if (o && typeof o === "object" && !Array.isArray(o)) {
+    for (const [k, v] of Object.entries(o)) if (!(named && k === "name")) flatten(v, pre ? `${pre}.${k}` : k, out);
+  }
   else if (o !== undefined) out[pre] = Array.isArray(o) ? o.join(", ") : String(o);
   return out;
 }
