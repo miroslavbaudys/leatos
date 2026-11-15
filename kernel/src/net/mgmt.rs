@@ -36,7 +36,14 @@
 //!   erases it and reboots into the previous record. No save while a trial
 //!   is pending (it would overwrite the only confirmed record).
 //!
-//! Upgrade, reboot and config changes need HTTP Basic auth (user `admin`, password from the
+//! - `POST /api/login`: checks the credentials and does nothing else (the
+//!   page's login form). `GET /api/log`: the RAM log's tail as JSON
+//!   (`{ram, dropped, text}`), with auth: it names hosts and addresses.
+//! - Requests with `X-Rrouter-UI: 1` (the page's own) get a 401 without
+//!   `WWW-Authenticate`, so the browser shows the page's login form
+//!   instead of its own password dialog.
+//!
+//! Upgrade, reboot, log and config changes need HTTP Basic auth (user `admin`, password from the
 //! `mgmt_pass=` boot argument); without a password they are refused.
 //! Listens on the LAN; on the WAN too only with `mgmt=wan` (development:
 //! a router's management belongs on the LAN). Plain HTTP: the password
@@ -83,6 +90,8 @@ const FLUSH_TIMEOUT: Duration = Duration::from_millis(1000);
 /// upload early can leave the connection half-open).
 const LINGER: Duration = Duration::from_secs(2);
 const PAGE: &str = include_str!("mgmt.html");
+/// `GET /api/log`: at most this much of the RAM log's tail (all of it).
+const LOG_MAX: usize = 64 * 1024;
 
 /// What the network task must do after [`Mgmt::step`].
 pub enum Action {
@@ -108,6 +117,9 @@ enum Route {
     ConfigPut,
     ConfigConfirm,
     ConfigRevert,
+    /// Credentials check for the page's login form.
+    Login,
+    Log,
 }
 
 /// Work for the store, done by the services task (it may take a while and
@@ -162,6 +174,8 @@ struct Conn {
     /// Connection start (for the timeouts).
     since: Option<timer::Instant>,
     responded_at: Option<timer::Instant>,
+    /// `X-Rrouter-UI`: answer 401 without `WWW-Authenticate`.
+    no_prompt: bool,
 }
 
 impl Conn {
@@ -180,6 +194,7 @@ impl Conn {
             after: After::Nothing,
             since: None,
             responded_at: None,
+            no_prompt: false,
         }
     }
 
@@ -201,7 +216,7 @@ impl Conn {
 
     fn error(&mut self, status: u16, msg: &str) {
         let body = format!("{{\"ok\":false,\"error\":{}}}", json_str(msg));
-        if status == 401 {
+        if status == 401 && !self.no_prompt {
             self.respond(
                 status,
                 "application/json",
@@ -453,6 +468,7 @@ impl Mgmt {
 
     /// A request head arrived: route it, check auth, claim the staging area.
     fn on_head(&mut self, i: usize, head: Head) {
+        self.conns[i].no_prompt = head.header("x-rrouter-ui").is_some();
         let route = match (head.method, head.path.as_str()) {
             (Method::Get, "/" | "/index.html") => Ok(Route::Index),
             (Method::Get, "/api/status") => Ok(Route::Status),
@@ -468,13 +484,15 @@ impl Mgmt {
             (Method::Post, "/api/config") => Ok(Route::ConfigPut),
             (Method::Post, "/api/config/confirm") => Ok(Route::ConfigConfirm),
             (Method::Post, "/api/config/revert") => Ok(Route::ConfigRevert),
+            (Method::Post, "/api/login") => Ok(Route::Login),
+            (Method::Get, "/api/log") => Ok(Route::Log),
             (
                 _,
                 "/" | "/index.html" | "/api/status" | "/api/upgrade" | "/api/upgrade/persist"
                 | "/api/upgrade/confirm" | "/api/upgrade/revert" | "/api/reboot"
                 | "/api/config" | "/api/config.json" | "/api/config/effective"
                 | "/api/config/effective.json" | "/api/config/confirm"
-                | "/api/config/revert",
+                | "/api/config/revert" | "/api/login" | "/api/log",
             ) => {
                 Err((405, "method not allowed"))
             }
@@ -485,7 +503,10 @@ impl Mgmt {
                 matches!(r, Route::ConfigPut | Route::ConfigConfirm | Route::ConfigRevert);
             let changes_image =
                 matches!(r, Route::UpgradePersist | Route::UpgradeConfirm | Route::UpgradeRevert);
-            if changes_config || changes_image || matches!(r, Route::Upgrade | Route::Reboot) {
+            if changes_config
+                || changes_image
+                || matches!(r, Route::Upgrade | Route::Reboot | Route::Login | Route::Log)
+            {
                 self.authorized(&head)?;
             }
             if changes_config && !self.has_store {
@@ -594,6 +615,16 @@ impl Mgmt {
                 self.conns[i].respond_json(200, &json);
             }
             Route::ConfigPut => self.check_config(i),
+            Route::Login => self.conns[i].respond_json(200, "{\"ok\":true}"),
+            Route::Log => {
+                let ram = crate::console::logging_to_ram();
+                let (text, dropped) = crate::console::log_tail(None, LOG_MAX);
+                let body = format!(
+                    "{{\"ram\":{ram},\"dropped\":{dropped},\"text\":{}}}",
+                    json_str(&text)
+                );
+                self.conns[i].respond_json(200, &body);
+            }
             Route::ConfigConfirm
             | Route::ConfigRevert
             | Route::UpgradeConfirm
@@ -919,7 +950,7 @@ fn status_json(
         "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"vlan_drops\":{},\"conntrack\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
-         \"mgmt\":{{\"on_wan\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
+         \"drop_reasons\":{{{}}},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
         json_str(env!("CARGO_PKG_VERSION")),
         json_str(env!("RROUTER_BUILD")),
         json_str(if cfg!(target_arch = "x86_64") {
@@ -948,7 +979,17 @@ fn status_json(
         sh.conntrack(),
         mgmt.wan_pppoe.as_deref().unwrap_or("null"),
         datapath::PPPOE_DROPS.load(Ordering::Relaxed),
+        fwd::forwarder::DropReason::all()
+            .iter()
+            .map(|r| format!(
+                "{}:{}",
+                json_str(r.name()),
+                datapath::DROP_REASONS[r.index()].load(Ordering::Relaxed)
+            ))
+            .collect::<Vec<_>>()
+            .join(","),
         mgmt.on_wan,
+        mgmt.password.is_some(),
         mgmt.password.is_some() && (mgmt.staging.is_some() || mgmt.uploader.is_some()),
         mgmt.password.is_some()
             && mgmt.has_store

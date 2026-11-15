@@ -5,38 +5,101 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rrouter</title>
 <style>
-  :root { --bg:#f6f7f9; --card:#fff; --fg:#1d2330; --muted:#6b7280; --line:#e3e6eb; --ok:#15803d; --bad:#b91c1c; --accent:#2563eb;
-          --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; }
+  :root { --bg:#f4f5f7; --card:#fff; --fg:#1d2330; --muted:#6b7280; --line:#e3e6eb; --ok:#15803d; --bad:#b91c1c; --warn:#b45309; --accent:#2563eb;
+          --nav:#fff; --navsel:#e8effd; --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --shadow:0 1px 2px rgba(0,0,0,.05); }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#111418; --card:#1a1f26; --fg:#e6e9ee; --muted:#9aa3af; --line:#2a313b; --ok:#4ade80; --bad:#f87171; --accent:#60a5fa;
-            --s1:#3987e5; --s2:#d95926; --s3:#199e70; }
+    :root { --bg:#111418; --card:#1a1f26; --fg:#e6e9ee; --muted:#9aa3af; --line:#2a313b; --ok:#4ade80; --bad:#f87171; --warn:#fbbf24; --accent:#60a5fa;
+            --nav:#161a20; --navsel:#1f2a3a; --s1:#3987e5; --s2:#d95926; --s3:#199e70; --shadow:none; }
   }
   * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
-  header { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; }
-  header h1 { margin:0; font-size:18px; }
-  header span { color:var(--muted); }
-  main { padding:16px; display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr)); max-width:1200px; }
-  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 14px; min-width:0; }
-  h2 { margin:0 0 8px; font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
-  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
-  td, th { text-align:left; padding:3px 6px 3px 0; border-bottom:1px solid var(--line); vertical-align:top; overflow-wrap:anywhere; }
-  th { color:var(--muted); font-weight:500; }
-  .up { color:var(--ok); } .down { color:var(--bad); }
+  html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
+  a { color:var(--accent); }
+  /* ---- shell */
+  .top { position:sticky; top:0; z-index:5; display:flex; gap:12px; align-items:center; padding:10px 16px; background:var(--nav); border-bottom:1px solid var(--line); }
+  .top h1 { margin:0; font-size:17px; letter-spacing:.01em; }
+  .top .meta { color:var(--muted); display:flex; gap:12px; flex-wrap:wrap; min-width:0; flex:1; font-size:13px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--muted); margin-right:5px; vertical-align:1px; }
+  .dot.up { background:var(--ok); } .dot.down { background:var(--bad); }
+  .shell { display:grid; grid-template-columns:200px minmax(0, 1fr); min-height:calc(100vh - 49px); }
+  nav { background:var(--nav); border-right:1px solid var(--line); padding:10px 8px; }
+  nav .grp { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; padding:12px 10px 4px; }
+  nav a { display:block; padding:7px 10px; border-radius:6px; color:var(--fg); text-decoration:none; }
+  nav a:hover { background:var(--bg); }
+  nav a[aria-current=page] { background:var(--navsel); color:var(--accent); font-weight:600; }
+  nav a .mark { color:var(--warn); margin-left:4px; }
+  main { padding:16px; max-width:1180px; width:100%; padding-bottom:90px; }
+  @media (max-width: 760px) {
+    .shell { display:block; }
+    nav { position:sticky; top:49px; z-index:4; display:flex; overflow-x:auto; gap:2px; padding:6px 8px; border-right:none; border-bottom:1px solid var(--line); }
+    nav .grp { display:none; }
+    nav a { white-space:nowrap; }
+    .top .meta .opt { display:none; }
+  }
+  .page[hidden] { display:none; }
+  .page > h2 { margin:2px 0 12px; font-size:20px; font-weight:600; }
+  .page > p.lead { margin:-6px 0 14px; color:var(--muted); }
+  .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr)); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 14px; min-width:0; box-shadow:var(--shadow); margin-bottom:12px; }
+  .grid > .card { margin-bottom:0; }
+  .grid + .card, .card + .grid { margin-top:12px; }
+  .card h3 { margin:0 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); font-weight:600; }
   .wide { grid-column:1 / -1; }
-  input, button { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); max-width:100%; }
-  button { background:var(--accent); color:#fff; border:none; cursor:pointer; }
-  button.danger { background:var(--bad); }
-  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:6px 0; }
-  #msg { white-space:pre-wrap; color:var(--muted); }
+  /* ---- tiles */
+  .tiles { display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); margin-bottom:12px; }
+  .tile { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 14px; box-shadow:var(--shadow); min-width:0; }
+  .tile span { display:block; color:var(--muted); font-size:12px; }
+  .tile b { display:block; font-size:21px; font-weight:600; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+  .tile small { color:var(--muted); overflow-wrap:anywhere; }
+  /* ---- tables */
+  .tw { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  td, th { text-align:left; padding:5px 8px 5px 0; border-bottom:1px solid var(--line); vertical-align:top; overflow-wrap:anywhere; }
+  th { color:var(--muted); font-weight:500; }
+  table.kv th { width:34%; }
+  td.num, th.num { text-align:right; }
+  .up { color:var(--ok); } .down { color:var(--bad); } .muted { color:var(--muted); }
   .warn { color:var(--bad); font-weight:600; }
-  .stat { display:flex; gap:20px; align-items:baseline; flex-wrap:wrap; margin-bottom:6px; }
-  .stat b { font-size:26px; font-weight:600; font-variant-numeric:tabular-nums; }
-  .stat span { color:var(--muted); }
-  .legend { display:flex; gap:14px; color:var(--muted); font-size:13px; }
+  .pill { display:inline-block; padding:0 7px; border-radius:10px; font-size:12px; border:1px solid var(--line); color:var(--muted); }
+  .pill.ok { color:var(--ok); border-color:currentColor; } .pill.bad { color:var(--bad); border-color:currentColor; }
+  /* ---- forms */
+  input, button, select { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); max-width:100%; }
+  button { background:var(--accent); color:#fff; border:none; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  button.danger { background:var(--bad); }
+  button.plain { background:none; color:var(--accent); border:1px solid var(--line); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:8px 0; }
+  .form { display:grid; gap:4px 20px; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); }
+  label { display:grid; gap:2px; margin:6px 0; color:var(--muted); }
+  label.check { display:flex; gap:8px; align-items:center; color:var(--fg); }
+  label input:not([type=checkbox]), label select { width:100%; }
+  .hint { color:var(--muted); font-size:13px; margin:4px 0; }
+  .ovr { color:var(--bad); font-size:12px; }
+  .bad { outline:2px solid var(--bad); outline-offset:1px; }
+  .changed { border-color:var(--warn); }
+  #statics input { width:100%; min-width:0; }
+  #statics td { border:none; padding:2px 6px 2px 0; }
+  .msg { white-space:pre-wrap; }
+  .msg.err { color:var(--bad); }
+  /* ---- banners, pending bar, dialogs */
+  .banner { background:var(--card); border:2px solid var(--bad); border-radius:8px; padding:10px 14px; margin-bottom:12px; }
+  .banner b { font-variant-numeric:tabular-nums; }
+  .pending { position:fixed; left:0; right:0; bottom:0; z-index:6; background:var(--card); border-top:2px solid var(--warn);
+             padding:10px 16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; box-shadow:0 -2px 10px rgba(0,0,0,.08); }
+  .pending[hidden] { display:none; }
+  .pending .what { flex:1; min-width:180px; }
+  dialog { border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--fg); padding:16px; width:min(560px, calc(100vw - 32px)); }
+  dialog::backdrop { background:rgba(0,0,0,.35); }
+  dialog h3 { margin:0 0 10px; font-size:16px; }
+  .diff td { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12.5px; }
+  .diff .old { color:var(--bad); text-decoration:line-through; } .diff .new { color:var(--ok); }
+  /* ---- charts */
+  .legend { display:flex; gap:14px; flex-wrap:wrap; color:var(--muted); font-size:13px; }
   .legend i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
+  .stat { display:flex; gap:20px; align-items:baseline; flex-wrap:wrap; margin:6px 0; }
+  .stat b { font-size:22px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .stat span { color:var(--muted); }
   .chart { position:relative; }
-  .chart svg { display:block; width:100%; height:170px; touch-action:none; }
+  .chart svg { display:block; width:100%; height:150px; touch-action:none; }
   .chart .grid { stroke:var(--line); stroke-width:1; }
   .chart text { fill:var(--muted); font-size:11px; font-variant-numeric:tabular-nums; }
   .chart .hair { stroke:var(--muted); stroke-width:1; }
@@ -44,120 +107,363 @@
          padding:6px 8px; font-size:12px; font-variant-numeric:tabular-nums; white-space:nowrap; box-shadow:0 2px 8px rgba(0,0,0,.12); }
   .tip i { display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:5px; }
   details { margin-top:6px; color:var(--muted); }
-  .banner { grid-column:1 / -1; background:var(--card); border:2px solid var(--bad); border-radius:8px; padding:12px 14px; }
-  .banner b { font-variant-numeric:tabular-nums; }
-  .cfg { display:grid; gap:12px 20px; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); }
-  fieldset { border:1px solid var(--line); border-radius:6px; padding:8px 10px 10px; margin:0; min-width:0; }
-  legend { color:var(--muted); padding:0 4px; }
-  label { display:grid; gap:2px; margin:6px 0; color:var(--muted); }
-  label.check { display:flex; gap:8px; align-items:center; color:var(--fg); }
-  label input:not([type=checkbox]), label select { width:100%; }
-  select { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); }
-  .bad { outline:2px solid var(--bad); outline-offset:1px; }
-  #statics input { width:100%; min-width:0; }
-  #statics td { border:none; padding:2px 6px 2px 0; }
-  button.plain { background:none; color:var(--accent); border:1px solid var(--line); }
-  #cfgmsg, #trialmsg, #ktrialmsg { white-space:pre-wrap; }
-  #cfgmsg.err { color:var(--bad); }
-  .hint { color:var(--muted); font-size:13px; }
-  .ovr { color:var(--bad); font-size:12px; }
+  pre.log { margin:0; max-height:65vh; overflow:auto; font:12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
 </style>
 </head>
 <body>
-<header><h1>rrouter</h1><span id="ver">…</span><span id="up"></span><span id="wanwarn" class="warn"></span></header>
+<div class="top">
+  <h1>rrouter</h1>
+  <div class="meta"><span id="wanstate"><i class="dot"></i>WAN …</span><span id="up"></span><span id="ver" class="opt">…</span><span id="wanwarn" class="warn"></span></div>
+  <button id="loginbtn" class="plain">Log in</button>
+</div>
+<div class="shell">
+<nav aria-label="Pages">
+  <div class="grp">Status</div>
+  <a href="#/">Overview</a>
+  <a href="#/interfaces">Interfaces</a>
+  <a href="#/clients">Clients</a>
+  <div class="grp">Network</div>
+  <a href="#/wan">WAN</a>
+  <a href="#/lan">LAN &amp; DHCP</a>
+  <a href="#/dns">DNS</a>
+  <a href="#/firewall">Firewall</a>
+  <a href="#/shaping">Traffic shaping</a>
+  <div class="grp">System</div>
+  <a href="#/system">System</a>
+  <a href="#/logs">Logs</a>
+</nav>
 <main>
   <div id="ktrialbar" class="banner" hidden>
     <div><b>Trial kernel</b> (<span id="ksrc"></span>). Confirm within <b id="ktrialleft">–</b> s, or the router reboots into the previous kernel.</div>
     <div class="row"><button id="kconfirm">Confirm kernel</button><button id="krevert" class="danger">Roll back now</button></div>
-    <div id="ktrialmsg"></div>
+    <div id="ktrialmsg" class="msg"></div>
   </div>
   <div id="trialbar" class="banner" hidden>
     <div><b>Trial configuration.</b> Confirm within <b id="trialleft">–</b> s, or the router reverts to the previous configuration and reboots.</div>
     <div class="row"><button id="confirm">Confirm</button><button id="revert" class="danger">Revert now</button></div>
-    <div id="trialmsg"></div>
+    <div id="trialmsg" class="msg"></div>
   </div>
-  <section class="wide"><h2>CPU load per core</h2>
-    <div class="legend"><span><i style="background:var(--s1)"></i>Datapath (forwarding, CAKE)</span><span><i style="background:var(--s2)"></i>Services (DHCP, DNS, web)</span><span><i style="background:var(--s3)"></i>Other (IRQs, timers)</span></div>
-    <div id="cpucharts"></div>
-    <details><summary>Last 10 seconds as a table</summary><table id="cputab"></table></details>
+  <div id="offline" class="banner" hidden>The router does not answer. This page keeps trying.</div>
+
+  <!-- ================= Overview ================= -->
+  <section class="page" data-page="" data-title="Overview">
+    <h2>Overview</h2>
+    <div class="tiles">
+      <div class="tile"><span>WAN</span><b id="t-wan">–</b><small id="t-wan2"></small></div>
+      <div class="tile"><span>Download now</span><b id="t-down">–</b><small id="t-down2">WAN receive</small></div>
+      <div class="tile"><span>Upload now</span><b id="t-upl">–</b><small id="t-upl2">WAN send</small></div>
+      <div class="tile"><span>Clients</span><b id="t-clients">–</b><small>DHCP leases</small></div>
+      <div class="tile"><span>Connections</span><b id="t-conns">–</b><small id="t-fwd"></small></div>
+      <div class="tile"><span>Time (UTC)</span><b id="t-time">–</b><small id="t-time2"></small></div>
+    </div>
+    <div class="card"><h3>WAN throughput</h3>
+      <div class="legend"><span><i style="background:var(--s1)"></i>Download</span><span><i style="background:var(--s2)"></i>Upload</span><span>since this page was opened, every 2 s</span></div>
+      <div class="chart"><svg id="ratechart" role="img" aria-label="WAN throughput"></svg><div id="ratetip" class="tip" hidden></div></div>
+    </div>
+    <div class="card"><h3>CPU load per core</h3>
+      <div class="legend"><span><i style="background:var(--s1)"></i>Datapath (forwarding, CAKE)</span><span><i style="background:var(--s2)"></i>Services (DHCP, DNS, web)</span><span><i style="background:var(--s3)"></i>Other (IRQs, timers)</span></div>
+      <div id="cpucharts"></div>
+      <details><summary>Last 10 seconds as a table</summary><div class="tw"><table id="cputab"></table></div></details>
+    </div>
   </section>
-  <section class="wide"><h2>Interfaces</h2><table id="ifs"></table></section>
-  <section><h2>WAN</h2><table id="wan"></table></section>
-  <section><h2>System</h2><table id="sys"></table></section>
-  <section class="wide"><h2>DHCP leases</h2><table id="leases"></table></section>
-  <section class="wide"><h2>Configuration</h2>
-    <div class="row"><input id="pass" type="password" placeholder="admin password (mgmt_pass)" autocomplete="current-password"><span class="hint">needed to save, confirm, upgrade and reboot</span></div>
-    <form id="cfg" class="cfg" autocomplete="off">
-      <fieldset><legend>WAN</legend>
+
+  <!-- ================= Interfaces ================= -->
+  <section class="page" data-page="interfaces" data-title="Interfaces" hidden>
+    <h2>Interfaces</h2>
+    <p class="lead">Physical ports and the router's addresses on them.</p>
+    <div class="card"><h3>Ports</h3><div class="tw"><table id="ifs"></table></div></div>
+    <div class="card"><h3>Egress queues</h3><div class="tw"><table id="qdiscs"></table></div>
+      <p class="hint">Each port's transmit side has its own queue (CAKE by default); settings under <a href="#/shaping">Traffic shaping</a>.</p></div>
+    <div class="card"><h3>VLAN interfaces</h3>
+      <p class="hint">Today the router has one LAN network and an optional VLAN tag on the WAN (<a href="#/wan">WAN</a>). Extra networks (for example a guest VLAN with its own subnet, DHCP pool and firewall zone) come with configuration schema v2.</p></div>
+  </section>
+
+  <!-- ================= Clients ================= -->
+  <section class="page" data-page="clients" data-title="Clients" hidden>
+    <h2>Clients</h2>
+    <p class="lead">Devices with a DHCP lease from the router.</p>
+    <div class="card">
+      <div class="row"><input id="clientq" placeholder="Filter by name, IP or MAC" style="flex:1; min-width:180px"></div>
+      <div class="tw"><table id="leases"></table></div>
+    </div>
+  </section>
+
+  <!-- ================= WAN ================= -->
+  <section class="page" data-page="wan" data-title="WAN" hidden>
+    <h2>WAN</h2>
+    <p class="lead">The internet uplink.</p>
+    <div class="grid">
+      <div class="card"><h3>Status</h3><table class="kv" id="wan"></table></div>
+      <form class="card cfg" autocomplete="off"><h3>Link</h3>
         <label>VLAN ID (empty = untagged)<input data-path="wan.vlan" data-opt type="number" min="1" max="4094" placeholder="e.g. 848"></label>
         <label>VLAN priority (PCP 0–7)<input data-path="wan.vlan_pcp" data-opt type="number" min="0" max="7" placeholder="0"></label>
-        <p class="hint">Only if the ISP requires a tagged link.</p>
-        <label>Connection<select data-path="wan.mode"><option value="dhcp">DHCP</option><option value="pppoe">PPPoE</option></select></label>
-        <label>PPPoE user name<input data-path="wan.pppoe.username" placeholder="user@isp" autocomplete="off"></label>
-        <label>PPPoE password<input data-path="wan.pppoe.password" data-secret type="password" placeholder="empty = keep the stored one" autocomplete="new-password"></label>
+        <p class="hint">Only if the ISP requires a tagged link. A change restarts the WAN.</p>
+      </form>
+    </div>
+    <form class="card cfg" autocomplete="off"><h3>Connection</h3>
+      <div class="form">
+        <label>Type<select data-path="wan.mode" id="wanmode"><option value="dhcp">DHCP</option><option value="pppoe">PPPoE</option></select></label>
+      </div>
+      <div class="form" id="pppoefields">
+        <label>User name<input data-path="wan.pppoe.username" placeholder="user@isp" autocomplete="off"></label>
+        <label>Password<input data-path="wan.pppoe.password" data-secret type="password" placeholder="empty = keep the stored one" autocomplete="new-password"></label>
         <label>Service name (empty = any)<input data-path="wan.pppoe.service"></label>
         <label>Access concentrator (empty = first to answer)<input data-path="wan.pppoe.ac_name"></label>
-        <label>PPPoE MTU<input data-path="wan.pppoe.mtu" data-opt type="number" min="1280" max="1492" placeholder="1492"></label>
+        <label>MTU<input data-path="wan.pppoe.mtu" data-opt type="number" min="1280" max="1492" placeholder="1492"></label>
         <label>LCP echo interval, s (0 = off)<input data-path="wan.pppoe.lcp_echo_interval" data-opt type="number" min="0" max="3600" placeholder="10"></label>
         <label>LCP echo failures before reconnecting<input data-path="wan.pppoe.lcp_echo_failure" data-opt type="number" min="1" max="100" placeholder="5"></label>
-        <p class="hint">A change restarts the WAN (DHCP client or PPPoE session). The password is never shown.</p>
-      </fieldset>
-      <fieldset><legend>LAN</legend>
+      </div>
+      <p class="hint">A change restarts the WAN (DHCP client or PPPoE session). The PPPoE password is never shown.</p>
+    </form>
+  </section>
+
+  <!-- ================= LAN ================= -->
+  <section class="page" data-page="lan" data-title="LAN & DHCP" hidden>
+    <h2>LAN &amp; DHCP</h2>
+    <p class="lead">The local network, its DHCP server and fixed addresses.</p>
+    <form class="card cfg" autocomplete="off"><h3>Network</h3>
+      <div class="form">
         <label>Router address / prefix<input data-path="lan.ipv4" placeholder="192.168.1.1/24"></label>
         <label>Local domain<input data-path="lan.domain" placeholder="lan"></label>
-        <label>DHCP pool (empty = automatic, hosts .100–.199)
-          <span class="row" style="margin:0"><input id="rlo" data-path="lan.dhcp.range" placeholder="first" style="flex:1"><input id="rhi" data-path="lan.dhcp.range" placeholder="last" style="flex:1"></span></label>
-        <label>Lease time (hours)<input id="lease" data-path="lan.dhcp.lease_secs" type="number" min="0.02" step="any"></label>
-      </fieldset>
-      <fieldset><legend>DNS</legend>
+      </div>
+      <p class="hint">Changing the router address boots as a trial: open the page at the new address and confirm, or the router goes back.</p>
+    </form>
+    <form class="card cfg" autocomplete="off"><h3>DHCP server</h3>
+      <div class="form">
+        <label>Pool, first address (empty = automatic, .100–.199)<input id="rlo" data-x data-path="lan.dhcp.range" placeholder="automatic"></label>
+        <label>Pool, last address<input id="rhi" data-x data-path="lan.dhcp.range" placeholder="automatic"></label>
+        <label>Lease time, hours<input id="lease" data-x data-path="lan.dhcp.lease_secs" type="number" min="0.02" step="any"></label>
+      </div>
+    </form>
+    <form class="card cfg" autocomplete="off" id="reservations"><h3>Reservations</h3>
+      <p class="hint">Always the same address for a device. Add one from <a href="#/clients">Clients</a>, or by hand.</p>
+      <div class="tw"><table id="statics"></table></div>
+      <div class="row"><button type="button" id="addstatic" class="plain">Add reservation</button></div>
+    </form>
+  </section>
+
+  <!-- ================= DNS ================= -->
+  <section class="page" data-page="dns" data-title="DNS" hidden>
+    <h2>DNS</h2>
+    <p class="lead">The router forwards LAN queries to the WAN's DNS servers and answers local names itself.</p>
+    <div class="grid">
+      <div class="card"><h3>Status</h3><table class="kv" id="dnsst"></table></div>
+      <form class="card cfg" autocomplete="off"><h3>Forwarder</h3>
         <label>Cache entries<input data-path="dns.cache_entries" type="number" min="16" max="65536"></label>
         <label class="check"><input data-path="dns.rebind_protection" type="checkbox">Rebind protection (drop answers pointing into private ranges)</label>
-      </fieldset>
-      <fieldset><legend>Time</legend>
-        <label>NTP servers (comma-separated names or addresses; empty = off)<input id="ntp" data-path="time.ntp_servers" placeholder="pool.ntp.org"></label>
-      </fieldset>
-      <fieldset><legend>Shaping (CAKE)</legend>
+      </form>
+    </div>
+  </section>
+
+  <!-- ================= Firewall ================= -->
+  <section class="page" data-page="firewall" data-title="Firewall" hidden>
+    <h2>Firewall</h2>
+    <p class="lead">Stateful: replies to tracked connections always pass; new connections follow the policy below.</p>
+    <div class="card"><h3>Policy in effect</h3>
+      <div class="tw"><table>
+        <tr><th>From \ to</th><th>WAN (internet)</th><th>LAN</th><th>Router itself</th></tr>
+        <tr><th>LAN</th><td><span class="pill ok">allow</span> masqueraded (NAT)</td><td class="muted">same network</td><td><span class="pill ok">allow</span> DHCP, DNS, web interface</td></tr>
+        <tr><th>WAN</th><td class="muted">–</td><td><span class="pill bad">drop</span> unless a reply</td><td><span class="pill bad">drop</span> except the WAN's own services <span id="fwmgmt"></span></td></tr>
+      </table></div>
+      <p class="hint">New TCP connections must start with a SYN; other protocols than TCP, UDP and ICMP are dropped for new flows. Rules, port forwards and zones for extra networks come with configuration schema v2.</p>
+    </div>
+    <div class="card"><h3>Dropped packets by reason</h3><div class="tw"><table id="drops"></table></div>
+      <p class="hint">Counted since boot by the forwarding plane (packets the router forwards, not its own).</p></div>
+  </section>
+
+  <!-- ================= Shaping ================= -->
+  <section class="page" data-page="shaping" data-title="Traffic shaping" hidden>
+    <h2>Traffic shaping</h2>
+    <p class="lead">Set the rates a little below the line's real speed, so the queue builds in the router (where CAKE keeps latency low) instead of in the modem.</p>
+    <form class="card cfg" autocomplete="off"><h3>Rates</h3>
+      <div class="form">
         <label>Upload, kbit/s (empty = unshaped)<input data-path="shaping.up_kbit" data-opt type="number" min="64"></label>
         <label>Download, kbit/s (empty = unshaped)<input data-path="shaping.down_kbit" data-opt type="number" min="64"></label>
         <label>Overhead per packet, bytes<input data-path="shaping.overhead" type="number" min="0" max="256"></label>
-        <label class="check"><input data-path="shaping.ecn_up" type="checkbox">ECN marking on upload</label>
-        <label class="check"><input data-path="shaping.ecn_down" type="checkbox">ECN marking on download</label>
-        <label>Queue discipline<select data-path="shaping.qdisc"><option value="cake">CAKE</option><option value="fq_codel">FQ-CoDel</option><option value="codel">CoDel (one queue)</option></select></label>
-        <label>Fairness<select data-path="shaping.isolation"><option value="triple-isolate">triple-isolate</option><option value="dual-srchost">dual-srchost</option><option value="dual-dsthost">dual-dsthost</option><option value="flows">flows</option></select></label>
-      </fieldset>
-      <fieldset><legend>Management</legend>
-        <label class="check"><input data-path="mgmt.on_wan" type="checkbox">Also on the WAN (development only)</label>
-        <p class="hint">Changing the LAN address or these settings boots as a trial: confirm it from the new address, or the router reverts.</p>
-      </fieldset>
-      <fieldset style="grid-column:1 / -1"><legend>DHCP reservations</legend>
-        <table id="statics"></table>
-        <div class="row"><button type="button" id="addstatic" class="plain">Add reservation</button></div>
-      </fieldset>
+      </div>
+      <p class="hint">The WAN's VLAN tag (+4 B) and PPPoE header (+8 B) are added to the overhead automatically.</p>
     </form>
-    <div class="row"><button id="save">Save and reboot</button><button id="discard" class="plain">Discard changes</button>
-      <button id="effective" class="plain" hidden title="Fill the form with the values the router runs with, boot arguments included; then Save, and remove those boot arguments">Use values in effect</button>
-      <a href="/api/config" download="config.toml">Export config.toml</a>
-      <label class="check" style="margin:0">Import:<input id="import" type="file" accept=".toml,text/plain"></label></div>
-    <div id="cfgmsg"></div>
+    <form class="card cfg" autocomplete="off"><h3>Queue</h3>
+      <div class="form">
+        <label>Queue discipline<select data-path="shaping.qdisc"><option value="cake">CAKE</option><option value="fq_codel">FQ-CoDel</option><option value="codel">CoDel (one queue)</option></select></label>
+        <label>Fairness<select data-path="shaping.isolation"><option value="triple-isolate">triple-isolate (per host, then per flow)</option><option value="dual-srchost">dual-srchost</option><option value="dual-dsthost">dual-dsthost</option><option value="flows">flows only</option></select></label>
+        <div>
+          <label class="check"><input data-path="shaping.ecn_up" type="checkbox">ECN marking on upload</label>
+          <label class="check"><input data-path="shaping.ecn_down" type="checkbox">ECN marking on download</label>
+        </div>
+      </div>
+      <p class="hint">Another queue discipline, fairness or ECN setting rebuilds the queue (packets in it are dropped once).</p>
+    </form>
+    <div class="card"><h3>Queues now</h3><div class="tw"><table id="qdiscs2"></table></div></div>
   </section>
-  <section class="wide"><h2>Upgrade (in RAM; a power cycle boots the SD card again)</h2>
-    <div class="row"><input id="file" type="file"><input id="cmd" placeholder="kernel command line (empty = keep current)" size="40"></div>
-    <div class="row"><button id="go">Upload and start</button><button id="reboot" class="danger">Reboot</button></div>
-    <div id="msg"></div>
+
+  <!-- ================= System ================= -->
+  <section class="page" data-page="system" data-title="System" hidden>
+    <h2>System</h2>
+    <div class="grid">
+      <div class="card"><h3>Router</h3><table class="kv" id="sys"></table></div>
+      <div>
+        <form class="card cfg" autocomplete="off"><h3>Time</h3>
+          <label>NTP servers (comma-separated; empty = off)<input id="ntp" data-x data-path="time.ntp_servers" placeholder="pool.ntp.org"></label>
+        </form>
+        <form class="card cfg" autocomplete="off"><h3>Management</h3>
+          <label class="check"><input data-path="mgmt.on_wan" type="checkbox">Also on the WAN (development only)</label>
+          <p class="hint">Boots as a trial: confirm afterwards, or the router reverts.</p>
+        </form>
+      </div>
+    </div>
+    <div class="card"><h3>Backup and restore</h3>
+      <div class="row"><a href="/api/config" download="config.toml">Export config.toml</a>
+        <label class="check" style="margin:0">Import:<input id="import" type="file" accept=".toml,text/plain"></label>
+        <button id="effective" class="plain" hidden title="Fill the forms with the values the router runs with, boot arguments included; then save, and remove those boot arguments">Use values in effect</button></div>
+      <p class="hint">The export leaves out secrets (the PPPoE password); an import without them keeps the stored ones.</p>
+      <div id="bkmsg" class="msg"></div>
+    </div>
+    <div class="card"><h3>Firmware</h3>
+      <div class="row"><input id="file" type="file"></div>
+      <label class="check"><input id="persist" type="checkbox">Store on the boot disk as a trial (otherwise in RAM only: a power cycle boots the stored kernel again)</label>
+      <div class="row"><input id="cmd" placeholder="kernel command line for an in-RAM upgrade (empty = keep current)" style="flex:1; min-width:200px"></div>
+      <div class="row"><button id="go">Upload and start</button><button id="reboot" class="danger">Reboot</button></div>
+      <div id="msg" class="msg"></div>
+    </div>
+  </section>
+
+  <!-- ================= Logs ================= -->
+  <section class="page" data-page="logs" data-title="Logs" hidden>
+    <h2>Logs</h2>
+    <div class="card">
+      <div class="row"><input id="logq" placeholder="Filter" style="flex:1; min-width:160px">
+        <label class="check" style="margin:0"><input id="logfollow" type="checkbox" checked>Follow</label>
+        <button id="logload" class="plain">Refresh</button></div>
+      <div id="loginfo" class="hint"></div>
+      <pre class="log" id="logtext"></pre>
+    </div>
   </section>
 </main>
+</div>
+
+<div class="pending" id="pending" hidden>
+  <div class="what"><b id="pcount"></b> <span id="pmsg" class="msg"></span></div>
+  <button id="review" class="plain">Review</button>
+  <button id="discard" class="plain">Discard</button>
+  <button id="save">Save</button>
+</div>
+
+<dialog id="logindlg">
+  <form method="dialog" id="loginform">
+    <h3>Log in</h3>
+    <p class="hint">User <b>admin</b>, the password from the boot argument <code>mgmt_pass=</code>. Kept for this browser tab only.</p>
+    <label>Password<input id="loginpass" type="password" autocomplete="current-password"></label>
+    <div id="loginmsg" class="msg err"></div>
+    <div class="row"><button id="loginok" value="ok">Log in</button><button type="button" class="plain" id="logincancel">Cancel</button></div>
+  </form>
+</dialog>
+<dialog id="reviewdlg">
+  <h3>Unsaved changes</h3>
+  <div id="issues" class="msg err"></div>
+  <div class="tw"><table class="diff" id="difftab"></table></div>
+  <div class="row"><button id="rsave">Save</button><button type="button" class="plain" id="rclose">Close</button></div>
+</dialog>
+<dialog id="askdlg">
+  <h3 id="asktitle"></h3>
+  <p id="asktext" class="msg"></p>
+  <div class="row"><button id="askok"></button><button type="button" class="plain" id="askcancel">Cancel</button></div>
+</dialog>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const n = (x) => Number(x).toLocaleString();
 const rows = (pairs) => pairs.map(([k, v]) => `<tr><th>${esc(k)}</th><td>${v}</td></tr>`).join("");
 const dur = (s) => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + "d " : "") + h + "h " + m + "m " + (s % 60) + "s"; };
+const bits = (bps) => bps >= 1e9 ? (bps / 1e9).toFixed(2) + " Gbit/s" : bps >= 1e6 ? (bps / 1e6).toFixed(1) + " Mbit/s" : bps >= 1e3 ? (bps / 1e3).toFixed(0) + " kbit/s" : Math.round(bps) + " bit/s";
+const bytes = (b) => b >= 1 << 30 ? (b / (1 << 30)).toFixed(2) + " GiB" : b >= 1 << 20 ? (b / (1 << 20)).toFixed(1) + " MiB" : b >= 1024 ? (b / 1024).toFixed(0) + " KiB" : b + " B";
+const store = { get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
+                set(k, v) { try { v === null ? sessionStorage.removeItem(k) : sessionStorage.setItem(k, v); } catch {} } };
 
-// CPU load per core: cpu.cores[c] = samples [busy, datapath, service] in
-// permille, oldest first, one per second. Stacked from the bottom: datapath
-// (forwarding tasks), services (router stack, DHCP, DNS, this web server),
-// other (the rest of busy: IRQs, timers, the executor). One chart per core
-// (small multiples, same scale).
+// ================= Pages (hash routing) =================
+const PAGES = [...document.querySelectorAll(".page")].map((p) => p.dataset.page);
+let page = "";
+function route() {
+  const h = location.hash.replace(/^#\/?/, "").split(/[/?]/)[0];
+  page = PAGES.includes(h) ? h : "";
+  for (const p of document.querySelectorAll(".page")) p.hidden = p.dataset.page !== page;
+  for (const a of document.querySelectorAll("nav a")) {
+    const target = a.getAttribute("href").replace(/^#\/?/, "");
+    if (target === page) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+  }
+  const sec = document.querySelector(`.page[data-page="${page}"]`);
+  document.title = (page ? sec.dataset.title + " · " : "") + "rrouter";
+  if (page === "") { cpuCores.forEach((_, c) => drawCpu(c)); drawRate(); }
+  if (page === "logs") loadLog();
+}
+window.addEventListener("hashchange", route);
+// Config path → the page that edits it (validation issues link there).
+const pageOf = (path) => ({ wan: "wan", lan: "lan", dns: "dns", shaping: "shaping", time: "system", mgmt: "system" })[path.split(/[.[]/)[0]] ?? "";
+
+// ================= Dialogs =================
+function ask(title, text, ok = "OK", danger = false) {
+  return new Promise((resolve) => {
+    $("asktitle").textContent = title; $("asktext").textContent = text;
+    $("askok").textContent = ok; $("askok").className = danger ? "danger" : "";
+    const d = $("askdlg");
+    const done = (v) => { d.close(); $("askok").onclick = $("askcancel").onclick = null; resolve(v); };
+    $("askok").onclick = () => done(true); $("askcancel").onclick = () => done(false);
+    d.oncancel = () => done(false);
+    d.showModal();
+  });
+}
+
+// ================= Login (HTTP Basic, password kept per tab) =================
+let pass = store.get("rrouter-pass");
+let authAvailable = true;
+const b64 = (s) => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
+const authHeaders = (p = pass) => ({ "X-Rrouter-UI": "1", ...(p ? { Authorization: "Basic " + b64("admin:" + p) } : {}) });
+function setPass(p) { pass = p; store.set("rrouter-pass", p); showLogin(); }
+function showLogin() {
+  $("loginbtn").textContent = !authAvailable ? "Read-only" : pass ? "Log out" : "Log in";
+  $("loginbtn").disabled = !authAvailable;
+  $("loginbtn").title = authAvailable ? "" : "Changes are disabled: boot with mgmt_pass=<password>";
+}
+let loginWaiter = null;
+function openLogin(why = "") {
+  $("loginmsg").textContent = why; $("loginpass").value = "";
+  if (!$("logindlg").open) $("logindlg").showModal();
+  $("loginpass").focus();
+  return new Promise((resolve) => { loginWaiter = resolve; });
+}
+function closeLogin(ok) { $("logindlg").close(); if (loginWaiter) { loginWaiter(ok); loginWaiter = null; } }
+$("loginform").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const p = $("loginpass").value;
+  $("loginmsg").textContent = "…";
+  try {
+    const r = await fetch("/api/login", { method: "POST", headers: authHeaders(p) });
+    if (r.ok) { setPass(p); closeLogin(true); return; }
+    const j = await r.json().catch(() => ({}));
+    $("loginmsg").textContent = r.status === 401 ? "Wrong password." : (j.error ?? `Refused (${r.status})`);
+  } catch (e) { $("loginmsg").textContent = "Request failed: " + e; }
+};
+$("logincancel").onclick = () => closeLogin(false);
+$("logindlg").oncancel = () => closeLogin(false);
+$("loginbtn").onclick = () => { if (pass) { setPass(null); if (page === "logs") loadLog(); } else openLogin(); };
+async function ensureLogin() {
+  if (!authAvailable) return false;
+  return pass ? true : openLogin();
+}
+// One API call with the stored credentials; a 401 asks to log in again.
+async function api(method, path, { body, type, headers = {} } = {}) {
+  const r = await fetch(path, { method, cache: "no-store", body,
+    headers: { ...authHeaders(), ...(type ? { "Content-Type": type } : {}), ...headers } });
+  const j = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
+  if (r.status === 401) { setPass(null); }
+  return { r, j };
+}
+
+// ================= CPU load per core =================
+// cpu.cores[c] = samples [busy, datapath, service] in permille, oldest
+// first, one per second. Stacked from the bottom: datapath, services,
+// other (the rest of busy: IRQs, timers, the executor).
 let cpuCores = [], cpuEv = [], cpuInterval = 1;
 const pct = (p) => (p / 10).toFixed(1) + " %";
 function cpuChart(c) {
@@ -177,7 +483,7 @@ function cpuChart(c) {
 }
 function drawCpu(c) {
   const svg = cpuChart(c), s = cpuCores[c] || [], N = 300;
-  const W = Math.max(svg.clientWidth, 200), H = cpuCores.length > 1 ? 120 : 170, L = 40, R = 6, T = 8, B = 20;
+  const W = Math.max(svg.clientWidth, 200), H = cpuCores.length > 1 ? 110 : 150, L = 40, R = 6, T = 8, B = 20;
   svg.style.height = H + "px";
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   const x = (i) => L + (W - L - R) * (N - s.length + i) / (N - 1);
@@ -206,6 +512,19 @@ function drawCpu(c) {
   svg.cpuMap = { x, L, R, W, N };
   if (cpuEv[c]) cpuHover(c, cpuEv[c]);
 }
+function tipLines(tip, lines) {
+  tip.replaceChildren(...lines.map(([color, text]) => {
+    const d = document.createElement("div");
+    if (color) { const k = document.createElement("i"); k.style.background = color; d.append(k); }
+    d.append(text);
+    return d;
+  }));
+  tip.hidden = false;
+}
+function placeTip(tip, hx, r, W) {
+  const left = hx * r.width / W;
+  tip.style.left = (left + 12 + tip.offsetWidth > r.width ? left - 12 - tip.offsetWidth : left + 12) + "px";
+}
 function cpuHover(c, ev) {
   cpuEv[c] = ev;
   const svg = $("cpu" + c), m = svg.cpuMap, s = cpuCores[c] || [];
@@ -215,19 +534,12 @@ function cpuHover(c, ev) {
   const [busy, dp, sv] = s[i], hx = m.x(i), ago = s.length - 1 - i;
   const h = $("hair" + c);
   h.setAttribute("x1", hx); h.setAttribute("x2", hx); h.setAttribute("visibility", "visible");
-  const tip = $("cputip" + c), line = (color, label, v) => {
-    const d = document.createElement("div");
-    if (color) { const k = document.createElement("i"); k.style.background = color; d.append(k); }
-    d.append(label + (v === undefined ? "" : ": " + pct(v)));
-    return d;
-  };
-  tip.replaceChildren(line(null, `core ${c}, ` + (ago ? `${ago} s ago` : "last second")),
-    line("var(--s1)", "Datapath", dp), line("var(--s2)", "Services", sv), line("var(--s3)", "Other", Math.max(busy - dp - sv, 0)), line(null, "Total", busy));
-  tip.hidden = false;
-  const left = hx * r.width / m.W;
-  tip.style.left = (left + 12 + tip.offsetWidth > r.width ? left - 12 - tip.offsetWidth : left + 12) + "px";
+  const tip = $("cputip" + c);
+  tipLines(tip, [[null, `core ${c}, ` + (ago ? `${ago} s ago` : "last second")], ["var(--s1)", "Datapath: " + pct(dp)],
+    ["var(--s2)", "Services: " + pct(sv)], ["var(--s3)", "Other: " + pct(Math.max(busy - dp - sv, 0))], [null, "Total: " + pct(busy)]]);
+  placeTip(tip, hx, r, m.W);
 }
-window.addEventListener("resize", () => cpuCores.forEach((_, c) => drawCpu(c)));
+window.addEventListener("resize", () => { cpuCores.forEach((_, c) => drawCpu(c)); drawRate(); });
 function showCpu(cpu) {
   cpuCores = cpu.cores; cpuInterval = cpu.interval_s;
   cpuCores.forEach((s, c) => {
@@ -237,7 +549,7 @@ function showCpu(cpu) {
     $("cpuavg" + c).textContent = s.length ? pct(s.reduce((a, d) => a + d[0], 0) / s.length) : "–";
     const secs = s.length * cpuInterval;
     $("cpuavgl" + c).textContent = secs >= 60 ? `average, last ${Math.round(secs / 60)} min` : `average, last ${secs} s`;
-    drawCpu(c);
+    if (page === "") drawCpu(c);
   });
   const head = cpuCores.map((_, c) => `<th>Core ${c}: total / datapath / services</th>`).join("");
   const rows10 = [];
@@ -248,93 +560,208 @@ function showCpu(cpu) {
   $("cputab").innerHTML = `<tr><th>Seconds ago</th>${head}</tr>` + rows10.join("");
 }
 
-let lastUptime = null;
+// ================= Throughput (from byte counters between polls) =================
+const RATE_N = 150;
+let rateHist = [], prevIfs = null, rateEv = null, ifRates = {};
+function trackRates(st) {
+  const now = performance.now(), cur = {};
+  for (const i of st.interfaces) cur[i.name] = { rx: i.rx_bytes, tx: i.tx_bytes };
+  if (prevIfs && now > prevIfs.t) {
+    const dt = (now - prevIfs.t) / 1000;
+    for (const [name, c] of Object.entries(cur)) {
+      const p = prevIfs.v[name];
+      if (p && c.rx >= p.rx && c.tx >= p.tx) ifRates[name] = { rx: (c.rx - p.rx) * 8 / dt, tx: (c.tx - p.tx) * 8 / dt };
+    }
+    const wan = st.interfaces[0] && ifRates[st.interfaces[0].name];
+    if (wan) { rateHist.push([wan.rx, wan.tx]); if (rateHist.length > RATE_N) rateHist.shift(); }
+  }
+  prevIfs = { t: now, v: cur };
+}
+function niceMax(v) { if (v <= 0) return 1e6; const e = 10 ** Math.floor(Math.log10(v)), m = v / e; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * e; }
+function drawRate() {
+  const svg = $("ratechart"), s = rateHist;
+  const W = Math.max(svg.clientWidth, 200), H = 150, L = 64, R = 6, T = 8, B = 20;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const max = niceMax(Math.max(0, ...s.flat()));
+  const x = (i) => L + (W - L - R) * (RATE_N - s.length + i) / (RATE_N - 1);
+  const y = (v) => T + (H - T - B) * (1 - v / max);
+  let g = "";
+  for (const v of [0, max / 2, max]) g += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${bits(v)}</text>`;
+  g += `<text x="${L}" y="${H - 4}">5 min ago</text><text x="${W - R}" y="${H - 4}" text-anchor="end">now</text>`;
+  if (s.length >= 2) {
+    for (const [k, col] of [[1, "--s2"], [0, "--s1"]]) {
+      g += `<polyline points="${s.map((d, i) => `${x(i).toFixed(1)},${y(d[k]).toFixed(1)}`).join(" ")}" fill="none" stroke="var(${col})" stroke-width="2" stroke-linejoin="round"/>`;
+    }
+  } else g += `<text x="${(L + W) / 2}" y="${H / 2}" text-anchor="middle">collecting…</text>`;
+  g += `<line id="ratehair" class="hair" y1="${T}" y2="${H - B}" visibility="hidden"/>`;
+  svg.innerHTML = g;
+  svg.rateMap = { x, L, R, W };
+  if (rateEv) rateHover(rateEv);
+}
+function rateHover(ev) {
+  rateEv = ev;
+  const svg = $("ratechart"), m = svg.rateMap, s = rateHist;
+  if (!m || !s.length) return;
+  const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) * m.W / r.width;
+  const i = Math.max(0, Math.min(s.length - 1, Math.round((px - m.L) / (m.W - m.L - m.R) * (RATE_N - 1)) - (RATE_N - s.length)));
+  const hx = m.x(i), h = $("ratehair"), ago = (s.length - 1 - i) * 2;
+  h.setAttribute("x1", hx); h.setAttribute("x2", hx); h.setAttribute("visibility", "visible");
+  tipLines($("ratetip"), [[null, ago ? `${ago} s ago` : "now"], ["var(--s1)", "Download: " + bits(s[i][0])], ["var(--s2)", "Upload: " + bits(s[i][1])]]);
+  placeTip($("ratetip"), hx, r, m.W);
+}
+$("ratechart").addEventListener("pointermove", rateHover);
+$("ratechart").addEventListener("pointerleave", () => { rateEv = null; $("ratetip").hidden = true; const h = $("ratehair"); if (h) h.setAttribute("visibility", "hidden"); });
+
+// ================= Status (polled every 2 s) =================
+const DROP_TEXT = {
+  "firewall": "new connection not allowed by the policy (e.g. unsolicited from the WAN)",
+  "invalid": "new TCP connection without SYN, or an ICMP error for no connection",
+  "not-for-us": "addressed to another MAC address",
+  "malformed": "broken Ethernet or IPv4 header",
+  "fragment": "IP fragment to forward (not reassembled yet)",
+  "no-route": "no route to the destination",
+  "table-full": "connection table full",
+  "hairpin": "would leave through the port it came in on (no hairpin NAT yet)",
+  "icmp-ratelimit": "ICMP error not sent: rate limit (50/s)",
+  "unsupported": "new flow with a protocol other than TCP, UDP or ICMP",
+  "too-big": "larger than the outgoing MTU without DF (no fragmentation)",
+};
+let st = null, lastUptime = null, failures = 0;
 async function refresh() {
-  let st;
-  try { st = await (await fetch("/api/status", {cache: "no-store"})).json(); }
-  catch (e) { $("up").textContent = "offline"; return; }
+  try { st = await (await fetch("/api/status", { cache: "no-store" })).json(); }
+  catch (e) {
+    // The router serves few connections at once: one failed poll (e.g.
+    // while the page loads) is retried soon; offline after two in a row.
+    if (++failures >= 2) { $("offline").hidden = false; $("up").textContent = "offline"; }
+    else setTimeout(refresh, 700);
+    return;
+  }
+  failures = 0;
+  $("offline").hidden = true;
+  trackRates(st);
   if (st.cpu) showCpu(st.cpu);
+  if (page === "") drawRate();
+  authAvailable = !!st.mgmt.auth; showLogin();
   $("ver").textContent = `v${st.version} · ${st.build ?? "?"} · ${st.arch}`;
   $("up").textContent = "up " + dur(st.uptime_s);
-  $("wanwarn").textContent = st.mgmt.on_wan ? "management open on WAN (mgmt=wan)" : "";
-  $("ifs").innerHTML = "<tr><th>Port</th><th>NIC</th><th>MAC</th><th>Link</th><th>Address</th><th>RX pkts</th><th>TX pkts</th><th>Shaper</th><th>Qdisc sent / drops / ECN / backlog</th></tr>" +
-    st.interfaces.map((i) => `<tr><td>${esc(i.name)}${i.vlan ? ` · VLAN ${i.vlan.id}` : ""}</td><td>${esc(i.model)}</td><td>${esc(i.mac)}</td>` +
+  $("wanwarn").textContent = st.mgmt.on_wan ? "management open on the WAN" : "";
+  const l = st.wan_lease, p = st.pppoe, wan = st.interfaces[0];
+  const wanUp = !!l && (!wan?.link || wan.link.up);
+  $("wanstate").innerHTML = `<i class="dot ${wanUp ? "up" : "down"}"></i>WAN ${wanUp ? esc(l.addr) : "down"}`;
+
+  // Overview tiles
+  $("t-wan").innerHTML = wanUp ? '<span class="up">online</span>' : '<span class="down">offline</span>';
+  $("t-wan2").textContent = l ? `${l.addr}${l.gateway ? " via " + l.gateway : ""}${p ? " · PPPoE" : ""}` : (p ? "PPPoE: " + p.state : "no lease");
+  const wr = wan && ifRates[wan.name];
+  $("t-down").textContent = wr ? bits(wr.rx) : "–";
+  $("t-upl").textContent = wr ? bits(wr.tx) : "–";
+  const sh = st.interfaces.map((i) => i.qdisc.shaped_kbit);
+  $("t-down2").textContent = "WAN receive" + (st.interfaces[1]?.qdisc.shaped_kbit ? ` · shaped ${bits(st.interfaces[1].qdisc.shaped_kbit * 1000)}` : "");
+  $("t-upl2").textContent = "WAN send" + (sh[0] ? ` · shaped ${bits(sh[0] * 1000)}` : "");
+  $("t-clients").textContent = n(st.dhcp_leases.filter((d) => d.bound).length);
+  $("t-conns").textContent = n(st.conntrack);
+  $("t-fwd").textContent = `${n(st.forwarded)} forwarded, ${n(st.dropped)} dropped`;
+  $("t-time").textContent = st.time?.utc ? st.time.utc.slice(11, 19) : "not synced";
+  $("t-time2").textContent = st.time?.utc ? st.time.utc.slice(0, 10) + ` · NTP stratum ${st.time.stratum}` : (st.time?.servers?.length ? "NTP: " + st.time.servers.join(", ") : "no NTP servers");
+
+  // Interfaces
+  $("ifs").innerHTML = "<tr><th>Port</th><th>NIC</th><th>MAC</th><th>Link</th><th>Addresses</th><th class=num>RX</th><th class=num>TX</th><th class=num>Now in / out</th></tr>" +
+    st.interfaces.map((i) => { const r = ifRates[i.name]; return `<tr><td><b>${esc(i.name)}</b>${i.vlan ? `<br><span class="muted">VLAN ${i.vlan.id}, PCP ${i.vlan.pcp}</span>` : ""}</td><td>${esc(i.model)}</td><td>${esc(i.mac)}</td>` +
       `<td>${i.link === null ? "–" : i.link.up ? `<span class="up">up ${i.link.mbps} Mbit/s${i.link.full_duplex ? "" : " half"}</span>` : '<span class="down">down</span>'}</td>` +
-      `<td>${i.addrs.map(esc).join("<br>") || "–"}</td><td>${n(i.rx_packets)}</td><td>${n(i.tx_packets)}</td>` +
-      `<td>${i.qdisc.shaped_kbit === null ? "unshaped" : n(i.qdisc.shaped_kbit) + " kbit/s"}</td>` +
-      `<td>${n(i.qdisc.sent)} / ${n(i.qdisc.dropped)} / ${n(i.qdisc.ecn_marked)} / ${n(i.qdisc.backlog_packets)}</td></tr>`).join("");
-  const l = st.wan_lease, p = st.pppoe;
+      `<td>${i.addrs.map(esc).join("<br>") || "–"}</td><td class=num>${n(i.rx_packets)} pkts<br><span class="muted">${bytes(i.rx_bytes)}</span>${i.rx_no_buf ? `<br><span class="warn">${n(i.rx_no_buf)} no buffer</span>` : ""}</td>` +
+      `<td class=num>${n(i.tx_packets)} pkts<br><span class="muted">${bytes(i.tx_bytes)}</span></td><td class=num>${r ? bits(r.rx) + "<br>" + bits(r.tx) : "–"}</td></tr>`; }).join("");
+  const qrows = "<tr><th>Port (egress)</th><th>Shaper</th><th class=num>Sent</th><th class=num>Dropped</th><th class=num>ECN marked</th><th class=num>Queued now</th></tr>" +
+    st.interfaces.map((i) => `<tr><td>${esc(i.name)} <span class="muted">${i === st.interfaces[0] ? "(upload)" : "(download)"}</span></td><td>${i.qdisc.shaped_kbit === null ? "unshaped" : n(i.qdisc.shaped_kbit) + " kbit/s"}</td>` +
+      `<td class=num>${n(i.qdisc.sent)}</td><td class=num>${n(i.qdisc.dropped)}</td><td class=num>${n(i.qdisc.ecn_marked)}</td><td class=num>${n(i.qdisc.backlog_packets)} pkts</td></tr>`).join("");
+  $("qdiscs").innerHTML = qrows; $("qdiscs2").innerHTML = qrows;
+
+  // WAN + DNS status
   const ppp = p ? [["PPPoE", esc(p.state) + (p.sessions ? ` · ${n(p.sessions)} session(s)` : "") + (p.last_error ? ` · last: ${esc(p.last_error)}` : "")]] : [];
-  $("wan").innerHTML = l ? rows([["Address", esc(l.addr)], ["Gateway", esc(l.gateway ?? "–")], ["DNS", l.dns.map(esc).join(", ") || "–"],
-      ...(l.via ? [["Link", `${esc(l.via)}, MTU ${l.mtu}`]] : []), ...ppp])
-    : rows([["Lease", "none"], ...ppp]);
+  const vl = wan?.vlan ? [["VLAN", `${wan.vlan.id} (PCP ${wan.vlan.pcp})` + (st.vlan_drops ? ` · ${n(st.vlan_drops)} frames with the wrong tag` : "")]] : [];
+  $("wan").innerHTML = rows([["Port", wan ? esc(wan.name) + (wan.link ? (wan.link.up ? ` · up ${wan.link.mbps} Mbit/s` : " · link down") : "") : "–"], ...vl,
+    ...(l ? [["Address", esc(l.addr)], ["Gateway", esc(l.gateway ?? "–")], ["DNS servers", l.dns.map(esc).join(", ") || "–"],
+      ...(l.via ? [["Link", `${esc(l.via)}, MTU ${l.mtu}`]] : [])] : [["Lease", "none"]]), ...ppp,
+    ...(st.pppoe_drops ? [["PPPoE drops", n(st.pppoe_drops)]] : [])]);
+  $("dnsst").innerHTML = rows([["Upstream", l?.dns?.length ? l.dns.map(esc).join(", ") : "none (no WAN lease)"],
+    ["Local names", `DHCP host names and reservations, as <i>name</i>.${esc(cfgOrig?.lan?.domain ?? "lan")}`]]);
+
+  // Firewall
+  $("fwmgmt").textContent = st.mgmt.on_wan ? "and the web interface (open on the WAN)" : "";
+  const dr = st.drop_reasons ?? {};
+  const drs = Object.entries(dr).sort((a, b) => b[1] - a[1]);
+  $("drops").innerHTML = "<tr><th>Reason</th><th class=num>Packets</th><th>Meaning</th></tr>" +
+    drs.map(([k, v]) => `<tr><td>${esc(k)}</td><td class=num>${n(v)}</td><td class="muted">${esc(DROP_TEXT[k] ?? "")}</td></tr>`).join("") +
+    `<tr><td>other</td><td class=num>${n(Math.max(0, st.dropped - drs.reduce((a, [, v]) => a + v, 0)))}</td><td class="muted">queue full, no packet buffer</td></tr>`;
+
+  // System
   $("sys").innerHTML = rows([
-    ["Forwarded", n(st.forwarded)], ["Dropped", n(st.dropped) + (st.vlan_drops ? ` (+ ${n(st.vlan_drops)} wrong VLAN tag)` : "") + (st.pppoe_drops ? ` (+ ${n(st.pppoe_drops)} PPPoE)` : "")], ["Connections", n(st.conntrack)],
-    ["Packet pool", `${n(st.pool.free)} free of ${n(st.pool.capacity)}` + (st.pool.alloc_failures ? `, ${n(st.pool.alloc_failures)} failures` : "")],
-    ["Heap", `${n(Math.round(st.heap.used / 1024))} KiB used, ${n(Math.round(st.heap.free / 1048576))} MiB free`],
-    ["Time (UTC)", st.time?.utc ? `${esc(st.time.utc.replace("T", " ").replace("Z", ""))} · NTP ${esc(st.time.server ?? "?")}, stratum ${st.time.stratum}, delay ${st.time.delay_ms} ms, polling every ${dur(st.time.poll_s)}`
+    ["Version", esc(`${st.version} (${st.build ?? "?"}, ${st.arch})`)], ["Uptime", dur(st.uptime_s)],
+    ["Kernel", esc(st.image?.source ?? "–")],
+    ["Config", esc(st.config) + (st.store ? "" : ' · <span class="warn">no store: changes cannot be saved</span>')],
+    ["Command line", esc(st.cmdline || "–")],
+    ["Time (UTC)", st.time?.utc ? `${esc(st.time.utc.replace("T", " ").replace("Z", ""))}<br><span class="muted">NTP ${esc(st.time.server ?? "?")}, stratum ${st.time.stratum}, delay ${st.time.delay_ms} ms, every ${dur(st.time.poll_s)}</span>`
       : `not synced${st.time?.servers?.length ? " (NTP: " + st.time.servers.map(esc).join(", ") + ")" : " (no NTP servers)"}`],
     ["Watchdog", !st.watchdog ? "–" : !st.watchdog.enabled ? "off (watchdog=0)"
       : (st.watchdog.hardware ? `${esc(st.watchdog.hardware)} ${st.watchdog.hw_secs} s` : "software only") + " + cross-core check" +
         (st.watchdog.last_reset_by_watchdog ? ' · <span class="warn">last reset by the watchdog</span>' : "")],
-    ["Command line", esc(st.cmdline || "–")],
-    ["Config", esc(st.config) + (st.store ? "" : " · no store: changes cannot be saved")],
-    ["Kernel", esc(st.image?.source ?? "–")],
-    ["Upgrade", st.mgmt.upgrade ? "enabled" + (st.mgmt.persist ? " (in RAM or stored)" : " (in RAM only: no store)") : "disabled (boot with mgmt_pass=…)"]]);
+    ["Packet pool", `${n(st.pool.free)} free of ${n(st.pool.capacity)}` + (st.pool.alloc_failures ? `, ${n(st.pool.alloc_failures)} failures` : "")],
+    ["Heap", `${n(Math.round(st.heap.used / 1024))} KiB used, ${n(Math.round(st.heap.free / 1048576))} MiB free`],
+    ["Upgrade", !st.mgmt.auth ? "disabled (boot with mgmt_pass=…)" : st.mgmt.upgrade ? (st.mgmt.persist ? "in RAM or stored" : "in RAM only (no store)") : "unavailable"]]);
+  $("persist").disabled = !st.mgmt.persist;
+  if (!st.mgmt.persist) $("persist").checked = false;
+
   showOverrides(st.overrides ?? {});
   $("trialbar").hidden = !st.trial;
   if (st.trial) $("trialleft").textContent = st.trial.remaining_s;
   const kt = st.image?.trial;
   $("ktrialbar").hidden = !kt;
   if (kt) { $("ktrialleft").textContent = kt.remaining_s; $("ksrc").textContent = st.image.source; }
-  $("save").disabled = !st.store || !!st.trial || !!kt;
-  // A reboot (uptime went back): reload the form from the new config.
-  if (lastUptime !== null && st.uptime_s < lastUptime) loadConfig();
+  updatePending();
+  // A reboot (uptime went back): reload the forms, unless edits are pending.
+  if (lastUptime !== null && st.uptime_s < lastUptime) { if (!changes().length) loadConfig(); prevIfs = null; }
   lastUptime = st.uptime_s;
-  $("leases").innerHTML = st.dhcp_leases.length
-    ? "<tr><th>Host</th><th>IP</th><th>MAC</th><th>State</th><th>Expires in</th></tr>" + st.dhcp_leases.map((d) =>
-        `<tr><td>${esc(d.hostname ?? "–")}</td><td>${esc(d.ip)}</td><td>${esc(d.mac)}</td><td>${d.bound ? "bound" : "offered"}</td><td>${dur(d.expires_in_s)}</td></tr>`).join("")
-    : rows([["Leases", "none"]]);
+  showLeases();
 }
 
-const auth = () => ({ Authorization: "Basic " + btoa("admin:" + $("pass").value) });
-const say = (t) => { $("msg").textContent = t; };
+// ================= Clients =================
+function showLeases() {
+  if (!st) return;
+  const q = $("clientq").value.trim().toLowerCase();
+  const reserved = new Set(readStatics().map((s) => (s.mac ?? "").toLowerCase()));
+  const ls = st.dhcp_leases.filter((d) => !q || [d.hostname, d.ip, d.mac].some((v) => (v ?? "").toLowerCase().includes(q)));
+  $("leases").innerHTML = st.dhcp_leases.length
+    ? "<tr><th>Name</th><th>IP address</th><th>MAC</th><th>State</th><th>Expires in</th><th></th></tr>" + ls.map((d) =>
+        `<tr><td>${esc(d.hostname ?? "–")}</td><td>${esc(d.ip)}</td><td>${esc(d.mac)}</td><td>${d.bound ? "bound" : "offered"}</td><td>${dur(d.expires_in_s)}</td>` +
+        `<td>${reserved.has(d.mac.toLowerCase()) ? '<span class="pill">reserved</span>' : `<button class="plain" data-reserve="${esc(d.mac)}">Reserve</button>`}</td></tr>`).join("")
+    : rows([["Leases", "none"]]);
+}
+$("clientq").oninput = showLeases;
+$("leases").onclick = (ev) => {
+  const mac = ev.target.dataset?.reserve;
+  const d = mac && st.dhcp_leases.find((x) => x.mac === mac);
+  if (!d) return;
+  staticRow({ mac: d.mac, ip: d.ip, hostname: d.hostname ?? "" });
+  updatePending(); showLeases();
+  location.hash = "#/lan";
+  $("reservations").scrollIntoView({ block: "start" });
+};
 
-$("go").onclick = async () => {
-  const f = $("file").files[0];
-  if (!f) return say("Choose a kernel ELF first.");
-  const headers = auth();
-  if ($("cmd").value.trim()) headers["X-Cmdline"] = $("cmd").value.trim();
-  say(`Uploading ${n(f.size)} bytes…`);
-  try {
-    const r = await fetch("/api/upgrade", { method: "POST", headers, body: f });
-    const j = await r.json();
-    if (!j.ok) return say(`Refused (${r.status}): ${j.error}`);
-    say(`Accepted: ${j.detail}\nStarting the new kernel; this page reconnects by itself.`);
-  } catch (e) { say("Upload failed: " + e); }
-};
-$("reboot").onclick = async () => {
-  if (!confirm("Reboot the router?")) return;
-  try {
-    const r = await fetch("/api/reboot", { method: "POST", headers: auth() });
-    const j = await r.json();
-    say(j.ok ? "Rebooting…" : `Refused (${r.status}): ${j.error}`);
-  } catch (e) { say("Request failed: " + e); }
-};
-// ---- Configuration form: /api/config.json <-> fields (data-path = the
-// field's path in the schema, which is also how validation issues name it).
-let cfgOrig = null;
+// ================= Configuration: forms ↔ /api/config.json =================
+// data-path = the field's path in the schema, which is also how validation
+// issues name it. All pages' forms are one working copy; the bar at the
+// bottom shows how it differs from the saved config (cfgBase).
+let cfgOrig = null, cfgBase = null;
 const getp = (o, path) => path.split(".").reduce((x, k) => x == null ? x : x[k], o);
 const setp = (o, path, v) => {
   const ks = path.split("."), last = ks.pop();
   const t = ks.reduce((x, k) => (x[k] ??= {}), o);
   if (v === undefined) delete t[last]; else t[last] = v;
 };
-const cfgSay = (t, err) => { $("cfgmsg").textContent = t; $("cfgmsg").className = err ? "err" : ""; };
-const fields = () => [...document.querySelectorAll("#cfg [data-path]")].filter((e) => !e.closest("#statics") && e.id !== "rlo" && e.id !== "rhi" && e.id !== "lease" && e.id !== "ntp");
+const cfgFields = () => [...document.querySelectorAll("form.cfg [data-path]")];
+const fields = () => cfgFields().filter((e) => !e.hasAttribute("data-x") && !e.dataset.key);
 
 function staticRow(s = {}) {
-  const i = $("statics").rows.length - 1;
+  if (!$("statics").rows.length) staticHead();
   const tr = document.createElement("tr");
   for (const [k, ph] of [["mac", "52:54:00:12:34:56"], ["ip", "192.168.1.10"], ["hostname", "name (optional)"]]) {
     const td = document.createElement("td"), inp = document.createElement("input");
@@ -342,15 +769,23 @@ function staticRow(s = {}) {
     td.append(inp); tr.append(td);
   }
   const td = document.createElement("td"), b = document.createElement("button");
-  b.type = "button"; b.className = "plain"; b.textContent = "Remove"; b.onclick = () => { tr.remove(); renumber(); };
+  b.type = "button"; b.className = "plain"; b.textContent = "Remove"; b.onclick = () => { tr.remove(); renumber(); updatePending(); showLeases(); };
   td.append(b); tr.append(td);
   $("statics").append(tr);
   renumber();
 }
+function staticHead() { $("statics").innerHTML = "<tr><th>MAC</th><th>IP address</th><th>Name</th><th></th></tr>"; }
 function renumber() {
   [...$("statics").rows].slice(1).forEach((tr, i) => tr.querySelectorAll("input").forEach((inp) => {
     inp.dataset.path = `lan.dhcp.static[${i}].${inp.dataset.key}`;
   }));
+}
+function readStatics() {
+  return [...$("statics").rows].slice(1).map((tr) => {
+    const o = {};
+    tr.querySelectorAll("input").forEach((i) => { if (i.value.trim()) o[i.dataset.key] = i.value.trim(); });
+    return o;
+  }).filter((o) => Object.keys(o).length);
 }
 function fillForm(c) {
   for (const e of fields()) {
@@ -364,8 +799,9 @@ function fillForm(c) {
   const ls = c.lan?.dhcp?.lease_secs;
   $("lease").value = ls === undefined ? "" : +(ls / 3600).toFixed(4);
   $("ntp").value = (c.time?.ntp_servers ?? []).join(", ");
-  $("statics").innerHTML = "<tr><th>MAC</th><th>IP address</th><th>Hostname</th><th></th></tr>";
+  staticHead();
   (c.lan?.dhcp?.static ?? []).forEach((s) => staticRow(s));
+  pppoeVisibility();
 }
 function readForm() {
   const c = structuredClone(cfgOrig);
@@ -381,18 +817,59 @@ function readForm() {
   setp(c, "lan.dhcp.range", lo || hi ? [lo, hi] : undefined);
   setp(c, "lan.dhcp.lease_secs", Math.round(Number($("lease").value) * 3600));
   setp(c, "time.ntp_servers", $("ntp").value.split(",").map((x) => x.trim()).filter((x) => x));
-  const st = [...$("statics").rows].slice(1).map((tr) => {
-    const o = {};
-    tr.querySelectorAll("input").forEach((i) => { if (i.value.trim()) o[i.dataset.key] = i.value.trim(); });
-    return o;
-  }).filter((o) => Object.keys(o).length);
-  setp(c, "lan.dhcp.static", st.length ? st : undefined);
+  const sts = readStatics();
+  setp(c, "lan.dhcp.static", sts.length ? sts : undefined);
   return c;
 }
+// path → shown value; arrays of plain values stay one entry.
+function flatten(o, pre = "", out = {}) {
+  if (Array.isArray(o) && o.some((x) => x && typeof x === "object")) o.forEach((x, i) => flatten(x, `${pre}[${i}]`, out));
+  else if (o && typeof o === "object" && !Array.isArray(o)) for (const [k, v] of Object.entries(o)) flatten(v, pre ? `${pre}.${k}` : k, out);
+  else if (o !== undefined) out[pre] = Array.isArray(o) ? o.join(", ") : String(o);
+  return out;
+}
+function changes() {
+  if (!cfgBase) return [];
+  const a = flatten(cfgBase), b = flatten(readForm()), out = [];
+  for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    if (k === "version" || a[k] === b[k]) continue;
+    out.push({ path: k, old: a[k], new: k === "wan.pppoe.password" ? "(new password)" : b[k] });
+  }
+  return out;
+}
+function updatePending() {
+  const ch = changes();
+  $("pending").hidden = !ch.length && !$("pmsg").textContent;
+  $("pcount").textContent = ch.length ? `${ch.length} unsaved change${ch.length > 1 ? "s" : ""}` : "";
+  const blocked = !st?.store ? "no store: changes cannot be saved" : st?.trial ? "confirm or revert the trial first"
+    : st?.image?.trial ? "confirm or revert the trial kernel first" : !authAvailable ? "read-only: boot with mgmt_pass=" : "";
+  $("save").disabled = $("rsave").disabled = !ch.length || !!blocked;
+  $("save").title = blocked;
+  // Mark changed fields and the pages that hold them.
+  const paths = new Set(ch.map((c) => c.path));
+  for (const e of cfgFields()) {
+    const p = e.dataset.path;
+    e.classList.toggle("changed", [...paths].some((x) => x === p || x.startsWith(p + ".") || x.startsWith(p + "[")));
+  }
+  const pages = new Set(ch.map((c) => pageOf(c.path)));
+  for (const a of document.querySelectorAll("nav a")) {
+    const pg = a.getAttribute("href").replace(/^#\/?/, "");
+    let m = a.querySelector(".mark");
+    if (pages.has(pg) && pg) { if (!m) { m = document.createElement("span"); m.className = "mark"; m.textContent = "●"; m.title = "unsaved changes"; a.append(m); } }
+    else if (m) m.remove();
+  }
+}
+const pSay = (t, err) => { $("pmsg").textContent = t; $("pmsg").className = "msg" + (err ? " err" : ""); updatePending(); };
+document.addEventListener("input", (ev) => { if (ev.target.closest("form.cfg")) { if ($("pmsg").className.includes("err")) pSay(""); updatePending(); } });
+document.addEventListener("change", (ev) => { if (ev.target.closest("form.cfg")) updatePending(); });
+for (const f of document.querySelectorAll("form.cfg")) f.onsubmit = (ev) => ev.preventDefault();
+function pppoeVisibility() { $("pppoefields").hidden = $("wanmode").value !== "pppoe"; }
+$("wanmode").addEventListener("change", pppoeVisibility);
+
 function markIssues(issues) {
-  document.querySelectorAll("#cfg .bad").forEach((e) => e.classList.remove("bad"));
+  document.querySelectorAll("form.cfg .bad").forEach((e) => e.classList.remove("bad"));
   for (const x of issues) {
-    for (const e of document.querySelectorAll("#cfg [data-path]")) {
+    for (const e of cfgFields()) {
       const p = e.dataset.path;
       if (x.path === p || x.path.startsWith(p + ".") || x.path.startsWith(p + "[") || p.startsWith(x.path + ".")) e.classList.add("bad");
     }
@@ -403,36 +880,62 @@ async function loadConfig() {
     const r = await fetch("/api/config.json", { cache: "no-store" });
     cfgOrig = await r.json();
     fillForm(cfgOrig); markIssues([]);
-  } catch (e) { cfgSay("Could not load the configuration: " + e, true); }
+    cfgBase = readForm(); // what the forms make of the saved config
+    updatePending();
+  } catch (e) { pSay("Could not load the configuration: " + e, true); }
 }
+function showReview(issues = []) {
+  const ch = changes();
+  $("issues").innerHTML = issues.length ? "Not saved:<br>" + issues.map((x) =>
+    `<a href="#/${pageOf(x.path)}" data-close>${esc(x.path)}</a>: ${esc(x.msg)}`).join("<br>") : "";
+  $("difftab").innerHTML = ch.length ? "<tr><th>Setting</th><th>Saved</th><th>New</th></tr>" + ch.map((c) =>
+    `<tr><td><a href="#/${pageOf(c.path)}" data-close>${esc(c.path)}</a></td><td class="old">${esc(c.old ?? "(default)")}</td><td class="new">${esc(c.new ?? "(default)")}</td></tr>`).join("")
+    : "<tr><td>No changes.</td></tr>";
+  if (!$("reviewdlg").open) $("reviewdlg").showModal();
+}
+$("reviewdlg").onclick = (ev) => { if (ev.target.hasAttribute?.("data-close")) $("reviewdlg").close(); };
+$("review").onclick = () => showReview();
+$("rclose").onclick = () => $("reviewdlg").close();
+$("discard").onclick = async () => {
+  if (changes().length && !(await ask("Discard changes?", "All unsaved changes on every page are lost.", "Discard", true))) return;
+  pSay(""); loadConfig();
+};
 async function postConfig(body, type) {
+  if (!(await ensureLogin())) return false;
   markIssues([]);
-  cfgSay("Saving…");
+  pSay("Saving…");
   let r, j;
-  try {
-    r = await fetch("/api/config", { method: "POST", headers: { ...auth(), "Content-Type": type }, body });
-    j = await r.json();
-  } catch (e) { return cfgSay("Request failed: " + e, true); }
+  try { ({ r, j } = await api("POST", "/api/config", { body, type })); }
+  catch (e) { pSay("Request failed: " + e, true); return false; }
   if (!j.ok) {
     markIssues(j.issues ?? []);
-    return cfgSay(`Not saved (${r.status}):\n${j.error}`, true);
+    if (r.status === 401) { pSay("Log in to save.", true); return false; }
+    if (j.issues?.length) { pSay(`Not saved (${r.status}): ${j.issues.length} problem(s), see Review.`, true); showReview(j.issues); }
+    else pSay(`Not saved (${r.status}): ${j.error}`, true);
+    return false;
   }
   if (j.trial) {
-    cfgSay(`${j.detail}.\nThis change boots as a trial. The router's LAN address is now ${j.lan}: ` +
+    pSay(`${j.detail}. This change boots as a trial. The router's LAN address is now ${j.lan}: ` +
       `open http://${j.lan}/ (renew your DHCP lease if needed) and press Confirm within ${j.confirm_within_s} s, ` +
       "or the router goes back to the previous configuration.");
   } else {
-    cfgSay(`${j.detail}: in effect now, no reboot.`);
-    loadConfig(); refresh();
+    pSay(`${j.detail[0].toUpperCase() + j.detail.slice(1)}: in effect now.`);
+    setTimeout(() => { if (!changes().length) pSay(""); }, 6000);
+    await loadConfig(); refresh();
   }
+  return true;
 }
+const saveNow = () => { if ($("reviewdlg").open) $("reviewdlg").close(); if (cfgOrig && changes().length) postConfig(JSON.stringify(readForm()), "application/json"); };
+$("save").onclick = saveNow;
+$("rsave").onclick = saveNow;
+
 // Boot arguments win over the stored config: say so at each field they
-// set, with the value in effect (the form shows the stored value).
+// set (the form shows the stored value).
 function showOverrides(ov) {
   $("effective").hidden = !Object.keys(ov).length;
-  document.querySelectorAll("#cfg .ovr").forEach((e) => e.remove());
+  document.querySelectorAll("form.cfg .ovr").forEach((e) => e.remove());
   for (const [path, kv] of Object.entries(ov)) {
-    const el = document.querySelector(`#cfg [data-path="${path}"]`);
+    const el = document.querySelector(`form.cfg [data-path="${path}"]`);
     const label = el && el.closest("label");
     if (!label) continue;
     const note = document.createElement("span");
@@ -444,38 +947,97 @@ function showOverrides(ov) {
 $("effective").onclick = async () => {
   try {
     const eff = await (await fetch("/api/config/effective.json", { cache: "no-store" })).json();
-    fillForm(eff); markIssues([]);
-    cfgSay("The form now holds the values in effect. Save to store them, then remove the boot arguments marked in red.");
-  } catch (e) { cfgSay("Could not load the values in effect: " + e, true); }
+    fillForm(eff); markIssues([]); updatePending();
+    $("bkmsg").textContent = "The forms now hold the values in effect. Save them, then remove the boot arguments marked in red.";
+  } catch (e) { $("bkmsg").textContent = "Could not load the values in effect: " + e; }
 };
-$("addstatic").onclick = () => staticRow();
-$("discard").onclick = () => { loadConfig(); cfgSay(""); };
-$("save").onclick = () => {
-  if (!cfgOrig) return;
-  const c = readForm();
-  if (JSON.stringify(c) === JSON.stringify(cfgOrig)) return cfgSay("Nothing changed.");
-  postConfig(JSON.stringify(c), "application/json");
-};
+$("addstatic").onclick = () => { staticRow(); updatePending(); };
 $("import").onchange = async () => {
   const f = $("import").files[0];
   $("import").value = "";
-  if (!f || !confirm(`Replace the configuration with ${f.name} and reboot?`)) return;
-  postConfig(await f.text(), "application/toml");
+  if (!f || !(await ask("Import configuration?", `Replace the whole configuration with ${f.name}? Changes to the LAN address or management boot as a trial.`, "Import"))) return;
+  $("bkmsg").textContent = "";
+  if (await postConfig(await f.text(), "application/toml")) $("bkmsg").textContent = `${f.name} imported.`;
 };
-async function trialOp(what, base = "/api/config/", msg = "trialmsg") {
+
+// ================= Trials, firmware, reboot =================
+async function trialOp(what, base, msg) {
+  if (!(await ensureLogin())) return;
   $(msg).textContent = "…";
   try {
-    const r = await fetch(base + what, { method: "POST", headers: auth() });
-    const j = await r.json();
+    const { r, j } = await api("POST", base + what);
     $(msg).textContent = j.ok ? j.detail : `Refused (${r.status}): ${j.error}`;
     refresh();
   } catch (e) { $(msg).textContent = "Request failed: " + e; }
 }
-$("confirm").onclick = () => trialOp("confirm");
-$("revert").onclick = () => { if (confirm("Go back to the previous configuration and reboot?")) trialOp("revert"); };
+$("confirm").onclick = () => trialOp("confirm", "/api/config/", "trialmsg");
+$("revert").onclick = async () => { if (await ask("Revert?", "Go back to the previous configuration and reboot?", "Revert and reboot", true)) trialOp("revert", "/api/config/", "trialmsg"); };
 $("kconfirm").onclick = () => trialOp("confirm", "/api/upgrade/", "ktrialmsg");
-$("krevert").onclick = () => { if (confirm("Go back to the previous kernel and reboot?")) trialOp("revert", "/api/upgrade/", "ktrialmsg"); };
+$("krevert").onclick = async () => { if (await ask("Roll back?", "Go back to the previous kernel and reboot?", "Roll back and reboot", true)) trialOp("revert", "/api/upgrade/", "ktrialmsg"); };
+const say = (t) => { $("msg").textContent = t; };
+$("persist").onchange = () => { $("cmd").disabled = $("persist").checked; };
+$("go").onclick = async () => {
+  const f = $("file").files[0];
+  if (!f) return say("Choose a kernel ELF first.");
+  const persist = $("persist").checked;
+  if (!(await ask("Upgrade?", persist ? `Store ${f.name} as a trial kernel and reboot into it? Confirm it afterwards, or the router rolls back.`
+    : `Start ${f.name} in RAM now? A power cycle boots the stored kernel again.`, "Upload and start"))) return;
+  if (!(await ensureLogin())) return;
+  const headers = {};
+  if (!persist && $("cmd").value.trim()) headers["X-Cmdline"] = $("cmd").value.trim();
+  say(`Uploading ${n(f.size)} bytes…`);
+  try {
+    const { r, j } = await api("POST", persist ? "/api/upgrade/persist" : "/api/upgrade", { body: f, headers });
+    if (!j.ok) return say(`Refused (${r.status}): ${j.error}`);
+    say(`Accepted: ${j.detail}\nStarting the new kernel; this page reconnects by itself.`);
+  } catch (e) { say("Upload failed: " + e); }
+};
+$("reboot").onclick = async () => {
+  if (!(await ask("Reboot?", "Reboot the router now? The network is down for a few seconds.", "Reboot", true))) return;
+  if (!(await ensureLogin())) return;
+  try {
+    const { r, j } = await api("POST", "/api/reboot");
+    say(j.ok ? "Rebooting…" : `Refused (${r.status}): ${j.error}`);
+  } catch (e) { say("Request failed: " + e); }
+};
 
+// ================= Logs =================
+let logText = "", logTimer = null;
+function showLog() {
+  const q = $("logq").value.trim().toLowerCase();
+  const lines = logText.split("\n");
+  const shown = q ? lines.filter((x) => x.toLowerCase().includes(q)) : lines;
+  const pre = $("logtext"), atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
+  pre.textContent = shown.join("\n");
+  if (atEnd || !q) pre.scrollTop = pre.scrollHeight;
+}
+async function loadLog() {
+  clearTimeout(logTimer);
+  if (page !== "logs") return;
+  if (!authAvailable) { $("loginfo").textContent = "The log needs a login, and logins are disabled (boot with mgmt_pass=…)."; return; }
+  if (!pass) {
+    $("loginfo").innerHTML = 'Log in to read the log. <button class="plain" id="loglogin">Log in</button>';
+    $("loglogin").onclick = async () => { if (await openLogin()) loadLog(); };
+    return;
+  }
+  try {
+    const { r, j } = await api("GET", "/api/log");
+    if (r.ok) {
+      logText = j.text;
+      $("loginfo").textContent = !j.ram ? "Log messages go to the serial console (boot argument log=console); nothing is kept in RAM."
+        : `RAM log, ${n(j.text.length)} bytes` + (j.dropped ? `; ${n(j.dropped)} older lines dropped (64 KiB kept)` : "");
+      showLog();
+    } else if (r.status === 401) { loadLog(); return; }
+    else $("loginfo").textContent = `Refused (${r.status}): ${j.error}`;
+  } catch (e) { $("loginfo").textContent = "Request failed: " + e; }
+  if ($("logfollow").checked) logTimer = setTimeout(loadLog, 3000);
+}
+$("logq").oninput = showLog;
+$("logload").onclick = loadLog;
+$("logfollow").onchange = loadLog;
+
+showLogin();
+route();
 loadConfig();
 refresh();
 setInterval(refresh, 2000);

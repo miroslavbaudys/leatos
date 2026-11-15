@@ -63,6 +63,10 @@ pub const LAN: IfIndex = 1;
 /// Counters for diagnostics (read by the self-test / stats output).
 pub static FORWARDED: AtomicU64 = AtomicU64::new(0);
 pub static DROPPED: AtomicU64 = AtomicU64::new(0);
+/// The forwarder's drops by reason (`fwd::forwarder::DropReason::index`),
+/// part of `DROPPED` (the web interface's firewall page).
+pub static DROP_REASONS: [AtomicU64; fwd::forwarder::DROP_REASONS] =
+    [const { AtomicU64::new(0) }; fwd::forwarder::DROP_REASONS];
 /// Received frames with the wrong VLAN tag for their port (or none).
 pub static VLAN_DROPS: AtomicU64 = AtomicU64::new(0);
 /// On a PPPoE port: received frames that are not PPPoE, control frames
@@ -443,8 +447,9 @@ impl Datapath {
                         Resolve::Queued { send_arp: false } => {}
                     }
                 }
-                Verdict::Drop(_) => {
+                Verdict::Drop(r) => {
                     DROPPED.fetch_add(1, Ordering::Relaxed);
+                    DROP_REASONS[r.index()].fetch_add(1, Ordering::Relaxed);
                 }
             }
         }

@@ -176,6 +176,7 @@ back. The same holds inside `[wan]`: `mode` is written only when it is
 not `dhcp` and `[wan.pppoe]` only when it differs from the defaults, so a
 config with just a VLAN stays readable by the kernel that introduced
 `[wan]`. Later versions add `[firewall]`
+(designed in `docs/config-v2.md`)
 (rules, `[[firewall.forward]]`), LAN VLANs and the management password
 hash, as the kernel implements them:
 
@@ -243,10 +244,21 @@ comments and custom ordering in an uploaded file are not kept. The file
 is UI-managed, with import/export.
 
 ## 6. Management interface
-The status page has a **Configuration** section: a form for LAN (address,
-domain, DHCP pool, lease time), DHCP reservations, DNS, shaping and
-management, with Save, Discard, Export (`config.toml`) and Import. Fields
-named by validation issues are highlighted.
+The web interface (`kernel/src/net/mgmt.html`, one compiled-in file) is
+hash-routed into pages: Overview (WAN state, throughput from the byte
+counters, CPU per core), Interfaces, Clients (leases; "Reserve" adds a
+reservation), WAN, LAN & DHCP, DNS, Firewall (the fixed v1 policy and
+drops by reason), Traffic shaping, System (time, management, backup and
+restore, firmware, reboot) and Logs (`GET /api/log`). All pages' forms
+edit one working copy of the config. A bar at the bottom counts the
+changes; Review shows the diff (setting, saved, new) and, after a refused
+save, the validation issues with links to their pages; Save posts the
+whole document. Login: a form checked by `POST /api/login`, then the
+password is kept in the tab's `sessionStorage` and sent as Basic auth;
+the page's requests carry `X-Rrouter-UI: 1`, so a 401 has no
+`WWW-Authenticate` and the browser shows no password dialog of its own.
+Networks, zones, rules and port forwards are designed in
+`docs/config-v2.md`.
 
 - `GET /api/config`: current config as TOML (secrets omitted), without
   boot-argument overrides (what a save starts from). `GET
