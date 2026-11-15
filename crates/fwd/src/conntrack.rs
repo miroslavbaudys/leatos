@@ -8,6 +8,10 @@
 //!   (RFC 4787 EIM): one internal `ip:port` keeps the same external port for
 //!   every destination (good for games/VoIP), while filtering stays
 //!   endpoint-dependent (only replies from contacted peers get in).
+//! - **DNAT** (port forwards, [`Conntrack::create_dnat`]): a connection to
+//!   the WAN address is sent on to an internal target; with hairpin, the
+//!   source is translated to the router too, so the target answers through
+//!   it. Forwarded ports are reserved: NAPT never allocates them.
 //! - Bounded: at most `max_conns` entries; new connections beyond that are refused.
 //! - TCP state is tracked loosely (enough for timeouts): SYN → established
 //!   on the reply SYN+ACK, FIN/RST → closing.
@@ -17,7 +21,8 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::net::Ipv4Addr;
 
-/// Inclusive NAT port range. Router-local sockets use ports >= 40000.
+/// Inclusive NAT port range. Router-local sockets use ports >= 60000
+/// (`forwarder::ROUTER_CLIENT_PORTS`); port forwards may use the rest.
 pub const NAT_PORTS: (u16, u16) = (10_000, 39_999);
 
 /// Timeouts in milliseconds.
@@ -71,7 +76,11 @@ pub enum TcpState {
 pub struct Conn {
     pub orig: Tuple,
     pub reply: Tuple,
+    /// Translated in some way (packets are rewritten to [`Conn::translated`]).
     pub nat: bool,
+    /// Holds a reference on the endpoint-independent mapping of
+    /// `(proto, orig.src, orig.sport)` (masquerade, hairpin).
+    pub mapped: bool,
     pub tcp: Option<TcpState>,
     /// A reply has been seen.
     pub replied: bool,
@@ -119,6 +128,8 @@ pub struct Conntrack {
     mappings: BTreeMap<(u8, Ipv4Addr, u16), Mapping>,
     /// (proto, external port) in use
     used_ports: BTreeMap<(u8, u16), ()>,
+    /// (proto, lo, hi): ports never allocated (port forwards).
+    reserved: Vec<(u8, u16, u16)>,
     max_conns: usize,
     hash_key: u64,
     /// This table is shard `shard` of `shards` (`forwarder::shard_of`): it
@@ -165,6 +176,7 @@ impl Conntrack {
             index: BTreeMap::new(),
             mappings: BTreeMap::new(),
             used_ports: BTreeMap::new(),
+            reserved: Vec::new(),
             max_conns,
             hash_key,
             shards,
@@ -210,7 +222,102 @@ impl Conntrack {
         (0..span)
             .map(|i| lo + ((start - lo) as u32 + i).rem_euclid(span) as u16)
             .filter(|p| p % n == k)
+            .filter(|p| !self.reserved.iter().any(|&(rp, lo, hi)| rp == proto && (lo..=hi).contains(p)))
             .find(|p| !self.used_ports.contains_key(&(proto, *p)))
+    }
+
+    /// Ports NAPT must not allocate: `(proto, lo, hi)` (the WAN ports of
+    /// port forwards). Existing mappings are kept.
+    pub fn set_reserved(&mut self, reserved: Vec<(u8, u16, u16)>) {
+        self.reserved = reserved;
+    }
+
+    /// The external port of `(proto, ip, port)`'s mapping, allocating one.
+    fn map_port(&mut self, orig: &Tuple) -> Option<u16> {
+        let key = (orig.proto, orig.src, orig.sport);
+        match self.mappings.get(&key) {
+            Some(m) => Some(m.port),
+            None => self.alloc_port(orig.proto, orig.sport),
+        }
+    }
+
+    fn insert(&mut self, now: u64, orig: Tuple, reply: Tuple, nat: bool, mapped: bool, tcp_flags: u8) -> Option<ConnId> {
+        if self.index.contains_key(&orig) || self.index.contains_key(&reply) {
+            return None; // clash (e.g. two internal hosts, same remote, same EIM port race)
+        }
+        if mapped {
+            let key = (orig.proto, orig.src, orig.sport);
+            let m = self.mappings.entry(key).or_insert(Mapping {
+                port: reply.dport,
+                refs: 0,
+            });
+            m.refs += 1;
+            self.used_ports.insert((orig.proto, reply.dport), ());
+        }
+        let conn = Conn {
+            orig,
+            reply,
+            nat,
+            mapped,
+            tcp: (orig.proto == PROTO_TCP).then_some(TcpState::SynSent),
+            replied: false,
+            expires: now + initial_timeout(orig.proto, tcp_flags),
+            packets: [0; 2],
+            bytes: [0; 2],
+            flow_hash: tuple_hash(self.hash_key, &orig),
+            orig_src_hash: host_hash(self.hash_key, orig.src),
+            orig_dst_hash: host_hash(self.hash_key, orig.dst),
+        };
+        let id = match self.free.pop() {
+            Some(id) => {
+                self.conns[id] = Some(conn);
+                id
+            }
+            None => {
+                self.conns.push(Some(conn));
+                self.conns.len() - 1
+            }
+        };
+        self.index.insert(orig, (id, Dir::Original));
+        self.index.insert(reply, (id, Dir::Reply));
+        self.stats.created += 1;
+        Some(id)
+    }
+
+    /// Track a new connection to a port forward: `orig` (to the router's
+    /// WAN address) goes on to `to` (internal ip, port). `masq` (hairpin:
+    /// the client is internal too): its source becomes `masq:<mapped
+    /// port>`, so the target answers through the router.
+    pub fn create_dnat(
+        &mut self,
+        now: u64,
+        orig: Tuple,
+        to: (Ipv4Addr, u16),
+        masq: Option<Ipv4Addr>,
+        tcp_flags: u8,
+    ) -> Option<ConnId> {
+        if self.len() >= self.max_conns {
+            self.stats.table_full += 1;
+            return None;
+        }
+        let (dst, dport) = match masq {
+            Some(ip) => match self.map_port(&orig) {
+                Some(p) => (ip, p),
+                None => {
+                    self.stats.nat_exhausted += 1;
+                    return None;
+                }
+            },
+            None => (orig.src, orig.sport),
+        };
+        let reply = Tuple {
+            proto: orig.proto,
+            src: to.0,
+            sport: to.1,
+            dst,
+            dport,
+        };
+        self.insert(now, orig, reply, true, masq.is_some(), tcp_flags)
     }
 
     /// Track a new connection whose first packet is `orig`. With `nat_ip`
@@ -253,45 +360,7 @@ impl Conntrack {
             }
             None => (orig.inverse(), false),
         };
-        if self.index.contains_key(&orig) || self.index.contains_key(&reply) {
-            return None; // clash (e.g. two internal hosts, same remote, same EIM port race)
-        }
-        if nat {
-            let key = (orig.proto, orig.src, orig.sport);
-            let m = self.mappings.entry(key).or_insert(Mapping {
-                port: reply.dport,
-                refs: 0,
-            });
-            m.refs += 1;
-            self.used_ports.insert((orig.proto, reply.dport), ());
-        }
-        let conn = Conn {
-            orig,
-            reply,
-            nat,
-            tcp: (orig.proto == PROTO_TCP).then_some(TcpState::SynSent),
-            replied: false,
-            expires: now + initial_timeout(orig.proto, tcp_flags),
-            packets: [0; 2],
-            bytes: [0; 2],
-            flow_hash: tuple_hash(self.hash_key, &orig),
-            orig_src_hash: host_hash(self.hash_key, orig.src),
-            orig_dst_hash: host_hash(self.hash_key, orig.dst),
-        };
-        let id = match self.free.pop() {
-            Some(id) => {
-                self.conns[id] = Some(conn);
-                id
-            }
-            None => {
-                self.conns.push(Some(conn));
-                self.conns.len() - 1
-            }
-        };
-        self.index.insert(orig, (id, Dir::Original));
-        self.index.insert(reply, (id, Dir::Reply));
-        self.stats.created += 1;
-        Some(id)
+        self.insert(now, orig, reply, nat, nat, tcp_flags)
     }
 
     /// Account a packet and advance state/timeouts.
@@ -340,7 +409,7 @@ impl Conntrack {
         };
         self.index.remove(&c.orig);
         self.index.remove(&c.reply);
-        if c.nat {
+        if c.mapped {
             let key = (c.orig.proto, c.orig.src, c.orig.sport);
             if let Some(m) = self.mappings.get_mut(&key) {
                 m.refs -= 1;

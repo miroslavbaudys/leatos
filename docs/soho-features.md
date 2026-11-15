@@ -116,7 +116,7 @@ forward to the current upstream (the upstream list is swapped atomically on `Wan
 `kernel/src/net/datapath.rs`, verified end to end in the lab:
 - NAPT/masquerade on the WAN with **endpoint-independent mapping**
   (RFC 4787) and endpoint-dependent filtering. NAT ports 10000–39999
-  (router-local sockets use ≥ 40000). Port preservation when free.
+  (router-local sockets use ≥ 60000; forwarded ports are skipped). Port preservation when free.
 - Conntrack: TCP state (SYN → established → closing/closed) with
   timeouts, UDP unreplied/assured, ICMP echo; bounded at 16384 entries;
   all NAT state flushed when the WAN address changes.
@@ -124,7 +124,8 @@ forward to the current upstream (the upstream list is swapped atomically on `Wan
   about NATed flows translated, including the embedded header.
 - Firewall: new flows only LAN→WAN; TCP must start with SYN; WAN→LAN only
   for tracked connections; hairpin, fragments and unknown protocols dropped.
-- Open: **port forwarding (DNAT)**, hairpin NAT, IP fragment reassembly
+- Port forwarding (DNAT) and hairpin NAT ✅ (2026-11-15, docs/config-v2.md).
+- Open: IP fragment reassembly
   (fragments are dropped today), ICMP unreachable for no-route, MSS
   clamping + PMTU (M5, with PPPoE), UPnP/NAT-PMP, faster conntrack
   structures (hash table + timer wheel instead of BTreeMap + O(n) expiry).

@@ -49,7 +49,9 @@ use crate::timer;
 use alloc::vec::Vec;
 use core::net::Ipv4Addr;
 use core::sync::atomic::{AtomicU64, Ordering};
-use fwd::forwarder::{Classification, Forwarder, Interface, Policy, Role, Verdict, shard_of};
+use fwd::forwarder::{
+    Classification, Forwarder, Interface, Policy, PortForward, Role, ShardHints, Verdict, shard_of,
+};
 use fwd::neigh::{NeighTable, Resolve};
 use fwd::{IfIndex, wire};
 use qdisc::{Dequeue, Qdisc};
@@ -160,6 +162,9 @@ pub struct Datapath {
     port_links: Vec<Vec<(u16, IfIndex)>>,
     /// The networks' prefixes (`shard_of`: flows between them).
     internal: Vec<(Ipv4Addr, u8)>,
+    /// The port forwards (`shard_of`: DNAT and hairpin connections live in
+    /// their target's shard); replaced with the policy, read per batch.
+    forwards: Mutex<alloc::sync::Arc<Vec<PortForward>>>,
     hk: Mutex<Hk>,
     local_rx_drops: AtomicU64,
     /// Per ingress port: forwarded IPv4 packets by ECN codepoint
@@ -267,6 +272,7 @@ impl Datapath {
             addrs: ifaces.iter().map(|i| Mutex::new(i.addr)).collect(),
             port_links,
             internal,
+            forwards: Mutex::new(alloc::sync::Arc::new(policy.forwards.clone())),
             hk: Mutex::new(Hk {
                 next_housekeeping: 0,
                 next_stats: STATS_MS,
@@ -294,9 +300,11 @@ impl Datapath {
 
     /// A saved config's zone firewall: every shard, for new flows.
     pub fn set_policy(&self, policy: Policy) {
+        let forwards = alloc::sync::Arc::new(policy.forwards.clone());
         for s in &self.shards {
             s.lock().set_policy(Some(policy.clone()));
         }
+        *self.forwards.lock() = forwards;
     }
 
     /// Into the qdisc of the link's port, with the link's VLAN tag.
@@ -424,6 +432,12 @@ impl Datapath {
         let pppoe = port.is_pppoe();
         let session = port.pppoe_session();
         let mut local = false;
+        let forwards = self.forwards.lock().clone();
+        let hints = ShardHints {
+            internal: &self.internal,
+            wan: self.addrs[WAN as usize].lock().map(|(a, _)| a),
+            forwards: &forwards,
+        };
         for mut pkt in batch.drain(..) {
             let Some((ifx, want_vid)) = self.link_of(port_ix, pkt.data()) else {
                 VLAN_DROPS.fetch_add(1, Ordering::Relaxed);
@@ -461,7 +475,7 @@ impl Datapath {
                 self.snoop_arp(ifx, pkt.data(), now, touched);
             }
             let len = pkt.len();
-            let k = shard_of(role, pkt.data(), SHARDS, self.hash_key, &self.internal);
+            let k = shard_of(role, pkt.data(), SHARDS, self.hash_key, &hints);
             let verdict =
                 self.shards[k]
                     .lock()
@@ -538,17 +552,23 @@ impl Datapath {
         };
         let mut conns = 0;
         let mut hits: Vec<u64> = Vec::new();
+        let mut fhits: Vec<u64> = Vec::new();
+        let add = |into: &mut Vec<u64>, from: &[u64]| {
+            into.resize(into.len().max(from.len()), 0);
+            for (h, n) in into.iter_mut().zip(from) {
+                *h += n;
+            }
+        };
         for s in &self.shards {
             let mut f = s.lock();
             f.expire(now);
             conns += f.ct.len();
-            hits.resize(hits.len().max(f.rule_hits.len()), 0);
-            for (h, n) in hits.iter_mut().zip(&f.rule_hits) {
-                *h += n;
-            }
+            add(&mut hits, &f.rule_hits);
+            add(&mut fhits, &f.forward_hits);
         }
         self.sh.conntrack.store(conns, Ordering::Relaxed);
         *self.sh.rule_hits.lock() = hits;
+        *self.sh.forward_hits.lock() = fhits;
         for (i, n) in self.neigh.iter().enumerate() {
             let retries = n.lock().poll(now);
             for (ifx, ip) in retries {

@@ -110,6 +110,28 @@ else
   fail "firewall probe: $(echo $probe)"
 fi
 
+# --- port forward + hairpin (docs/config-v2.md): LAB_GUEST config, lab_forward= -------
+# Forward lab-web: the router's WAN address :8080 -> this client's :8080
+# (httpd above). The ISP fetches it through the router (ISP cgi-bin/fetch:
+# back to the caller's, i.e. the router's, address); hairpin: this client
+# fetches it through the WAN address too. lab_forward=0 (no forward): the
+# negative control, both must fail.
+fw=$($bb sed -n 's/.*lab_forward=\([0-9]*\).*/\1/p' /proc/cmdline)
+if [ -n "$fw" ]; then
+  r=$($bb wget -q -T 10 -O - "http://$ISP/cgi-bin/fetch?8080" 2>&1)
+  case "$r" in
+    *"fetch=OK"*rrouter-lab-client*) pass "port forward: the ISP reaches this client's web server via the WAN address ($r)" ;;
+    *) fail "port forward: the ISP cannot reach this client via the WAN address ($r)" ;;
+  esac
+  wanip=$($bb wget -q -T 5 -O - "http://$ISP/cgi-bin/ip" 2>&1)
+  body=$($bb wget -q -T 5 -O - "http://$wanip:8080/" 2>/dev/null)
+  if [ "$body" = "rrouter-lab-client" ]; then
+    pass "hairpin: http://$wanip:8080/ from inside reaches this client"
+  else
+    fail "hairpin: http://$wanip:8080/ from inside ('$body')"
+  fi
+fi
+
 # --- shaping (M6): throughput ~ shaped rate, latency stays low under load ------------
 want=$($bb sed -n 's/.*lab_shape_kbit=\([0-9]*\).*/\1/p' /proc/cmdline)
 now_ms() { $bb awk '{printf "%d", $1 * 1000}' /proc/uptime; }

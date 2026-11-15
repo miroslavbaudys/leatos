@@ -36,6 +36,9 @@ pub const MAX_VLAN_ID: u16 = 4094;
 pub const MAX_PPPOE_STRING: usize = 255;
 /// Most SNTP servers accepted.
 pub const MAX_NTP_SERVERS: usize = 4;
+/// The router's own client ports start here (`fwd`'s
+/// `ROUTER_CLIENT_PORTS`): no port forward there.
+pub const ROUTER_PORTS: u16 = 60_000;
 /// Names that mean something else where zones are expected.
 const RESERVED: [&str; 3] = ["wan", "router", "any"];
 
@@ -519,6 +522,12 @@ fn forwards(c: &Config, x: &mut Issues) {
                 x.add(format!("{p}.to"), "is the router's own address")
             }
             Some(_) => {}
+        }
+        if fw.wan_port.hi >= ROUTER_PORTS {
+            x.add(
+                format!("{p}.wan_port"),
+                format!("{ROUTER_PORTS}–65535 are the router's own (DNS, time)"),
+            );
         }
         if let Some(tp) = fw.to.port
             && u32::from(tp) + u32::from(fw.wan_port.span()) > 65535

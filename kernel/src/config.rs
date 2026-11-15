@@ -545,11 +545,43 @@ pub fn firewall() -> fwd::forwarder::Policy {
             accept: r.action == schema::Action::Accept,
         })
         .collect();
+    let forwards = c
+        .firewall
+        .forwards
+        .iter()
+        .filter(|f| f.enabled)
+        .map(|f| fwd::forwarder::PortForward {
+            protos: match f.proto {
+                schema::Proto::Udp => proto::UDP,
+                schema::Proto::TcpUdp => proto::TCP | proto::UDP,
+                _ => proto::TCP,
+            },
+            lo: f.wan_port.lo,
+            hi: f.wan_port.hi,
+            to: f.to.ip,
+            to_port: f.to.port,
+            src: net(&f.src),
+            hairpin: f.hairpin,
+        })
+        .collect();
     fwd::forwarder::Policy {
         forward,
         input,
         rules,
+        forwards,
     }
+}
+
+/// Names of the enabled port forwards, in the order of the forwarder's
+/// `forward_hits` (status page).
+pub fn forward_names() -> Vec<String> {
+    get()
+        .firewall
+        .forwards
+        .iter()
+        .filter(|f| f.enabled)
+        .map(|f| f.name.clone())
+        .collect()
 }
 
 /// Names of the enabled rules, in the order of the forwarder's

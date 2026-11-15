@@ -274,7 +274,7 @@
     <p class="lead">Stateful: replies to tracked connections always pass; new connections follow the policy below.</p>
     <div class="card"><h3>Zones in effect</h3>
       <div class="tw"><table id="zmatrix"></table></div>
-      <p class="hint">Rows: where a new connection starts; columns: where it goes. Networks of one zone always reach each other. New TCP connections must start with a SYN; protocols other than TCP, UDP and ICMP are dropped for new flows. The WAN zone is fixed: nothing new comes in from the internet (port forwards come later).</p>
+      <p class="hint">Rows: where a new connection starts; columns: where it goes. Networks of one zone always reach each other. New TCP connections must start with a SYN; protocols other than TCP, UDP and ICMP are dropped for new flows. The WAN zone is fixed: nothing new comes in from the internet except through port forwards (below).</p>
     </div>
     <form class="card cfg" autocomplete="off" id="zonesform"><h3>Zones</h3>
       <div class="tw"><table id="zones"></table></div>
@@ -287,6 +287,12 @@
       <div class="row"><button type="button" id="addrule" class="plain">Add rule</button>
         <span class="hint">Checked from the top for each new connection (and for traffic to the router); the first match decides, otherwise the zones do. Applied at once, to new connections.</span></div>
       <p class="hint">"To" <b>router</b> means traffic for the router itself (its web interface, DNS, …); <b>any</b> matches forwarded traffic and the router. Replies to the router's own requests (DHCP, DNS upstream, time) always pass. <b>reject</b> drops for now. Rules to the router boot as a trial.</p>
+    </form>
+    <form class="card cfg" autocomplete="off" id="fwdsform"><h3>Port forwards</h3>
+      <div class="tw"><table id="fwds"></table></div>
+      <div class="row"><button type="button" id="addfwd" class="plain">Add port forward</button>
+        <span class="hint">New connections to the router's WAN address on these ports go to a device inside; no extra rule needed. Applied at once.</span></div>
+      <p class="hint">Target: <code>address</code> (same ports) or <code>address:port</code> (a range maps onto port, port+1, …). <b>Hairpin</b>: devices inside reach it through the WAN address too. Ports 60000–65535 are the router's own.</p>
     </form>
     <div class="card"><h3>Dropped packets by reason</h3><div class="tw"><table id="drops"></table></div>
       <p class="hint">Counted since boot by the forwarding plane (packets the router forwards, not its own).</p></div>
@@ -855,6 +861,7 @@ function fillForm(c) {
   renderZones(c.zone ?? []);
   renderNets(c.network ?? []);
   renderRules(c.firewall?.rule ?? []);
+  renderFwds(c.firewall?.forward ?? []);
 }
 function readForm() {
   const c = structuredClone(cfgOrig);
@@ -867,6 +874,8 @@ function readForm() {
   const rules = readRules();
   c.firewall = { ...(c.firewall ?? {}) };
   if (rules.length) c.firewall.rule = rules; else delete c.firewall.rule;
+  const fwds = readFwds();
+  if (fwds.length) c.firewall.forward = fwds; else delete c.firewall.forward;
   if (!Object.keys(c.firewall).length) delete c.firewall;
   for (const e of fields()) {
     let v;
@@ -1067,6 +1076,8 @@ function readRules() {
 function renderRuleHits() {
   const by = Object.fromEntries((st?.rules ?? []).map((r) => [r.name, r.hits]));
   for (const td of document.querySelectorAll("#rules [data-hits]")) td.textContent = td.dataset.hits in by ? n(by[td.dataset.hits]) : "–";
+  const fb = Object.fromEntries((st?.forwards ?? []).map((r) => [r.name, r.hits]));
+  for (const td of document.querySelectorAll("#fwds [data-fhits]")) td.textContent = td.dataset.fhits in fb ? n(fb[td.dataset.fhits]) : "–";
 }
 $("addrule").onclick = () => {
   const rs = readRules();
@@ -1076,6 +1087,57 @@ $("addrule").onclick = () => {
   updatePending();
 };
 $("rules").addEventListener("input", rulePaths);
+
+// ---- Port forwards.
+let fwdOrig = [];
+function renderFwds(list) {
+  fwdOrig = list.map((f) => structuredClone(f));
+  const t = $("fwds");
+  t.replaceChildren(el("tr", {}, ["On", "Name", "Protocol", "WAN port", "To", "Only from", "Hairpin", "Connections", ""].map((h) => el("th", { textContent: h }))));
+  list.forEach((f, i) => {
+    const tr = el("tr", { dataset: { orig: String(i) } });
+    const inp = (key, v, ph, size) => el("td", {}, [el("input", { value: v ?? "", placeholder: ph, size, dataset: { key } })]);
+    const proto = el("select", { dataset: { key: "proto" } }, ["tcp", "udp", "tcp+udp"].map((o) => el("option", { value: o, textContent: o })));
+    proto.value = f.proto ?? "tcp";
+    tr.append(el("td", {}, [el("input", { type: "checkbox", checked: f.enabled !== false, dataset: { key: "enabled" } })]),
+      inp("name", f.name, "nas-https", 12), el("td", {}, [proto]), inp("wan_port", f.wan_port, "8443 or 8000-8010", 12),
+      inp("to", f.to, "192.168.1.10:443", 18), inp("src", f.src, "anyone", 14),
+      el("td", {}, [el("input", { type: "checkbox", checked: f.hairpin !== false, dataset: { key: "hairpin" } })]),
+      el("td", { className: "num", dataset: { fhits: f.name ?? "" } }),
+      el("td", {}, [el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); updatePending(); } })]));
+    t.append(tr);
+  });
+  fwdPaths();
+  renderRuleHits();
+}
+function fwdPaths() {
+  for (const tr of [...$("fwds").rows].slice(1)) {
+    const name = tr.querySelector('[data-key="name"]').value.trim();
+    for (const e of tr.querySelectorAll("[data-key]")) e.dataset.path = `firewall.forward.${name}.${e.dataset.key}`;
+  }
+}
+function readFwds() {
+  if (!$("fwds").rows.length) return cfgOrig?.firewall?.forward ?? [];
+  return [...$("fwds").rows].slice(1).map((tr) => {
+    const o = structuredClone(fwdOrig[Number(tr.dataset.orig)] ?? {});
+    const v = (k) => tr.querySelector(`[data-key="${k}"]`);
+    o.name = v("name").value.trim();
+    for (const k of ["enabled", "hairpin"]) { if (v(k).checked) delete o[k]; else o[k] = false; }
+    if (v("proto").value === "tcp") delete o.proto; else o.proto = v("proto").value;
+    o.wan_port = v("wan_port").value.trim();
+    o.to = v("to").value.trim();
+    const src = v("src").value.trim(); if (src) o.src = src; else delete o.src;
+    return o;
+  });
+}
+$("addfwd").onclick = () => {
+  const fs = readFwds();
+  fs.push({ name: "", wan_port: "", to: "" });
+  renderFwds(fs);
+  [...$("fwds").rows].at(-1).querySelector('[data-key="name"]').focus();
+  updatePending();
+};
+$("fwds").addEventListener("input", fwdPaths);
 
 // Zone matrix of the working copy: who may open connections to whom.
 function renderMatrix(c) {

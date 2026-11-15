@@ -988,6 +988,8 @@ fn zone_rule_and_forward_checks() {
     assert_eq!(fw(|f| f.wan_port = PortRange { lo: 27005, hi: 27005 }), ["firewall.forward.games.wan_port"]);
     assert!(fw(|f| { f.proto = Proto::Udp; f.wan_port = PortRange::one(8443) }).is_empty());
     assert_eq!(fw(|f| { f.wan_port = PortRange { lo: 8443, hi: 8450 }; f.to.port = Some(65533); }), ["firewall.forward.nas-https.to"]);
+    assert_eq!(fw(|f| f.wan_port = PortRange { lo: 59_990, hi: 60_010 }), ["firewall.forward.nas-https.wan_port"], "the router's ports");
+    assert!(fw(|f| f.wan_port = PortRange::one(51_820)).is_empty(), "WireGuard's port is fine");
     assert_eq!(
         with_v2(|c| {
             c.mgmt.on_wan = true;
@@ -1101,12 +1103,11 @@ fn v2_value_types() {
 fn what_the_kernel_supports() {
     // Networks on lan0, VLANs, zones, DHCP off: supported.
     let mut c = parse(FULL_V2).unwrap();
-    c.firewall.forwards.clear();
     c.dns.hosts.clear();
     assert_eq!(c.unsupported(), vec![]);
-    // Not yet: forwards, DNS hosts, other ports, static WAN (rules are in).
+    // Not yet: DNS hosts, other ports, static WAN (rules, forwards are in).
     let p = parse(FULL_V2).unwrap().unsupported().into_iter().map(|i| i.path).collect::<Vec<_>>();
-    assert_eq!(p, ["firewall.forward", "dns.host"]);
+    assert_eq!(p, ["dns.host"]);
     let mut d = c.clone();
     d.networks[1].ports = vec!["lan1".into()];
     assert_eq!(d.unsupported()[0].path, "network.guest.ports");

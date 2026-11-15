@@ -1123,6 +1123,19 @@ fn status_json(
         );
     }
     s.push(']');
+    // Port forwards in effect and the connections they took.
+    s.push_str(",\"forwards\":[");
+    let hits = sh.forward_hits.lock().clone();
+    for (n, name) in config::forward_names().iter().enumerate() {
+        let _ = write!(
+            s,
+            "{}{{\"name\":{},\"hits\":{}}}",
+            if n > 0 { "," } else { "" },
+            json_str(name),
+            hits.get(n).copied().unwrap_or(0)
+        );
+    }
+    s.push(']');
     // Wall clock (SNTP) and watchdog.
     let ntp = services.and_then(LanServices::ntp_status);
     let _ = write!(

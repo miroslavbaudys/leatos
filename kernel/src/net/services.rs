@@ -152,7 +152,9 @@ impl LanServices {
             });
         }
         let wan = &mut wan[0];
-        let port = 40_000 + (timer::ticks() % 20_000) as u16;
+        // 65000–65535: router-local (fwd::forwarder::ROUTER_CLIENT_PORTS),
+        // apart from SNTP's 60000–64999; never a NAT or forwarded port.
+        let port = 65_000 + (timer::ticks() % 536) as u16;
         let mut s = udp_socket(32, 32 * 4096);
         s.bind(port).expect("bind upstream port");
         let upstream_sock = Some(wan.sockets.add(s));

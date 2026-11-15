@@ -804,9 +804,6 @@ impl Config {
         if !self.zones.is_empty() {
             add("zone".into(), "firewall zones");
         }
-        if !self.firewall.forwards.is_empty() {
-            add("firewall.forward".into(), "port forwards");
-        }
         if !self.dns.hosts.is_empty() {
             add("dns.host".into(), "local DNS records");
         }
@@ -822,7 +819,7 @@ impl Config {
     /// Settings this kernel does not implement yet (docs/config-v2.md §9):
     /// a save or a stored config with them is refused. Implemented:
     /// networks on `lan0` (untagged or VLANs), zones, DHCP per network,
-    /// rules. Not yet: other ports (bridging), port forwards, DNS hosts,
+    /// rules, port forwards. Not yet: other ports (bridging), DNS hosts,
     /// another WAN port, a static WAN.
     pub fn unsupported(&self) -> Vec<Issue> {
         let mut out = Vec::new();
@@ -836,9 +833,6 @@ impl Config {
             if n.ports.len() != 1 || n.ports[0] != PORT_LAN {
                 add(alloc::format!("network.{}.ports", n.name), "ports other than lan0");
             }
-        }
-        if !self.firewall.forwards.is_empty() {
-            add("firewall.forward".into(), "port forwards");
         }
         if !self.dns.hosts.is_empty() {
             add("dns.host".into(), "local DNS records");

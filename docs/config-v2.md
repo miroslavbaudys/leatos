@@ -3,10 +3,10 @@
 Status (2026-11-15): **the schema is implemented** in `crates/config`
 (types, validation, migration, the v1-compatible writer, CLI editing by
 name). The kernel implements networks on `lan0` (untagged or VLANs, a
-DHCP server each), zones (forwarding between them, input policy), rules
-and the web interface's Networks and Firewall pages (§9 steps 1–4). Port
-forwards, DNS hosts, more ports and a static WAN are refused as
-unsupported (`Config::unsupported`). Schema v1 is
+DHCP server each), zones (forwarding between them, input policy), rules,
+port forwards with hairpin, and the web interface's Networks and
+Firewall pages (§9 steps 1–5). DNS hosts, more ports and a static WAN
+are refused as unsupported (`Config::unsupported`). Schema v1 is
 in `docs/config-and-storage.md` §5. v2 is the data model the multipage
 web interface is built against (Networks and Firewall pages). It also covers
 the kernel work listed for M10 in `docs/roadmap.md`: one router interface
@@ -182,9 +182,13 @@ A forward also lets the flow through the firewall: no separate rule is
 needed (like OpenWrt redirects). Port interactions with the router's own
 ports:
 - **NAPT ports (10000–39999):** forwarded ports in this range are skipped
-  when NAPT allocates a source port, so a mapping never shadows a forward.
-- **Router-local ports (≥ 40000):** the ephemeral allocator skips
-  forwarded ports.
+  when NAPT allocates a source port, so a mapping never shadows a forward
+  (`Conntrack::set_reserved`).
+- **Router-local ports (60000–65535):** the router's own client sockets
+  (SNTP 60000–64999, DNS upstream 65000–65535) live here, and forwards
+  may not use them (validation), so a reply to the router is never taken
+  for a forwarded connection. Forwards may use everything below,
+  WireGuard's 51820 for example.
 - **Fixed router ports:** a forward may not use a port the router itself
   listens on from the WAN (`:80` with `mgmt.on_wan`). Validation rejects
   it.
@@ -297,16 +301,26 @@ is enough, as on OpenWrt.
     an `allow`ed service (DHCP UDP 67, DNS 53, NTP UDP 123, ping, web TCP
     80). smoltcp never sees them. `reject` drops for now (no RST / port
     unreachable yet). Replies to the router's own clients always pass,
-    before rules and zones: TCP/UDP to ports ≥ 40000 (router-local
+    before rules and zones: TCP/UDP to ports ≥ 60000 (router-local
     sockets), UDP 68 (the DHCP client), ICMP other than echo requests. So
     a rule "from any to router: drop" cannot break its DHCP, DNS
     upstream or SNTP. The WAN zone's input stays open otherwise (smoltcp
     answers only on ports it listens on); rules can close it.
-- **DNAT.** A conntrack entry gets a destination translation next to the
-  source one. A forward is a static lookup (proto, WAN port) → target, done
-  before routing on a conntrack miss from the WAN. Hairpin: the same
-  lookup for LAN-side packets to the WAN address, plus a source
-  translation to the router's address on the target's network.
+- **DNAT** ✅. `Policy::forwards` (`fwd::forwarder::PortForward`). On a
+  conntrack miss for a TCP/UDP packet to the WAN address, a matching
+  forward (from the WAN if `src` allows; from inside only with hairpin)
+  routes it to the target and creates the connection with
+  `Conntrack::create_dnat`: the reply tuple is the target's, so packets
+  are rewritten both ways by the same code as masquerade (whatever
+  differs between the tuple seen and `Conn::translated`; ICMP errors
+  alike). Hairpin also translates the source to the router's address on
+  the target's network (an endpoint-independent mapping), so the target
+  answers through the router. A forward lets its connections through the
+  firewall; zones and rules are not consulted. `shard_of` puts DNAT and
+  hairpin connections in the shard of their target endpoint
+  (`ShardHints`: WAN address, forwards), so both directions meet; NAPT
+  never allocates a forwarded port. Hit counters per forward
+  (`forward_hits`, `/api/status` `forwards[]`).
 - **On apply:** rule and forward changes apply to new flows. Tracked
   connections that the new policy would refuse are removed. This is a
   pass over each shard, at most 16384 entries in total, run in the
@@ -372,7 +386,12 @@ pointing at the right row while the user edits.
    a reject rule (guest TCP 80 to the WAN: refused, rule hit); negative
    control `LAB_GUEST_RULES=0` (both fail). `store-test`: a rule saved
    through the API applies live.
-5. Port forwards + hairpin. Lab: the ISP VM reaches a client's HTTP
-   server through a forward, and doesn't without it.
+5. ✅ (2026-11-15) Port forwards + hairpin (DNAT, live apply, Firewall
+   page editor with hit counters; router-local ports moved to ≥ 60000).
+   `LAB_GUEST=1 scripts/lab-test.sh`: the ISP VM fetches the client's
+   web server through the router's WAN address (`cgi-bin/fetch`), and the
+   client reaches itself through the WAN address (hairpin); negative
+   control `LAB_FORWARD=0` (both fail). `store-test`: a forward saved
+   through the API applies live.
 6. Multi-port bridge (M10), static WAN, IPv6 (M7, `[wan.ipv6]` and
    per-network RA).

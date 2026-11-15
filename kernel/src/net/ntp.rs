@@ -7,7 +7,7 @@
 //!   share its cache, upstreams and port rules. IPv4 literals need no
 //!   lookup.
 //! - Transport: one UDP socket on the WAN interface, bound at a port
-//!   ≥ 40000 (router-local, never mistaken for NAT).
+//!   ≥ 60000 (router-local, never mistaken for NAT or a port forward).
 //! - Starts once the WAN has a lease (DNS upstreams known).
 
 use crate::net::svc::HostIf;
