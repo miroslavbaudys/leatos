@@ -447,6 +447,10 @@ In rough order of value:
 12. **IPv6 (M7).** DHCPv6-PD over DHCP and PPPoE (IPv6CP), a /64 per
    network with RA/RDNSS, the zone firewall for IPv6 (inbound blocked by
    default), `[wan.ipv6]`.
+13. **mDNS across networks** (`docs/mdns.md`, design only). A filtered
+   reflector in `crates/proto-mdns`: `[[mdns.reflect]]` rules (from, to,
+   service types), `allow = ["mdns"]` for zones; caching proxy and
+   `ff02::fb` later.
 
 Outside this document (`docs/roadmap.md`): PPPoE long-run stability and a
 bufferbloat run on the PPPoE line with the right shaper overhead (M5),
