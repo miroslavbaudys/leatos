@@ -3,6 +3,7 @@
 
 pub mod datapath;
 pub mod device;
+pub mod mdns;
 pub mod mgmt;
 pub mod ntp;
 pub mod packet;

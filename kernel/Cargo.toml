@@ -36,6 +36,7 @@ boot-image.workspace = true
 proto-http.workspace = true
 config.workspace = true
 auth.workspace = true
+proto-mdns.workspace = true
 cli.workspace = true
 config-store.workspace = true
 linked_list_allocator = "0.10"
@@ -46,6 +47,7 @@ smoltcp = { version = "0.14", default-features = false, features = [
     "alloc", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6",
     "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "socket-dns",
     "auto-icmp-echo-reply", # the router answers pings on its own addresses
+    "multicast",            # 224.0.0.251 for the mDNS reflector (net::mdns)
 ] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]

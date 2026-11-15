@@ -332,6 +332,7 @@ dependencies = [
  "proto-dhcp",
  "proto-dns",
  "proto-http",
+ "proto-mdns",
  "proto-pppoe",
  "proto-sntp",
  "qdisc",

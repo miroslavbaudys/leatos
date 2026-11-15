@@ -1272,6 +1272,25 @@ fn status_json(
         );
     }
     s.push(']');
+    // mDNS reflector, per network taking part.
+    s.push_str(",\"mdns\":[");
+    for (n, (name, m)) in services.map(LanServices::mdns_status).unwrap_or_default().iter().enumerate() {
+        let _ = write!(
+            s,
+            "{}{{\"network\":{},\"received\":{},\"sent\":{},\"filtered\":{},\"duplicate\":{},\"rate_limited\":{},\"malformed\":{},\"foreign\":{},\"oversize\":{}}}",
+            if n > 0 { "," } else { "" },
+            json_str(name),
+            m.received,
+            m.sent,
+            m.filtered,
+            m.duplicate,
+            m.rate_limited,
+            m.malformed,
+            m.foreign,
+            m.oversize
+        );
+    }
+    s.push(']');
     // Wall clock (SNTP) and watchdog.
     let ntp = services.and_then(LanServices::ntp_status);
     let _ = write!(

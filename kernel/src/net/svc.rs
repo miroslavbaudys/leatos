@@ -527,7 +527,7 @@ pub async fn run(
         }
         pinger.step(&mut hosts[0].sockets);
         if let Some(svc) = services.as_mut() {
-            svc.step(&mut hosts);
+            svc.step(&mut hosts, &sh.links);
         }
         let action = mgmt.step(&mut hosts, sh, services.as_ref());
         if let Some((conn, op)) = mgmt.take_op()

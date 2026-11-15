@@ -872,7 +872,8 @@ impl Config {
     /// Settings this kernel does not implement yet (docs/config-v2.md §9):
     /// a save or a stored config with them is refused. Implemented:
     /// networks on `lan0` (untagged or VLANs), zones, DHCP per network,
-    /// rules, port forwards. Not yet: other ports (bridging), DNS hosts,
+    /// rules, port forwards, mDNS reflection. Not yet: other ports
+    /// (bridging), DNS hosts,
     /// another WAN port, a static WAN.
     pub fn unsupported(&self) -> Vec<Issue> {
         let mut out = Vec::new();
@@ -889,9 +890,6 @@ impl Config {
         }
         if !self.dns.hosts.is_empty() {
             add("dns.host".into(), "local DNS records");
-        }
-        if self.mdns.reflect.iter().any(|r| r.enabled) {
-            add("mdns.reflect".into(), "mDNS reflection");
         }
         if self.wan.port != PORT_WAN {
             add("wan.port".into(), "a WAN port other than wan0");

@@ -573,6 +573,26 @@ pub fn firewall() -> fwd::forwarder::Policy {
     }
 }
 
+/// The enabled `[[mdns.reflect]]` entries for `proto_mdns::Reflector`,
+/// networks as indices into [`networks`] (validated: names exist, types
+/// parse).
+pub fn mdns_rules() -> Vec<proto_mdns::Rule> {
+    let c = get();
+    let idx = |name: &str| c.networks.iter().position(|n| n.name == name);
+    c.mdns
+        .reflect
+        .iter()
+        .filter(|r| r.enabled)
+        .filter_map(|r| {
+            Some(proto_mdns::Rule {
+                from: idx(&r.from)?,
+                to: r.to.iter().filter_map(|t| idx(t)).collect(),
+                services: r.services.iter().filter_map(|s| proto_mdns::ServiceType::parse(s)).collect(),
+            })
+        })
+        .collect()
+}
+
 /// Names of the enabled port forwards, in the order of the forwarder's
 /// `forward_hits` (status page).
 pub fn forward_names() -> Vec<String> {

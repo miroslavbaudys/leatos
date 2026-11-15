@@ -1,10 +1,11 @@
 # mDNS across networks (design)
 
-Status (2026-11-15): steps 1–2 done: `crates/proto-mdns` (wire format +
-the filtered reflector, host tests incl. mutation fuzzing) and the config
-(`[[mdns.reflect]]`, zone service `mdns`, validation). Kernel wiring and
-the lab test are not done yet (§8); until then the kernel refuses enabled
-reflect entries.
+Status (2026-11-15): steps 1–3 done in QEMU: `crates/proto-mdns` (wire
+format + the filtered reflector, host tests incl. mutation fuzzing), the
+config (`[[mdns.reflect]]`, zone service `mdns`, validation) and the
+kernel (`net/mdns.rs`, counters on `/api/status` and the CLI), with a
+first lab check (`LAB_MDNS=1`, §7). Open: a browse test with real mDNS
+software, a web page section, the apu4 (§8).
 
 mDNS (RFC 6762) and DNS-SD (RFC 6763) are link-local: queries and
 announcements go to `224.0.0.251:5353` (IPv6 `ff02::fb`) with TTL 255, and
@@ -87,18 +88,41 @@ behind it without changing the kernel side.
   oversize.
 - Host tests for each point above, plus a fuzz target (M9).
 
-## 4. Kernel
-- `kernel/Cargo.toml`: smoltcp feature `multicast` (default group count
-  is enough).
-- `net/svc.rs`: on each LAN link that takes part, `join_multicast_group
-  (224.0.0.251)` once its address is set, leave on reconfigure; never on
-  the WAN. The IGMP reports smoltcp then sends keep IGMP-snooping switches
-  and APs delivering the group.
-- `net/services.rs`: a 5353 UDP socket per participating `Net`,
-  `set_hop_limit(Some(255))`, fixed buffers from `udp_socket(..)`; `step()`
-  feeds received datagrams to the `Reflector` and sends its output on the
-  target networks' sockets. `Priority::Service`; the datapath is untouched.
-  Reflected packets reach the LAN qdisc like any local traffic.
+## 4. Kernel (`kernel/src/net/mdns.rs`)
+- `kernel/Cargo.toml`: smoltcp feature `multicast` (the default group
+  count, 4 per interface, is enough: one group).
+- `Mdns`, owned by `LanServices` like `Ntp`: for each network a rule
+  involves (`Reflector::takes_part`), `join_multicast_group(224.0.0.251)`
+  on that link's interface and a UDP socket on 5353 (16 datagrams, 24 KiB
+  each way, `set_hop_limit(Some(255))`); never on the WAN. Network `k` of
+  `config::networks` is reflector network `k`; `config::mdns_rules()`
+  maps the enabled entries to those indices.
+- `reconfigure` (boot and every live config apply): memberships that
+  stay (same interface, same VID) are kept; the others are left at once
+  (the leave goes out on the tag still in effect); new or retagged ones
+  are joined only once the datapath shows the link active with the
+  network's VID (`step`, rechecked every 20 ms while one waits). The
+  services task runs ahead of the datapath after a live change: a report
+  queued before `Datapath::apply` would carry the link's old tag (none,
+  for a network just added) and never reach the network. This was caught
+  by `LAB_MDNS=1 LAB_GUEST_LIVE=1` (no IGMP join on the live-added guest
+  VLAN). Sockets are closed and reopened. Counters stay while the network
+  names stay the same.
+- `step` (end of `LanServices::step`): each received datagram goes to
+  `Reflector::handle`; its copies are sent to `224.0.0.251:5353` on the
+  target networks' sockets (smoltcp picks the source address and the
+  multicast MAC). A full socket buffer drops (bounded). `Priority::Service`;
+  the datapath is untouched (the forwarder passes 5353 up when the zone
+  allows `mdns`); reflected packets reach the LAN qdisc like any local
+  traffic.
+- smoltcp sends the IGMP v2 report when the group is joined on an
+  interface that has its address; it answers IGMP queries. The guest
+  zone's input policy drops IGMP queries (no service bit for IGMP); this
+  matters only for snooping switches that do not flood 224.0.0.0/24
+  (RFC 4541 says they must).
+- Status: `GET /api/status` `"mdns":[{network, received, sent, filtered,
+  duplicate, rate_limited, malformed, foreign, oversize}]` (networks taking
+  part), the CLI `status` an `mdns :` line per network.
 - Ports: 5353 is a server socket like 53; the ≥ 60000 rule for router
   client sockets does not apply.
 
@@ -114,10 +138,7 @@ services = ["_airplay._tcp", "_raop._tcp", "_googlecast._tcp", "_ipp._tcp"]
   zones. Answers flow back along the same rule; a rule is needed only per
   direction of discovery. `enabled = false` keeps an entry without it
   taking effect. CLI paths by name (`mdns.reflect.iot-to-lan.services`).
-- Until the kernel side exists (§8 step 3), `Config::unsupported` lists
-  enabled `mdns.reflect` entries, so a save with them is refused; the
-  zone service `mdns` alone is accepted (`fwd` maps UDP 5353 to
-  `svc::MDNS`).
+- `fwd` maps UDP 5353 to `svc::MDNS` for the zone input policy.
 - `Service::Mdns` (`allow = ["mdns"]`) and `svc::MDNS` = UDP 5353: a
   zone with a restrictive input policy must allow it for its network to
   take part. Validation (paths like `mdns.reflect.iot-to-lan.to[1]`):
@@ -146,20 +167,30 @@ services = ["_airplay._tcp", "_raop._tcp", "_googlecast._tcp", "_ipp._tcp"]
    reflector behaviour.
 
 ## 7. Tests
-- Host tests and fuzzing in `crates/proto-mdns` (§3).
-- `LAB_MDNS=1 scripts/lab-test.sh` (on top of `LAB_GUEST=1`):
-  `avahi-publish` on the main LAN, `avahi-browse` on VLAN 20, in
-  **separate network namespaces** (a host on both links finds the service
-  directly and proves nothing). Needs avahi added to the pinned Alpine
-  packages in `scripts/lab/fetch-alpine.sh`.
-- Negative controls: `LAB_MDNS_RULES=0` (nothing found); a service type
-  not in the rule (not found); zone without `allow = ["mdns"]` (not found,
-  input drop counter rises).
+- Host tests and fuzzing in `crates/proto-mdns` (§3); config validation
+  in `crates/config`; the zone input bit in `crates/fwd`.
+- ✅ `LAB_MDNS=1 scripts/lab-test.sh` (implies `LAB_GUEST=1`): the guest
+  zone allows `mdns`, rule `guest-printers` reflects `_ipp._tcp` guest →
+  lan. The client sends a crafted announcement (`_ipp._tcp` + `_ssh._tcp`)
+  from 5353 on VLAN 20 (busybox `nc -u`); checks: the router's counters
+  (guest received +1, lan sent +1), and on the LAN capture (QEMU
+  `filter-dump`, decoded by the host's tcpdump): the copy from
+  192.168.1.1 to 224.0.0.251 with TTL 255 carrying `_ipp` and not `_ssh`,
+  and the router's IGMP reports for 224.0.0.251 on both networks.
+  Negative control `LAB_MDNS_RULES=0` (the rule disabled: all three
+  fail). Combines with `LAB_GUEST_LIVE=1` (added live) and
+  `RROUTER_ARCH=x86_64`.
+- Open: a browse test with real mDNS software (`avahi-publish` on one
+  network, `avahi-browse` on the other, in **separate network
+  namespaces**: a host on both links finds the service directly and
+  proves nothing; avahi in the pinned Alpine packages).
 
 ## 8. Order
 1. ✅ `crates/proto-mdns` reflector + tests.
 2. ✅ Config schema, `Service::Mdns`, validation.
-3. Kernel: smoltcp multicast, sockets, wiring, counters on `/api/status`.
-4. Lab test with negative controls; web page section and CLI status.
+3. ✅ Kernel: smoltcp multicast, sockets, wiring, counters on
+   `/api/status` and the CLI; first lab check (§7).
+4. Browse test with avahi (§7); web page section (reflect entries,
+   counters).
 5. On the apu4 with a real IoT VLAN.
 6. Later: IPv6 (`ff02::fb`, with M7), caching proxy, legacy unicast.

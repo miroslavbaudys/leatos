@@ -448,6 +448,12 @@ fn status(ctx: &Ctx, wan: &str) {
             q.backlog_packets
         );
     }
+    for (name, m) in ctx.services.map(LanServices::mdns_status).unwrap_or_default() {
+        println!(
+            "mdns     : {name}: {} in, {} out, {} filtered, {} dup, {} rate-limited, {} bad, {} foreign",
+            m.received, m.sent, m.filtered, m.duplicate, m.rate_limited, m.malformed, m.foreign
+        );
+    }
     let ntp = ctx.services.and_then(LanServices::ntp_status);
     match (wallclock::now(), &ntp) {
         (Some(t), Some(n)) if n.synced.is_some() => {

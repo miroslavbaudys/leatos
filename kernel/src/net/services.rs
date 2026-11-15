@@ -9,9 +9,11 @@
 //! Per network (`config::networks`): `0.0.0.0:67` (DHCP, unless switched
 //! off) and `:53` (DNS from clients) on its interface; one resolver and
 //! local zone for all of them. WAN `:<random high port>` (queries to
-//! upstream servers).
+//! upstream servers). `:5353` on networks taking part in mDNS reflection
+//! (`net::mdns`).
 
 use crate::config;
+use crate::net::mdns::Mdns;
 use crate::net::ntp::{self, Ntp};
 use crate::net::svc::HostIf;
 use crate::{println, timer};
@@ -29,6 +31,8 @@ use smoltcp::wire::IpEndpoint;
 const DNS_PORT: u16 = 53;
 /// How often leases are checked for expiry.
 const EXPIRE_EVERY_SECS: u64 = 10;
+/// How soon to look again while an mDNS group join waits for the datapath.
+const MDNS_RECHECK_MS: u64 = 20;
 
 /// One network's services: its DHCP server (if enabled) and the DNS
 /// socket on its address.
@@ -48,6 +52,8 @@ pub struct LanServices {
     next_expire: u64,
     /// SNTP over the WAN (none without a WAN).
     ntp: Option<Ntp>,
+    /// mDNS across networks.
+    mdns: Mdns,
 }
 fn udp_socket(datagrams: usize, bytes: usize) -> udp::Socket<'static> {
     let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; datagrams], vec![0; bytes]);
@@ -172,12 +178,14 @@ impl LanServices {
         let upstream_sock = Some(wan.sockets.add(s));
         let ntp = Some(Ntp::new(wan));
         println!("  lan services    : dns cache {}", dns_cfg.cache_entries);
+        let mdns = Mdns::new(hosts, links);
         Some(Self {
             nets,
             dns,
             upstream_sock,
             next_expire: 0,
             ntp,
+            mdns,
         })
     }
 
@@ -233,6 +241,7 @@ impl LanServices {
         if let Some(n) = self.ntp.as_mut() {
             n.reconfigure();
         }
+        self.mdns.reconfigure(hosts, links);
         let first = &cfgs[0];
         println!(
             "  lan services    : reconfigured: dhcp {}..{} ({} static, {} lease(s) dropped), domain .{}, cache {}",
@@ -275,6 +284,11 @@ impl LanServices {
     /// SNTP state (status page).
     pub fn ntp_status(&self) -> Option<ntp::Status> {
         self.ntp.as_ref().map(Ntp::status)
+    }
+
+    /// mDNS reflector counters per network taking part.
+    pub fn mdns_status(&self) -> Vec<(&str, proto_mdns::Stats)> {
+        self.mdns.status()
     }
 
     fn apply_dhcp_events(dns: &mut Resolver, net: &str, domain: &str, events: Vec<DhcpEvent>) {
@@ -331,8 +345,9 @@ impl LanServices {
     }
 
     /// Process received datagrams and timers. Called by the services task
-    /// after polling the interfaces (`hosts` as in [`Self::new`]).
-    pub fn step(&mut self, hosts: &mut [HostIf]) {
+    /// after polling the interfaces (`hosts` as in [`Self::new`];
+    /// `links[i]` is `hosts[i]`'s link).
+    pub fn step(&mut self, hosts: &mut [HostIf], links: &[crate::net::shared::LinkShared]) {
         // DHCP servers.
         let mut buf = [0u8; 1500];
         let expire = now_secs() >= self.next_expire;
@@ -397,6 +412,8 @@ impl LanServices {
         // DNS: retries / timeouts.
         let actions = self.dns.poll(now_ms());
         self.send_dns(hosts, actions);
+
+        self.mdns.step(hosts, links);
     }
 
     /// When `step` must run again even without traffic.
@@ -407,6 +424,9 @@ impl LanServices {
         let mut wait_ms = dns_in.map_or(expire_in, |d| d.min(expire_in));
         if let Some(at) = self.ntp.as_ref().and_then(Ntp::next_deadline_ms) {
             wait_ms = wait_ms.min(at.saturating_sub(ms_now));
+        }
+        if self.mdns.wants_soon() {
+            wait_ms = wait_ms.min(MDNS_RECHECK_MS);
         }
         timer::Instant::now()
             .checked_add(core::time::Duration::from_millis(wait_ms))

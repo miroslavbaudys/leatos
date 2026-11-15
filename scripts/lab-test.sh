@@ -72,6 +72,17 @@
 #                        with hairpin; the ISP fetches through it and the
 #                        client through the WAN address. Negative control:
 #                        LAB_FORWARD=0 (no forward: both fail).
+#   LAB_MDNS=1           (implies LAB_GUEST=1) mDNS across networks
+#                        (docs/mdns.md): the guest zone allows "mdns" and
+#                        the rule guest-printers reflects _ipp._tcp from
+#                        guest to lan. The client announces a printer
+#                        (_ipp._tcp + _ssh._tcp) on VLAN 20; checks: the
+#                        router's counters (guest received, lan sent) and,
+#                        on the LAN capture, the copy from 192.168.1.1 to
+#                        224.0.0.251 with TTL 255 holding _ipp but not
+#                        _ssh, plus the router's IGMP joins on both
+#                        networks. Negative control: LAB_MDNS_RULES=0 (the
+#                        rule disabled: every mDNS check fails).
 #   LAB_GUEST_LIVE=1     the same, but added live: the router boots with the
 #                        main LAN only (and mgmt_pass=lab-pass); the client
 #                        POSTs the guest config (in its initrd) to
@@ -106,12 +117,17 @@ fi
 GUEST="${LAB_GUEST:-}"
 GUEST_LIVE="${LAB_GUEST_LIVE:-}"
 [[ -n "$GUEST_LIVE" ]] && GUEST=1
+MDNS="${LAB_MDNS:-}"
+MDNS_RULES="${LAB_MDNS_RULES:-1}"
+[[ -n "$MDNS" ]] && GUEST=1
 GUEST_ZONE="${LAB_GUEST_ZONE:-guest}"
 GUEST_RULES="${LAB_GUEST_RULES:-1}"
 FORWARD="${LAB_FORWARD:-1}"
 LAN_PORT="${LAB_LAN_PORT:-10003}"
 WAN_PORT="${LAB_WAN_PORT:-10005}"
 WORK=$(mktemp -d -t rrouter-lab)
+PCAP_DIR="${LAB_PCAP_DIR:-}"
+[[ -n "$MDNS" && -z "$PCAP_DIR" ]] && PCAP_DIR="$WORK/pcap"
 PIDS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null || true; done
@@ -163,8 +179,17 @@ zone = "$GUEST_ZONE"
 [[zone]]
 name = "guest"
 input = "drop"
-allow = ["dhcp", "dns", "ping"]
+allow = ["dhcp", "dns", "ping"$([[ -n "$MDNS" ]] && echo ', "mdns"')]
 forward_to = ["wan"]
+CFG
+  [[ -n "$MDNS" ]] && cat >>"$WORK/config.toml" <<CFG
+
+[[mdns.reflect]]
+name = "guest-printers"
+enabled = $([[ "$MDNS_RULES" == 1 ]] && echo true || echo false)
+from = "guest"
+to = ["lan"]
+services = ["_ipp._tcp"]
 CFG
   [[ "$GUEST_RULES" == 1 ]] && cat >>"$WORK/config.toml" <<'CFG'
 
@@ -208,11 +233,11 @@ CFG
     CLIENT_INITRD="$WORK/client-initrd.img"
   fi
   ROUTER_STORE="$WORK/store.img"
-  echo "== router config${GUEST_LIVE:+ (added live by the client)}: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")"
+  echo "== router config${GUEST_LIVE:+ (added live by the client)}: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")$([[ -n "$MDNS" ]] && echo ", mdns reflect (enabled: $MDNS_RULES)")"
 fi
 
 echo "== start rrouter${ROUTER_ARGS:+ ($(echo "$ROUTER_ARGS" | sed 's/pppoe_pass=[^ ]*/pppoe_pass=***/'))}"
-QEMU_STORE="$ROUTER_STORE" QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" QEMU_PCAP_DIR="${LAB_PCAP_DIR:-}" QEMU_ACCEL="$QEMU_ACCEL" QEMU_APPEND="$ROUTER_ARGS" \
+QEMU_STORE="$ROUTER_STORE" QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" QEMU_PCAP_DIR="$PCAP_DIR" QEMU_ACCEL="$QEMU_ACCEL" QEMU_APPEND="$ROUTER_ARGS" \
   scripts/qemu-run.sh "target/$ARCH-unknown-none/debug/rrouter" >"$WORK/router.log" 2>&1 &
 PIDS+=($!)
 wait_for "$WORK/router.log" "rrouter: boot ok" 40 || { echo "router did not boot:"; cat "$WORK/router.log"; exit 1; }
@@ -223,7 +248,7 @@ PIDS+=($!)
 
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD}${GUEST_LIVE:+ lab_guest_live=1}"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so
@@ -345,6 +370,31 @@ if [[ -n "$irq_up" && "$irq_up" -gt 0 ]]; then
 else
   echo "  LAB FAIL: irq placement: expected device interrupts on core $want_up, got [${irqs:-?}]"
   router_fails=$((router_fails + 1))
+fi
+
+# mDNS on the wire (LAB_MDNS=1): the reflected copy on the main LAN comes
+# from the router's LAN address, to the group, with TTL 255, and carries
+# only the allowed service; the router joined 224.0.0.251 on both networks.
+if [[ -n "$MDNS" ]]; then
+  tcpdump -nn -e -v -r "$PCAP_DIR/lan.pcap" 'udp port 5353 or igmp or (vlan and (udp port 5353 or igmp))' 2>/dev/null \
+    | awk '/^[^ \t]/ { if (l != "") print l; l = $0; next } { l = l " " $0 } END { if (l != "") print l }' >"$WORK/mdns.txt"
+  if ! tr -d '\r' <"$WORK/client.log" | grep -q "LAB MDNS SENT"; then
+    echo "  LAB FAIL: mdns wire: the client's reflection check did not pass"; router_fails=$((router_fails + 1))
+  else
+    copy=$(grep -v "vlan 20" "$WORK/mdns.txt" | grep "192.168.1.1.5353 > 224.0.0.251.5353" || true)
+    if [[ "$copy" == *"ttl 255"* && "$copy" == *"labprn._ipp._tcp.local"* && "$copy" != *"_ssh"* ]]; then
+      echo "  LAB PASS: mdns wire: copy from 192.168.1.1 to 224.0.0.251, ttl 255, _ipp only"
+    else
+      echo "  LAB FAIL: mdns wire: no proper copy on the LAN (${copy:0:300})"; router_fails=$((router_fails + 1))
+    fi
+  fi
+  igmp_lan=$(grep -v "vlan 20" "$WORK/mdns.txt" | grep -c "192.168.1.1 > 224.0.0.251: igmp v2 report 224.0.0.251" || true)
+  igmp_guest=$(grep "vlan 20" "$WORK/mdns.txt" | grep -c "10.20.0.1 > 224.0.0.251: igmp v2 report 224.0.0.251" || true)
+  if [[ "$igmp_lan" -ge 1 && "$igmp_guest" -ge 1 ]]; then
+    echo "  LAB PASS: mdns igmp: router joined 224.0.0.251 on lan ($igmp_lan) and guest ($igmp_guest)"
+  else
+    echo "  LAB FAIL: mdns igmp: joins lan=$igmp_lan guest=$igmp_guest"; router_fails=$((router_fails + 1))
+  fi
 fi
 
 if [[ "$router_fails" == 0 ]] && tr -d '\r' <"$WORK/client.log" | grep -q "LAB DONE fails=0" && ! tr -d '\r' <"$WORK/client.log" | grep -q "LAB FAIL"; then

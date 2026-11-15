@@ -1274,13 +1274,9 @@ fn mdns_too_many_service_types() {
 }
 
 #[test]
-fn mdns_not_in_the_kernel_yet() {
+fn mdns_is_supported() {
     let mut c = with_mdns();
     c.dns.hosts.clear();
-    let p: Vec<String> = c.unsupported().into_iter().map(|i| i.path).collect();
-    assert_eq!(p, ["mdns.reflect"]);
-    // Disabled entries and the zone service alone are fine.
-    c.mdns.reflect[0].enabled = false;
     assert!(c.unsupported().is_empty());
 }
 
