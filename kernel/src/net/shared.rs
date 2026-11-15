@@ -177,6 +177,9 @@ pub struct Shared {
     pub control: Mutex<Control>,
     /// Tracked connections (published by the datapath).
     pub conntrack: AtomicUsize,
+    /// Packets each firewall rule decided, summed over the shards
+    /// (published by the datapath once a second; `config::rule_names`).
+    pub rule_hits: Mutex<Vec<u64>>,
 }
 
 static SHARED: Once<&'static Shared> = Once::new();
@@ -193,6 +196,7 @@ pub fn init(ports: Vec<PortShared>, links: Vec<LinkShared>) -> &'static Shared {
             svc_kick: irq::new_event(),
             control: Mutex::new(Control::default()),
             conntrack: AtomicUsize::new(0),
+            rule_hits: Mutex::new(Vec::new()),
         }))
     })
 }

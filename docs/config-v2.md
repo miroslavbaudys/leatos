@@ -3,8 +3,8 @@
 Status (2026-11-15): **the schema is implemented** in `crates/config`
 (types, validation, migration, the v1-compatible writer, CLI editing by
 name). The kernel implements networks on `lan0` (untagged or VLANs, a
-DHCP server each), zones (forwarding between them, input policy) and the
-web interface's Networks and Firewall pages (§9 steps 1–3). Rules, port
+DHCP server each), zones (forwarding between them, input policy), rules
+and the web interface's Networks and Firewall pages (§9 steps 1–4). Port
 forwards, DNS hosts, more ports and a static WAN are refused as
 unsupported (`Config::unsupported`). Schema v1 is
 in `docs/config-and-storage.md` §5. v2 is the data model the multipage
@@ -274,21 +274,34 @@ is enough, as on OpenWrt.
     `lan0`, so they share one LAN qdisc. CAKE's host isolation then spans
     every network, and the download shaper covers them all (the roadmap
     requires this).
-- **Firewall** (zones ✅, rules later).
+- **Firewall** (zones ✅, rules ✅).
   - `fwd::forwarder::Policy`: per zone a bitmask of zones it may forward
     to, and its input (`None` = all, or a mask of `svc::*` services),
     compiled from the config by `config::firewall` (zone 0 = wan, 1 = lan,
     then the defined zones), set on every shard, replaced live on a save
-    (`Control::policy`). The rule list comes with step 4.
+    (`Control::policy`).
+  - Rules: `Policy::rules` (`fwd::forwarder::Rule`: from zone or any, to
+    a zone / the router / any, protocol bits, source and destination
+    prefix, destination port range, accept or drop), compiled from the
+    enabled `[[firewall.rule]]`s. On a new flow (conntrack miss) and for
+    traffic to the router the first matching rule decides, else the
+    zones. Each shard counts packets per rule (`rule_hits`); the datapath
+    sums them once a second into `Shared::rule_hits`, shown as `rules[]`
+    in `/api/status` and on the Firewall page. A new policy restarts the
+    counters. Tracked connections are not re-checked when rules change
+    (they run until they end).
   - Checked only on a conntrack miss, so per-packet cost is unchanged for
     tracked flows.
   - Input policy: packets for the router from a zone with `input = drop`
     are dropped in the forwarder (`drop_reasons.input`) unless they are
     an `allow`ed service (DHCP UDP 67, DNS 53, NTP UDP 123, ping, web TCP
     80). smoltcp never sees them. `reject` drops for now (no RST / port
-    unreachable yet). The WAN zone's input stays open in the kernel: what
-    reaches the router there is the replies its own clients wait for, and
-    smoltcp answers only on ports it listens on.
+    unreachable yet). Replies to the router's own clients always pass,
+    before rules and zones: TCP/UDP to ports ≥ 40000 (router-local
+    sockets), UDP 68 (the DHCP client), ICMP other than echo requests. So
+    a rule "from any to router: drop" cannot break its DHCP, DNS
+    upstream or SNTP. The WAN zone's input stays open otherwise (smoltcp
+    answers only on ports it listens on); rules can close it.
 - **DNAT.** A conntrack entry gets a destination translation next to the
   source one. A forward is a static lookup (proto, WAN port) → target, done
   before routing on a conntrack miss from the WAN. Hairpin: the same
@@ -352,8 +365,13 @@ pointing at the right row while the user edits.
    LAN are refused (router firewall drop counter); negative control
    `LAB_GUEST_ZONE=lan` (both isolation checks fail). `store-test`: a
    network added through the web API is saved and rebooted into.
-4. Rules (`[[firewall.rule]]`). Lab: a rule opens one port, with a
-   negative control.
+4. ✅ (2026-11-15) Rules (`[[firewall.rule]]`): forwarder rules with hit
+   counters, live apply, Firewall page editor (ordered, enable, hits).
+   `LAB_GUEST=1 scripts/lab-test.sh` adds an accept rule (guest ICMP to
+   192.168.1.10, which the zones refuse: rule hit, no firewall drop) and
+   a reject rule (guest TCP 80 to the WAN: refused, rule hit); negative
+   control `LAB_GUEST_RULES=0` (both fail). `store-test`: a rule saved
+   through the API applies live.
 5. Port forwards + hairpin. Lab: the ISP VM reaches a client's HTTP
    server through a forward, and doesn't without it.
 6. Multi-port bridge (M10), static WAN, IPv6 (M7, `[wan.ipv6]` and

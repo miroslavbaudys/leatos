@@ -198,12 +198,41 @@ if [ -n "$guest" ]; then
       pass "guest: router web interface blocked (input policy)"
     fi
     before=$(fwdrops)
-    $bb ping -c 3 -W 1 -I "$gip" 192.168.1.10 >/dev/null 2>&1
+    $bb ping -c 3 -W 1 -I "$gip" 192.168.1.20 >/dev/null 2>&1
     after=$(fwdrops)
     if [ -n "$before" ] && [ -n "$after" ] && [ $((after - before)) -ge 3 ]; then
       pass "guest: new connections to the main LAN refused (router firewall drops $before -> $after)"
     else
       fail "guest: main LAN not refused (router firewall drops ${before:-?} -> ${after:-?})"
+    fi
+    # Rules (scripts/lab-test.sh): guest-ping-nas opens ICMP to 192.168.1.10
+    # (no host there: the proof is the rule's hit counter, and no firewall
+    # drop); guest-no-isp-web refuses guest TCP 80 to the WAN while guest
+    # ICMP to the ISP passed above. lab_guest_rules=0: the negative control.
+    hits() { $bb wget -q -T 5 -O - "http://192.168.1.1/api/status" 2>/dev/null | $bb tr '{' '\n' | $bb grep "\"name\":\"$1\"" | $bb sed -n 's/.*"hits":\([0-9]*\).*/\1/p'; }
+    before=$(fwdrops); h0=$(hits guest-ping-nas)
+    $bb ping -c 3 -W 1 -I "$gip" 192.168.1.10 >/dev/null 2>&1
+    $bb sleep 2   # hit counters are published once a second
+    after=$(fwdrops); h1=$(hits guest-ping-nas)
+    # One ping = one tracked connection (same ICMP id): the rule decides
+    # its first packet, conntrack the rest.
+    if [ -n "$h1" ] && [ "$h1" -gt "${h0:-0}" ] && [ -n "$before" ] && [ "$before" = "$after" ]; then
+      pass "guest: rule guest-ping-nas opens ICMP to 192.168.1.10 (hits ${h0:-0} -> $h1, firewall drops unchanged)"
+    else
+      fail "guest: rule guest-ping-nas (hits ${h0:-none} -> ${h1:-none}, firewall drops ${before:-?} -> ${after:-?})"
+    fi
+    # Guest-sourced HTTP to the ISP: route traffic to the ISP through the
+    # VLAN for this check only (all the main-LAN checks are done).
+    $bb ip rule add to "$ISP" table 20 pref 100
+    h0=$(hits guest-no-isp-web)
+    if $bb wget -q -T 4 -O /dev/null "http://$ISP/" 2>/dev/null; then web=reached; else web=refused; fi
+    $bb sleep 2
+    h1=$(hits guest-no-isp-web)
+    $bb ip rule del to "$ISP" table 20 pref 100
+    if [ "$web" = refused ] && [ -n "$h1" ] && [ "$h1" -gt "${h0:-0}" ]; then
+      pass "guest: rule guest-no-isp-web refuses http://$ISP/ from the guest (hits ${h0:-0} -> $h1)"
+    else
+      fail "guest: rule guest-no-isp-web: http://$ISP/ $web from the guest (hits ${h0:-none} -> ${h1:-none})"
     fi
   fi
 fi

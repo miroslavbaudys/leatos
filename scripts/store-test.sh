@@ -137,13 +137,13 @@ check "invalid TOML -> 422" 422 "$(save_toml "$WORK/bad.toml")"
 printf 'version = 1\n\n[lan]\nipv4 = "10.30.0.1/24"\n\n[lan.dhcp]\nrange = ["10.40.0.100", "10.40.0.199"]\n' >"$WORK/incons.toml"
 check "inconsistent config -> 422" 422 "$(save_toml "$WORK/incons.toml")"
 check "422 names the field" "network.lan.dhcp.range" "$(json "$WORK/resp" issues.0.path | cut -d'[' -f1)"
-# Valid, but beyond what this kernel implements (a firewall rule): refused.
+# Valid, but beyond what this kernel implements (a port forward): refused.
 python3 -I -c 'import json,sys
 c=json.load(open(sys.argv[1]))
-c["firewall"]={"rule":[{"name":"ssh","from":"lan","to":"router","proto":"tcp","dst_port":22,"action":"drop"}]}
+c["firewall"]={"forward":[{"name":"web","wan_port":8080,"to":"10.20.0.50:80"}]}
 open(sys.argv[2],"w").write(json.dumps(c))' "$WORK/cfg.json" "$WORK/v2.json"
-check "unsupported setting (firewall rule) -> 422" 422 "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/v2.json" "$URL/api/config")"
-check "  ... names it" "firewall.rule" "$(json "$WORK/resp" issues.0.path)"
+check "unsupported setting (port forward) -> 422" 422 "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/v2.json" "$URL/api/config")"
+check "  ... names it" "firewall.forward" "$(json "$WORK/resp" issues.0.path)"
 check "refused saves left the store unchanged" "A 1 0" "$(slot)"
 
 # A change without a trial, sent as JSON the way the page does: saved and
@@ -246,6 +246,14 @@ check "  ... stored as version 2" "1 1" "$("$RRSTORE" show "$IMG" 2>/dev/null | 
 up 2 || true
 check "  ... rebooted with both networks" "lan guest 20 guest" "$(status networks.0.name) $(status networks.1.name) $(status networks.1.vlan) $(status networks.1.zone)"
 check "  ... guest network up on VLAN 20" 1 "$(count 'net lan0       : guest 10.20.0.1/24 (vlan 20, zone 2)')"
+# A forwarding rule applies live (no reboot, no trial); the status lists it.
+curl -s -m 10 -o "$WORK/cfg.json" "$URL/api/config.json" || true
+python3 -I -c 'import json,sys
+c=json.load(open(sys.argv[1]))
+c["firewall"]={"rule":[{"name":"no-smtp","from":"lan","to":"wan","proto":"tcp","dst_port":25,"action":"drop"}]}
+open(sys.argv[2],"w").write(json.dumps(c))' "$WORK/cfg.json" "$WORK/rule.json"
+check "rule added -> 200, applied live" "200 true false" "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/rule.json" "$URL/api/config") $(json "$WORK/resp" applied) $(json "$WORK/resp" reboot)"
+check "  ... in effect (status)" "no-smtp 0 2" "$(status rules.0.name) $(status rules.0.hits) $(count "$CFG_LINE")"
 stop
 
 WHAT="$ARCH, ${QEMU_STORE_BUS:-virtio}, $STORE_MIB MiB"

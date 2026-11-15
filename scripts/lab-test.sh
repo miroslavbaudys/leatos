@@ -61,6 +61,12 @@
 #                        refused (router firewall drop counter). Negative
 #                        control: LAB_GUEST_ZONE=lan puts the network in the
 #                        main zone, so the last two checks must fail.
+#                        Rules (step 4): guest-ping-nas (accept ICMP from
+#                        the guest to 192.168.1.10, which the zones refuse)
+#                        and guest-no-isp-web (reject guest TCP 80 to the
+#                        WAN); the client checks both through the rules'
+#                        hit counters and the traffic. Negative control:
+#                        LAB_GUEST_RULES=0 (config without them: both fail).
 #
 # SNTP: the router syncs from the ISP's ntpd (ntp=ntp.isp.example: resolved
 # through the router's DNS forwarder) and its clock must then be within 5 s
@@ -89,6 +95,7 @@ if [[ -n "$ISP_PPPOE" ]]; then
 fi
 GUEST="${LAB_GUEST:-}"
 GUEST_ZONE="${LAB_GUEST_ZONE:-guest}"
+GUEST_RULES="${LAB_GUEST_RULES:-1}"
 LAN_PORT="${LAB_LAN_PORT:-10003}"
 WAN_PORT="${LAB_WAN_PORT:-10005}"
 WORK=$(mktemp -d -t rrouter-lab)
@@ -142,11 +149,29 @@ input = "drop"
 allow = ["dhcp", "dns", "ping"]
 forward_to = ["wan"]
 CFG
+  [[ "$GUEST_RULES" == 1 ]] && cat >>"$WORK/config.toml" <<'CFG'
+
+[[firewall.rule]]
+name = "guest-ping-nas"
+from = "guest"
+to = "lan"
+proto = "icmp"
+dst = "192.168.1.10"
+action = "accept"
+
+[[firewall.rule]]
+name = "guest-no-isp-web"
+from = "guest"
+to = "wan"
+proto = "tcp"
+dst_port = 80
+action = "reject"
+CFG
   cargo build -q -p rrstore --release
   target/release/rrstore create "$WORK/store.img" --mib 32 >/dev/null
   target/release/rrstore put "$WORK/store.img" config "$WORK/config.toml" >/dev/null
   ROUTER_STORE="$WORK/store.img"
-  echo "== router config: networks lan + guest (VLAN 20, zone $GUEST_ZONE)"
+  echo "== router config: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")"
 fi
 
 echo "== start rrouter${ROUTER_ARGS:+ ($(echo "$ROUTER_ARGS" | sed 's/pppoe_pass=[^ ]*/pppoe_pass=***/'))}"
@@ -161,7 +186,7 @@ PIDS+=($!)
 
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE}"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so

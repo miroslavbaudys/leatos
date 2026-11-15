@@ -1101,12 +1101,12 @@ fn v2_value_types() {
 fn what_the_kernel_supports() {
     // Networks on lan0, VLANs, zones, DHCP off: supported.
     let mut c = parse(FULL_V2).unwrap();
-    c.firewall = Firewall::default();
+    c.firewall.forwards.clear();
     c.dns.hosts.clear();
     assert_eq!(c.unsupported(), vec![]);
-    // Not yet: rules, forwards, DNS hosts, other ports, static WAN.
+    // Not yet: forwards, DNS hosts, other ports, static WAN (rules are in).
     let p = parse(FULL_V2).unwrap().unsupported().into_iter().map(|i| i.path).collect::<Vec<_>>();
-    assert_eq!(p, ["firewall.rule", "firewall.forward", "dns.host"]);
+    assert_eq!(p, ["firewall.forward", "dns.host"]);
     let mut d = c.clone();
     d.networks[1].ports = vec!["lan1".into()];
     assert_eq!(d.unsupported()[0].path, "network.guest.ports");

@@ -282,6 +282,12 @@
         <span class="hint">Built in: <b>wan</b>, and <b>lan</b> (everything to the router, forwards to the WAN) until you define a zone named lan.</span></div>
       <p class="hint">"To the router: drop" refuses everything from that zone except the services ticked (DHCP is needed for clients to get an address). Policy changes apply to new connections at once; adding or removing a zone reboots the router.</p>
     </form>
+    <form class="card cfg" autocomplete="off" id="rulesform"><h3>Rules</h3>
+      <div class="tw"><table id="rules"></table></div>
+      <div class="row"><button type="button" id="addrule" class="plain">Add rule</button>
+        <span class="hint">Checked from the top for each new connection (and for traffic to the router); the first match decides, otherwise the zones do. Applied at once, to new connections.</span></div>
+      <p class="hint">"To" <b>router</b> means traffic for the router itself (its web interface, DNS, …); <b>any</b> matches forwarded traffic and the router. Replies to the router's own requests (DHCP, DNS upstream, time) always pass. <b>reject</b> drops for now. Rules to the router boot as a trial.</p>
+    </form>
     <div class="card"><h3>Dropped packets by reason</h3><div class="tw"><table id="drops"></table></div>
       <p class="hint">Counted since boot by the forwarding plane (packets the router forwards, not its own).</p></div>
   </section>
@@ -746,6 +752,7 @@ async function refresh() {
     nets.map((n) => `<tr><td>${esc(n.name)}</td><td>${n.vlan || "untagged"}</td><td>${esc(n.ipv4)}</td><td>${esc(n.zone)}</td><td class=num>${n.dhcp ? n.leases : "no DHCP"}</td></tr>`).join("")
     : rows([["Networks", "none"]]);
   renderNetStatus();
+  renderRuleHits();
 }
 
 // ================= Clients =================
@@ -847,6 +854,7 @@ function fillForm(c) {
   pppoeVisibility();
   renderZones(c.zone ?? []);
   renderNets(c.network ?? []);
+  renderRules(c.firewall?.rule ?? []);
 }
 function readForm() {
   const c = structuredClone(cfgOrig);
@@ -856,6 +864,10 @@ function readForm() {
   if (nets) c.network = [c.network[0], ...nets];
   const zones = readZones();
   if (zones.length) c.zone = zones; else delete c.zone;
+  const rules = readRules();
+  c.firewall = { ...(c.firewall ?? {}) };
+  if (rules.length) c.firewall.rule = rules; else delete c.firewall.rule;
+  if (!Object.keys(c.firewall).length) delete c.firewall;
   for (const e of fields()) {
     let v;
     if (e.type === "checkbox") v = e.checked;
@@ -900,6 +912,7 @@ function renderNets(list) {
   netOrig = list.slice(1).map((n) => structuredClone(n));
   list.slice(1).forEach((n, i) => netRow(n, i));
   renderNetStatus();
+  renderRuleHits();
 }
 function netRow(n = {}, i = netOrig.length) {
   const tr = el("tr", { dataset: { orig: String(i) } });
@@ -996,6 +1009,7 @@ function rezone() {
   const zs = readZones(), ns = readNets();
   renderZones(zs);
   if (ns) renderNets([cfgOrig.network[0], ...ns]);
+  renderRules(readRules());
   updatePending();
 }
 $("addzone").onclick = () => {
@@ -1005,6 +1019,63 @@ $("addzone").onclick = () => {
   updatePending();
 };
 $("zones").addEventListener("change", (ev) => { if (ev.target.dataset.key === "name") rezone(); });
+
+// ---- Rules: ordered; first match decides.
+const PROTOS = ["any", "tcp", "udp", "tcp+udp", "icmp"];
+let ruleOrig = [];
+function renderRules(list) {
+  ruleOrig = list.map((r) => structuredClone(r));
+  const zs = ["wan", ...zoneNames()];
+  const t = $("rules");
+  t.replaceChildren(el("tr", {}, ["On", "Name", "From", "To", "Protocol", "Source", "Destination", "Port", "Action", "Hits", ""].map((h) => el("th", { textContent: h }))));
+  list.forEach((r, i) => {
+    const tr = el("tr", { dataset: { orig: String(i) } });
+    const sel = (key, opts, v) => { const x = el("select", { dataset: { key } }, opts.map((o) => el("option", { value: o, textContent: o }))); x.value = v; return el("td", {}, [x]); };
+    const inp = (key, v, ph, size) => el("td", {}, [el("input", { value: v ?? "", placeholder: ph, size, dataset: { key } })]);
+    const move = (d) => () => { const rs = readRules(); const j = i + d; if (j < 0 || j >= rs.length) return; [rs[i], rs[j]] = [rs[j], rs[i]]; renderRules(rs); updatePending(); };
+    tr.append(el("td", {}, [el("input", { type: "checkbox", checked: r.enabled !== false, dataset: { key: "enabled" } })]),
+      inp("name", r.name, "allow-printer", 12), sel("from", ["any", ...zs], r.from ?? "any"), sel("to", ["any", "router", ...zs], r.to ?? "any"),
+      sel("proto", PROTOS, r.proto ?? "any"), inp("src", r.src, "any", 13), inp("dst", r.dst, "any", 13), inp("dst_port", r.dst_port, "any", 9),
+      sel("action", ["accept", "drop", "reject"], r.action ?? "accept"), el("td", { className: "num", dataset: { hits: r.name ?? "" } }),
+      el("td", {}, [el("button", { type: "button", className: "plain", textContent: "↑", title: "Move up", onclick: move(-1) }),
+        el("button", { type: "button", className: "plain", textContent: "↓", title: "Move down", onclick: move(1) }),
+        el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); updatePending(); } })]));
+    t.append(tr);
+  });
+  rulePaths();
+  renderRuleHits();
+}
+function rulePaths() {
+  for (const tr of [...$("rules").rows].slice(1)) {
+    const name = tr.querySelector('[data-key="name"]').value.trim();
+    for (const e of tr.querySelectorAll("[data-key]")) e.dataset.path = `firewall.rule.${name}.${e.dataset.key}`;
+  }
+}
+function readRules() {
+  if (!$("rules").rows.length) return cfgOrig?.firewall?.rule ?? [];
+  return [...$("rules").rows].slice(1).map((tr) => {
+    const o = structuredClone(ruleOrig[Number(tr.dataset.orig)] ?? {});
+    const v = (k) => tr.querySelector(`[data-key="${k}"]`);
+    o.name = v("name").value.trim();
+    if (v("enabled").checked) delete o.enabled; else o.enabled = false;
+    for (const k of ["from", "to", "action"]) o[k] = v(k).value;
+    if (v("proto").value === "any") delete o.proto; else o.proto = v("proto").value;
+    for (const k of ["src", "dst", "dst_port"]) { const x = v(k).value.trim(); if (x) o[k] = x; else delete o[k]; }
+    return o;
+  });
+}
+function renderRuleHits() {
+  const by = Object.fromEntries((st?.rules ?? []).map((r) => [r.name, r.hits]));
+  for (const td of document.querySelectorAll("#rules [data-hits]")) td.textContent = td.dataset.hits in by ? n(by[td.dataset.hits]) : "–";
+}
+$("addrule").onclick = () => {
+  const rs = readRules();
+  rs.push({ name: "", from: zoneNames().includes("guest") ? "guest" : "lan", to: "router", proto: "tcp", dst_port: "80", action: "accept" });
+  renderRules(rs);
+  [...$("rules").rows].at(-1).querySelector('[data-key="name"]').focus();
+  updatePending();
+};
+$("rules").addEventListener("input", rulePaths);
 
 // Zone matrix of the working copy: who may open connections to whom.
 function renderMatrix(c) {

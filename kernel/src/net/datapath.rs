@@ -537,12 +537,18 @@ impl Datapath {
             p
         };
         let mut conns = 0;
+        let mut hits: Vec<u64> = Vec::new();
         for s in &self.shards {
             let mut f = s.lock();
             f.expire(now);
             conns += f.ct.len();
+            hits.resize(hits.len().max(f.rule_hits.len()), 0);
+            for (h, n) in hits.iter_mut().zip(&f.rule_hits) {
+                *h += n;
+            }
         }
         self.sh.conntrack.store(conns, Ordering::Relaxed);
+        *self.sh.rule_hits.lock() = hits;
         for (i, n) in self.neigh.iter().enumerate() {
             let retries = n.lock().poll(now);
             for (ifx, ip) in retries {

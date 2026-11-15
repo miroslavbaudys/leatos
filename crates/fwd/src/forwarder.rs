@@ -73,9 +73,79 @@ pub struct Policy {
     /// `input[z]`: what zone `z` may send to the router itself: `None` =
     /// everything, `Some(mask)` = only these [`svc`] services (ARP always).
     pub input: Vec<Option<u8>>,
+    /// Exceptions, checked in order before the zone policy; the first
+    /// match decides ([`Forwarder::rule_hits`] counts per rule).
+    pub rules: Vec<Rule>,
+}
+
+/// Where a [`Rule`] applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleTo {
+    /// Forwarded or to the router.
+    Any,
+    /// Traffic for the router itself.
+    Router,
+    /// Forwarded into this zone.
+    Zone(u8),
+}
+
+/// Protocols of a [`Rule`]: bits.
+pub mod proto {
+    pub const TCP: u8 = 1;
+    pub const UDP: u8 = 2;
+    pub const ICMP: u8 = 4;
+    pub const ANY: u8 = 0xff;
+}
+
+/// One firewall rule (`[[firewall.rule]]`), compiled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rule {
+    /// Source zone; `None` = any.
+    pub from: Option<u8>,
+    pub to: RuleTo,
+    /// [`proto`] bits (other IP protocols match only `ANY`).
+    pub protos: u8,
+    /// (network, prefix length); `None` = any.
+    pub src: Option<(Ipv4Addr, u8)>,
+    pub dst: Option<(Ipv4Addr, u8)>,
+    /// Inclusive destination port range (TCP/UDP only).
+    pub dport: Option<(u16, u16)>,
+    /// Accept (else drop).
+    pub accept: bool,
+}
+
+fn in_net(ip: Ipv4Addr, net: Option<(Ipv4Addr, u8)>) -> bool {
+    net.is_none_or(|(a, l)| broadcast_of(a, l) == broadcast_of(ip, l))
+}
+
+impl Rule {
+    fn matches(&self, from: u8, to: RuleTo, p: u8, src: Ipv4Addr, dst: Ipv4Addr, dport: Option<u16>) -> bool {
+        let pbit = match p {
+            PROTO_TCP => proto::TCP,
+            PROTO_UDP => proto::UDP,
+            PROTO_ICMP => proto::ICMP,
+            _ => 0,
+        };
+        self.from.is_none_or(|z| z == from)
+            && (self.to == RuleTo::Any || self.to == to)
+            && (self.protos == proto::ANY || self.protos & pbit != 0)
+            && in_net(src, self.src)
+            && in_net(dst, self.dst)
+            && self
+                .dport
+                .is_none_or(|(lo, hi)| dport.is_some_and(|d| (lo..=hi).contains(&d)))
+    }
 }
 
 impl Policy {
+    /// The first rule that matches: (its index, accept).
+    fn rule(&self, from: u8, to: RuleTo, p: u8, src: Ipv4Addr, dst: Ipv4Addr, dport: Option<u16>) -> Option<(usize, bool)> {
+        self.rules
+            .iter()
+            .position(|r| r.matches(from, to, p, src, dst, dport))
+            .map(|i| (i, self.rules[i].accept))
+    }
+
     fn may_forward(&self, from: u8, to: u8) -> bool {
         from == to
             || self
@@ -195,6 +265,10 @@ enum Key {
     Other,
 }
 
+/// The router's own client sockets use ports from here up (CLAUDE.md:
+/// router-local sockets bind ≥ 40000); traffic to them is replies.
+pub const ROUTER_CLIENT_PORTS: u16 = 40_000;
+
 /// ICMP errors: token bucket, 50/s with a burst of 20.
 const ICMP_RATE_PER_SEC: u64 = 50;
 const ICMP_BURST: u64 = 20;
@@ -212,6 +286,8 @@ pub struct Forwarder {
     icmp_tokens: u64,
     icmp_refill_ms: u64,
     policy: Option<Policy>,
+    /// Packets each of the policy's rules decided (reset by a new policy).
+    pub rule_hits: Vec<u64>,
 }
 
 fn broadcast_of(addr: Ipv4Addr, len: u8) -> Ipv4Addr {
@@ -396,6 +472,7 @@ impl Forwarder {
             icmp_tokens: ICMP_BURST,
             icmp_refill_ms: 0,
             policy: None,
+            rule_hits: Vec::new(),
         }
     }
 
@@ -459,17 +536,47 @@ impl Forwarder {
     /// Use the zone firewall (`None`: the fixed LAN → WAN policy). Applies
     /// to new flows; tracked ones keep going.
     pub fn set_policy(&mut self, policy: Option<Policy>) {
+        self.rule_hits = alloc::vec![0; policy.as_ref().map_or(0, |p| p.rules.len())];
         self.policy = policy;
+    }
+
+    /// The rule that decides a new flow or packet for the router, counted.
+    fn decide(&mut self, from: u8, to: RuleTo, p: u8, src: Ipv4Addr, dst: Ipv4Addr, dport: Option<u16>) -> Option<bool> {
+        let (i, accept) = self.policy.as_ref()?.rule(from, to, p, src, dst, dport)?;
+        if let Some(h) = self.rule_hits.get_mut(i) {
+            *h += 1;
+        }
+        Some(accept)
     }
 
     /// Traffic for the router from `ingress`: accepted, or dropped by the
     /// zone's input policy. ARP and non-IPv4 never get here.
+    ///
+    /// Replies to the router's own clients (ports from
+    /// [`ROUTER_CLIENT_PORTS`], the DHCP client's 68, ICMP other than echo
+    /// requests) always pass: rules and zone input are about what reaches
+    /// the router's services.
     fn input(&mut self, ingress: IfIndex, f: &[u8], v: &Ipv4View) -> Verdict {
         let zone = self.ifs[ingress as usize].zone;
+        let dport = (v.l4_len >= 4 && !v.is_fragment).then(|| wire::get16(f, v.l4 + 2));
+        let icmp_type = (v.proto == PROTO_ICMP && v.l4_len >= 1 && !v.is_fragment).then(|| f[v.l4]);
+        let reply = match v.proto {
+            PROTO_TCP | PROTO_UDP => dport.is_some_and(|d| d >= ROUTER_CLIENT_PORTS || (v.proto == PROTO_UDP && d == 68)),
+            PROTO_ICMP => icmp_type.is_some_and(|t| t != wire::ICMP_ECHO_REQUEST),
+            _ => false,
+        };
+        if reply {
+            return self.local();
+        }
+        let ports = matches!(v.proto, PROTO_TCP | PROTO_UDP).then_some(dport).flatten();
+        match self.decide(zone, RuleTo::Router, v.proto, v.src(f), v.dst(f), ports) {
+            Some(true) => return self.local(),
+            Some(false) => return self.drop(DropReason::Input),
+            None => {}
+        }
         let Some(allowed) = self.policy.as_ref().and_then(|p| p.input(zone)) else {
             return self.local();
         };
-        let dport = (v.l4_len >= 4 && !v.is_fragment).then(|| wire::get16(f, v.l4 + 2));
         let service = match (v.proto, dport) {
             (PROTO_UDP, Some(67)) => svc::DHCP,
             (PROTO_UDP | PROTO_TCP, Some(53)) => svc::DNS,
@@ -590,9 +697,12 @@ impl Forwarder {
                         DropReason::Unsupported
                     });
                 };
-                let allowed = match &self.policy {
-                    Some(p) => p.may_forward(iface.zone, egress_if.zone),
-                    None => iface.role == Role::Lan && egress_if.role == Role::Wan,
+                let ports = matches!(t.proto, PROTO_TCP | PROTO_UDP).then_some(t.dport);
+                let rule = self.decide(iface.zone, RuleTo::Zone(egress_if.zone), t.proto, t.src, t.dst, ports);
+                let allowed = match (&self.policy, rule) {
+                    (_, Some(accept)) => accept,
+                    (Some(p), None) => p.may_forward(iface.zone, egress_if.zone),
+                    (None, None) => iface.role == Role::Lan && egress_if.role == Role::Wan,
                 };
                 if !allowed {
                     return self.drop(DropReason::Firewall);
@@ -1501,6 +1611,7 @@ mod tests {
         fw.set_policy(Some(Policy {
             forward: vec![0, 0b101, 0b001],
             input: vec![None, None, Some(svc::DHCP | svc::DNS)],
+            rules: vec![],
         }));
     }
 
@@ -1538,7 +1649,7 @@ mod tests {
         let mut f = tcp_frame(WAN_MAC, SERVER, HOST, 443, 9000, TCP_SYN);
         assert_eq!(run(&mut fw, 0, WAN, &mut f), Verdict::Drop(DropReason::Firewall));
         // Two interfaces of one zone reach each other without a forward bit.
-        fw.set_policy(Some(Policy { forward: vec![0, 0b001, 0b001], input: vec![] }));
+        fw.set_policy(Some(Policy { forward: vec![0, 0b001, 0b001], input: vec![], rules: vec![] }));
         fw.ifs[GUEST as usize].zone = 1;
         let mut f = tcp_frame(GUEST_MAC, GUEST_HOST, HOST, 5001, 22, TCP_SYN);
         assert!(matches!(run(&mut fw, 0, GUEST, &mut f), Verdict::Forward { egress: LAN, .. }));
@@ -1591,5 +1702,80 @@ mod tests {
             assert_eq!(kr, k, "reply of flow {i} in another shard");
             assert!(matches!(fws[kr].process(1, GUEST, &mut r, len), Verdict::Forward { egress: LAN, .. }));
         }
+    }
+
+    // ---- rules (docs/config-v2.md §3) ----------------------------------
+
+    fn rule(from: Option<u8>, to: RuleTo, protos: u8, accept: bool) -> Rule {
+        Rule { from, to, protos, src: None, dst: None, dport: None, accept }
+    }
+
+    fn with_rules(fw: &mut Forwarder, rules: Vec<Rule>) {
+        fw.set_policy(Some(Policy {
+            forward: vec![0, 0b101, 0b001],
+            input: vec![None, None, Some(svc::DHCP | svc::DNS)],
+            rules,
+        }));
+    }
+
+    #[test]
+    fn rules_decide_before_the_zones_first_match_wins() {
+        let mut fw = router();
+        zoned(&mut fw);
+        let nas = Ipv4Addr::new(192, 168, 1, 10);
+        with_rules(&mut fw, vec![
+            // Guest may ping the NAS (zones say guest -> lan: no) ...
+            Rule { dst: Some((nas, 32)), ..rule(Some(2), RuleTo::Zone(1), proto::ICMP, true) },
+            // ... and nothing else of the guest may use port 80 outside.
+            Rule { dport: Some((80, 80)), ..rule(Some(2), RuleTo::Any, proto::TCP, false) },
+            // Never reached for guest port 80: the rule above matched first.
+            Rule { dport: Some((80, 80)), ..rule(Some(2), RuleTo::Zone(0), proto::TCP, true) },
+        ]);
+        let echo = icmp_echo(ICMP_ECHO_REQUEST, 9, 1);
+        let mut f = to(GUEST_MAC, ipv4_frame(GUEST_HOST, nas, PROTO_ICMP, 64, &echo));
+        assert!(matches!(run(&mut fw, 0, GUEST, &mut f), Verdict::Forward { egress: LAN, .. }), "accept rule opens it");
+        let mut f = to(GUEST_MAC, ipv4_frame(GUEST_HOST, HOST, PROTO_ICMP, 64, &echo));
+        assert_eq!(run(&mut fw, 0, GUEST, &mut f), Verdict::Drop(DropReason::Firewall), "another LAN host: zones");
+        let mut f = tcp_frame(GUEST_MAC, GUEST_HOST, SERVER, 7000, 80, TCP_SYN);
+        assert_eq!(run(&mut fw, 0, GUEST, &mut f), Verdict::Drop(DropReason::Firewall), "drop rule beats the zone");
+        let mut f = tcp_frame(GUEST_MAC, GUEST_HOST, SERVER, 7001, 443, TCP_SYN);
+        assert!(matches!(run(&mut fw, 0, GUEST, &mut f), Verdict::Forward { egress: WAN, .. }), "443: zones");
+        assert_eq!(fw.rule_hits, [1, 1, 0]);
+        // Tracked flows are not re-checked: the reply of the NAS ping passes.
+        let mut r = to(LAN_MAC, ipv4_frame(nas, GUEST_HOST, PROTO_ICMP, 64, &icmp_echo(ICMP_ECHO_REPLY, 9, 1)));
+        assert!(matches!(run(&mut fw, 1, LAN, &mut r), Verdict::Forward { egress: GUEST, .. }));
+        assert_eq!(fw.rule_hits, [1, 1, 0]);
+        // A new policy starts the counters again.
+        with_rules(&mut fw, vec![]);
+        assert!(fw.rule_hits.is_empty());
+    }
+
+    #[test]
+    fn rules_to_the_router_and_replies_to_its_own_clients() {
+        let mut fw = router();
+        zoned(&mut fw);
+        with_rules(&mut fw, vec![
+            // The guest may reach the web interface after all ...
+            Rule { dport: Some((80, 80)), ..rule(Some(2), RuleTo::Router, proto::TCP, true) },
+            // ... and the WAN nothing at all on the router.
+            rule(Some(0), RuleTo::Router, proto::ANY, false),
+        ]);
+        let mut f = tcp_frame(GUEST_MAC, GUEST_HOST, ROUTER_GUEST, 5000, 80, TCP_SYN);
+        assert_eq!(run(&mut fw, 0, GUEST, &mut f), Verdict::Local, "accept rule beats the zone's input");
+        let mut f = tcp_frame(GUEST_MAC, GUEST_HOST, ROUTER_GUEST, 5000, 22, TCP_SYN);
+        assert_eq!(run(&mut fw, 0, GUEST, &mut f), Verdict::Drop(DropReason::Input), "other ports: zone input");
+        let mut f = tcp_frame(WAN_MAC, SERVER, ROUTER_WAN, 5000, 80, TCP_SYN);
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), Verdict::Drop(DropReason::Input), "drop rule on the WAN");
+        // Replies to the router's own clients still pass: DNS upstream,
+        // the DHCP client, ICMP errors.
+        let d = udp_datagram(SERVER, ROUTER_WAN, 53, 41_234, b"answer");
+        let mut f = to(WAN_MAC, ipv4_frame(SERVER, ROUTER_WAN, PROTO_UDP, 64, &d));
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), Verdict::Local, "DNS upstream reply");
+        let d = udp_datagram(GW, ROUTER_WAN, 67, 68, b"offer");
+        let mut f = to(WAN_MAC, ipv4_frame(GW, ROUTER_WAN, PROTO_UDP, 64, &d));
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), Verdict::Local, "DHCP client");
+        let mut f = to(WAN_MAC, ipv4_frame(GW, ROUTER_WAN, PROTO_ICMP, 64, &icmp_echo(ICMP_ECHO_REPLY, 3, 1)));
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), Verdict::Local, "echo reply");
+        assert_eq!(fw.rule_hits, [1, 1]);
     }
 }

@@ -517,7 +517,51 @@ pub fn firewall() -> fwd::forwarder::Policy {
             ),
         });
     }
-    fwd::forwarder::Policy { forward, input }
+    use fwd::forwarder::{Rule, RuleTo, proto};
+    let net = |n: &Option<schema::Net>| n.map(|n| (n.0.network(), n.0.prefix));
+    let rules = c
+        .firewall
+        .rules
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| Rule {
+            from: (r.from != "any").then(|| zone_index(&names, &r.from)),
+            to: match r.to.as_str() {
+                "any" => RuleTo::Any,
+                "router" => RuleTo::Router,
+                z => RuleTo::Zone(zone_index(&names, z)),
+            },
+            protos: match r.proto {
+                schema::Proto::Tcp => proto::TCP,
+                schema::Proto::Udp => proto::UDP,
+                schema::Proto::TcpUdp => proto::TCP | proto::UDP,
+                schema::Proto::Icmp => proto::ICMP,
+                schema::Proto::Any => proto::ANY,
+            },
+            src: net(&r.src),
+            dst: net(&r.dst),
+            dport: r.dst_port.map(|p| (p.lo, p.hi)),
+            // reject drops for now (no RST / port unreachable yet)
+            accept: r.action == schema::Action::Accept,
+        })
+        .collect();
+    fwd::forwarder::Policy {
+        forward,
+        input,
+        rules,
+    }
+}
+
+/// Names of the enabled rules, in the order of the forwarder's
+/// `rule_hits` (status page).
+pub fn rule_names() -> Vec<String> {
+    get()
+        .firewall
+        .rules
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.name.clone())
+        .collect()
 }
 
 /// The WAN's 802.1Q tag (TCI: VLAN ID + priority), `None` = untagged:

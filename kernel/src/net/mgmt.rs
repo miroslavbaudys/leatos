@@ -1110,6 +1110,19 @@ fn status_json(
         );
     }
     s.push(']');
+    // Firewall rules in effect (enabled ones) and the packets they decided.
+    s.push_str(",\"rules\":[");
+    let hits = sh.rule_hits.lock().clone();
+    for (n, name) in config::rule_names().iter().enumerate() {
+        let _ = write!(
+            s,
+            "{}{{\"name\":{},\"hits\":{}}}",
+            if n > 0 { "," } else { "" },
+            json_str(name),
+            hits.get(n).copied().unwrap_or(0)
+        );
+    }
+    s.push(']');
     // Wall clock (SNTP) and watchdog.
     let ntp = services.and_then(LanServices::ntp_status);
     let _ = write!(
