@@ -33,7 +33,7 @@ The store starts with a **store header** (sector 0) that lists the
 | Area | Offset | Slot size | Contents | Written |
 |---|---|---|---|---|
 | `config` | 4 KiB | 256 KiB | `config.toml` (UTF-8 TOML) | on Save |
-| `leases` | 1 MiB | 128 KiB | dynamic DHCP leases (binary) | in batches (e.g. every 10 min) and on shutdown |
+| `leases` | 1 MiB | 128 KiB | bound DHCP leases of every network (binary, `proto_dhcp::v4::persist`) | when the set of leases changed (checked every 60 s) and before a reboot or upgrade |
 | `images` | 2 MiB | rest / 2 | kernels from persistent upgrades (docs/upgrades.md) | on persistent upgrade |
 
 The slot size is stored in the header, so areas can grow in a later
@@ -111,6 +111,20 @@ After two saves with a new schema, a rollback to an old kernel finds no
 config it can read and uses defaults. During a kernel trial (persistent
 upgrades, docs/upgrades.md), the kernel therefore saves no config at
 all until the kernel is confirmed (409, and refused on the console).
+
+### Leases (`leases` area)
+The bound DHCP leases of every network, as a snapshot: network name, then
+MAC, address and hostname per lease (`proto_dhcp::v4::persist`, record
+version 1). No expiry is stored: at boot every saved lease gets a full
+lease time again (`Server::restore`). A client's lease never outlives its
+last renewal plus the lease time, so the router may hold an address too
+long but never hands out one still in use, and renewals need not be
+written. `svc` compares the bound leases with the stored ones every
+60 s and writes only when they differ (a new client, an address or
+hostname change, an expiry), plus once before a reboot or upgrade, so
+the SD card sees a few writes per hour at most. A restore keeps only
+what the current config still allows (subnet, pool, reservations), so a
+changed config never resurrects a conflicting lease.
 
 ## 5. Configuration
 ### Format
@@ -411,6 +425,13 @@ For when the network is not an option: the console prompt `rrouter> `.
   next boot reverts. Negative controls: corrupt the new record → the previous one;
   corrupt both → `config: defaults`.
 
+- `scripts/lease-test.sh` (`RROUTER_ARCH=x86_64`, `QEMU_STORE_BUS=sd` too):
+  the lab client takes a lease; the router is killed after its periodic
+  save and started again (a power cut), then a second lease (other MAC)
+  is followed at once by `POST /api/reboot`. After each restart, before any
+  new DHCP, the router lists the lease and resolves the name. Negative
+  control: `LEASE_TEST_NO_STORE=1`.
+
 - `scripts/cli-test.sh` (`RROUTER_ARCH=x86_64`, `QEMU_STORE_BUS=sd` too)
   types into the UART: help, status, leases, line editing, unknown
   commands and settings, a refused invalid save, a live save, a LAN
@@ -424,5 +445,6 @@ For when the network is not an option: the console prompt `rrouter> `.
 | `crates/config`: schema v1 (LAN, DHCP + reservations, DNS, shaping, mgmt), defaults, validation, TOML; schema v2 (networks, zones, rules, forwards; `docs/config-v2.md`) with v1 migration and v1-compatible writer | ✅ host-tested |
 | Kernel: one `Config` loaded at boot (refactor, no behaviour change) | ✅ `config::load()`; boot arguments overlay it |
 | virtio-blk + store partition in QEMU, lab check | ✅ `drivers::virtio_blk`, `store`, `tools/rrstore`, `GET`/`POST /api/config`, `scripts/store-test.sh` (aarch64 + x86_64) |
+| DHCP leases in the `leases` area | ✅ (2026-11-15) `proto_dhcp::v4::persist` + `Server::restore` (host-tested), `net/svc.rs` `LeaseStore`, `scripts/lease-test.sh` (both arches, virtio + SD) |
 | Web interface: config pages, save + reboot, confirm/revert | ✅ form + import/export on the status page, JSON API, trial records (flags), `scripts/store-test.sh` covers confirm, timeout, revert and a kill during the trial (aarch64 + x86_64) |
 | apu4: SD driver, store partition in `apu-image.sh` | ✅ in QEMU (`sdhci-pci`, SDSC + SDHC, both arches, full `store-test.sh`) and SeaBIOS → Limine with the apu4 image as the SD card; on the apu4 ✅ (2026-11-14): image with the store and `--config`, boots from the stored config with only `mgmt_pass=` on the command line; saves write both slots (~0.1 s each including HTTP, applied live) and survive a reboot |

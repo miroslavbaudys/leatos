@@ -21,6 +21,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use proto_dhcp::v4::packet::{CLIENT_PORT, SERVER_PORT};
+use proto_dhcp::v4::persist;
 use proto_dhcp::v4::server::{self as dhcp, Event as DhcpEvent};
 use proto_dns::resolver::{self, Action, Resolver};
 use proto_dns::zone::{Source, Zone};
@@ -257,6 +258,39 @@ impl LanServices {
             first.domain,
             dns_cfg.cache_entries
         );
+    }
+
+    /// The bound leases of every network with DHCP, for the store
+    /// (`persist`); compared by `svc` to decide whether to write.
+    pub fn lease_snapshot(&self) -> Vec<persist::Network> {
+        self.nets
+            .iter()
+            .filter_map(|n| {
+                n.dhcp.as_ref().map(|(s, _)| persist::Network {
+                    name: n.cfg.name.clone(),
+                    leases: s.snapshot(),
+                })
+            })
+            .collect()
+    }
+
+    /// Leases from the store after a restart: each network's (by name)
+    /// go to its DHCP server, which keeps what the config still allows,
+    /// and into the DNS zone. Returns (restored, saved).
+    pub fn restore_leases(&mut self, saved: &[persist::Network]) -> (usize, usize) {
+        let mut restored = 0;
+        for net in &mut self.nets {
+            let (Some((server, _)), Some(s)) = (net.dhcp.as_mut(), saved.iter().find(|s| s.name == net.cfg.name)) else {
+                continue;
+            };
+            for ev in server.restore(now_secs(), &s.leases) {
+                if let DhcpEvent::Bound { ip, hostname: Some(h), .. } = ev {
+                    self.dns.zone_mut().add_in(&net.cfg.domain, &h, ip, Source::Dhcp);
+                }
+                restored += 1;
+            }
+        }
+        (restored, saved.iter().map(|s| s.leases.len()).sum())
     }
 
     /// Current DHCP leases of all networks (status page).

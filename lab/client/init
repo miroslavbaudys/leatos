@@ -34,6 +34,49 @@ else
   echo "LAB DONE fails=$fails"; $bb poweroff -f
 fi
 
+# --- leases across router restarts (scripts/lease-test.sh: lab_leases=1) -----------
+# Only these checks, then power off. A: the host kills the router once it
+# has saved this lease (periodic save) and starts it again (a power cut);
+# B: a second identity (other MAC) takes a lease and asks the router to
+# reboot at once (saved on the way down). After each restart, before any
+# DHCP from us, the router must list the lease and resolve its name.
+if $bb grep -q 'lab_leases=1' /proc/cmdline; then
+  st() { $bb wget -q -T 3 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null; }
+  up() { st | $bb sed -n 's/.*"uptime_s":\([0-9]*\).*/\1/p'; }
+  mark() { # once the router has been up 10 s, so a quick restart shows
+    for _ in $($bb seq 1 30); do u0=$(up); [ -n "$u0" ] && [ "$u0" -ge 10 ] && break; $bb sleep 1; done
+    t0=$($bb date +%s)
+  }
+  restarted() { # since mark: the router's uptime fell behind our clock
+    [ -n "$u0" ] || return 1
+    for _ in $($bb seq 1 150); do
+      u=$(up); t=$($bb date +%s)
+      [ -n "$u" ] && [ $((u + 3)) -lt $((u0 + t - t0)) ] && return 0
+      $bb sleep 1
+    done; return 1
+  }
+  kept() { # ip hostname what
+    if st | $bb grep -q "\"ip\":\"$1\",\"hostname\":\"$2\",\"bound\":true"; then pass "leases: $3: $2 $1 listed after the restart"
+    else fail "leases: $3: $2 $1 not listed after the restart"; fi
+    if $bb nslookup "$2.lan" 192.168.1.1 2>&1 | $bb grep -v "^Server" | $bb grep -q "$1\$"; then pass "leases: $3: $2.lan resolves"
+    else fail "leases: $3: $2.lan does not resolve"; fi
+  }
+  mark
+  echo "LAB leases: lease $ip, waiting for the router to restart"
+  if restarted; then kept "$ip" labclient "power cut"; else fail "leases: router did not come back"; fi
+  # B: another MAC, a fresh lease, then a reboot request right away.
+  $bb ifconfig eth0 down; $bb ip link set eth0 address 52:54:00:00:00:21; $bb ifconfig eth0 up
+  if $bb udhcpc -i eth0 -n -q -t 10 -T 1 -x hostname:labclient2 -s /udhcpc.sh; then
+    . /tmp/lease
+    mark
+    $bb wget -q -T 5 -O /dev/null --post-data= "http://admin:lab-pass@192.168.1.1/api/reboot" 2>/dev/null
+    if restarted; then kept "$ip" labclient2 "reboot"; else fail "leases: router did not come back after the reboot (uptime '${u:-}' now $t, marked ${u0:-} at $t0)"; fi
+  else
+    fail "leases: no lease for the second MAC"
+  fi
+  echo "LAB DONE fails=$fails"; $bb poweroff -f
+fi
+
 # --- live config (scripts/lab-test.sh LAB_GUEST_LIVE=1) -----------------------
 # The router booted with the main LAN only; add the guest network, zone,
 # rules and forward from /guest.toml without a reboot, before every check.

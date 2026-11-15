@@ -19,6 +19,7 @@ use crate::net::device::PortDevice;
 use crate::net::mgmt::{Mgmt, StoreOp};
 use crate::net::pppoe::Pppoe;
 use crate::net::services::LanServices;
+use proto_dhcp::v4::persist;
 use crate::net::shared::{Shared, WanChange};
 use crate::net::stack::{self, WaitAny};
 use crate::{println, timer};
@@ -474,6 +475,92 @@ async fn store_op(
     }
 }
 
+/// How often the bound DHCP leases are compared with the stored ones.
+const LEASE_CHECK: Duration = Duration::from_secs(60);
+const LEASE_AREA: &str = "leases";
+
+/// DHCP leases in the store's `leases` area (docs/config-and-storage.md,
+/// format in `proto_dhcp::v4::persist`): read at boot, written when the
+/// set of bound leases changed (checked every [`LEASE_CHECK`], so
+/// renewals alone never write the SD card) and before a reboot or an
+/// upgrade.
+struct LeaseStore {
+    /// Off without a store, without a `leases` area or without networks.
+    enabled: bool,
+    /// What the store holds (or, after a restore, what was kept of it).
+    saved: Vec<persist::Network>,
+    next_check: timer::Instant,
+}
+
+impl LeaseStore {
+    async fn load(st: Option<&mut crate::store::Store>, svc: Option<&mut LanServices>) -> Self {
+        let mut me = LeaseStore {
+            enabled: false,
+            saved: Vec::new(),
+            next_check: timer::Instant::now().checked_add(LEASE_CHECK).unwrap_or(timer::Instant::now()),
+        };
+        let (Some(st), Some(svc)) = (st, svc) else {
+            return me;
+        };
+        match st.read_current(LEASE_AREA, persist::FORMAT).await {
+            Err(e) => {
+                println!("  leases          : not kept ({e})");
+                return me;
+            }
+            Ok((None, _)) => println!("  leases          : none stored"),
+            Ok((Some(rec), _)) => match persist::decode(&rec.payload) {
+                Ok(nets) => {
+                    let (kept, saved) = svc.restore_leases(&nets);
+                    println!(
+                        "  leases          : restored {kept} of {saved} (slot {}, seq {})",
+                        crate::store::slot_name(rec.slot),
+                        rec.header.seq
+                    );
+                }
+                Err(e) => println!("  leases          : stored record unreadable ({e}), starting empty"),
+            },
+        }
+        me.enabled = true;
+        me.saved = svc.lease_snapshot();
+        me
+    }
+
+    fn wake_at(&self) -> Option<timer::Instant> {
+        self.enabled.then_some(self.next_check)
+    }
+
+    fn due(&self) -> bool {
+        self.enabled && timer::Instant::now() >= self.next_check
+    }
+
+    /// Write the bound leases if they differ from the stored ones.
+    async fn save(&mut self, st: Option<&mut crate::store::Store>, svc: Option<&LanServices>) {
+        self.next_check = timer::Instant::now().checked_add(LEASE_CHECK).unwrap_or(timer::Instant::now());
+        let (true, Some(st), Some(svc)) = (self.enabled, st, svc) else {
+            return;
+        };
+        let snap = svc.lease_snapshot();
+        if snap == self.saved {
+            return;
+        }
+        let data = persist::encode(&snap);
+        match st.write_record(LEASE_AREA, persist::FORMAT, persist::FORMAT, &data, 0).await {
+            Ok((slot, h)) => {
+                println!(
+                    "  leases          : saved {} (slot {}, seq {}, {} bytes)",
+                    snap.iter().map(|n| n.leases.len()).sum::<usize>(),
+                    crate::store::slot_name(slot),
+                    h.seq,
+                    h.len
+                );
+                self.saved = snap;
+            }
+            // Tried again at the next check.
+            Err(e) => println!("  leases          : save failed: {e}"),
+        }
+    }
+}
+
 /// The services task: never returns.
 pub async fn run(
     mut hosts: Vec<HostIf>,
@@ -485,6 +572,7 @@ pub async fn run(
     let (mut slots, links, _) = stack::place_networks(&[]);
     let links = if sh.links.len() > 1 { links } else { Vec::new() };
     let mut services = LanServices::new(&mut hosts, &links);
+    let mut leases = LeaseStore::load(store.as_mut(), services.as_mut()).await;
     let mut mgmt = Mgmt::new(&mut hosts, &links, store.is_some());
     let mut cli = Cli::new(store.is_some());
     let mut pppoe = crate::config::pppoe().map(|c| Pppoe::new(c, &sh.ports[0]));
@@ -554,6 +642,9 @@ pub async fn run(
             }
             mgmt.op_done(conn, &op, r.map(|(detail, _)| detail));
         }
+        if leases.due() {
+            leases.save(store.as_mut(), services.as_ref()).await;
+        }
         let cli_action = cli.step(&Ctx {
             hosts: &hosts,
             sh,
@@ -604,6 +695,8 @@ pub async fn run(
             None => {}
         }
         if let Some(action) = action {
+            // Leases first, so the next boot (or kernel) gets them back.
+            leases.save(store.as_mut(), services.as_ref()).await;
             // The datapath stops the NICs and acts; nothing left to do here.
             sh.post_action(action);
             loop {
@@ -630,6 +723,9 @@ pub async fn run(
                 svc.next_deadline()
                     .saturating_duration_since(timer::Instant::now()),
             );
+        }
+        if let Some(at) = leases.wake_at() {
+            delay = delay.min(at.saturating_duration_since(timer::Instant::now()));
         }
         if let Some(at) = pinger.deadline() {
             delay = delay.min(at.saturating_duration_since(timer::Instant::now()));

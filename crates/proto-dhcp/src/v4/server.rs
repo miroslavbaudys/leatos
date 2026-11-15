@@ -11,7 +11,8 @@
 //! - A returning client gets its previous address if it's still free.
 //! - INIT-REBOOT requests for a free in-range address are ACKed even if no
 //!   lease is on record, so clients keep working after a router restart
-//!   (until lease persistence lands).
+//!   without a store (with one, [`Server::restore`] brings the leases back:
+//!   [`super::persist`]).
 //! - Relayed requests (giaddr != 0) are ignored.
 
 use super::packet::{FLAG_BROADCAST, Message, MessageType, OP_REPLY, OP_REQUEST, Options};
@@ -445,6 +446,62 @@ impl Server {
         self.declined.retain(|_, until| *until > now);
         out.events
     }
+
+    /// The bound leases, for a snapshot ([`super::persist`]), by MAC.
+    pub fn snapshot(&self) -> Vec<super::persist::Saved> {
+        self.leases
+            .values()
+            .filter(|l| l.state == LeaseState::Bound)
+            .map(|l| super::persist::Saved {
+                mac: l.mac,
+                ip: l.ip,
+                hostname: l.hostname.clone(),
+            })
+            .collect()
+    }
+
+    /// Bring back leases from a snapshot (router restart), each bound for a
+    /// full lease time from `now` ([`super::persist`] says why). A lease is
+    /// skipped when the current config no longer allows it (as in
+    /// [`Server::reconfigure`]: a reservation of the MAC elsewhere, the
+    /// address out of the pool, reserved for another MAC or already taken)
+    /// or when its MAC already has a lease. A reservation's hostname wins
+    /// over the saved one. Returns `Bound` events for the DNS zone.
+    pub fn restore(&mut self, now: u64, saved: &[super::persist::Saved]) -> Vec<Event> {
+        let mut out = Vec::new();
+        for s in saved {
+            if self.leases.contains_key(&s.mac) {
+                continue;
+            }
+            let ok = match self.static_for_mac(&s.mac) {
+                Some(st) => st.ip == s.ip,
+                None => self.in_subnet(s.ip) && self.available_for(s.ip, &s.mac, now),
+            };
+            if !ok {
+                continue;
+            }
+            let hostname = self
+                .static_for_mac(&s.mac)
+                .and_then(|st| st.hostname.clone())
+                .or_else(|| s.hostname.clone());
+            self.leases.insert(
+                s.mac,
+                Lease {
+                    mac: s.mac,
+                    ip: s.ip,
+                    hostname: hostname.clone(),
+                    state: LeaseState::Bound,
+                    expires: now + u64::from(self.cfg.lease_secs),
+                },
+            );
+            out.push(Event::Bound {
+                mac: s.mac,
+                ip: s.ip,
+                hostname,
+            });
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -514,6 +571,52 @@ mod tests {
         let ack = reply_of(&s.handle(now, &r.emit()));
         assert_eq!(ack.options.msg_type, Some(MessageType::Ack));
         ack.yiaddr
+    }
+
+    #[test]
+    fn snapshot_and_restore_across_a_restart() {
+        use crate::v4::persist::{self, Saved};
+        let mut s = Server::new(cfg());
+        let ip_a = dora(&mut s, A, Some("laptop"), 0);
+        dora(&mut s, NAS, None, 0);
+        // An offer only: not saved.
+        let c: Mac = [2, 0, 0, 0, 0, 0xc];
+        s.handle(0, &client_msg(c, MessageType::Discover).emit());
+        let snap = s.snapshot();
+        assert_eq!(snap.len(), 2, "{snap:?}");
+        let bytes = persist::encode(&[persist::Network { name: "lan".into(), leases: snap.clone() }]);
+
+        // Restart: a new server, restored long after the old clock.
+        let saved = persist::decode(&bytes).unwrap().remove(0).leases;
+        let mut s = Server::new(cfg());
+        let ev = s.restore(5, &saved);
+        assert_eq!(ev.len(), 2);
+        assert!(ev.contains(&Event::Bound { mac: A, ip: ip_a, hostname: Some("laptop".into()) }));
+        let a = s.leases().find(|l| l.mac == A).unwrap();
+        assert_eq!((a.ip, a.state, a.expires), (ip_a, LeaseState::Bound, 5 + 3600), "a full lease time again");
+        // The address stays the client's: B gets the other one.
+        assert_ne!(dora(&mut s, B, None, 6), ip_a);
+        // Restoring twice changes nothing.
+        assert!(s.restore(7, &saved).is_empty());
+
+        // The config changed meanwhile: what no longer fits is skipped.
+        let mut s = Server::new(cfg());
+        let other: Mac = [2, 0, 0, 0, 0, 0xd];
+        let stale = [
+            Saved { mac: NAS, ip: Ipv4Addr::new(192, 168, 1, 11), hostname: None }, // reservation moved
+            Saved { mac: other, ip: Ipv4Addr::new(192, 168, 1, 10), hostname: None }, // reserved for NAS
+            Saved { mac: other, ip: Ipv4Addr::new(10, 0, 0, 100), hostname: None }, // other subnet
+            Saved { mac: other, ip: Ipv4Addr::new(192, 168, 1, 150), hostname: None }, // out of the pool
+            Saved { mac: other, ip: SERVER, hostname: None }, // the router
+            Saved { mac: A, ip: Ipv4Addr::new(192, 168, 1, 100), hostname: Some("a".into()) },
+            Saved { mac: B, ip: Ipv4Addr::new(192, 168, 1, 100), hostname: None }, // taken by A
+        ];
+        let ev = s.restore(0, &stale);
+        assert_eq!(ev, [Event::Bound { mac: A, ip: Ipv4Addr::new(192, 168, 1, 100), hostname: Some("a".into()) }]);
+        // A reservation's hostname wins over the saved one.
+        let mut s = Server::new(cfg());
+        let ev = s.restore(0, &[Saved { mac: NAS, ip: Ipv4Addr::new(192, 168, 1, 10), hostname: Some("old".into()) }]);
+        assert_eq!(ev, [Event::Bound { mac: NAS, ip: Ipv4Addr::new(192, 168, 1, 10), hostname: Some("nas".into()) }]);
     }
 
     #[test]
