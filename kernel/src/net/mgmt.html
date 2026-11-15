@@ -442,7 +442,7 @@ function route() {
 window.addEventListener("hashchange", route);
 // Config path → the page that edits it (validation issues link there).
 const pageOf = (path) => path === "dns.domain" || path.startsWith(`network.${lanName}.`) ? "lan"
-  : ({ wan: "wan", network: "networks", zone: "firewall", firewall: "firewall", dns: "dns", shaping: "shaping", time: "system", mgmt: "system" })[path.split(/[.[]/)[0]] ?? "";
+  : ({ wan: "wan", network: "networks", zone: "firewall", firewall: "firewall", mdns: "firewall", dns: "dns", shaping: "shaping", time: "system", mgmt: "system" })[path.split(/[.[]/)[0]] ?? "";
 
 // ================= Dialogs =================
 function ask(title, text, ok = "OK", danger = false) {
@@ -964,7 +964,7 @@ function readForm() {
 // ---- Networks (docs/config-v2.md): the extra networks, one row each. The
 // first network is the LAN page's. Row inputs carry data-key (not read
 // generically) and a data-path for validation highlights.
-const SERVICES = ["dhcp", "dns", "ntp", "ping", "mgmt"];
+const SERVICES = ["dhcp", "dns", "ntp", "ping", "mgmt", "mdns"];
 const el = (tag, { dataset, style, ...props } = {}, kids = []) => {
   const e = Object.assign(document.createElement(tag), props);
   if (dataset) Object.assign(e.dataset, dataset);

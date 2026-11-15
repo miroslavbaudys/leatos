@@ -1172,3 +1172,128 @@ fn management_password_is_hashed_and_secret() {
     assert_eq!(paths(parse("version = 2\n[mgmt]\npassword_hash = \"plain\"\n").unwrap_err()), ["mgmt.password_hash"]);
     assert_eq!(c.without("mgmt.password_hash").unwrap().mgmt.password_hash, None);
 }
+
+// ---- mDNS ------------------------------------------------------------------
+
+const MDNS: &str = r#"
+[[mdns.reflect]]
+name = "iot-to-lan"
+from = "iot"
+to = ["lan", "guest"]
+services = ["_ipp._tcp", "_AirPlay._tcp"]
+"#;
+
+/// FULL_V2 with the zones allowing mDNS and [`MDNS`] added.
+fn with_mdns() -> Config {
+    let text = FULL_V2.replace(r#"allow = ["dhcp", "dns", "ping"]"#, r#"allow = ["dhcp", "dns", "ping", "mdns"]"#)
+        .replace(r#"allow = ["dhcp", "dns"]"#, r#"allow = ["dhcp", "dns", "mdns"]"#);
+    parse(&(text + MDNS)).unwrap()
+}
+
+fn mdns_issues(f: impl FnOnce(&mut Config)) -> Vec<String> {
+    let mut c = with_mdns();
+    f(&mut c);
+    match c.validate() {
+        Ok(()) => Vec::new(),
+        Err(v) => v.into_iter().map(|i| i.path).collect(),
+    }
+}
+
+#[test]
+fn mdns_parses_and_round_trips() {
+    let c = with_mdns();
+    let r = &c.mdns.reflect[0];
+    assert_eq!((r.name.as_str(), r.from.as_str(), r.enabled), ("iot-to-lan", "iot", true));
+    assert_eq!(r.to, ["lan", "guest"]);
+    assert_eq!(c.zone("iot").unwrap().allow, [Service::Dhcp, Service::Dns, Service::Mdns]);
+    assert_eq!(parse(&c.to_toml()).unwrap(), c);
+    assert_eq!(parse_json(&c.to_json()).unwrap(), c);
+    // Not written when empty; needs version 2.
+    assert!(!Config::default().to_toml().contains("mdns"));
+    let lan_only = Config { mdns: c.mdns.clone(), ..Config::default() };
+    assert!(!lan_only.fits_v1());
+    assert!(lan_only.beyond_v1_paths().contains(&"mdns.reflect".into()));
+    assert!(parse("version = 2\n[mdns]\nreflector = true\n").is_err(), "unknown field");
+}
+
+#[test]
+fn mdns_checks() {
+    assert!(mdns_issues(|_| {}).is_empty());
+    assert_eq!(mdns_issues(|c| c.mdns.reflect[0].from = "dmz".into()), ["mdns.reflect.iot-to-lan.from"]);
+    assert_eq!(mdns_issues(|c| c.mdns.reflect[0].to.push("nope".into())), ["mdns.reflect.iot-to-lan.to[2]"]);
+    assert_eq!(mdns_issues(|c| c.mdns.reflect[0].to.push("iot".into())), ["mdns.reflect.iot-to-lan.to[2]"], "to itself");
+    assert_eq!(mdns_issues(|c| c.mdns.reflect[0].to.push("lan".into())), ["mdns.reflect.iot-to-lan.to[2]"], "twice");
+    assert_eq!(mdns_issues(|c| c.mdns.reflect[0].to.clear()), ["mdns.reflect.iot-to-lan.to"]);
+    assert_eq!(mdns_issues(|c| c.mdns.reflect[0].services.clear()), ["mdns.reflect.iot-to-lan.services"]);
+    for bad in ["ipp._tcp", "_ipp", "_ipp._sctp", "_ipp._tcp.local", "_x y._tcp"] {
+        assert_eq!(mdns_issues(|c| c.mdns.reflect[0].services.push(bad.into())), ["mdns.reflect.iot-to-lan.services[2]"], "{bad}");
+    }
+    assert_eq!(mdns_issues(|c| c.mdns.reflect[0].services.push("_IPP._TCP".into())), ["mdns.reflect.iot-to-lan.services[2]"], "twice, any case");
+    // Names: keys, unique.
+    assert_eq!(mdns_issues(|c| c.mdns.reflect[0].name = "Bad Name".into()), ["mdns.reflect[0].name"]);
+    assert_eq!(
+        mdns_issues(|c| c.mdns.reflect.push(c.mdns.reflect[0].clone())),
+        ["mdns.reflect[1].name"]
+    );
+    assert_eq!(mdns_issues(|c| {
+        let e = c.mdns.reflect[0].clone();
+        c.mdns.reflect = (0..33).map(|i| MdnsReflect { name: alloc::format!("r{i}"), ..e.clone() }).collect();
+    }), ["mdns.reflect"]);
+}
+
+#[test]
+fn mdns_needs_the_zones_to_allow_it() {
+    // The iot zone (input = reject) without "mdns": the source is refused.
+    let issues = mdns_issues(|c| c.zones.iter_mut().find(|z| z.name == "iot").unwrap().allow.retain(|s| *s != Service::Mdns));
+    assert_eq!(issues, ["mdns.reflect.iot-to-lan.from"]);
+    // Guest (input = drop) without it: that target is refused.
+    let issues = mdns_issues(|c| c.zones.iter_mut().find(|z| z.name == "guest").unwrap().allow.retain(|s| *s != Service::Mdns));
+    assert_eq!(issues, ["mdns.reflect.iot-to-lan.to[1]"]);
+    // The built-in lan zone accepts everything; redefined as drop it needs it.
+    let issues = mdns_issues(|c| c.zones.push(Zone { name: "lan".into(), input: Policy::Drop, allow: vec![Service::Mgmt], forward_to: vec!["wan".into()] }));
+    assert_eq!(issues, ["mdns.reflect.iot-to-lan.to[0]"]);
+    // Message names the zone and where to fix it.
+    let mut c = with_mdns();
+    c.zones[0].allow.retain(|s| *s != Service::Mdns);
+    let e = c.validate().unwrap_err();
+    assert!(e[0].msg.contains("zone \"guest\" must allow \"mdns\""), "{}", e[0].msg);
+}
+
+#[test]
+fn mdns_too_many_service_types() {
+    let issues = mdns_issues(|c| {
+        c.mdns.reflect[0].services = (0..proto_mdns::MAX_SERVICES + 1).map(|i| alloc::format!("_s{i}._tcp")).collect();
+    });
+    assert_eq!(issues, ["mdns.reflect"]);
+    // Disabled entries do not count.
+    let issues = mdns_issues(|c| {
+        c.mdns.reflect[0].services = (0..proto_mdns::MAX_SERVICES + 1).map(|i| alloc::format!("_s{i}._tcp")).collect();
+        c.mdns.reflect[0].enabled = false;
+    });
+    assert!(issues.is_empty());
+}
+
+#[test]
+fn mdns_not_in_the_kernel_yet() {
+    let mut c = with_mdns();
+    c.dns.hosts.clear();
+    let p: Vec<String> = c.unsupported().into_iter().map(|i| i.path).collect();
+    assert_eq!(p, ["mdns.reflect"]);
+    // Disabled entries and the zone service alone are fine.
+    c.mdns.reflect[0].enabled = false;
+    assert!(c.unsupported().is_empty());
+}
+
+#[test]
+fn mdns_cli_paths() {
+    let c = with_mdns();
+    let d = c.with_assignment(r#"mdns.reflect.iot-to-lan.services = ["_ipp._tcp"]"#).unwrap();
+    assert_eq!(d.mdns.reflect[0].services, ["_ipp._tcp"]);
+    let d = d.with_assignment(r#"mdns.reflect.cast = { from = "guest", to = ["lan"], services = ["_googlecast._tcp"] }"#).unwrap();
+    assert_eq!(d.mdns.reflect.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["iot-to-lan", "cast"]);
+    assert!(diff_lines(&c, &d).iter().any(|l| l.contains("mdns.reflect.cast")), "{:?}", diff_lines(&c, &d));
+    let e = d.without("mdns.reflect.iot-to-lan").unwrap();
+    assert_eq!(e.mdns.reflect.len(), 1);
+    assert!(e.without("mdns").unwrap().mdns.is_empty());
+    assert!(c.with_assignment(r#"mdns.reflect.iot-to-lan.to = ["dmz"]"#).unwrap().validate().is_err(), "checked on save");
+}

@@ -3,7 +3,7 @@
 //!
 //! List entries with a name are addressed by it: the config is edited as
 //! a table in which `[[network]]`, `[[zone]]`, `[[firewall.rule]]` and
-//! `[[firewall.forward]]` are keyed by `name` (`network.guest.vlan = 20`,
+//! `[[firewall.forward]]`, `[[mdns.reflect]]` are keyed by `name` (`network.guest.vlan = 20`,
 //! `firewall.rule.ssh = { from = "wan", to = "router", … }`). The order
 //! of existing entries is kept; new ones go last. `lan.…` means the first
 //! network (version 1's `[lan]`), `lan.domain` is `dns.domain`.
@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use toml::{Table, Value};
 
 /// Lists keyed by `name`, as paths.
-const KEYED: [&[&str]; 4] = [&["network"], &["zone"], &["firewall", "rule"], &["firewall", "forward"]];
+const KEYED: [&[&str]; 5] = [&["network"], &["zone"], &["firewall", "rule"], &["firewall", "forward"], &["mdns", "reflect"]];
 
 fn syntax(e: impl ToString) -> Error {
     Error::Syntax(e.to_string())
@@ -61,6 +61,7 @@ fn from_table(mut t: Table, order: &Config) -> Result<Config, Error> {
             ["network"] => order.networks.iter().map(|n| n.name.clone()).collect(),
             ["zone"] => order.zones.iter().map(|z| z.name.clone()).collect(),
             ["firewall", "rule"] => order.firewall.rules.iter().map(|r| r.name.clone()).collect(),
+            ["mdns", "reflect"] => order.mdns.reflect.iter().map(|r| r.name.clone()).collect(),
             _ => order.firewall.forwards.iter().map(|f| f.name.clone()).collect(),
         }
     };

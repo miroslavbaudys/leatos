@@ -59,6 +59,8 @@ pub mod svc {
     pub const PING: u8 = 8;
     /// The web interface (TCP 80).
     pub const MGMT: u8 = 16;
+    /// mDNS (UDP 5353), for the reflector (docs/mdns.md).
+    pub const MDNS: u8 = 32;
 }
 
 /// The zone firewall (docs/config-v2.md §6), checked for new flows only.
@@ -690,6 +692,7 @@ impl Forwarder {
             (PROTO_UDP, Some(67)) => svc::DHCP,
             (PROTO_UDP | PROTO_TCP, Some(53)) => svc::DNS,
             (PROTO_UDP, Some(123)) => svc::NTP,
+            (PROTO_UDP, Some(5353)) => svc::MDNS,
             (PROTO_TCP, Some(80)) => svc::MGMT,
             (PROTO_ICMP, _) if v.l4_len >= 1 && f[v.l4] == wire::ICMP_ECHO_REQUEST => svc::PING,
             _ => 0,
@@ -1827,6 +1830,19 @@ mod tests {
         };
         assert_eq!(run(&mut fw, 0, GUEST, &mut udp(53)), Verdict::Local, "DNS allowed");
         assert_eq!(run(&mut fw, 0, GUEST, &mut udp(123)), Verdict::Drop(DropReason::Input), "NTP not");
+        // mDNS to the group: refused unless the zone allows it.
+        let mdns = || {
+            let group = Ipv4Addr::new(224, 0, 0, 251);
+            let d = udp_datagram(GUEST_HOST, group, 5353, 5353, b"q");
+            to([0x01, 0x00, 0x5e, 0, 0, 0xfb], ipv4_frame(GUEST_HOST, group, PROTO_UDP, 255, &d))
+        };
+        assert_eq!(run(&mut fw, 0, GUEST, &mut mdns()), Verdict::Drop(DropReason::Input), "mDNS not allowed");
+        let mut p = fw.policy.clone().unwrap();
+        p.input[2] = p.input[2].map(|m| m | svc::MDNS);
+        fw.set_policy(Some(p.clone()));
+        assert_eq!(run(&mut fw, 0, GUEST, &mut mdns()), Verdict::Local, "mDNS allowed");
+        p.input[2] = p.input[2].map(|m| m & !svc::MDNS);
+        fw.set_policy(Some(p));
         // DHCP to the broadcast address.
         let d = udp_datagram(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, 68, 67, b"discover");
         let mut f = to([0xff; 6], ipv4_frame(Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST, PROTO_UDP, 64, &d));
@@ -1839,7 +1855,7 @@ mod tests {
         let echo = icmp_echo(ICMP_ECHO_REQUEST, 7, 1);
         let mut f = to(GUEST_MAC, ipv4_frame(GUEST_HOST, ROUTER_GUEST, PROTO_ICMP, 64, &echo));
         assert_eq!(run(&mut fw, 0, GUEST, &mut f), Verdict::Drop(DropReason::Input), "ping");
-        assert_eq!(fw.stats.drops[DropReason::Input.index()], 4);
+        assert_eq!(fw.stats.drops[DropReason::Input.index()], 5, "NTP, mDNS, web ×2, ping");
         // The LAN zone accepts everything.
         let mut f = tcp_frame(LAN_MAC, HOST, ROUTER_LAN, 5000, 80, TCP_SYN);
         assert_eq!(run(&mut fw, 0, LAN, &mut f), Verdict::Local);

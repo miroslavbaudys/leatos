@@ -512,6 +512,7 @@ pub fn firewall() -> fwd::forwarder::Policy {
                         schema::Service::Ntp => svc::NTP,
                         schema::Service::Ping => svc::PING,
                         schema::Service::Mgmt => svc::MGMT,
+                        schema::Service::Mdns => svc::MDNS,
                     })
                     .fold(0, |a, b| a | b),
             ),

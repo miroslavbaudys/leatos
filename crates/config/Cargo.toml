@@ -9,6 +9,7 @@ description = "Router configuration: schema with defaults, validation, config.to
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 auth = { workspace = true }
+proto-mdns = { workspace = true }
 toml = { version = "1.2", default-features = false, features = ["serde", "parse", "display"] }
 
 [lints]

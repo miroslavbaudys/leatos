@@ -72,6 +72,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "Firewall::is_empty")]
     pub firewall: Firewall,
     pub dns: Dns,
+    #[serde(skip_serializing_if = "Mdns::is_empty")]
+    pub mdns: Mdns,
     pub shaping: Shaping,
     pub mgmt: Mgmt,
     pub time: Time,
@@ -86,6 +88,7 @@ impl Default for Config {
             zones: Vec::new(),
             firewall: Firewall::default(),
             dns: Dns::default(),
+            mdns: Mdns::default(),
             shaping: Shaping::default(),
             mgmt: Mgmt::default(),
             time: Time::default(),
@@ -223,6 +226,9 @@ pub enum Service {
     Ping,
     /// The web interface.
     Mgmt,
+    /// mDNS (UDP 5353): networks of the zone take part in
+    /// `[[mdns.reflect]]`.
+    Mdns,
 }
 
 /// A firewall zone (docs/config-v2.md §3).
@@ -378,6 +384,36 @@ impl Firewall {
 }
 
 // ---- services --------------------------------------------------------------
+
+/// mDNS across networks (docs/mdns.md).
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Mdns {
+    #[serde(rename = "reflect", skip_serializing_if = "Vec::is_empty")]
+    pub reflect: Vec<MdnsReflect>,
+}
+
+impl Mdns {
+    pub fn is_empty(&self) -> bool {
+        self.reflect.is_empty()
+    }
+}
+
+/// Makes the services of one network discoverable on others: queries go
+/// `to` → `from`, answers and announcements `from` → `to`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MdnsReflect {
+    pub name: String,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    /// The network the services are on.
+    pub from: String,
+    /// The networks they become discoverable on.
+    pub to: Vec<String>,
+    /// DNS-SD service types: `_ipp._tcp`, `_airplay._tcp`, …
+    pub services: Vec<String>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -818,6 +854,9 @@ impl Config {
         if !self.dns.hosts.is_empty() {
             add("dns.host".into(), "local DNS records");
         }
+        if !self.mdns.is_empty() {
+            add("mdns.reflect".into(), "mDNS reflection");
+        }
         if self.wan.port != PORT_WAN {
             add("wan.port".into(), "a WAN port other than wan0");
         }
@@ -850,6 +889,9 @@ impl Config {
         }
         if !self.dns.hosts.is_empty() {
             add("dns.host".into(), "local DNS records");
+        }
+        if self.mdns.reflect.iter().any(|r| r.enabled) {
+            add("mdns.reflect".into(), "mDNS reflection");
         }
         if self.wan.port != PORT_WAN {
             add("wan.port".into(), "a WAN port other than wan0");

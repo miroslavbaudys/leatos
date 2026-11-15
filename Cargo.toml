@@ -25,6 +25,7 @@ config-store = { path = "crates/config-store" }
 config = { path = "crates/config" }
 cli = { path = "crates/cli" }
 auth = { path = "crates/auth" }
+proto-mdns = { path = "crates/proto-mdns" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

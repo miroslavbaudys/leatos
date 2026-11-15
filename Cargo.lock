@@ -66,6 +66,7 @@ name = "config"
 version = "0.1.0"
 dependencies = [
  "auth",
+ "proto-mdns",
  "serde",
  "serde_json",
  "toml",

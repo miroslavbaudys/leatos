@@ -1,8 +1,10 @@
 # mDNS across networks (design)
 
-Status (2026-11-15): step 1 done: `crates/proto-mdns` (wire format + the
-filtered reflector, 22 host tests incl. mutation fuzzing). Config, kernel
-wiring and the lab test are not done yet (§8).
+Status (2026-11-15): steps 1–2 done: `crates/proto-mdns` (wire format +
+the filtered reflector, host tests incl. mutation fuzzing) and the config
+(`[[mdns.reflect]]`, zone service `mdns`, validation). Kernel wiring and
+the lab test are not done yet (§8); until then the kernel refuses enabled
+reflect entries.
 
 mDNS (RFC 6762) and DNS-SD (RFC 6763) are link-local: queries and
 announcements go to `224.0.0.251:5353` (IPv6 `ff02::fb`) with TTL 255, and
@@ -108,13 +110,23 @@ from = "iot"
 to = ["lan"]
 services = ["_airplay._tcp", "_raop._tcp", "_googlecast._tcp", "_ipp._tcp"]
 ```
-- Answers flow back along the same rule (to → from); a rule is needed
-  only per direction of discovery.
-- `Service::Mdns` (`allow = ["mdns"]`) and `svc::MDNS` = UDP 5353 to
-  224.0.0.251: a zone with a restrictive input policy must allow it for
-  its network to take part. Validation: networks exist, are not the WAN,
-  and the `from`/`to` zones allow `mdns`; service names look like
-  `_x._tcp` / `_x._udp`. Applied live, no trial.
+- `from` and `to` are **network** names (reflection is per link), not
+  zones. Answers flow back along the same rule; a rule is needed only per
+  direction of discovery. `enabled = false` keeps an entry without it
+  taking effect. CLI paths by name (`mdns.reflect.iot-to-lan.services`).
+- Until the kernel side exists (§8 step 3), `Config::unsupported` lists
+  enabled `mdns.reflect` entries, so a save with them is refused; the
+  zone service `mdns` alone is accepted (`fwd` maps UDP 5353 to
+  `svc::MDNS`).
+- `Service::Mdns` (`allow = ["mdns"]`) and `svc::MDNS` = UDP 5353: a
+  zone with a restrictive input policy must allow it for its network to
+  take part. Validation (paths like `mdns.reflect.iot-to-lan.to[1]`):
+  names are keys and unique, at most 32 entries; `from` and every `to`
+  are existing networks whose zone accepts input or allows `mdns`; `to`
+  is non-empty, without `from` or repeats; `services` non-empty, each
+  parsed by `proto_mdns::ServiceType::parse`, no repeats (any case); at
+  most 128 distinct types over the enabled entries. A config with
+  `[mdns]` needs schema version 2. Applied live, no trial.
 - Default: no rules, nothing reflected.
 
 ## 6. Pitfalls
@@ -146,7 +158,7 @@ services = ["_airplay._tcp", "_raop._tcp", "_googlecast._tcp", "_ipp._tcp"]
 
 ## 8. Order
 1. ✅ `crates/proto-mdns` reflector + tests.
-2. Config schema, `Service::Mdns`, validation.
+2. ✅ Config schema, `Service::Mdns`, validation.
 3. Kernel: smoltcp multicast, sockets, wiring, counters on `/api/status`.
 4. Lab test with negative controls; web page section and CLI status.
 5. On the apu4 with a real IoT VLAN.

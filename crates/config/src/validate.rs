@@ -6,7 +6,7 @@
 //! (`network.lan.dhcp.static[3].ip`).
 
 use crate::{
-    Cidr, Config, Network, Policy, Proto, VERSION, WanMode, ZONE_WAN,
+    Cidr, Config, Network, Policy, Proto, Service, VERSION, WanMode, ZONE_WAN,
 };
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -23,6 +23,7 @@ pub const MAX_ZONES: usize = 16;
 pub const MAX_RULES: usize = 256;
 pub const MAX_FORWARDS: usize = 128;
 pub const MAX_DNS_HOSTS: usize = 256;
+pub const MAX_MDNS_RULES: usize = 32;
 /// Most ports a network may be on.
 pub const MAX_PORTS: usize = 8;
 const MIN_LEASE_SECS: u32 = 60;
@@ -128,6 +129,7 @@ pub(crate) fn check(c: &Config) -> Result<(), Vec<Issue>> {
     rules(c, &mut x);
     forwards(c, &mut x);
     dns(c, &mut x);
+    mdns(c, &mut x);
     let s = &c.shaping;
     for (name, rate) in [
         ("shaping.up_kbit", s.up_kbit),
@@ -598,6 +600,70 @@ fn dns(c: &Config, x: &mut Issues) {
                 format!("\"{}\" is already in dns.host[{j}]", h.name),
             );
         }
+    }
+}
+
+// ---- mDNS ------------------------------------------------------------------
+
+fn mdns(c: &Config, x: &mut Issues) {
+    let r = &c.mdns.reflect;
+    if r.len() > MAX_MDNS_RULES {
+        x.add("mdns.reflect", format!("at most {MAX_MDNS_RULES} entries"));
+    }
+    let paths = entry_paths("mdns.reflect", r.iter().map(|r| r.name.as_str()), 32);
+    check_names(x, &paths, r.iter().map(|r| r.name.as_str()), 32, &[]);
+    // A network takes part only if its zone lets mDNS reach the router.
+    let zone_ok = |x: &mut Issues, path: String, net: &str| {
+        let Some(n) = c.network(net) else {
+            x.add(path, format!("no network \"{net}\""));
+            return;
+        };
+        if let Some(z) = c.zone(&n.zone)
+            && z.input != Policy::Accept
+            && !z.allow.contains(&Service::Mdns)
+        {
+            x.add(path, format!("zone \"{}\" must allow \"mdns\" (zone.{}.allow)", z.name, z.name));
+        }
+    };
+    let mut types = BTreeSet::new();
+    for (e, p) in r.iter().zip(&paths) {
+        zone_ok(x, format!("{p}.from"), &e.from);
+        if e.to.is_empty() {
+            x.add(format!("{p}.to"), "at least one network");
+        }
+        let mut seen = BTreeSet::new();
+        for (i, t) in e.to.iter().enumerate() {
+            let path = format!("{p}.to[{i}]");
+            if *t == e.from {
+                x.add(path, "the services are already on that network");
+            } else if !seen.insert(t) {
+                x.add(path, format!("\"{t}\" is listed twice"));
+            } else {
+                zone_ok(x, path, t);
+            }
+        }
+        if e.services.is_empty() {
+            x.add(format!("{p}.services"), "at least one service type, e.g. \"_ipp._tcp\"");
+        }
+        let mut seen = BTreeSet::new();
+        for (i, s) in e.services.iter().enumerate() {
+            let path = format!("{p}.services[{i}]");
+            match proto_mdns::ServiceType::parse(s) {
+                None => x.add(path, "must be a service type like \"_ipp._tcp\" or \"_sleep-proxy._udp\""),
+                Some(t) => {
+                    let t = t.to_string();
+                    if !seen.insert(t.clone()) {
+                        x.add(path, format!("\"{s}\" is listed twice"));
+                    }
+                    if e.enabled {
+                        types.insert(t);
+                    }
+                }
+            }
+        }
+    }
+    if types.len() > proto_mdns::MAX_SERVICES {
+        x.add("mdns.reflect", format!("at most {} service types in all", proto_mdns::MAX_SERVICES));
     }
 }
 
