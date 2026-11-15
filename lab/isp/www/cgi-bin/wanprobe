@@ -1,0 +1,21 @@
+#!/usr/bin/busybox sh
+# WAN input check: is the caller (the router's WAN address after NAT)
+# silent to unsolicited traffic? A TCP connect that is refused got a RST,
+# one that times out was dropped. Control: our own closed port refuses.
+bb=/usr/bin/busybox
+addr=${REMOTE_ADDR#\[}; addr=${addr%\]}; addr=${addr#::ffff:}
+echo "Content-Type: text/plain"
+echo
+tcp() { # host port -> OPEN | REFUSED | SILENT (busybox wget's messages)
+  out=$($bb wget -q -T 3 -O /dev/null "http://$1:$2/" 2>&1)
+  case "$out" in
+    *refused*) echo REFUSED ;;
+    *"timed out"*) echo SILENT ;;
+    *) echo OPEN ;;   # connected: any answer, even an HTTP error
+  esac
+}
+echo "control=$(tcp 127.0.0.1 22)"
+echo "tcp22=$(tcp "$addr" 22)"
+echo "tcp80=$(tcp "$addr" 80)"
+if $bb ping -c 1 -W 2 "$addr" >/dev/null 2>&1; then echo "ping=REPLY"; else echo "ping=SILENT"; fi
+echo "addr=$addr"

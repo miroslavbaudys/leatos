@@ -123,6 +123,20 @@ else
   fail "firewall probe: $(echo $probe)"
 fi
 
+# WAN input: the router stays silent to unsolicited traffic from the
+# internet (no RST, no port unreachable, no ping reply). The ISP probes the
+# router's WAN address (ISP cgi-bin/wanprobe; control: its own closed port
+# must refuse). Negative controls (scripts/lab-test.sh): LAB_ROUTER_ARGS=
+# mgmt=wan (tcp80 open), LAB_WAN_OPEN=1 (a rule accepting wan -> router:
+# RST and ping reply again).
+wp=$($bb wget -q -T 20 -O - "http://$ISP/cgi-bin/wanprobe" 2>&1)
+if echo "$wp" | $bb grep -q "control=REFUSED" && echo "$wp" | $bb grep -q "tcp22=SILENT" \
+   && echo "$wp" | $bb grep -q "tcp80=SILENT" && echo "$wp" | $bb grep -q "ping=SILENT"; then
+  pass "wan input: router silent to unsolicited traffic (tcp 22, tcp 80, ping; control refused)"
+else
+  fail "wan input: $(echo $wp)"
+fi
+
 # --- port forward + hairpin (docs/config-v2.md): LAB_GUEST config, lab_forward= -------
 # Forward lab-web: the router's WAN address :8080 -> this client's :8080
 # (httpd above). The ISP fetches it through the router (ISP cgi-bin/fetch:

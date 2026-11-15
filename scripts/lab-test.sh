@@ -94,6 +94,9 @@
 #                        _ssh, plus the router's IGMP joins on both
 #                        networks. Negative control: LAB_MDNS_RULES=0 (the
 #                        rule disabled: every mDNS check fails).
+#   LAB_WAN_OPEN=1       (implies LAB_GUEST=1) negative control for the WAN
+#                        input check: a rule accepting wan -> router, so the
+#                        router answers the ISP's probes (RST, ping) again.
 #   LAB_GUEST_LIVE=1     the same, but added live: the router boots with the
 #                        main LAN only (and mgmt_pass=lab-pass); the client
 #                        POSTs the guest config (in its initrd) to
@@ -136,6 +139,8 @@ GUEST_LIVE="${LAB_GUEST_LIVE:-}"
 MDNS="${LAB_MDNS:-}"
 MDNS_RULES="${LAB_MDNS_RULES:-1}"
 [[ -n "$MDNS" ]] && GUEST=1
+WAN_OPEN="${LAB_WAN_OPEN:-}"
+[[ -n "$WAN_OPEN" ]] && GUEST=1
 GUEST_ZONE="${LAB_GUEST_ZONE:-guest}"
 GUEST_RULES="${LAB_GUEST_RULES:-1}"
 FORWARD="${LAB_FORWARD:-1}"
@@ -226,6 +231,14 @@ to = "wan"
 proto = "tcp"
 dst_port = 80
 action = "reject"
+CFG
+  [[ -n "$WAN_OPEN" ]] && cat >>"$WORK/config.toml" <<'CFG'
+
+[[firewall.rule]]
+name = "wan-open"
+from = "wan"
+to = "router"
+action = "accept"
 CFG
   [[ "$FORWARD" == 1 ]] && cat >>"$WORK/config.toml" <<'CFG'
 

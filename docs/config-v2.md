@@ -113,9 +113,15 @@ Unchanged from v1, with two additions:
 - `mode = "static"` with `[wan.static]` (`ipv4`, `gateway`, `dns`).
 
 The WAN is always zone `wan`, a built-in zone: input drop, masquerade on,
-`forward_to` empty. Its policy can be changed only through rules and
-forwards. `[mgmt] on_wan` stays the only way to open management on the
-WAN, and it remains for development only.
+`forward_to` empty. Input drop is silent: no RST, no ICMP port
+unreachable, no ping reply, so a scan from the internet sees nothing but
+the forwarded ports (`kernel/src/config.rs` `firewall`). Replies to the
+router's own clients (DHCP, DNS upstream, SNTP, ICMP errors) pass before
+the policy. Its policy can be changed only through rules (`from = "wan"`,
+`to = "router"`) and forwards. `[mgmt] on_wan` stays the only way to open
+management on the WAN, and it remains for development only. Lab check:
+"wan input" in `scripts/lab-test.sh` (the ISP probes TCP 22/80 and ping;
+negative controls `LAB_ROUTER_ARGS=mgmt=wan`, `LAB_WAN_OPEN=1`).
 
 ### `[[network]]`
 | Field | Default | Notes |

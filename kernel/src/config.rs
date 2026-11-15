@@ -482,10 +482,13 @@ pub fn networks() -> Vec<Lan> {
 }
 
 /// The zone firewall for the forwarder (docs/config-v2.md §6): zone
-/// indices as in [`networks`]. The WAN zone's input stays open: what
-/// arrives there for the router is the replies its own clients (DHCP,
-/// PPPoE, DNS upstream, SNTP) wait for, and smoltcp answers only on
-/// ports it listens on. `reject` drops (no RST / port unreachable yet).
+/// indices as in [`networks`]. The WAN zone drops everything for the
+/// router (no RST, no port unreachable, no ping reply: nothing tells a
+/// scanner a host is there) except the web interface with `mgmt.on_wan`;
+/// replies to the router's own clients (DHCP, DNS upstream, SNTP, ICMP
+/// errors) pass before the policy (`fwd::forwarder` `input`), PPPoE is
+/// not IP, and `[[firewall.rule]]`s from `wan` to `router` can open more.
+/// `reject` drops (no RST / port unreachable yet).
 pub fn firewall() -> fwd::forwarder::Policy {
     use fwd::forwarder::svc;
     let c = get();
@@ -501,7 +504,7 @@ pub fn firewall() -> fwd::forwarder::Policy {
                 .fold(0, |a, b| a | b),
         );
         input.push(match z.input {
-            _ if i == 0 => None,
+            _ if i == 0 => Some(if c.mgmt.on_wan { svc::MGMT } else { 0 }),
             schema::Policy::Accept => None,
             schema::Policy::Drop | schema::Policy::Reject => Some(
                 z.allow
