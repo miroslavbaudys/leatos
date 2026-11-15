@@ -44,6 +44,9 @@
 #                        router's hardware watchdog in the lab, both arches)
 #   QEMU_APPEND="..."    kernel command line (DTB /chosen/bootargs), e.g.
 #                        "shape_up=42000 shape_down=50000 idle_spin_us=0"
+#                        log=console is added unless it sets log= (the
+#                        scripts read log messages from the console; the
+#                        kernel's default is its RAM log once booted)
 #   QEMU_EXTRA="..."     extra QEMU arguments
 set -euo pipefail
 
@@ -165,7 +168,9 @@ fi
 
 # shellcheck disable=SC2206
 EXTRA=(${QEMU_EXTRA:-})
-if [[ -n "${QEMU_APPEND:-}" && -z "${QEMU_DISK:-}" ]]; then EXTRA+=(-append "$QEMU_APPEND"); fi
+APPEND="${QEMU_APPEND:-}"
+case " $APPEND" in *" log="*) ;; *) APPEND="log=console${APPEND:+ $APPEND}" ;; esac
+if [[ -z "${QEMU_DISK:-}" ]]; then EXTRA+=(-append "$APPEND"); fi
 
 # QEMU_BIN (sudo callers) names the aarch64 binary; derive the x86 one from it.
 BIN="${QEMU_BIN:-$DEFAULT_BIN}"

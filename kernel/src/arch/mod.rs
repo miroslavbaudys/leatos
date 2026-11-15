@@ -7,8 +7,11 @@
 //!   `irq_disable`, `wait_for_interrupt`, `halt` (smoke builds: power off),
 //!   `park` (stop this core only),
 //!   `dma_barrier` (order descriptor accesses against device DMA and MMIO)
-//! - `console`: `init(base)`, `write_str`, `emergency_write_str`, `read_byte`
-//!   (polled input for the serial CLI)
+//! - `console`: `init(base)`, `write_str`, `emergency_write_str`; receive:
+//!   `rx_irq_setup(&BootInfo) -> Option<(intid, Trigger)>` (route the UART's
+//!   RX interrupt, masked), `rx_irq_enable`, `rx_drain_irq(push)` (IRQ
+//!   context: FIFO → `push`, try-lock only), `rx_drain_thread(push)` (the
+//!   polled fallback, IRQs masked)
 //! - `irqchip`: `init(&BootInfo)`, `enable(intid, Trigger)`, `disable(intid)`;
 //!   the backend's IRQ entry calls `crate::irq::dispatch(intid)`. MSI-X:
 //!   `msi_vector(n)` (the n-th device vector, if the platform delivers

@@ -33,6 +33,8 @@ pub fn die() -> ! {
     arch::cpu::irq_disable();
     DYING.store(true, Ordering::Release);
     smp::stop_others();
+    // What led up to it, if log output went to RAM (`console::log_to_ram`).
+    crate::console::fatal_dump_log();
     // Before the clock runs (very early boot) there is no way to wait, and
     // a fault that early would only fault again: halt.
     let freq = timer::frequency();

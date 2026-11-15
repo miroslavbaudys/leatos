@@ -34,6 +34,8 @@ pub enum IrqChipInfo {
     Apic {
         lapic: usize,
         ioapic: Option<(usize, u32)>,
+        /// COM1's IRQ: (GSI, MPS INTI flags), see `acpi::Acpi::com1`.
+        com1: (u32, u16),
     },
 }
 
@@ -129,6 +131,9 @@ pub struct BootInfo {
     /// (start, size) of the RAM bank that contains the kernel.
     pub ram: (usize, usize),
     pub console_base: Option<usize>,
+    /// The console UART's interrupt (aarch64: GIC INTID from the DTB;
+    /// x86_64: `None`, COM1's comes with `IrqChipInfo::Apic`).
+    pub console_irq: Option<u32>,
     pub power: PowerMethod,
     pub irqchip: Option<IrqChipInfo>,
     /// Interrupt ID of the per-CPU timer used for tickless deadlines.
@@ -171,7 +176,7 @@ impl BootInfo {
             Some(IrqChipInfo::GicV3 { gicd, gicr, .. }) => {
                 println!("  irqchip         : GICv3, gicd {gicd:#x}, gicr {gicr:#x}")
             }
-            Some(IrqChipInfo::Apic { lapic, ioapic }) => match ioapic {
+            Some(IrqChipInfo::Apic { lapic, ioapic, .. }) => match ioapic {
                 Some((io, gsi)) => println!(
                     "  irqchip         : local APIC {lapic:#x}, IOAPIC {io:#x} (GSI {gsi}..)"
                 ),

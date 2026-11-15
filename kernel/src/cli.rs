@@ -2,11 +2,20 @@
 //! when the network is not an option (`crates/cli`: line editor + parser).
 //!
 //! Runs inside the services task (`net::svc`), like the web interface:
-//! [`Cli::step`] polls the UART (`arch::console::read_byte`; COM1's
-//! interrupt would need IOAPIC routing), echoes, and runs commands.
-//! Polling: every 50 ms, every 2 ms for 2 s after input (pasted lines
-//! outrun a 16-byte FIFO otherwise). The services task does what needs
-//! the store or a reboot ([`CliAction`]).
+//! [`Cli::step`] reads what the UART's RX interrupt put in the console's
+//! ring (`console::read_byte`; a pasted config does not outrun the 16-byte
+//! FIFO), echoes, and runs each finished line before reading on, so
+//! command output follows its line. The FIFO is also polled (every 50 ms,
+//! every 2 ms for 2 s after polling found input): the fallback without an
+//! interrupt. The services task does what needs the store or a reboot
+//! ([`CliAction`]).
+//!
+//! **Console use**: the console knows the CLI's line (`console::prompt`,
+//! `console::echo`) and redraws it after other output. Once the CLI is
+//! ready, log messages go to the RAM log (`console::log_to_ram`, the `log`
+//! command) unless the boot argument `log=console` keeps them on the UART
+//! (tests); the CLI's own output always goes to the UART
+//! (`console::cli_output`).
 //!
 //! Config edits are TOML assignments on a pending copy of the stored
 //! config (`config::schema::Config::with_assignment`). `config save`
@@ -17,6 +26,7 @@
 //! No authentication: the serial port is physical access.
 
 use crate::config::{self, schema};
+use crate::console;
 use crate::net::services::LanServices;
 use crate::net::shared::Shared;
 use crate::net::svc::HostIf;
@@ -25,7 +35,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
-use cli::{Command, LineEditor, Output, Which};
+use cli::{Command, LineEditor, LogArg, Output, Which};
 use qdisc::Qdisc as _;
 use core::fmt::Write as _;
 use core::time::Duration;
@@ -34,8 +44,11 @@ const PROMPT: &str = "rrouter> ";
 const POLL_IDLE: Duration = Duration::from_millis(50);
 const POLL_ACTIVE: Duration = Duration::from_millis(2);
 const ACTIVE_FOR: Duration = Duration::from_secs(2);
-/// Bytes read per step (more wait for the next one, 2 ms later).
+/// Bytes read per step (more wait for the next step, which comes at once).
 const READ_BATCH: usize = 256;
+/// Bytes of long output (`log all`) written per step: about 45 ms at
+/// 115200 baud, so the services task and its core's watchdog keep running.
+const WRITE_CHUNK: usize = 512;
 
 /// Work for the services task.
 pub enum CliAction {
@@ -54,13 +67,17 @@ pub struct Ctx<'a> {
 pub struct Cli {
     ed: LineEditor,
     pending: Option<schema::Config>,
-    /// Lines received while a save was in progress.
+    /// Finished lines not run yet (one at a time; held while a save runs).
     queued: VecDeque<String>,
     busy: bool,
     has_store: bool,
     next_poll: timer::Instant,
     active_until: timer::Instant,
     started: bool,
+    /// The prompt is on the current line (it prefixes the echoed line).
+    prompted: bool,
+    /// Long output still being written (text, bytes written).
+    stream: Option<(String, usize)>,
     wan: String,
 }
 
@@ -79,6 +96,8 @@ impl Cli {
             next_poll: timer::Instant::now(),
             active_until: timer::Instant::now(),
             started: false,
+            prompted: false,
+            stream: None,
             wan: String::from("no lease"),
         }
     }
@@ -88,72 +107,159 @@ impl Cli {
         self.wan = text;
     }
 
-    /// When [`Self::step`] wants to run next.
+    /// When [`Self::step`] wants to run next (input wakes the task too:
+    /// `console::rx_event`).
     pub fn wake_at(&self) -> timer::Instant {
         self.next_poll
     }
 
-    /// Poll the UART and run what was typed. At most one action per step.
+    /// More to do right away (output to write, input to read): the
+    /// services task yields and steps again.
+    pub fn more(&self) -> bool {
+        !self.busy && (self.stream.is_some() || !self.queued.is_empty() || console::rx_pending())
+    }
+
+    fn prompt(&mut self) {
+        self.prompted = true;
+        console::prompt(PROMPT);
+    }
+
+    /// Read what was typed and run it. At most one action per step.
     pub fn step(&mut self, ctx: &Ctx) -> Option<CliAction> {
-        let now = timer::Instant::now();
-        if now < self.next_poll {
-            return None;
-        }
         if !self.started {
             self.started = true;
             println!("  cli             : serial console ready (type help)");
-            print!("{PROMPT}");
-        }
-        let mut bytes = Vec::new();
-        while bytes.len() < READ_BATCH {
-            match crate::arch::console::read_byte() {
-                Some(b) => bytes.push(b),
-                None => break,
+            if !config::log_to_console() {
+                println!(
+                    "  log             : further messages go to the RAM log (CLI: log; boot argument log=console keeps them here)"
+                );
+                console::log_to_ram();
             }
+            self.prompt();
         }
-        if !bytes.is_empty() {
-            self.active_until = after(ACTIVE_FOR);
-            for out in self.ed.feed(&bytes) {
+        let now = timer::Instant::now();
+        if now >= self.next_poll {
+            // The fallback (no RX interrupt) and a safety net.
+            if console::poll_rx() > 0 {
+                self.active_until = after(ACTIVE_FOR);
+            }
+            self.next_poll = after(if now < self.active_until {
+                POLL_ACTIVE
+            } else {
+                POLL_IDLE
+            });
+        }
+        console::cli_output(|| self.work(ctx))
+    }
+
+    fn work(&mut self, ctx: &Ctx) -> Option<CliAction> {
+        if self.write_stream() {
+            return None;
+        }
+        let mut budget = READ_BATCH;
+        while !self.busy {
+            if let Some(line) = self.queued.pop_front() {
+                let action = self.run(&line, ctx);
+                if action.is_some() {
+                    return action;
+                }
+                if self.stream.is_some() {
+                    return None; // the prompt follows the output
+                }
+                self.prompt();
+                continue;
+            }
+            if budget == 0 {
+                break;
+            }
+            let Some(b) = console::read_byte() else { break };
+            budget -= 1;
+            for out in self.ed.feed(&[b]) {
                 match out {
-                    Output::Echo(e) => print!("{}", core::str::from_utf8(&e).unwrap_or("")),
-                    Output::Line(l) => self.queued.push_back(l),
-                    Output::Cancel => print!("{PROMPT}"),
+                    Output::Echo(e) => {
+                        let mut now = String::from(if self.prompted { PROMPT } else { "" });
+                        now.push_str(self.ed.current());
+                        console::echo(core::str::from_utf8(&e).unwrap_or(""), &now);
+                    }
+                    Output::Line(l) => {
+                        self.prompted = false;
+                        self.queued.push_back(l);
+                    }
+                    Output::Cancel => self.prompt(),
                 }
             }
         }
-        self.next_poll = after(if timer::Instant::now() < self.active_until {
-            POLL_ACTIVE
-        } else {
-            POLL_IDLE
-        });
-        while !self.busy {
-            let line = self.queued.pop_front()?;
-            let action = self.run(&line, ctx);
-            if action.is_some() {
-                return action;
-            }
-            print!("{PROMPT}");
-        }
         None
+    }
+
+    /// Write the next chunk of long output; true while some is left.
+    fn write_stream(&mut self) -> bool {
+        let Some((text, done)) = self.stream.as_mut() else {
+            return false;
+        };
+        let mut end = (*done + WRITE_CHUNK).min(text.len());
+        while !text.is_char_boundary(end) {
+            end += 1;
+        }
+        print!("{}", &text[*done..end]);
+        *done = end;
+        if end < text.len() {
+            return true;
+        }
+        self.stream = None;
+        self.prompt();
+        true
     }
 
     /// The services task finished a [`CliAction::Save`].
     pub fn save_done(&mut self, result: Result<String, String>, rebooting: bool) {
         self.busy = false;
-        match result {
-            Ok(detail) if rebooting => {
-                self.pending = None;
-                println!("saved ({detail}); the LAN or management settings changed: rebooting");
+        console::cli_output(|| {
+            match result {
+                Ok(detail) if rebooting => {
+                    self.pending = None;
+                    println!("saved ({detail}); the LAN or management settings changed: rebooting");
+                }
+                Ok(detail) => {
+                    self.pending = None;
+                    println!("saved and applied ({detail})");
+                }
+                Err(e) => println!("error: not saved: {e}"),
             }
-            Ok(detail) => {
-                self.pending = None;
-                println!("saved and applied ({detail})");
+            if !rebooting {
+                self.prompt();
             }
-            Err(e) => println!("error: not saved: {e}"),
+        });
+    }
+
+    fn log(&mut self, arg: LogArg) {
+        let lines = match arg {
+            LogArg::Clear => {
+                console::log_clear();
+                println!("log cleared");
+                return;
+            }
+            LogArg::All => None,
+            LogArg::Last(n) => Some(n),
+        };
+        if !console::logging_to_ram() {
+            println!("log messages go to the console (boot argument log=console)");
+            return;
         }
-        if !rebooting {
-            print!("{PROMPT}");
+        let (text, dropped) = console::log_tail(lines, usize::MAX);
+        if text.is_empty() {
+            println!("log is empty");
+            return;
         }
+        let mut out = String::new();
+        if dropped > 0 && lines.is_none() {
+            let _ = writeln!(out, "({dropped} older lines dropped: the RAM log keeps 64 KiB)");
+        }
+        out.push_str(&text);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        self.stream = Some((out, 0));
     }
 
     fn run(&mut self, line: &str, ctx: &Ctx) -> Option<CliAction> {
@@ -169,6 +275,7 @@ impl Cli {
             Command::Help => println!("{}", cli::HELP),
             Command::Status => status(ctx, &self.wan),
             Command::Leases => leases(ctx),
+            Command::Log(arg) => self.log(arg),
             Command::Show(w) => {
                 let c = match w {
                     Which::Running => Some(config::get().as_ref().clone()),
@@ -283,6 +390,12 @@ fn status(ctx: &Ctx, wan: &str) {
     );
     println!("config   : {}", config::source());
     println!("cmdline  : {}", config::Redacted(config::bootargs()));
+    println!(
+        "console  : rx {}, {} byte(s) lost, log {}",
+        if console::rx_irq() { "interrupt" } else { "polled" },
+        console::rx_dropped(),
+        if console::logging_to_ram() { "in RAM (log)" } else { "on the console" }
+    );
     println!("wan      : {wan}");
     for (host, p) in ctx.hosts.iter().zip(&ctx.sh.ports) {
         let snap = *p.snap.lock();

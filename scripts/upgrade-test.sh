@@ -44,7 +44,9 @@ OBJCOPY="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p
 if [[ -x "$OBJCOPY" ]]; then "$OBJCOPY" --strip-debug "$ELF" "$WORK/new.elf"; else cp "$ELF" "$WORK/new.elf"; fi
 cp "$ELF" "$WORK/boot.elf" # boot a copy: the build may change under us
 CRC="$(python3 -I -c 'import sys,zlib; print("%08x" % zlib.crc32(open(sys.argv[1],"rb").read()))' "$WORK/new.elf")"
-ARGS="mgmt=wan mgmt_pass=test lan=10.10.0.1/24"
+# log=console: the uploaded kernels get ARGS as their command line, and
+# the checks read their log messages from the console.
+ARGS="log=console mgmt=wan mgmt_pass=test lan=10.10.0.1/24"
 
 QEMU_NET=user QEMU_NIC=igb QEMU_WAN_HOSTFWD="tcp:127.0.0.1:$PORT-:80" QEMU_APPEND="$ARGS" \
   scripts/qemu-run.sh "$WORK/boot.elf" >"$LOG" 2>&1 &

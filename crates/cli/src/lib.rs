@@ -32,11 +32,25 @@ pub enum Which {
     Pending,
 }
 
+/// What `log` shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogArg {
+    /// The last N lines.
+    Last(usize),
+    All,
+    Clear,
+}
+
+/// Lines `log` shows without an argument.
+pub const LOG_DEFAULT_LINES: usize = 40;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Help,
     Status,
     Leases,
+    /// `log [N|all|clear]`: the last N lines of the RAM log (`None` = all).
+    Log(LogArg),
     Show(Which),
     /// `config set <path> = <value>`: the assignment, verbatim.
     Set(String),
@@ -51,6 +65,7 @@ pub const HELP: &str = "\
 commands:
   status                         system, ports, WAN, time, watchdog, CPU
   leases                         DHCP leases
+  log [N|all|clear]              messages since boot (default: last 40 lines)
   config show [running|stored|pending]
   config set <setting> = <value> edit (TOML), e.g. config set shaping.up_kbit = 18000
   config unset <setting>         back to the default
@@ -73,6 +88,13 @@ pub fn parse(line: &str) -> Result<Option<Command>, String> {
         ("help" | "?", []) => Command::Help,
         ("status", []) => Command::Status,
         ("leases", []) => Command::Leases,
+        ("log", []) => Command::Log(LogArg::Last(LOG_DEFAULT_LINES)),
+        ("log", ["all"]) => Command::Log(LogArg::All),
+        ("log", ["clear"]) => Command::Log(LogArg::Clear),
+        ("log", [n]) if n.parse::<usize>().is_ok_and(|n| n > 0) => {
+            Command::Log(LogArg::Last(n.parse().unwrap_or(LOG_DEFAULT_LINES)))
+        }
+        ("log", _) => return bad("usage: log [N|all|clear]"),
         ("reboot", []) => Command::Reboot,
         ("config", ["show"] | ["show", "running"]) => Command::Show(Which::Running),
         ("config", ["show", "stored"]) => Command::Show(Which::Stored),

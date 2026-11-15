@@ -20,11 +20,13 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 core::arch::global_asm!(include_str!("isr.S"), options(att_syntax));
 
 pub const TIMER_VECTOR: u32 = 32;
+/// COM1 through the IOAPIC (`irqchip::route_com1`). 33 is the IPI.
+pub const COM1_VECTOR: u32 = 34;
 pub const MSI_VECTORS: core::ops::RangeInclusive<u32> = 48..=63;
 pub const SPURIOUS_VECTOR: u32 = 255;
 pub const PIC_VECTORS: core::ops::RangeInclusive<u32> = 224..=239;
 /// Number of (vector, stub) pairs in isr.S.
-const STUBS: usize = 32 + 2 + 16 + 16 + 1;
+const STUBS: usize = 32 + 3 + 16 + 16 + 1;
 
 unsafe extern "C" {
     static isr_vectors: [[u64; 2]; STUBS];

@@ -1,15 +1,17 @@
 //! Local APIC (xAPIC, MMIO) with the legacy 8259 PICs masked.
 //!
-//! Interrupt IDs are **vectors**: 32 = local APIC timer, 48-63 = device
-//! MSI-X (`crate::pci`), 255 = spurious. Legacy INTx via the IOAPIC
-//! is not used: on PCs its routing needs the ACPI `_PRT` (AML), while MSI-X
-//! works on every device rrouter targets (virtio-net, Intel i211).
+//! Interrupt IDs are **vectors**: 32 = local APIC timer, 34 = COM1 (the
+//! serial console's RX), 48-63 = device MSI-X (`crate::pci`), 255 =
+//! spurious. PCI INTx via the IOAPIC is not used: on PCs its routing needs
+//! the ACPI `_PRT` (AML), while MSI-X works on every device rrouter targets
+//! (virtio-net, Intel i211). The one IOAPIC entry in use is COM1's ISA IRQ
+//! 4, which the MADT alone describes (interrupt source overrides).
 //!
 //! Locking: the APIC is used from thread context (timer programming,
 //! enable) and IRQ context (EOI, NAPI-style disable), so every access runs
 //! with IRQs masked (`with_lapic`). On a single core that is deadlock-free.
 
-use super::exceptions::{MSI_VECTORS, PIC_VECTORS, SPURIOUS_VECTOR, TIMER_VECTOR};
+use super::exceptions::{COM1_VECTOR, MSI_VECTORS, PIC_VECTORS, SPURIOUS_VECTOR, TIMER_VECTOR};
 use super::port::{inb, outb};
 use crate::irq::Trigger;
 use crate::mmio::Region;
@@ -160,11 +162,77 @@ fn set_msix_mask(vector: u32, masked: bool) {
     });
 }
 
-/// Unmask: the LVT timer, or a device's MSI-X entry. A message that came in
+/// The first IOAPIC, and COM1's redirection entry index in it.
+static IOAPIC: Mutex<Option<(Region, u32)>> = Mutex::new(None);
+const IOREGSEL: usize = 0x00;
+const IOWIN: usize = 0x10;
+const RTE_MASKED: u32 = 1 << 16;
+
+fn with_ioapic<R>(f: impl FnOnce(&mut Region, u32) -> R) -> Option<R> {
+    let was = super::cpu::irqs_enabled();
+    super::cpu::irq_disable();
+    let r = IOAPIC.lock().as_mut().map(|(r, pin)| f(r, *pin));
+    if was {
+        super::cpu::irq_enable();
+    }
+    r
+}
+
+fn ioapic_write(r: &mut Region, reg: u32, v: u32) {
+    r.write32(IOREGSEL, reg);
+    r.write32(IOWIN, v);
+}
+
+/// Program COM1's IOAPIC entry (masked) to raise [`COM1_VECTOR`] on the
+/// boot core. `None` without an IOAPIC, or if the GSI is not on the first.
+pub(super) fn route_com1(info: &BootInfo) -> Option<(u32, Trigger)> {
+    let Some(IrqChipInfo::Apic {
+        ioapic: Some((base, gsi_base)),
+        com1: (gsi, flags),
+        ..
+    }) = info.irqchip
+    else {
+        return None;
+    };
+    crate::mm::mmu::map_device(base, base + 0x1000);
+    // SAFETY: the MADT's IOAPIC page, mapped as device memory just above
+    // (or by PLATFORM_MMIO), owned exclusively by this module.
+    let mut r = unsafe { Region::new(base, 0x1000) };
+    r.write32(IOREGSEL, 1);
+    let entries = (r.read32(IOWIN) >> 16 & 0xff) + 1;
+    let pin = gsi.checked_sub(gsi_base).filter(|&p| p < entries)?;
+    // MPS INTI flags: polarity bits 0-1 (3 = active low), trigger bits 2-3
+    // (3 = level); 0 = the ISA default, edge and active high.
+    let low_active = flags & 3 == 3;
+    let level = flags >> 2 & 3 == 3;
+    let lo = COM1_VECTOR | RTE_MASKED | (low_active as u32) << 13 | (level as u32) << 15;
+    let dest = APIC_IDS[0].load(core::sync::atomic::Ordering::Relaxed);
+    ioapic_write(&mut r, 0x10 + 2 * pin + 1, dest << 24);
+    ioapic_write(&mut r, 0x10 + 2 * pin, lo);
+    let was = super::cpu::irqs_enabled();
+    super::cpu::irq_disable();
+    *IOAPIC.lock() = Some((r, pin));
+    if was {
+        super::cpu::irq_enable();
+    }
+    Some((COM1_VECTOR, if level { Trigger::Level } else { Trigger::Edge }))
+}
+
+fn set_com1_mask(masked: bool) {
+    with_ioapic(|r, pin| {
+        r.write32(IOREGSEL, 0x10 + 2 * pin);
+        let v = r.read32(IOWIN);
+        r.write32(IOWIN, if masked { v | RTE_MASKED } else { v & !RTE_MASKED });
+    });
+}
+
+/// Unmask: the LVT timer, COM1's IOAPIC entry, or a device's MSI-X entry. A message that came in
 /// while masked is pending in the device and is delivered now.
 pub fn enable(intid: u32, _trigger: Trigger) {
     if intid == TIMER_VECTOR {
         with_lapic(|r| r.modify32(LVT_TIMER, |v| v & !MASKED));
+    } else if intid == COM1_VECTOR {
+        set_com1_mask(false);
     } else if MSI_VECTORS.contains(&intid) {
         set_msix_mask(intid, false);
     }
@@ -174,6 +242,8 @@ pub fn enable(intid: u32, _trigger: Trigger) {
 pub fn disable(intid: u32) {
     if intid == TIMER_VECTOR {
         with_lapic(|r| r.modify32(LVT_TIMER, |v| v | MASKED));
+    } else if intid == COM1_VECTOR {
+        set_com1_mask(true);
     } else if MSI_VECTORS.contains(&intid) {
         set_msix_mask(intid, true);
     }

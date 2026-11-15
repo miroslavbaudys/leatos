@@ -511,6 +511,12 @@ pub fn panic_halts() -> bool {
     arg(bootargs(), "panic") == Some("halt")
 }
 
+/// `log=console`: log messages keep going to the serial console after
+/// boot (tests read them there). Default: the RAM log (CLI `log`).
+pub fn log_to_console() -> bool {
+    arg(bootargs(), "log") == Some("console")
+}
+
 /// Boot argument `cores=N`: use at most N cores (default: all, up to
 /// `smp::MAX_CORES`). `cores=1` runs everything on the boot core (A/B tests).
 pub fn cores() -> Option<usize> {

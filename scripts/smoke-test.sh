@@ -44,7 +44,7 @@ boot() { # features [extra kernel arguments] [boots to wait for]
   local args="${QEMU_APPEND:-}${2:+ $2}"
   args="${args# }"
   if [[ "$BOOT_MODE" == limine ]]; then
-    scripts/apu-image.sh --debug --features "$1" ${args:+--cmdline "$args"} --out "$IMG" >/dev/null
+    scripts/apu-image.sh --debug --features "$1" --cmdline "log=console${args:+ $args}" --out "$IMG" >/dev/null
   else
     cargo build -p rrouter-kernel --target "$TARGET" --features "$1" --quiet
   fi

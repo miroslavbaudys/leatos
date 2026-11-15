@@ -16,6 +16,9 @@ pub struct Acpi {
     pub lapic: usize,
     /// (MMIO address, first GSI) of the first IOAPIC.
     pub ioapic: Option<(usize, u32)>,
+    /// COM1's interrupt (ISA IRQ 4): (GSI, MPS INTI flags) after the
+    /// MADT's interrupt source overrides; flags 0 = ISA default (edge, high).
+    pub com1: (u32, u16),
     pub cpus: usize,
     /// Local APIC IDs of the enabled cores, in MADT order (first `cpus.min(MAX_CORES)`).
     pub apic_ids: [u64; crate::smp::MAX_CORES],
@@ -116,6 +119,7 @@ pub fn parse(rsdp_pa: u64) -> Result<Acpi, &'static str> {
 
 fn madt(t: &[u8], acpi: &mut Acpi) {
     acpi.lapic = u32_at(t, 36).unwrap_or(0) as usize;
+    acpi.com1 = (4, 0);
     let mut off = 44;
     while let (Some(&kind), Some(&len)) = (t.get(off), t.get(off + 1)) {
         let len = len as usize;
@@ -134,6 +138,12 @@ fn madt(t: &[u8], acpi: &mut Acpi) {
             1 if acpi.ioapic.is_none() => {
                 if let (Some(addr), Some(gsi)) = (u32_at(e, 4), u32_at(e, 8)) {
                     acpi.ioapic = Some((addr as usize, gsi));
+                }
+            }
+            // Interrupt source override: bus 0 (ISA), source IRQ 4.
+            2 if e.get(2..4) == Some(&[0, 4]) => {
+                if let (Some(gsi), Some(flags)) = (u32_at(e, 4), u16_at(e, 8)) {
+                    acpi.com1 = (gsi, flags);
                 }
             }
             5 => {

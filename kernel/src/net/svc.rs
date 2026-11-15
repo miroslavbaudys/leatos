@@ -459,10 +459,16 @@ pub async fn run(
     let mut mgmt = Mgmt::new(&mut hosts, store.is_some());
     let mut cli = Cli::new(store.is_some());
     let mut pppoe = crate::config::pppoe().map(|c| Pppoe::new(c, &sh.ports[0]));
-    let events = [sh.svc_kick];
+    // Serial input wakes the task too (the CLI).
+    let rx = crate::console::rx_event();
+    let events: Vec<&'static crate::irq::IrqEvent> =
+        [Some(sh.svc_kick), rx].into_iter().flatten().collect();
 
     loop {
         sh.svc_kick.take();
+        if let Some(rx) = rx {
+            rx.take();
+        }
         poll_stacks(&mut hosts, sh);
         let change = match pppoe.as_mut() {
             Some(p) => {
@@ -566,7 +572,7 @@ pub async fn run(
 
         // More frames arrived while we worked: go round again, after
         // letting the datapath run.
-        if sh.ports.iter().any(|p| !p.local_rx.lock().is_empty()) {
+        if cli.more() || sh.ports.iter().any(|p| !p.local_rx.lock().is_empty()) {
             crate::executor::yield_now().await;
             continue;
         }

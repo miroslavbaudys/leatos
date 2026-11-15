@@ -5,7 +5,7 @@
  * exceptions.rs. The kernel uses no SSE (soft-float target), so no FPU
  * state needs saving.
  *
- * Vectors: 0-31 CPU exceptions, 32 local APIC timer, 33 wake/stop IPI, 48-63 device MSI-X,
+ * Vectors: 0-31 CPU exceptions, 32 local APIC timer, 33 wake/stop IPI, 34 COM1, 48-63 device MSI-X,
  * 224-239 the remapped (masked) 8259 PICs, 255 spurious. `isr_vectors` lists (vector, stub address) pairs for the IDT.
  */
     .section .text
@@ -29,7 +29,7 @@ isr_\n:
     .irp n, 8,10,11,12,13,14,17,21,29,30
     ISR_ERR \n
     .endr
-    .irp n, 32,33,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,255
+    .irp n, 32,33,34,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,255
     ISR_NOERR \n
     .endr
 
@@ -74,7 +74,7 @@ isr_common:
     .balign 8
     .global isr_vectors
 isr_vectors:
-    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,255
+    .irp n, 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,255
     .quad   \n
     .quad   isr_\n
     .endr

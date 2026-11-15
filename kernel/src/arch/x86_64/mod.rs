@@ -81,6 +81,7 @@ pub fn discover(start_info: usize) -> Result<BootInfo, &'static str> {
         },
         ram: si.ram,
         console_base: None,
+        console_irq: None,
         power: PowerMethod::AcpiS5 {
             pm1a_cnt,
             pm1b_cnt: a.pm1b_cnt,
@@ -90,6 +91,7 @@ pub fn discover(start_info: usize) -> Result<BootInfo, &'static str> {
         irqchip: Some(IrqChipInfo::Apic {
             lapic: a.lapic,
             ioapic: a.ioapic,
+            com1: a.com1,
         }),
         timer_intid: exceptions::TIMER_VECTOR,
         pcie,

@@ -7,6 +7,9 @@
 #   QEMU_STORE_BUS=sd scripts/cli-test.sh      # store on the SD card
 #   CLI_TEST_SKIP_SAVE=1 scripts/cli-test.sh   # negative control: the
 #                                              # persistence checks must fail
+#   CLI_TEST_LOG=console scripts/cli-test.sh   # negative control: log
+#                                              # messages stay on the console,
+#                                              # the RAM log checks must fail
 #   CLI_TEST_VERBOSE=1 ...                     # print the console
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -64,12 +67,23 @@ cp "target/$TARGET/debug/rrouter" "$WORK/rrouter.elf"
 target/release/rrstore create "$IMG" --mib 32 >/dev/null
 mkfifo "$FIFO"
 
+# The kernel's default: log messages go to the RAM log once the CLI runs.
+QEMU_APPEND="log=${CLI_TEST_LOG:-ram}${QEMU_APPEND:+ $QEMU_APPEND}" \
 QEMU_STORE="$IMG" QEMU_NET=user scripts/qemu-run.sh "$WORK/rrouter.elf" <"$FIFO" >"$LOG" 2>&1 &
 QPID=$!
 exec 3>"$FIFO"
 wait_count 1 "serial console ready" $((T * 2)) || { fail "cli started"; exit 1; }
-wait_count 1 "net self-test" "$T" || true
 pass "cli started"
+
+echo "== RAM log"
+# The net self-test reports after the CLI is up: into the RAM log.
+for _ in $(seq 1 "$T"); do send "log"; has "net self-test" && break; sleep 1; done
+expect "log lists messages from after boot" '^\[ *[0-9]*\.[0-9]*\]   net self-test'
+# On the console it would read "  net self-test" (after a redrawn prompt);
+# in log output it has a timestamp.
+if [[ "$(tr -d '\r' <"$LOG" | grep -a "net self-test   :" | grep -vac '^\[')" == 0 ]]; then pass "log messages stay off the console"; else fail "log messages stay off the console"; fi
+send "log 1"
+if [[ "$(echo "$OUT" | grep -ac '^\[')" == 1 ]]; then pass "log 1 shows one line"; else fail "log 1 shows one line"; fi
 
 echo "== commands"
 send "help"; expect "help lists the commands" "config set <setting> = <value>"
@@ -80,6 +94,15 @@ send "leases"; expect "leases answers" "no leases"
 # Line editing: "statsx" + 2 backspaces + "us" = "status".
 send $'statsx\x7f\x7fus'; expect "backspace edits the line" ", up "
 send "bogus"; expect "unknown command" "unknown command: bogus"
+send "status"; expect "console input through the interrupt" "^console  : rx interrupt"
+# A paste: several lines at once run one by one, output in order.
+n=$(count "rrouter> "); before=$(wc -c <"$LOG" | tr -d ' ')
+printf 'leases\rhelp\rbogus2\r' >&3
+wait_count $((n + 3)) "rrouter> " "$T" || true; sleep 0.2
+OUT=$(tail -c +$((before + 1)) "$LOG" | tr -d '\r')
+if echo "$OUT" | grep -a -e "no leases" -e "config set <setting>" -e "unknown command: bogus2" | tr '\n' '|' \
+  | grep -aq "no leases|.*config set <setting>.*|.*unknown command: bogus2"; then pass "pasted lines run in order"
+else fail "pasted lines run in order ($(echo "$OUT" | grep -a -e leases -e "config set" -e bogus2 | tr '\n' '|'))"; fi
 
 echo "== config edit"
 send "config show stored"; expect "show stored" "cache_entries = 4096"
@@ -90,6 +113,7 @@ send "config set dns.cache_entries = 1234"
 send "config diff"; expect "diff shows the change" "+ dns.cache_entries = 1234"
 if [[ "${CLI_TEST_SKIP_SAVE:-0}" != 1 ]]; then send "config save"; fi
 expect "save applies live" "saved and applied"
+send "log 10"; expect "the save is in the RAM log" "cli             : config saved"
 send "config show running"; expect "running config has the new value" "cache_entries = 1234"
 send "config diff"; expect "nothing pending after the save" "no pending edit"
 

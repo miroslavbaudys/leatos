@@ -33,10 +33,15 @@ pub unsafe fn discover(x0: usize, kernel_start: usize) -> Result<BootInfo, &'sta
         .find(|&(s, len)| kernel_start >= s && kernel_start < s + len)
         .ok_or("no memory region contains the kernel")?;
 
-    let console_base = fdt
-        .find_compatible(&["arm,pl011"])
+    let uart = fdt.find_compatible(&["arm,pl011"]);
+    let console_base = uart
         .and_then(|n| n.reg()?.next())
         .map(|r| r.starting_address as usize);
+    // `interrupts = <type num flags>` (GIC, 3 cells).
+    let console_irq = uart.and_then(|n| {
+        let mut cells = be_u32s(n.property("interrupts")?.value);
+        Some(gic_intid(cells.next()?, cells.next()?))
+    });
 
     let power = match fdt
         .find_node("/psci")
@@ -99,6 +104,7 @@ pub unsafe fn discover(x0: usize, kernel_start: usize) -> Result<BootInfo, &'sta
         cpu_ids,
         ram,
         console_base,
+        console_irq,
         power,
         irqchip,
         timer_intid,

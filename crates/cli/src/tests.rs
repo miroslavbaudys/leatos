@@ -89,6 +89,10 @@ fn commands() {
     assert_eq!(p(" status "), Command::Status);
     assert_eq!(p("leases"), Command::Leases);
     assert_eq!(p("reboot"), Command::Reboot);
+    assert_eq!(p("log"), Command::Log(LogArg::Last(LOG_DEFAULT_LINES)));
+    assert_eq!(p("log 5"), Command::Log(LogArg::Last(5)));
+    assert_eq!(p("log all"), Command::Log(LogArg::All));
+    assert_eq!(p("log clear"), Command::Log(LogArg::Clear));
     assert_eq!(p("config show"), Command::Show(Which::Running));
     assert_eq!(p("config show stored"), Command::Show(Which::Stored));
     assert_eq!(p("config show pending"), Command::Show(Which::Pending));
@@ -113,6 +117,9 @@ fn command_errors() {
         ("config set = 5", "usage: config set"),
         ("config unset", "usage: config unset"),
         ("config unset a b", "usage: config unset"),
+        ("log 0", "usage: log"),
+        ("log x", "usage: log"),
+        ("log 5 6", "usage: log"),
     ] {
         let e = parse(line).unwrap_err();
         assert!(e.starts_with(msg), "{line}: {e}");
