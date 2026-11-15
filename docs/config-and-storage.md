@@ -247,9 +247,16 @@ rollbacks.
   used at least every 12 h; `POST /api/logout` ends one. Scripts may keep
   using Basic auth: the last verified password is cached (HMAC under a
   random key), so PBKDF2 runs once. A wrong password blocks password
-  checks for a second. Salts and tokens come from `kernel/src/entropy.rs`
-  (SHA-256 pool fed with boot time, boot arguments, MAC addresses and
-  request arrival times; the apu4 has no hardware RNG, so best effort).
+  checks for a second. Salts and tokens come from `kernel/src/entropy.rs`:
+  a SHA-256 pool fed with boot time, boot arguments, MAC addresses,
+  request arrival times and, where it works, the AMD CCP's TRNG
+  (`drivers::ccp`, PCI 1022:1537 on the apu4). The TRNG's words are only
+  mixed in, never used alone, and health-checked: 0, 0xffffffff, repeats
+  and a startup test switch it off (Jaguar's RDRAND is not used: AMD
+  family 15h/16h hardware RNGs have returned constants). `/api/status`
+  `entropy` and the System page say which sources are in use. The apu4's
+  current firmware leaves the CCP disabled (queue mask 0); PC Engines
+  coreboot v4.16.0.1 or newer enables it.
 - Secrets that must be usable in clear (PPPoE password) are stored as
   is, like on other SOHO routers.
 - `GET /api/config` and the TOML export omit secret fields; an upload

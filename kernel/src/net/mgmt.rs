@@ -1088,7 +1088,7 @@ fn status_json(
         "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"vlan_drops\":{},\"conntrack\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
-         \"drop_reasons\":{{{}}},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
+         \"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
         json_str(env!("CARGO_PKG_VERSION")),
         json_str(env!("RROUTER_BUILD")),
         json_str(if cfg!(target_arch = "x86_64") {
@@ -1126,6 +1126,7 @@ fn status_json(
             ))
             .collect::<Vec<_>>()
             .join(","),
+        json_str(&crate::entropy::status()),
         mgmt.on_wan,
         mgmt.auth_configured(),
         json_str(mgmt.auth_source()),

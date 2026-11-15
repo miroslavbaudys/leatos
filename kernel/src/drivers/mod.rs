@@ -2,6 +2,8 @@
 //! stack uses for every NIC model, and [`Disk`], the one the store uses
 //! for every block device.
 
+#[allow(unsafe_code)] // the register window's constructor (read-only TRNG register)
+pub mod ccp;
 #[allow(unsafe_code)] // the register window's constructor
 pub mod i6300esb;
 #[allow(unsafe_code)] // register window + DMA buffer hand-off (slot ownership)

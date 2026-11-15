@@ -750,6 +750,7 @@ async function refresh() {
     ["Packet pool", `${n(st.pool.free)} free of ${n(st.pool.capacity)}` + (st.pool.alloc_failures ? `, ${n(st.pool.alloc_failures)} failures` : "")],
     ["Heap", `${n(Math.round(st.heap.used / 1024))} KiB used, ${n(Math.round(st.heap.free / 1048576))} MiB free`],
     ["Password", { "boot argument": "from the boot argument mgmt_pass= (wins over the configured one)", config: "configured (stored as a hash)", none: "none: changes are disabled (serial CLI: config set mgmt.password = \"…\")" }[st.mgmt.password] ?? "–"],
+    ["Randomness", esc(st.entropy ?? "–")],
     ["Upgrade", !st.mgmt.auth ? "disabled (no password)" : st.mgmt.upgrade ? (st.mgmt.persist ? "in RAM or stored" : "in RAM only (no store)") : "unavailable"]]);
   $("persist").disabled = !st.mgmt.persist;
   if (!st.mgmt.persist) $("persist").checked = false;
