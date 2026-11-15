@@ -88,6 +88,11 @@
   <section class="wide"><h2>Configuration</h2>
     <div class="row"><input id="pass" type="password" placeholder="admin password (mgmt_pass)" autocomplete="current-password"><span class="hint">needed to save, confirm, upgrade and reboot</span></div>
     <form id="cfg" class="cfg" autocomplete="off">
+      <fieldset><legend>WAN</legend>
+        <label>VLAN ID (empty = untagged)<input data-path="wan.vlan" data-opt type="number" min="1" max="4094" placeholder="e.g. 848"></label>
+        <label>VLAN priority (PCP 0–7)<input data-path="wan.vlan_pcp" data-opt type="number" min="0" max="7" placeholder="0"></label>
+        <p class="hint">Only if the ISP requires a tagged link. A change restarts the WAN DHCP client.</p>
+      </fieldset>
       <fieldset><legend>LAN</legend>
         <label>Router address / prefix<input data-path="lan.ipv4" placeholder="192.168.1.1/24"></label>
         <label>Local domain<input data-path="lan.domain" placeholder="lan"></label>
@@ -244,7 +249,7 @@ async function refresh() {
   $("up").textContent = "up " + dur(st.uptime_s);
   $("wanwarn").textContent = st.mgmt.on_wan ? "management open on WAN (mgmt=wan)" : "";
   $("ifs").innerHTML = "<tr><th>Port</th><th>NIC</th><th>MAC</th><th>Link</th><th>Address</th><th>RX pkts</th><th>TX pkts</th><th>Shaper</th><th>Qdisc sent / drops / ECN / backlog</th></tr>" +
-    st.interfaces.map((i) => `<tr><td>${esc(i.name)}</td><td>${esc(i.model)}</td><td>${esc(i.mac)}</td>` +
+    st.interfaces.map((i) => `<tr><td>${esc(i.name)}${i.vlan ? ` · VLAN ${i.vlan.id}` : ""}</td><td>${esc(i.model)}</td><td>${esc(i.mac)}</td>` +
       `<td>${i.link === null ? "–" : i.link.up ? `<span class="up">up ${i.link.mbps} Mbit/s${i.link.full_duplex ? "" : " half"}</span>` : '<span class="down">down</span>'}</td>` +
       `<td>${i.addrs.map(esc).join("<br>") || "–"}</td><td>${n(i.rx_packets)}</td><td>${n(i.tx_packets)}</td>` +
       `<td>${i.qdisc.shaped_kbit === null ? "unshaped" : n(i.qdisc.shaped_kbit) + " kbit/s"}</td>` +
@@ -252,7 +257,7 @@ async function refresh() {
   const l = st.wan_lease;
   $("wan").innerHTML = l ? rows([["Address", esc(l.addr)], ["Gateway", esc(l.gateway ?? "–")], ["DNS", l.dns.map(esc).join(", ") || "–"]]) : rows([["Lease", "none"]]);
   $("sys").innerHTML = rows([
-    ["Forwarded", n(st.forwarded)], ["Dropped", n(st.dropped)], ["Connections", n(st.conntrack)],
+    ["Forwarded", n(st.forwarded)], ["Dropped", n(st.dropped) + (st.vlan_drops ? ` (+ ${n(st.vlan_drops)} wrong VLAN tag)` : "")], ["Connections", n(st.conntrack)],
     ["Packet pool", `${n(st.pool.free)} free of ${n(st.pool.capacity)}` + (st.pool.alloc_failures ? `, ${n(st.pool.alloc_failures)} failures` : "")],
     ["Heap", `${n(Math.round(st.heap.used / 1024))} KiB used, ${n(Math.round(st.heap.free / 1048576))} MiB free`],
     ["Time (UTC)", st.time?.utc ? `${esc(st.time.utc.replace("T", " ").replace("Z", ""))} · NTP ${esc(st.time.server ?? "?")}, stratum ${st.time.stratum}, delay ${st.time.delay_ms} ms, polling every ${dur(st.time.poll_s)}`

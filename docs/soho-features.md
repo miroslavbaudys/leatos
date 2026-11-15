@@ -20,7 +20,9 @@ Pitfalls:
 - **MTU and MSS:** the WAN MTU is 1492, so **clamp TCP MSS** (1452 for IPv4)
   on SYNs crossing the WAN. Without clamping, some websites hang.
 - **ISP VLAN:** many ISPs require PPPoE on a VLAN tag (some Czech ISPs, for
-  example O2 with VLAN 848; verify per ISP). Make `wan.vlan` configurable.
+  example O2 with VLAN 848; verify per ISP). `wan.vlan` (+ `wan.vlan_pcp`)
+  is implemented (software tag in `net::datapath`; boot argument
+  `wan_vlan=`); PPPoE on top of it comes with M5.
 - RFC 4638 (MTU 1500 over PPPoE) is optional and only works if the ISP supports it.
 - Reconnect with exponential backoff. Send PADT on shutdown so the ISP
   doesn't keep a stale session. Handle forced daily disconnects.

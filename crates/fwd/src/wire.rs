@@ -11,6 +11,12 @@ use core::net::Ipv4Addr;
 pub const ETH_HDR: usize = 14;
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
 pub const ETHERTYPE_ARP: u16 = 0x0806;
+/// IEEE 802.1Q VLAN tag (C-tag).
+pub const ETHERTYPE_VLAN: u16 = 0x8100;
+/// IEEE 802.1ad service tag (QinQ outer tag).
+pub const ETHERTYPE_QINQ: u16 = 0x88a8;
+/// Bytes a VLAN tag adds to a frame (TPID + TCI).
+pub const VLAN_HDR: usize = 4;
 pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
@@ -56,6 +62,76 @@ pub fn set_macs(frame: &mut [u8], dst: Mac, src: Mac) {
 }
 pub fn is_multicast_mac(m: &Mac) -> bool {
     m[0] & 1 != 0
+}
+
+// ---- VLAN (802.1Q) ---------------------------------------------------------------
+
+/// Tag control information: priority (PCP, 0–7) and VLAN ID (0–4095).
+pub fn vlan_tci_of(vid: u16, pcp: u8) -> u16 {
+    (u16::from(pcp & 7) << 13) | (vid & 0x0fff)
+}
+
+/// The TCI of an 802.1Q-tagged frame, `None` if the frame is untagged
+/// (or too short for a tag).
+pub fn vlan_tci(frame: &[u8]) -> Option<u16> {
+    (frame.len() >= ETH_HDR + VLAN_HDR && get16(frame, 12) == ETHERTYPE_VLAN)
+        .then(|| get16(frame, 14))
+}
+
+/// What to do with a received frame, given the port's VLAN.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VlanRx {
+    /// Process it; `strip`: remove its tag first ([`vlan_remove`]).
+    Accept { strip: bool },
+    /// Wrong or missing tag, or stacked tags.
+    Drop,
+}
+
+/// Ingress rule for a port tagged with VLAN `want` (`None`: untagged).
+/// A tagged port accepts only frames with its VID; an untagged port
+/// accepts untagged and priority-tagged (VID 0) frames. Stacked tags
+/// (QinQ, or 802.1Q in 802.1Q) are dropped everywhere.
+pub fn vlan_rx(frame: &[u8], want: Option<u16>) -> VlanRx {
+    let Some(et) = ethertype(frame) else {
+        return VlanRx::Accept { strip: false }; // runt: the forwarder drops it
+    };
+    if et == ETHERTYPE_QINQ {
+        return VlanRx::Drop;
+    }
+    if et != ETHERTYPE_VLAN {
+        return match want {
+            None => VlanRx::Accept { strip: false },
+            Some(_) => VlanRx::Drop,
+        };
+    }
+    // MACs + tag + the inner EtherType.
+    if frame.len() < ETH_HDR + VLAN_HDR {
+        return VlanRx::Drop;
+    }
+    let (tci, inner) = (get16(frame, 14), get16(frame, 16));
+    if inner == ETHERTYPE_VLAN || inner == ETHERTYPE_QINQ {
+        return VlanRx::Drop;
+    }
+    if tci & 0x0fff == want.unwrap_or(0) {
+        VlanRx::Accept { strip: true }
+    } else {
+        VlanRx::Drop
+    }
+}
+
+/// Remove the tag in place: the MAC addresses move 4 bytes towards the
+/// payload. The frame then starts at `frame[VLAN_HDR..]`.
+pub fn vlan_remove(frame: &mut [u8]) {
+    frame.copy_within(0..12, VLAN_HDR);
+}
+
+/// Insert a tag in place. `buf` is the frame with [`VLAN_HDR`] free bytes
+/// in front of it (`buf[VLAN_HDR..]` = the untagged frame); afterwards
+/// `buf` is the tagged frame.
+pub fn vlan_insert(buf: &mut [u8], tci: u16) {
+    buf.copy_within(VLAN_HDR..VLAN_HDR + 12, 0);
+    put16(buf, 12, ETHERTYPE_VLAN);
+    put16(buf, 14, tci);
 }
 
 // ---- checksums ------------------------------------------------------------------
@@ -378,6 +454,7 @@ pub mod test_util {
 mod tests {
     use super::test_util::*;
     use super::*;
+    use alloc::vec::Vec;
 
     const A: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 100);
     const B: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 1);
@@ -422,5 +499,58 @@ mod tests {
         let a = parse_arp(&buf[..n]).unwrap();
         assert_eq!((a.op, a.sender_ip, a.target_ip), (1, A, B));
         assert_eq!(ethertype(&buf[..n]), Some(ETHERTYPE_ARP));
+    }
+
+    /// `frame` with a tag (TPID `tpid`, TCI `tci`) after the MAC addresses.
+    fn tagged(frame: &[u8], tpid: u16, tci: u16) -> Vec<u8> {
+        let mut t = frame[..12].to_vec();
+        t.extend_from_slice(&tpid.to_be_bytes());
+        t.extend_from_slice(&tci.to_be_bytes());
+        t.extend_from_slice(&frame[12..]);
+        t
+    }
+
+    #[test]
+    fn vlan_ingress_rules() {
+        let plain = ipv4_frame(A, B, PROTO_UDP, 64, &udp_datagram(A, B, 1, 2, b"x"));
+        let t848 = tagged(&plain, ETHERTYPE_VLAN, vlan_tci_of(848, 5));
+        let t849 = tagged(&plain, ETHERTYPE_VLAN, 849);
+        let prio = tagged(&plain, ETHERTYPE_VLAN, vlan_tci_of(0, 3));
+        let qinq = tagged(&t848, ETHERTYPE_QINQ, 100);
+        let double = tagged(&t848, ETHERTYPE_VLAN, 848);
+        let accept = VlanRx::Accept { strip: true };
+        let keep = VlanRx::Accept { strip: false };
+        // Tagged port (VID 848).
+        assert_eq!(vlan_rx(&t848, Some(848)), accept);
+        assert_eq!(vlan_rx(&t849, Some(848)), VlanRx::Drop);
+        assert_eq!(vlan_rx(&prio, Some(848)), VlanRx::Drop);
+        assert_eq!(vlan_rx(&plain, Some(848)), VlanRx::Drop);
+        assert_eq!(vlan_rx(&qinq, Some(848)), VlanRx::Drop);
+        assert_eq!(vlan_rx(&double, Some(848)), VlanRx::Drop);
+        // Untagged port.
+        assert_eq!(vlan_rx(&plain, None), keep);
+        assert_eq!(vlan_rx(&prio, None), accept);
+        assert_eq!(vlan_rx(&t848, None), VlanRx::Drop);
+        assert_eq!(vlan_rx(&qinq, None), VlanRx::Drop);
+        // Short frames never panic.
+        for n in 0..20 {
+            let _ = vlan_rx(&t848[..n], Some(848));
+            let _ = vlan_rx(&t848[..n], None);
+        }
+        assert_eq!(vlan_rx(&t848[..16], Some(848)), VlanRx::Drop);
+        assert_eq!(vlan_tci(&t848), Some(vlan_tci_of(848, 5)));
+        assert_eq!(vlan_tci(&plain), None);
+    }
+
+    #[test]
+    fn vlan_insert_remove_roundtrip() {
+        let plain = ipv4_frame(A, B, PROTO_TCP, 64, &tcp_segment(A, B, 1, 2, TCP_SYN, b""));
+        let tci = vlan_tci_of(848, 1);
+        let mut buf = alloc::vec![0u8; VLAN_HDR];
+        buf.extend_from_slice(&plain);
+        vlan_insert(&mut buf, tci);
+        assert_eq!(buf, tagged(&plain, ETHERTYPE_VLAN, tci));
+        vlan_remove(&mut buf);
+        assert_eq!(&buf[VLAN_HDR..], &plain[..]);
     }
 }

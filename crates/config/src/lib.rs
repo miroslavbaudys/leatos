@@ -27,6 +27,7 @@ mod validate;
 
 pub use edit::{diff_lines, flat_lines};
 pub use types::{Cidr, Mac};
+pub use validate::MAX_VLAN_ID;
 pub use validate::Issue;
 
 use alloc::string::{String, ToString};
@@ -44,6 +45,10 @@ pub const MAX_LEN: usize = 64 * 1024;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
+    /// Written only when set, so a config without WAN settings stays
+    /// readable by kernels from before `[wan]` (rollback of an upgrade).
+    #[serde(skip_serializing_if = "Wan::is_default")]
+    pub wan: Wan,
     pub lan: Lan,
     pub dns: Dns,
     pub shaping: Shaping,
@@ -55,6 +60,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             version: VERSION,
+            wan: Wan::default(),
             lan: Lan::default(),
             dns: Dns::default(),
             shaping: Shaping::default(),
@@ -215,6 +221,25 @@ impl Default for Shaping {
     }
 }
 
+/// The WAN link. Same settings as the boot arguments `wan_vlan=`,
+/// `wan_pcp=`.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Wan {
+    /// 802.1Q VLAN ID (1–4094) the ISP expects on the WAN; unset =
+    /// untagged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vlan: Option<u16>,
+    /// Priority (PCP, 0–7) in the tag of frames sent on the WAN VLAN.
+    pub vlan_pcp: u8,
+}
+
+impl Wan {
+    pub fn is_default(&self) -> bool {
+        *self == Wan::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Mgmt {
@@ -339,11 +364,14 @@ impl Config {
     }
 
     /// Changing from `old` to `self` could cut the user off from the web
-    /// interface (another LAN address or subnet, management settings): such
-    /// a save boots as a trial that must be confirmed
+    /// interface (another LAN address or subnet, management settings, the
+    /// WAN link while the interface is served on the WAN): such a save
+    /// boots as a trial that must be confirmed
     /// (docs/config-and-storage.md §6).
     pub fn needs_trial(&self, old: &Config) -> bool {
-        self.lan.ipv4 != old.lan.ipv4 || self.mgmt != old.mgmt
+        self.lan.ipv4 != old.lan.ipv4
+            || self.mgmt != old.mgmt
+            || (self.wan != old.wan && (self.mgmt.on_wan || old.mgmt.on_wan))
     }
 
     /// Cross-field checks; every problem found, not just the first.

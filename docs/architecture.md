@@ -63,6 +63,21 @@ watchdog backed by a hardware timer resets a stuck one (M8,
    shaper allows it, then encapsulates and transmits. The qdisc is the only
    place packets wait (no hidden queues).
 
+**VLAN tags (802.1Q, implemented for the WAN):** a port's tag
+(`PortShared::vlan`, from `[wan] vlan`) exists only at the two ends of the
+datapath. `Datapath::rx_batch` checks it first (`wire::vlan_rx`: on a
+tagged port only its VID, on an untagged port only untagged or
+priority-tagged frames; stacked tags never) and removes it (a 12-byte move
+of the MAC addresses into the headroom gap); everything else is dropped and
+counted (`VLAN_DROPS`, `vlan_drops` in `/api/status`). `flush_port` adds it
+again after the qdisc, right before the NIC, so this one place covers
+forwarded frames, ARP requests and smoltcp's frames. The forwarder, ARP
+snooping, neighbor tables, smoltcp and the qdiscs therefore only see
+untagged frames, and `crates/fwd` stays tag-free. Because the qdisc counts
+untagged lengths, the WAN shaper adds the tag's 4 bytes to its overhead
+(`config::Qos::port_rate`). LAN VLANs (M10) will reuse the same two
+hooks, with one interface per (port, VID).
+
 ### Forwarding plane
 smoltcp is a *host* stack: it has no forwarding, NAT, conntrack, bridging or
 PPPoE. The `fwd` crate provides these. It is the largest and riskiest part of

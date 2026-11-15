@@ -67,6 +67,9 @@ impl Config {
             def = def.and_then(|d| d.get(*p)).and_then(Value::as_table);
             cur = match cur.get_mut(*p) {
                 Some(Value::Table(x)) => x,
+                // A section left out of the canonical form because it is
+                // all defaults (`[wan]`): already unset.
+                None if optional_known(path) => return Ok(self.clone()),
                 _ => return Err(unknown()),
             };
         }
@@ -89,7 +92,13 @@ impl Config {
 fn optional_known(path: &str) -> bool {
     matches!(
         path,
-        "shaping.up_kbit" | "shaping.down_kbit" | "lan.dhcp.range" | "lan.dhcp.static"
+        "shaping.up_kbit"
+            | "shaping.down_kbit"
+            | "lan.dhcp.range"
+            | "lan.dhcp.static"
+            | "wan"
+            | "wan.vlan"
+            | "wan.vlan_pcp"
     )
 }
 

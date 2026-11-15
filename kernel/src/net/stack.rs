@@ -63,6 +63,11 @@ pub struct Port {
     irq: Option<(u32, &'static IrqEvent)>,
 }
 
+/// `vlan 848 (pcp 0)` for a port's tag.
+pub fn vlan_text(tci: u16) -> alloc::string::String {
+    alloc::format!("vlan {} (pcp {})", tci & 0x0fff, tci >> 13)
+}
+
 pub fn now() -> NetInstant {
     NetInstant::from_micros(timer::uptime().as_micros() as i64)
 }
@@ -135,7 +140,7 @@ pub fn bring_up(
             }
         };
         let mac = dev.mac();
-        let rate = qos.rate(if i == 0 { qos.up_kbit } else { qos.down_kbit });
+        let rate = qos.port_rate(i == 0);
         let ecn = if i == 0 { qos.ecn_up } else { qos.ecn_down };
         let aqm = Aqm::new(
             qos,
@@ -162,6 +167,7 @@ pub fn bring_up(
             qdisc: Mutex::new(qdisc),
             local_rx: Mutex::new(VecDeque::with_capacity(LOCAL_RX_MAX)),
             snap: Mutex::new(PortSnap::default()),
+            vlan: PortShared::vlan_atomic(if i == 0 { crate::config::wan_tci() } else { None }),
         };
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = timer::ticks();
@@ -205,6 +211,9 @@ pub fn bring_up(
         );
         if i == 1 {
             println!("  net {name}       : {} (static)", lan_cidr());
+        }
+        if let Some(tci) = port.vlan() {
+            println!("  net {name}       : {}", vlan_text(tci));
         }
         ports.push(Port {
             name,
@@ -270,7 +279,7 @@ pub type SharedDatapath = &'static Datapath;
 pub fn apply_qos(sh: &Shared, old: &crate::config::Qos, new: &crate::config::Qos) {
     for (i, port) in sh.ports.iter().enumerate() {
         let up = i == 0;
-        let rate = new.rate(if up { new.up_kbit } else { new.down_kbit });
+        let rate = new.port_rate(up);
         let (ecn_old, ecn_new) = if up {
             (old.ecn_up, new.ecn_up)
         } else {

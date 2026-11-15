@@ -21,7 +21,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::net::Ipv4Addr;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
 /// Bound on frames waiting for the router stack.
@@ -44,6 +44,29 @@ pub struct PortShared {
     /// Frames for the router stack, filled by the datapath.
     pub local_rx: Mutex<VecDeque<PacketBuf>>,
     pub snap: Mutex<PortSnap>,
+    /// 802.1Q tag of the port ([`Self::vlan`]): `VLAN_SET | TCI`, 0 =
+    /// untagged. The datapath removes it on RX and adds it on TX; svc
+    /// changes it when a saved config changes `[wan]`.
+    pub vlan: AtomicU32,
+}
+
+const VLAN_SET: u32 = 1 << 16;
+
+impl PortShared {
+    /// The port's tag (TCI), `None` = untagged.
+    pub fn vlan(&self) -> Option<u16> {
+        let v = self.vlan.load(Ordering::Relaxed);
+        (v & VLAN_SET != 0).then_some(v as u16)
+    }
+
+    pub fn set_vlan(&self, tci: Option<u16>) {
+        let v = tci.map_or(0, |t| VLAN_SET | u32::from(t));
+        self.vlan.store(v, Ordering::Relaxed);
+    }
+
+    pub fn vlan_atomic(tci: Option<u16>) -> AtomicU32 {
+        AtomicU32::new(tci.map_or(0, |t| VLAN_SET | u32::from(t)))
+    }
 }
 
 /// A WAN lease change for the forwarder: address/prefix and gateway.

@@ -1,12 +1,18 @@
 //! The forwarding datapath: drivers ↔ `fwd::Forwarder` ↔ qdiscs.
 //!
 //! ```text
-//!  NIC RX ─► shard_of ─► Forwarder shard ─┬─ Local ───► port.local_rx ─► smoltcp (router stack)
+//!  NIC RX ─► VLAN ─► shard_of ─► Forwarder shard ─┬─ Local ───► port.local_rx ─► smoltcp (router stack)
 //!                                         ├─ Forward ─► neigh[egress] ─► egress qdisc
 //!                                         └─ Drop
 //!  smoltcp TX ──────────────────────────────────────────────────────────► port qdisc
-//!  port qdisc ─► (pull, while the NIC has room) ─► NIC TX
+//!  port qdisc ─► (pull, while the NIC has room) ─► VLAN ─► NIC TX
 //! ```
+//!
+//! 802.1Q tags (the port's [`PortShared::vlan`]) exist only at the two
+//! ends: removed first thing on RX (`wire::vlan_rx`: wrong or missing tags
+//! are dropped and counted in [`VLAN_DROPS`]), added last on TX. The
+//! forwarder, ARP, the neighbor tables, smoltcp and the qdiscs see untagged
+//! frames; the WAN shaper adds the tag's 4 bytes (`config::Qos::port_rate`).
 //!
 //! The qdisc is the only place packets wait; the neighbor table holds at
 //! most 3 packets per unresolved next hop.
@@ -49,6 +55,8 @@ pub const LAN: IfIndex = 1;
 /// Counters for diagnostics (read by the self-test / stats output).
 pub static FORWARDED: AtomicU64 = AtomicU64::new(0);
 pub static DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Received frames with the wrong VLAN tag for their port (or none).
+pub static VLAN_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// Bookkeeping only the primary direction task touches.
 struct Hk {
@@ -56,6 +64,7 @@ struct Hk {
     next_stats: u64,
     last_dequeued: [u64; 2],
     ecn_reported: [u64; 2],
+    vlan_reported: u64,
 }
 
 pub struct Datapath {
@@ -159,6 +168,7 @@ impl Datapath {
                 next_stats: STATS_MS,
                 last_dequeued: [0; 2],
                 ecn_reported: [0; 2],
+                vlan_reported: 0,
             }),
             local_rx_drops: AtomicU64::new(0),
             ecn_seen: [const { [const { AtomicU64::new(0) }; 4] }; 2],
@@ -275,8 +285,17 @@ impl Datapath {
     pub fn rx_batch(&self, ifx: IfIndex, batch: &mut Vec<PacketBuf>, touched: &mut [bool; 2]) {
         let now = now_ms();
         let role = if ifx == WAN { Role::Wan } else { Role::Lan };
+        let want_vid = self.sh.ports[ifx as usize].vlan().map(|tci| tci & 0x0fff);
         let mut local = false;
         for mut pkt in batch.drain(..) {
+            match wire::vlan_rx(pkt.data(), want_vid) {
+                wire::VlanRx::Accept { strip: false } => {}
+                wire::VlanRx::Accept { strip: true } => pkt.pop_vlan(),
+                wire::VlanRx::Drop => {
+                    VLAN_DROPS.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
             if wire::ethertype(pkt.data()) == Some(wire::ETHERTYPE_ARP) {
                 self.snoop_arp(ifx, pkt.data(), now, touched);
             }
@@ -365,6 +384,14 @@ impl Datapath {
     /// One console line per port that sent traffic since the last report.
     fn print_qdisc_stats(&self) {
         let mut printed = false;
+        let vlan_drops = relaxed(&VLAN_DROPS);
+        let new_vlan_drops = {
+            let mut hk = self.hk.lock();
+            core::mem::replace(&mut hk.vlan_reported, vlan_drops) != vlan_drops
+        };
+        if new_vlan_drops {
+            crate::println!("  vlan            : {vlan_drops} frames dropped (wrong or missing tag)");
+        }
         for (i, nif) in self.sh.ports.iter().enumerate().take(2) {
             let e: [u64; 4] = core::array::from_fn(|c| relaxed(&self.ecn_seen[i][c]));
             let total: u64 = e.iter().sum();
@@ -456,10 +483,14 @@ pub fn flush_port(port: &PortShared, dev: &mut Nic) -> FlushResult {
     let now = now_ns();
     let mut r = FlushResult::default();
     dev.reap_tx();
+    let tag = port.vlan();
     let mut qdisc = port.qdisc.lock();
     while dev.can_transmit() {
         match qdisc.dequeue(now) {
-            Dequeue::Packet(p) => {
+            Dequeue::Packet(mut p) => {
+                if let Some(tci) = tag {
+                    p.push_vlan(tci);
+                }
                 if dev.transmit(p).is_err() {
                     DROPPED.fetch_add(1, Ordering::Relaxed);
                 }

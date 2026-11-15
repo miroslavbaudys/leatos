@@ -32,6 +32,13 @@
 #                        as a negative control, e.g. LAB_ROUTER_ARGS=ecn=1
 #                        with the default expectation.
 #
+#   LAB_VLAN=N           the ISP serves on 802.1Q VLAN N only and the router
+#                        gets wan_vlan=N (after LAB_ROUTER_ARGS, so those win).
+#                        Negative controls: LAB_ROUTER_ARGS=wan_vlan=0
+#                        (untagged) or another VLAN must fail (no WAN lease).
+#   LAB_BIG_PING=1472    ICMP data size of the client's full-size ping
+#                        (1473 = negative control: fragmented, dropped).
+#
 # SNTP: the router syncs from the ISP's ntpd (ntp=ntp.isp.example: resolved
 # through the router's DNS forwarder) and its clock must then be within 5 s
 # of the host's. Negative control: LAB_ROUTER_ARGS=ntp=203.0.113.99
@@ -47,6 +54,9 @@ ROUTER_ARGS=""
 ROUTER_ARGS="$ROUTER_ARGS ${LAB_ROUTER_ARGS:-}"
 # The first ntp= wins: only add the default when the caller sets none.
 [[ " ${LAB_ROUTER_ARGS:-} " == *" ntp="* ]] || ROUTER_ARGS="$ROUTER_ARGS ntp=ntp.isp.example"
+ISP_VLAN="${LAB_VLAN:-}"
+# The router takes the first occurrence of an argument: LAB_ROUTER_ARGS wins.
+[[ -n "$ISP_VLAN" ]] && ROUTER_ARGS="$ROUTER_ARGS wan_vlan=$ISP_VLAN"
 LAN_PORT="${LAB_LAN_PORT:-10003}"
 WAN_PORT="${LAB_WAN_PORT:-10005}"
 WORK=$(mktemp -d -t rrouter-lab)
@@ -64,11 +74,11 @@ lab_cpu_flags
 echo "== build"
 ARCH="${RROUTER_ARCH:-aarch64}"
 cargo build -q -p rrouter-kernel --target "$ARCH-unknown-none"
-ALPINE_DIR=$(scripts/lab/fetch-alpine.sh | tail -1)
+ALPINE_DIR=$(scripts/lab/fetch-alpine.sh ${ISP_VLAN:+modloop} | tail -1)
 ISP_INITRD=$(scripts/lab/build-initrd.sh isp | tail -1)
 CLIENT_INITRD=$(scripts/lab/build-initrd.sh client | tail -1)
 
-echo "== start ISP (203.0.113.1)"
+echo "== start ISP (203.0.113.1${ISP_VLAN:+ on VLAN $ISP_VLAN})"
 start_isp "$WAN_PORT" "$WORK/isp.log" || exit 1
 
 echo "== start rrouter${ROUTER_ARGS:+ ($ROUTER_ARGS)}"
@@ -82,7 +92,7 @@ wait_for "$WORK/router.log" "rrouter: boot ok" 40 || { echo "router did not boot
 PIDS+=($!)
 
 echo "== start client"
-linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT"
+linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=${LAB_BIG_PING:-1472}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so
@@ -102,7 +112,7 @@ if [[ "${LAB_VERBOSE:-0}" == "1" ]]; then
 fi
 
 echo "== router"
-tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|net wan0 .*lease|net ping|qos |qdisc |cpu  |ntp  |watchdog  " | sed 's/^/  /' || true
+tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|net wan0 .*(lease|vlan)|net ping|qos |qdisc |cpu  |ntp  |watchdog  |vlan  " | sed 's/^/  /' || true
 echo "== results"
 tr -d '\r' <"$WORK/client.log" | grep -E "^LAB (PASS|FAIL|INFO|WARN)|^    \|" | sed 's/^/  /' || true
 

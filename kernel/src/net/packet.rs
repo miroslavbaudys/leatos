@@ -147,6 +147,19 @@ impl PacketBuf {
         self.len -= n;
     }
 
+    /// Remove the 802.1Q tag of a tagged frame (checked by
+    /// `wire::vlan_rx`): the MAC addresses move 4 bytes, the rest stays.
+    pub fn pop_vlan(&mut self) {
+        fwd::wire::vlan_remove(self.data_mut());
+        self.pull_front(fwd::wire::VLAN_HDR);
+    }
+
+    /// Add an 802.1Q tag in front of the EtherType, from the headroom.
+    pub fn push_vlan(&mut self, tci: u16) {
+        self.push_front(fwd::wire::VLAN_HDR);
+        fwd::wire::vlan_insert(self.data_mut(), tci);
+    }
+
     /// The packet plus all tailroom after it (for in-place rewrites that may
     /// grow the packet, e.g. ICMP error generation).
     pub fn data_with_tailroom_mut(&mut self) -> &mut [u8] {

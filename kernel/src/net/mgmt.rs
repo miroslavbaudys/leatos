@@ -906,7 +906,7 @@ fn status_json(
     cpu.push_str("]}");
     let _ = write!(
         s,
-        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"conntrack\":{},\
+        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"vlan_drops\":{},\"conntrack\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"wan_lease\":{wan_lease},\
          \"mgmt\":{{\"on_wan\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
@@ -934,6 +934,7 @@ fn status_json(
         timer::uptime().as_secs(),
         datapath::FORWARDED.load(Ordering::Relaxed),
         datapath::DROPPED.load(Ordering::Relaxed),
+        datapath::VLAN_DROPS.load(Ordering::Relaxed),
         sh.conntrack(),
         mgmt.on_wan,
         mgmt.password.is_some() && (mgmt.staging.is_some() || mgmt.uploader.is_some()),
@@ -960,12 +961,16 @@ fn status_json(
             .iter()
             .map(|a| json_str(&format!("{a}")))
             .collect();
+        let vlan = nif
+            .vlan()
+            .map(|t| format!("{{\"id\":{},\"pcp\":{}}}", t & 0x0fff, t >> 13))
+            .unwrap_or_else(|| String::from("null"));
         let rate = rate
             .map(|r| format!("{}", r.bits_per_sec / 1000))
             .unwrap_or_else(|| String::from("null"));
         let _ = write!(
             s,
-            "{}{{\"name\":{},\"model\":{},\"mac\":{},\"link\":{link},\"addrs\":[{}],\
+            "{}{{\"name\":{},\"model\":{},\"mac\":{},\"vlan\":{vlan},\"link\":{link},\"addrs\":[{}],\
              \"rx_packets\":{},\"rx_bytes\":{},\"rx_no_buf\":{},\"tx_packets\":{},\"tx_bytes\":{},\
              \"qdisc\":{{\"shaped_kbit\":{rate},\"sent\":{},\"dropped\":{},\"ecn_marked\":{},\"backlog_packets\":{}}}}}",
             if n > 0 { "," } else { "" },

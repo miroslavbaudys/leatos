@@ -14,6 +14,8 @@ const MAX_LEASE_SECS: u32 = 30 * 86400;
 const MIN_RATE_KBIT: u64 = 64;
 const MAX_RATE_KBIT: u64 = 10_000_000;
 const MAX_OVERHEAD: u32 = 256;
+/// Highest usable 802.1Q VLAN ID (4095 is reserved, 0 means untagged).
+pub const MAX_VLAN_ID: u16 = 4094;
 /// Most SNTP servers accepted.
 pub const MAX_NTP_SERVERS: usize = 4;
 
@@ -46,6 +48,17 @@ pub(crate) fn check(c: &Config) -> Result<(), Vec<Issue>> {
     let mut x = Issues(Vec::new());
     if c.version != VERSION {
         x.add("version", format!("must be {VERSION}"));
+    }
+    if let Some(v) = c.wan.vlan
+        && !(1..=MAX_VLAN_ID).contains(&v)
+    {
+        x.add(
+            "wan.vlan",
+            format!("must be 1–{MAX_VLAN_ID} (omit it for an untagged WAN)"),
+        );
+    }
+    if c.wan.vlan_pcp > 7 {
+        x.add("wan.vlan_pcp", "must be 0–7");
     }
     lan(c, &mut x);
     if !(16..=65536).contains(&c.dns.cache_entries) {

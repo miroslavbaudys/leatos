@@ -231,9 +231,38 @@ fn lease_text(c: &LeaseChange) -> String {
 
 /// A saved config becomes the running one (no trial): shaping, DHCP and
 /// DNS are reconfigured in place.
-fn apply_saved(cfg: crate::config::schema::Config, source: String, sh: &Shared, services: Option<&mut LanServices>) {
+fn apply_saved(
+    cfg: crate::config::schema::Config,
+    source: String,
+    sh: &Shared,
+    wan: &mut HostIf,
+    services: Option<&mut LanServices>,
+) {
     let old = crate::config::qos();
+    let old_tag = crate::config::wan_tci();
     crate::config::apply(cfg, source);
+    let tag = crate::config::wan_tci();
+    if tag != old_tag
+        && let Some(port) = sh.ports.first()
+    {
+        port.set_vlan(tag);
+        println!(
+            "  net {}       : now {}, restarting DHCP",
+            port.name,
+            tag.map_or(String::from("untagged"), stack::vlan_text)
+        );
+        // The lease belongs to the old link: ask again on the new one
+        // (the `Deconfigured` event clears the WAN address meanwhile).
+        let dhcp = wan
+            .sockets
+            .iter()
+            .find(|(_, s)| matches!(s, smoltcp::socket::Socket::Dhcpv4(_)))
+            .map(|(h, _)| h);
+        if let Some(h) = dhcp {
+            wan.sockets.get_mut::<dhcpv4::Socket>(h).reset();
+        }
+    }
+    // Also picks up the WAN tag's 4 bytes of shaper overhead.
     stack::apply_qos(sh, &old, &crate::config::qos());
     if let Some(svc) = services {
         svc.reconfigure();
@@ -359,7 +388,7 @@ pub async fn run(
             let r = store_op(st, &op).await;
             if let (Ok((_, Some(source))), StoreOp::Save { flags: 0, cfg, .. }) = (&r, &op) {
                 // Saved without a trial: run it now, no reboot.
-                apply_saved((**cfg).clone(), source.clone(), sh, services.as_mut());
+                apply_saved((**cfg).clone(), source.clone(), sh, &mut hosts[0], services.as_mut());
             }
             mgmt.op_done(conn, &op, r.map(|(detail, _)| detail));
         }
@@ -392,7 +421,7 @@ pub async fn run(
                             if reboot {
                                 action = Some(crate::net::mgmt::Action::Reboot);
                             } else if let Some(source) = source {
-                                apply_saved(*cfg, source, sh, services.as_mut());
+                                apply_saved(*cfg, source, sh, &mut hosts[0], services.as_mut());
                             }
                             cli.save_done(Ok(detail), reboot);
                         }

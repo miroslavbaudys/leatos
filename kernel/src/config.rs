@@ -213,6 +213,8 @@ pub fn get() -> Arc<schema::Config> {
 pub fn overrides() -> Vec<(&'static str, &'static str)> {
     const MAP: &[(&str, &str)] = &[
         ("lan", "lan.ipv4"),
+        ("wan_vlan", "wan.vlan"),
+        ("wan_pcp", "wan.vlan_pcp"),
         ("shape_up", "shaping.up_kbit"),
         ("shape_down", "shaping.down_kbit"),
         ("shape_overhead", "shaping.overhead"),
@@ -262,6 +264,14 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
             .dhcp
             .statics
             .retain(|s| net.is_host(s.ip) && s.ip != net.addr);
+    }
+    match arg_u64(args, "wan_vlan") {
+        Some(0) => c.wan.vlan = None,
+        Some(v) if v <= u64::from(schema::MAX_VLAN_ID) => c.wan.vlan = Some(v as u16),
+        _ => {}
+    }
+    if let Some(p) = arg_u64(args, "wan_pcp").filter(|&p| p <= 7) {
+        c.wan.vlan_pcp = p as u8;
     }
     let s = &mut c.shaping;
     if let Some(r) = arg_u64(args, "shape_up") {
@@ -377,6 +387,16 @@ pub fn lan() -> Lan {
             })
             .collect(),
     }
+}
+
+/// The WAN's 802.1Q tag (TCI: VLAN ID + priority), `None` = untagged:
+/// `[wan] vlan` / `vlan_pcp`, boot arguments `wan_vlan=848` (`0` = off),
+/// `wan_pcp=0..7`.
+pub fn wan_tci() -> Option<u16> {
+    let c = get();
+    c.wan
+        .vlan
+        .map(|v| fwd::wire::vlan_tci_of(v, c.wan.vlan_pcp))
 }
 
 pub struct Dns {
@@ -499,6 +519,11 @@ pub struct Qos {
     pub ecn_down: bool,
     pub aqm: AqmKind,
     pub isolation: qdisc::cake::Isolation,
+    /// The WAN is VLAN-tagged: its frames are 4 bytes longer on the wire
+    /// than the qdisc sees (the tag is added after it, in
+    /// `datapath::flush_port`), so the upload shaper adds them to
+    /// `overhead`. `shape_overhead` must not include the tag.
+    pub wan_vlan: bool,
 }
 
 pub fn qos() -> Qos {
@@ -521,13 +546,22 @@ pub fn qos() -> Qos {
             schema::Isolation::DualDstHost => qdisc::cake::Isolation::DualDstHost,
             schema::Isolation::Flows => qdisc::cake::Isolation::Flows,
         },
+        wan_vlan: c.wan.vlan.is_some(),
     }
 }
 
 impl Qos {
-    pub fn rate(&self, kbit: Option<u64>) -> Option<qdisc::shaper::Rate> {
+    /// The shaper of a port: WAN egress (`up`) at the upload rate, LAN
+    /// egress at the download rate; unset = not shaped.
+    pub fn port_rate(&self, up: bool) -> Option<qdisc::shaper::Rate> {
+        let kbit = if up { self.up_kbit } else { self.down_kbit };
+        let tag = if up && self.wan_vlan {
+            fwd::wire::VLAN_HDR as u32
+        } else {
+            0
+        };
         kbit.map(|k| qdisc::shaper::Rate {
-            overhead: self.overhead,
+            overhead: self.overhead + tag,
             ..qdisc::shaper::Rate::kbit(k)
         })
     }

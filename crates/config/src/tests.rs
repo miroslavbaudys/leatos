@@ -41,6 +41,10 @@ on_wan = true
 
 [time]
 ntp_servers = ["ntp.isp.example", "192.0.2.123"]
+
+[wan]
+vlan = 848
+vlan_pcp = 1
 "#;
 
 fn ip(a: u8, b: u8, c: u8, d: u8) -> core::net::Ipv4Addr {
@@ -103,6 +107,13 @@ fn full_document_parses() {
     );
     assert!(c.mgmt.on_wan);
     assert_eq!(c.time.ntp_servers, ["ntp.isp.example", "192.0.2.123"]);
+    assert_eq!(
+        c.wan,
+        Wan {
+            vlan: Some(848),
+            vlan_pcp: 1
+        }
+    );
 }
 
 #[test]
@@ -393,6 +404,42 @@ fn shaping_and_dns_checks() {
 }
 
 #[test]
+fn wan_checks() {
+    assert_eq!(invalid(|c| c.wan.vlan = Some(0)), ["wan.vlan"]);
+    assert_eq!(invalid(|c| c.wan.vlan = Some(4095)), ["wan.vlan"]);
+    assert_eq!(invalid(|c| c.wan.vlan_pcp = 8), ["wan.vlan_pcp"]);
+    for v in [1, 848, MAX_VLAN_ID] {
+        let mut c = Config::default();
+        c.wan.vlan = Some(v);
+        assert_eq!(parse(&c.to_toml()).unwrap(), c);
+    }
+    assert!(parse("[wan]\nvlan = 70000\n").is_err(), "beyond u16");
+    assert!(parse("[wan]\nvlan_id = 848\n").is_err(), "unknown field");
+}
+
+#[test]
+fn untagged_wan_is_left_out_of_the_canonical_form() {
+    // Kernels from before `[wan]` reject unknown sections: a config that
+    // does not use it must not contain it (rollback after an upgrade).
+    let c = Config::default();
+    assert!(!c.to_toml().contains("[wan]"), "{}", c.to_toml());
+    assert!(!c.to_json().contains("\"wan\""), "{}", c.to_json());
+    assert!(!flat_lines(&c).iter().any(|l| l.starts_with("wan.")));
+    let t = c.with_assignment("wan.vlan = 848").unwrap();
+    assert_eq!(t.wan.vlan, Some(848));
+    assert!(t.to_toml().contains("[wan]"));
+    assert!(diff_lines(&c, &t).contains(&"+ wan.vlan = 848".to_string()));
+    // Unsetting it (or anything in an absent section) gives the default back.
+    assert_eq!(t.without("wan.vlan").unwrap(), c);
+    assert_eq!(t.without("wan").unwrap(), c);
+    assert_eq!(c.without("wan.vlan").unwrap(), c);
+    assert_eq!(c.without("wan.vlan_pcp").unwrap(), c);
+    assert!(c.without("wan.nosuch").is_err());
+    // The web form sends the section with defaults: still the same config.
+    assert_eq!(parse_json(r#"{"wan":{"vlan_pcp":0}}"#).unwrap(), c);
+}
+
+#[test]
 fn time_checks() {
     assert_eq!(
         invalid(|c| c.time.ntp_servers = vec!["a.example".into(); 5]),
@@ -520,6 +567,13 @@ fn trial_for_changes_that_can_lock_the_user_out() {
     let mut m = old.clone();
     m.mgmt.on_wan = true;
     assert!(m.needs_trial(&old));
+    // The WAN VLAN only matters for access while mgmt is on the WAN.
+    let mut w = old.clone();
+    w.wan.vlan = Some(848);
+    assert!(!w.needs_trial(&old));
+    let mut on = m.clone();
+    on.wan.vlan = Some(848);
+    assert!(on.needs_trial(&m));
 }
 
 #[test]

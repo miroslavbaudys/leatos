@@ -20,8 +20,11 @@ lab_cpu_flags() {
 }
 
 # Start an Alpine lab VM with one NIC on a UDP socket link (background; PID appended to PIDS).
+# VM_DISK: optional read-only raw disk for the VM (/dev/vda).
 linux_vm() { # initrd mac local_port remote_port log [extra kernel args]
-  qemu-system-aarch64 -machine virt "${CPU[@]}" -m 512M -nographic \
+  local disk=()
+  [[ -n "${VM_DISK:-}" ]] && disk=(-drive "file=$VM_DISK,if=virtio,format=raw,readonly=on")
+  qemu-system-aarch64 -machine virt "${CPU[@]}" -m 512M -nographic ${disk[@]+"${disk[@]}"} \
     -kernel "$ALPINE_DIR/vmlinuz-virt" -initrd "$1" \
     -append "console=ttyAMA0 rdinit=/init quiet loglevel=3 ${6:-}" \
     -netdev "dgram,id=n0,local.type=inet,local.host=127.0.0.1,local.port=$3,remote.type=inet,remote.host=127.0.0.1,remote.port=$4" \
@@ -30,8 +33,14 @@ linux_vm() { # initrd mac local_port remote_port log [extra kernel args]
 }
 
 # Start the ISP VM (203.0.113.1) on the router's WAN link and wait until ready.
+# With ISP_VLAN=N it serves on VLAN N (needs ALPINE_DIR from
+# `fetch-alpine.sh modloop`).
 start_isp() { # wan_port log
-  linux_vm "$ISP_INITRD" 52:54:00:00:01:01 $(($1 + 1)) "$1" "$2"
+  if [[ -n "${ISP_VLAN:-}" ]]; then
+    VM_DISK="$ALPINE_DIR/modloop-virt" linux_vm "$ISP_INITRD" 52:54:00:00:01:01 $(($1 + 1)) "$1" "$2" "lab_vlan=$ISP_VLAN"
+  else
+    linux_vm "$ISP_INITRD" 52:54:00:00:01:01 $(($1 + 1)) "$1" "$2"
+  fi
   wait_for "$2" "LAB isp ready" 30 || { echo "ISP did not start:"; cat "$2"; return 1; }
 }
 

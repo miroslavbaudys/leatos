@@ -4,6 +4,10 @@
 #   web server (httpd, with CGI helpers), DNS server (dnsd: isp.example),
 #   TCP byte sink on port 5001 (tcpsvd + wc), NTP server (busybox ntpd -l:
 #   without peers it serves its own clock, i.e. the host's, as stratum 1).
+# lab_vlan=N on the kernel command line (scripts/lab-test.sh LAB_VLAN=N):
+#   all of this on eth0.N, an 802.1Q-tagged link, as ISPs that require a
+#   VLAN; eth0 itself gets no address, so untagged frames reach nothing.
+#   8021q comes from modloop-virt, attached as the VM's disk.
 bb=/usr/bin/busybox
 bx=/usr/bin/busybox-extras
 export PATH=/usr/bin:/usr/sbin:/bin:/sbin
@@ -17,10 +21,24 @@ for m in failover net_failover virtio_net af_packet; do
 done
 $bb hostname isp
 $bb ifconfig lo 127.0.0.1 up
-$bb ifconfig eth0 203.0.113.1 netmask 255.255.255.0 up || { echo "LAB FAIL: isp has no eth0"; $bb poweroff -f; }
+IF=eth0
+vlan=$($bb sed -n 's/.*lab_vlan=\([0-9]*\).*/\1/p' /proc/cmdline)
+if [ -n "$vlan" ]; then
+  for m in virtio_blk squashfs; do modprobe "$m" 2>/dev/null || $bb modprobe "$m" 2>/dev/null; done
+  $bb mkdir -p /.modloop
+  $bb mount -t squashfs -o ro /dev/vda /.modloop || { echo "LAB FAIL: isp: no modloop disk"; $bb poweroff -f; }
+  $bb mount -o bind /.modloop/modules /lib/modules
+  $bb modprobe 8021q || { echo "LAB FAIL: isp: no 8021q module"; $bb poweroff -f; }
+  $bb ifconfig eth0 up
+  $bb ip link add link eth0 name "eth0.$vlan" type vlan id "$vlan" || { echo "LAB FAIL: isp: cannot add VLAN $vlan"; $bb poweroff -f; }
+  IF="eth0.$vlan"
+  echo "LAB isp: serving on VLAN $vlan ($IF)"
+fi
+$bb ifconfig "$IF" 203.0.113.1 netmask 255.255.255.0 up || { echo "LAB FAIL: isp has no $IF"; $bb poweroff -f; }
+$bb sed "s/^interface .*/interface $IF/" /etc/udhcpd.conf >/tmp/udhcpd.conf
 $bb touch /tmp/udhcpd.leases
 $bb dd if=/dev/zero of=/www/5mb bs=1024 count=5120 2>/dev/null   # shaper throughput test
-$bx udhcpd -S /etc/udhcpd.conf
+$bx udhcpd -S /tmp/udhcpd.conf
 $bx httpd -p 80 -h /www
 # Long single-connection upload sink (ECN/AQM check): replies with the byte count.
 $bx tcpsvd -E 0.0.0.0 5001 $bb wc -c &

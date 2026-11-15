@@ -123,6 +123,10 @@ before parsing.
 ```toml
 version = 1
 
+[wan]                    # optional; written only when set
+vlan = 848               # 802.1Q VLAN ID 1–4094; unset = untagged
+vlan_pcp = 0             # priority in the tag, 0–7
+
 [lan]
 ipv4 = "10.10.0.1/24"
 domain = "lan"
@@ -154,9 +158,13 @@ on_wan = false
 ```
 
 Schema version 1 (`crates/config`) has the sections above. Every field
-has a default, so a file may set only what it changes. Later versions add
-`[wan]`, `[firewall]` (rules, `[[firewall.forward]]`), VLANs and the
-management password hash, as the kernel implements them:
+has a default, so a file may set only what it changes. `[wan]` was added
+within version 1: it is left out of the canonical form while it holds only
+defaults, so a config that doesn't use it stays readable by older kernels
+(which reject unknown sections), e.g. after a persistent upgrade rolls
+back. Later versions add the rest of `[wan]` (mode, PPPoE), `[firewall]`
+(rules, `[[firewall.forward]]`), LAN VLANs and the management password
+hash, as the kernel implements them:
 
 ```toml
 [[firewall.forward]]     # later

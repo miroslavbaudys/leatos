@@ -2,6 +2,10 @@
 # Download the Alpine Linux aarch64 netboot kernel + initramfs and the
 # busybox-extras package (udhcpd, httpd, dnsd) used by the lab VMs, into
 # lab/cache/ (gitignored), and verify pinned SHA-256s.
+#   Usage: fetch-alpine.sh [modloop]   (prints the directory)
+# `modloop` also fetches modloop-virt, the squashfs with all of the
+# kernel's modules (8021q for the VLAN lab: scripts/lab-test.sh LAB_VLAN=N);
+# it must match ALPINE_KERNEL.
 # Alpine replaces netboot files on point releases: if a hash mismatches,
 # review the new release and update ALPINE_* and the hashes below.
 set -euo pipefail
@@ -19,11 +23,15 @@ sha_for() {
     vmlinuz-virt) echo cd05fed9e617b5df93dc62ece9b78c422fd94e9b432a2f7c092714b139d5eef4 ;;
     initramfs-virt) echo 189402937646965374ef2df5d37f76467135179ae168c88175df2fe3e264a0b0 ;;
     "$EXTRAS_APK") echo 64a2c66f44f2218473f56dd63355d988c3da0bdae6384d6d94d32587328ccea3 ;;
+    modloop-virt) echo a726889467d1d4fefa4ba1ed710f28b9db1fbd019ca3eba2d4c6c65b33536343 ;;
   esac
 }
 
+FILES="vmlinuz-virt initramfs-virt $EXTRAS_APK"
+[[ "${1:-}" == modloop ]] && FILES="$FILES modloop-virt"
+
 mkdir -p "$DIR"
-for f in vmlinuz-virt initramfs-virt "$EXTRAS_APK"; do
+for f in $FILES; do
   url="$BASE/$f"
   [[ "$f" == *.apk ]] && url="$PKGS/$f"
   if [[ ! -f "$DIR/$f" ]]; then
