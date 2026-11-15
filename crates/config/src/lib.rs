@@ -606,6 +606,17 @@ impl Pppoe {
 pub struct Mgmt {
     /// Also serve the web interface on the WAN. Development only.
     pub on_wan: bool,
+    /// The web interface's password (user `admin`) as a PBKDF2-SHA256
+    /// hash (`auth::hash_password`). A secret like the PPPoE password:
+    /// never shown, kept when a save leaves it out, an empty string
+    /// removes it. The boot argument `mgmt_pass=` wins over it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password_hash: Option<String>,
+    /// A new password in clear, only on the way in (the web form, the
+    /// CLI): the kernel replaces it with `password_hash` before the config
+    /// is stored or used ([`Config::hash_new_password`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 /// The wall clock: SNTP servers, asked over the WAN.
@@ -813,6 +824,9 @@ impl Config {
         if self.wan.mode == WanMode::Static || self.wan.static_ip.is_some() {
             add("wan.static".into(), "a static WAN address");
         }
+        if self.mgmt.password_hash.is_some() || self.mgmt.password.is_some() {
+            add("mgmt.password_hash".into(), "a management password in the config");
+        }
         out
     }
 
@@ -917,7 +931,7 @@ impl Config {
         };
         nets || zones
             || to_router(self) != to_router(old)
-            || self.mgmt != old.mgmt
+            || self.mgmt.on_wan != old.mgmt.on_wan
             || (self.wan != old.wan && (self.mgmt.on_wan || old.mgmt.on_wan))
     }
 
@@ -926,7 +940,26 @@ impl Config {
     pub fn without_secrets(&self) -> Config {
         let mut c = self.clone();
         c.wan.pppoe.password = None;
+        c.mgmt.password_hash = None;
+        c.mgmt.password = None;
         c
+    }
+
+    /// A new password in clear (`mgmt.password`) becomes `password_hash`
+    /// (fresh salt from `pool`); an empty `password_hash` means none.
+    /// Returns whether the password changed (sessions should end).
+    pub fn hash_new_password(&mut self, pool: &mut auth::Pool) -> bool {
+        let m = &mut self.mgmt;
+        if m.password_hash.as_deref() == Some("") {
+            m.password_hash = None;
+        }
+        match m.password.take() {
+            Some(p) => {
+                m.password_hash = Some(auth::hash_password(&p, pool, auth::ITERATIONS));
+                true
+            }
+            None => false,
+        }
     }
 
     /// A submitted config left secrets out (it came from
@@ -935,6 +968,9 @@ impl Config {
     pub fn keep_secrets(&mut self, current: &Config) {
         if self.wan.pppoe.password.is_none() {
             self.wan.pppoe.password = current.wan.pppoe.password.clone();
+        }
+        if self.mgmt.password_hash.is_none() {
+            self.mgmt.password_hash = current.mgmt.password_hash.clone();
         }
     }
 

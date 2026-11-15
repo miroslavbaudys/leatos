@@ -306,8 +306,11 @@ impl Cli {
                         println!("no changes");
                     }
                     for l in d {
-                        if l[2..].starts_with("wan.pppoe.password") {
-                            println!("{} wan.pppoe.password = (secret)", &l[..1]);
+                        if let Some(k) = ["wan.pppoe.password", "mgmt.password_hash", "mgmt.password"]
+                            .iter()
+                            .find(|k| l[2..].starts_with(*k))
+                        {
+                            println!("{} {k} = (secret)", &l[..1]);
                         } else {
                             println!("{l}");
                         }

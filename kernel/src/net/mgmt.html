@@ -76,7 +76,9 @@
   .ovr { color:var(--bad); font-size:12px; }
   .bad { outline:2px solid var(--bad); outline-offset:1px; }
   .changed { border-color:var(--warn); }
-  #statics input { width:100%; min-width:0; }
+  #statics input, .netstatics input { width:100%; min-width:0; }
+  .netstatics td { border:none; padding:2px 6px 2px 0; }
+  tr.netdetail > td { background:var(--bg); padding:8px 10px; }
   #statics td { border:none; padding:2px 6px 2px 0; }
   .msg { white-space:pre-wrap; }
   .msg.err { color:var(--bad); }
@@ -336,6 +338,9 @@
         <form class="card cfg" autocomplete="off"><h3>Management</h3>
           <label class="check"><input data-path="mgmt.on_wan" type="checkbox">Also on the WAN (development only)</label>
           <p class="hint">Boots as a trial: confirm afterwards, or the router reverts.</p>
+          <label>New password (user admin; 8–128 characters)<input id="newpass" data-x data-path="mgmt.password" type="password" autocomplete="new-password" placeholder="unchanged"></label>
+          <label>Repeat it<input id="newpass2" data-x type="password" autocomplete="new-password" placeholder="unchanged"></label>
+          <p class="hint" id="passhint">Stored as a salted PBKDF2 hash, never shown. Saving it ends every login session, this one too.</p>
         </form>
       </div>
     </div>
@@ -379,7 +384,7 @@
 <dialog id="logindlg">
   <form method="dialog" id="loginform">
     <h3>Log in</h3>
-    <p class="hint">User <b>admin</b>, the password from the boot argument <code>mgmt_pass=</code>. Kept for this browser tab only.</p>
+    <p class="hint">User <b>admin</b>: the configured password, or the boot argument <code>mgmt_pass=</code>. The tab keeps a session token, not the password.</p>
     <label>Password<input id="loginpass" type="password" autocomplete="current-password"></label>
     <div id="loginmsg" class="msg err"></div>
     <div class="row"><button id="loginok" value="ok">Log in</button><button type="button" class="plain" id="logincancel">Cancel</button></div>
@@ -442,16 +447,19 @@ function ask(title, text, ok = "OK", danger = false) {
   });
 }
 
-// ================= Login (HTTP Basic, password kept per tab) =================
-let pass = store.get("rrouter-pass");
+// ================= Login: a session token per tab =================
+// POST /api/login with the password (HTTP Basic, once) returns a token;
+// every later request sends "Authorization: Bearer <token>", so the
+// password is not kept and the router checks its hash once per login.
+let token = store.get("rrouter-token");
 let authAvailable = true;
 const b64 = (s) => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
-const authHeaders = (p = pass) => ({ "X-Rrouter-UI": "1", ...(p ? { Authorization: "Basic " + b64("admin:" + p) } : {}) });
-function setPass(p) { pass = p; store.set("rrouter-pass", p); showLogin(); }
+const authHeaders = () => ({ "X-Rrouter-UI": "1", ...(token ? { Authorization: "Bearer " + token } : {}) });
+function setToken(t) { token = t; store.set("rrouter-token", t); showLogin(); }
 function showLogin() {
-  $("loginbtn").textContent = !authAvailable ? "Read-only" : pass ? "Log out" : "Log in";
+  $("loginbtn").textContent = !authAvailable ? "Read-only" : token ? "Log out" : "Log in";
   $("loginbtn").disabled = !authAvailable;
-  $("loginbtn").title = authAvailable ? "" : "Changes are disabled: boot with mgmt_pass=<password>";
+  $("loginbtn").title = authAvailable ? "" : "Changes are disabled: no password yet (serial CLI: config set mgmt.password = \"…\", or boot with mgmt_pass=)";
 }
 let loginWaiter = null;
 function openLogin(why = "") {
@@ -466,25 +474,32 @@ $("loginform").onsubmit = async (ev) => {
   const p = $("loginpass").value;
   $("loginmsg").textContent = "…";
   try {
-    const r = await fetch("/api/login", { method: "POST", headers: authHeaders(p) });
-    if (r.ok) { setPass(p); closeLogin(true); return; }
+    const r = await fetch("/api/login", { method: "POST", headers: { "X-Rrouter-UI": "1", Authorization: "Basic " + b64("admin:" + p) } });
     const j = await r.json().catch(() => ({}));
+    if (r.ok && j.token) { setToken(j.token); closeLogin(true); return; }
     $("loginmsg").textContent = r.status === 401 ? "Wrong password." : (j.error ?? `Refused (${r.status})`);
   } catch (e) { $("loginmsg").textContent = "Request failed: " + e; }
 };
 $("logincancel").onclick = () => closeLogin(false);
 $("logindlg").oncancel = () => closeLogin(false);
-$("loginbtn").onclick = () => { if (pass) { setPass(null); if (page === "logs") loadLog(); } else openLogin(); };
+$("loginbtn").onclick = async () => {
+  if (token) {
+    try { await fetch("/api/logout", { method: "POST", headers: authHeaders() }); } catch {}
+    setToken(null);
+    if (page === "logs") loadLog();
+  } else openLogin();
+};
 async function ensureLogin() {
   if (!authAvailable) return false;
-  return pass ? true : openLogin();
+  return token ? true : openLogin();
 }
-// One API call with the stored credentials; a 401 asks to log in again.
+// One API call with the session; a 401 (expired, or the password changed)
+// asks to log in again.
 async function api(method, path, { body, type, headers = {} } = {}) {
   const r = await fetch(path, { method, cache: "no-store", body,
     headers: { ...authHeaders(), ...(type ? { "Content-Type": type } : {}), ...headers } });
   const j = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
-  if (r.status === 401) { setPass(null); }
+  if (r.status === 401) { setToken(null); }
   return { r, j };
 }
 
@@ -734,7 +749,8 @@ async function refresh() {
         (st.watchdog.last_reset_by_watchdog ? ' · <span class="warn">last reset by the watchdog</span>' : "")],
     ["Packet pool", `${n(st.pool.free)} free of ${n(st.pool.capacity)}` + (st.pool.alloc_failures ? `, ${n(st.pool.alloc_failures)} failures` : "")],
     ["Heap", `${n(Math.round(st.heap.used / 1024))} KiB used, ${n(Math.round(st.heap.free / 1048576))} MiB free`],
-    ["Upgrade", !st.mgmt.auth ? "disabled (boot with mgmt_pass=…)" : st.mgmt.upgrade ? (st.mgmt.persist ? "in RAM or stored" : "in RAM only (no store)") : "unavailable"]]);
+    ["Password", { "boot argument": "from the boot argument mgmt_pass= (wins over the configured one)", config: "configured (stored as a hash)", none: "none: changes are disabled (serial CLI: config set mgmt.password = \"…\")" }[st.mgmt.password] ?? "–"],
+    ["Upgrade", !st.mgmt.auth ? "disabled (no password)" : st.mgmt.upgrade ? (st.mgmt.persist ? "in RAM or stored" : "in RAM only (no store)") : "unavailable"]]);
   $("persist").disabled = !st.mgmt.persist;
   if (!st.mgmt.persist) $("persist").checked = false;
 
@@ -765,12 +781,12 @@ async function refresh() {
 function showLeases() {
   if (!st) return;
   const q = $("clientq").value.trim().toLowerCase();
-  const reserved = new Set(readStatics().map((s) => (s.mac ?? "").toLowerCase()));
+  const reserved = new Set([...readStatics(), ...(readNets() ?? []).flatMap((x) => x.dhcp?.static ?? [])].map((s) => (s.mac ?? "").toLowerCase()));
   const ls = st.dhcp_leases.filter((d) => !q || [d.hostname, d.ip, d.mac].some((v) => (v ?? "").toLowerCase().includes(q)));
   $("leases").innerHTML = st.dhcp_leases.length
     ? "<tr><th>Name</th><th>IP address</th><th>Network</th><th>MAC</th><th>State</th><th>Expires in</th><th></th></tr>" + ls.map((d) =>
         `<tr><td>${esc(d.hostname ?? "–")}</td><td>${esc(d.ip)}</td><td>${esc(d.network ?? "")}</td><td>${esc(d.mac)}</td><td>${d.bound ? "bound" : "offered"}</td><td>${dur(d.expires_in_s)}</td>` +
-        `<td>${reserved.has(d.mac.toLowerCase()) ? '<span class="pill">reserved</span>' : (d.network ?? lanName) === lanName ? `<button class="plain" data-reserve="${esc(d.mac)}">Reserve</button>` : ""}</td></tr>`).join("")
+        `<td>${reserved.has(d.mac.toLowerCase()) ? '<span class="pill">reserved</span>' : `<button class="plain" data-reserve="${esc(d.mac)}">Reserve</button>`}</td></tr>`).join("")
     : rows([["Leases", "none"]]);
 }
 $("clientq").oninput = showLeases;
@@ -778,10 +794,24 @@ $("leases").onclick = (ev) => {
   const mac = ev.target.dataset?.reserve;
   const d = mac && st.dhcp_leases.find((x) => x.mac === mac);
   if (!d) return;
-  staticRow({ mac: d.mac, ip: d.ip, hostname: d.hostname ?? "" });
-  updatePending(); showLeases();
-  location.hash = "#/lan";
-  $("reservations").scrollIntoView({ block: "start" });
+  const lease = { mac: d.mac, ip: d.ip, hostname: d.hostname ?? "" };
+  // The first network's reservations are on the LAN page; the others' in
+  // their DHCP panel on the Networks page.
+  const row = (d.network ?? lanName) === lanName ? null
+    : netMainRows().find((tr) => tr.querySelector('[data-key="name"]').value.trim() === d.network);
+  if (row) {
+    const det = row.nextElementSibling;
+    netStaticRow(det.querySelector(".netstatics"), lease);
+    det.hidden = false;
+    netPaths(); updatePending(); showLeases();
+    location.hash = "#/networks";
+    det.scrollIntoView({ block: "center" });
+  } else {
+    staticRow(lease);
+    updatePending(); showLeases();
+    location.hash = "#/lan";
+    $("reservations").scrollIntoView({ block: "start" });
+  }
 };
 
 // ================= Configuration: forms ↔ /api/config.json =================
@@ -812,7 +842,9 @@ const setp = (o, path, v) => {
 let lanName = "lan";
 const lanPath = (rest) => `network.${lanName}.${rest}`;
 const cfgFields = () => [...document.querySelectorAll("form.cfg [data-path]")];
-const fields = () => cfgFields().filter((e) => !e.hasAttribute("data-x") && !e.dataset.key);
+// Inputs read generically by their data-path; list editors (statics,
+// network rows and DHCP panels, zones, rules, forwards) read their own.
+const fields = () => cfgFields().filter((e) => !e.hasAttribute("data-x") && !e.dataset.key && !e.dataset.dkey && !e.dataset.skey);
 
 function staticRow(s = {}) {
   if (!$("statics").rows.length) staticHead();
@@ -891,6 +923,12 @@ function readForm() {
   setp(c, "time.ntp_servers", $("ntp").value.split(",").map((x) => x.trim()).filter((x) => x));
   const sts = readStatics();
   setp(c, lanPath("dhcp.static"), sts.length ? sts : undefined);
+  // A new password only when both fields agree.
+  const np = $("newpass").value, np2 = $("newpass2").value;
+  if (np && np === np2) setp(c, "mgmt.password", np); else setp(c, "mgmt.password", undefined);
+  $("passhint").textContent = np && np !== np2 ? "The two passwords differ."
+    : "Stored as a salted PBKDF2 hash, never shown. Saving it ends every login session, this one too.";
+  $("passhint").className = "hint" + (np && np !== np2 ? " warn" : "");
   return c;
 }
 // ---- Networks (docs/config-v2.md): the extra networks, one row each. The
@@ -931,23 +969,60 @@ function netRow(n = {}, i = netOrig.length) {
   if (n.zone && !zoneNames().includes(n.zone)) zone.append(el("option", { value: n.zone, textContent: n.zone }));
   zone.value = n.zone ?? "lan";
   const dhcp = el("input", { type: "checkbox", checked: n.dhcp?.enabled !== false, dataset: { key: "dhcp" } });
-  const rm = el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); netPaths(); updatePending(); } });
+  const detail = netDetail(n);
+  const more = el("button", { type: "button", className: "plain", textContent: "DHCP…", title: "Pool, lease time, reservations",
+    onclick: () => { detail.hidden = !detail.hidden; } });
+  const rm = el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); detail.remove(); netPaths(); updatePending(); showLeases(); } });
   tr.append(inp("name", { placeholder: "guest", size: 10 }), inp("vlan", { type: "number", min: 1, max: 4094, placeholder: "20", size: 5 }),
     inp("ipv4", { placeholder: "10.20.0.1/24", size: 15 }), el("td", {}, [zone]), el("td", {}, [dhcp]),
-    el("td", { className: "num", dataset: { leases: n.name ?? "" } }), el("td", {}, [rm]));
-  $("nets").append(tr);
+    el("td", { className: "num", dataset: { leases: n.name ?? "" } }), el("td", {}, [more, rm]));
+  $("nets").append(tr, detail);
   netPaths();
 }
-// Validation paths of the row inputs follow the names typed.
+// A network's DHCP settings: pool, lease time, reservations (a row under
+// the network's row, hidden until "DHCP…").
+function netDetail(n) {
+  const d = n.dhcp ?? {};
+  const field = (dkey, label, v, props = {}) => el("label", {}, [label, el("input", { value: v ?? "", ...props, dataset: { dkey } })]);
+  const statics = el("table", { className: "netstatics" });
+  const head = el("tr", {}, ["MAC", "IP address", "Name", ""].map((h) => el("th", { textContent: h })));
+  statics.append(head);
+  const box = el("td", { colSpan: 7 }, [
+    el("div", { className: "form" }, [
+      field("lo", "Pool, first address (empty = automatic)", d.range?.[0], { placeholder: "automatic" }),
+      field("hi", "Pool, last address", d.range?.[1], { placeholder: "automatic" }),
+      field("lease", "Lease time, hours", d.lease_secs === undefined ? "" : +(d.lease_secs / 3600).toFixed(4), { type: "number", min: 0.02, step: "any", placeholder: "12" })]),
+    el("div", { className: "hint", textContent: "Reservations: always the same address for a device." }), statics,
+    el("div", { className: "row" }, [el("button", { type: "button", className: "plain", textContent: "Add reservation",
+      onclick: () => { netStaticRow(statics, {}); netPaths(); updatePending(); } })])]);
+  const tr = el("tr", { className: "netdetail", hidden: true }, [box]);
+  (d.static ?? []).forEach((x) => netStaticRow(statics, x));
+  return tr;
+}
+function netStaticRow(table, s) {
+  const tr = el("tr");
+  for (const [k, ph] of [["mac", "52:54:00:12:34:56"], ["ip", "10.20.0.10"], ["hostname", "name (optional)"]]) {
+    tr.append(el("td", {}, [el("input", { value: s[k] ?? "", placeholder: ph, dataset: { skey: k } })]));
+  }
+  tr.append(el("td", {}, [el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); netPaths(); updatePending(); showLeases(); } })]));
+  table.append(tr);
+}
+const netMainRows = () => [...$("nets").rows].slice(2).filter((tr) => tr.dataset.orig !== undefined);
 function netPaths() {
-  for (const tr of [...$("nets").rows].slice(2)) {
+  for (const tr of netMainRows()) {
     const name = tr.querySelector('[data-key="name"]').value.trim();
     for (const e of tr.querySelectorAll("[data-key]")) e.dataset.path = `network.${name}.${e.dataset.key === "dhcp" ? "dhcp.enabled" : e.dataset.key}`;
+    const det = tr.nextElementSibling;
+    if (!det?.classList.contains("netdetail")) continue;
+    const dp = { lo: "dhcp.range[0]", hi: "dhcp.range[1]", lease: "dhcp.lease_secs" };
+    for (const e of det.querySelectorAll("[data-dkey]")) e.dataset.path = `network.${name}.${dp[e.dataset.dkey]}`;
+    [...det.querySelectorAll(".netstatics tr")].slice(1).forEach((r, i) =>
+      r.querySelectorAll("[data-skey]").forEach((e) => { e.dataset.path = `network.${name}.dhcp.static[${i}].${e.dataset.skey}`; }));
   }
 }
 function readNets() {
   if (!$("nets").rows.length) return null;
-  return [...$("nets").rows].slice(2).map((tr) => {
+  return netMainRows().map((tr) => {
     const o = structuredClone(netOrig[Number(tr.dataset.orig)] ?? {});
     const v = (k) => tr.querySelector(`[data-key="${k}"]`);
     o.name = v("name").value.trim();
@@ -957,6 +1032,18 @@ function readNets() {
     o.zone = v("zone").value;
     o.dhcp = { ...(o.dhcp ?? {}) };
     if (v("dhcp").checked) delete o.dhcp.enabled; else o.dhcp.enabled = false;
+    const det = tr.nextElementSibling;
+    if (det?.classList.contains("netdetail")) {
+      const dv = (k) => det.querySelector(`[data-dkey="${k}"]`).value.trim();
+      if (dv("lo") || dv("hi")) o.dhcp.range = [dv("lo"), dv("hi")]; else delete o.dhcp.range;
+      if (dv("lease")) o.dhcp.lease_secs = Math.round(Number(dv("lease")) * 3600);
+      const sts = [...det.querySelectorAll(".netstatics tr")].slice(1).map((r) => {
+        const x = {};
+        r.querySelectorAll("[data-skey]").forEach((e) => { if (e.value.trim()) x[e.dataset.skey] = e.value.trim(); });
+        return x;
+      }).filter((x) => Object.keys(x).length);
+      if (sts.length) o.dhcp.static = sts; else delete o.dhcp.static;
+    }
     if (!Object.keys(o.dhcp).length) delete o.dhcp;
     return o;
   });
@@ -1180,7 +1267,7 @@ function changes() {
   const a = flatten(cfgBase), b = flatten(readForm()), out = [];
   for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
     if (k === "version" || a[k] === b[k]) continue;
-    out.push({ path: k, old: a[k], new: k === "wan.pppoe.password" ? "(new password)" : b[k] });
+    out.push({ path: k, old: a[k], new: k === "wan.pppoe.password" || k === "mgmt.password" ? "(new password)" : b[k] });
   }
   return out;
 }
@@ -1222,6 +1309,8 @@ function markIssues(issues) {
       if (x.path === p || x.path.startsWith(p + ".") || x.path.startsWith(p + "[") || p.startsWith(x.path + ".")) e.classList.add("bad");
     }
   }
+  // A problem in a network's DHCP panel: show the panel.
+  for (const tr of document.querySelectorAll("tr.netdetail")) if (tr.querySelector(".bad")) tr.hidden = false;
 }
 async function loadConfig() {
   try {
@@ -1270,7 +1359,9 @@ async function postConfig(body, type) {
       `open http://${j.lan}/ (renew your DHCP lease if needed) and press Confirm within ${j.confirm_within_s} s, ` +
       "or the router goes back to the previous configuration.");
   } else {
-    pSay(`${j.detail[0].toUpperCase() + j.detail.slice(1)}: in effect now.`);
+    const pwChanged = changes().some((c) => c.path === "mgmt.password");
+    pSay(`${j.detail[0].toUpperCase() + j.detail.slice(1)}: in effect now.` + (pwChanged ? " The password changed: log in again with the new one." : ""));
+    if (pwChanged) { setToken(null); $("newpass").value = ""; $("newpass2").value = ""; }
     setTimeout(() => { if (!changes().length) pSay(""); }, 6000);
     await loadConfig(); refresh();
   }
@@ -1366,7 +1457,7 @@ async function loadLog() {
   clearTimeout(logTimer);
   if (page !== "logs") return;
   if (!authAvailable) { $("loginfo").textContent = "The log needs a login, and logins are disabled (boot with mgmt_pass=…)."; return; }
-  if (!pass) {
+  if (!token) {
     $("loginfo").innerHTML = 'Log in to read the log. <button class="plain" id="loglogin">Log in</button>';
     $("loglogin").onclick = async () => { if (await openLogin()) loadLog(); };
     return;

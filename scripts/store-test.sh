@@ -257,5 +257,40 @@ check "rule + port forward added -> 200, applied live" "200 true false" "$(code 
 check "  ... in effect (status)" "no-smtp 0 nas 0 2" "$(status rules.0.name) $(status rules.0.hits) $(status forwards.0.name) $(status forwards.0.hits) $(count "$CFG_LINE")"
 stop
 
+echo "== management password in the config, login sessions"
+"$RRSTORE" create "$IMG" --mib "$STORE_MIB" >/dev/null
+printf 'version = 2\n\n[mgmt]\non_wan = true\npassword_hash = "%s"\n' "$("$RRSTORE" hash 's3cret-pass')" >"$WORK/pw.toml"
+"$RRSTORE" put "$IMG" config "$WORK/pw.toml" >/dev/null
+boot pw "" QEMU_NET=user QEMU_WAN_HOSTFWD="tcp:127.0.0.1:$PORT-:80"   # no mgmt_pass=
+up 1 || true
+check "password from the config" "true config" "$(status mgmt.auth) $(status mgmt.password)"
+check "wrong password -> 401" 401 "$(code -u admin:wrong -X POST "$URL/api/login")"
+check "  ... the right one at once -> 429 (one try per second)" 429 "$(code -u admin:s3cret-pass -X POST "$URL/api/login")"
+sleep 1.2
+check "right password -> 200" 200 "$(code -u admin:s3cret-pass -X POST "$URL/api/login")"
+TOKEN="$(json "$WORK/resp" token)"
+check "  ... with a 32-digit token" 32 "${#TOKEN}"
+curl -s -m 10 -o "$WORK/cfg.json" "$URL/api/config.json" || true
+check "the hash is never shown" 0 "$(grep -c pbkdf2 "$WORK/cfg.json" || true)"
+check "save with the token -> 200" 200 "$(code -H "Authorization: Bearer $TOKEN" -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/cfg.json" "$URL/api/config")"
+check "  ... the hash is kept" 1 "$("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c '^password_hash = "pbkdf2-sha256' || true)"
+check "a made-up token -> 401" 401 "$(code -H "Authorization: Bearer 0123456789abcdef0123456789abcdef" -X POST "$URL/api/reboot")"
+python3 -I -c 'import json,sys
+c=json.load(open(sys.argv[1])); c["mgmt"]["password"]="n3w-password"
+open(sys.argv[2],"w").write(json.dumps(c))' "$WORK/cfg.json" "$WORK/pw.json"
+check "password change -> 200, live" "200 true" "$(code -H "Authorization: Bearer $TOKEN" -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/pw.json" "$URL/api/config") $(json "$WORK/resp" applied)"
+check "  ... the session ends" 401 "$(code -H "Authorization: Bearer $TOKEN" -X POST "$URL/api/login")"
+check "  ... stored as a hash only" "1 0" "$("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c '^password_hash = "pbkdf2-sha256' || true) $("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c 'n3w-password' || true)"
+check "  ... the new password works" 200 "$(code -u admin:n3w-password -X POST "$URL/api/login")"
+TOKEN="$(json "$WORK/resp" token)"
+check "  ... the old one not" 401 "$(code -u admin:s3cret-pass -X POST "$URL/api/login")"
+check "logout ends the session" "200 401" "$(code -H "Authorization: Bearer $TOKEN" -X POST "$URL/api/logout") $(code -H "Authorization: Bearer $TOKEN" -X POST "$URL/api/login")"
+stop
+"$RRSTORE" create "$IMG" --mib "$STORE_MIB" >/dev/null
+boot nopw "mgmt=wan" QEMU_NET=user QEMU_WAN_HOSTFWD="tcp:127.0.0.1:$PORT-:80"
+up 1 || true
+check "control, no password anywhere: login refused" "403 false none" "$(code -u admin:anything -X POST "$URL/api/login") $(status mgmt.auth) $(status mgmt.password)"
+stop
+
 WHAT="$ARCH, ${QEMU_STORE_BUS:-virtio}, $STORE_MIB MiB"
 if [[ "$FAILED" == 0 ]]; then echo "STORE TEST ($WHAT): PASS"; else echo "STORE TEST ($WHAT): FAIL"; exit 1; fi

@@ -1,0 +1,14 @@
+[package]
+name = "auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Management authentication: PBKDF2-SHA256 password hashes, an entropy pool, session tokens."
+
+[dependencies]
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }  # no SIMD: the kernel targets are soft-float
+hmac = { version = "0.12", default-features = false }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+
+[lints]
+workspace = true

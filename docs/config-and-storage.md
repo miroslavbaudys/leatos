@@ -231,7 +231,25 @@ load and writes the new version only on the next save. See §4 for
 rollbacks.
 
 ### Secrets
-- The management password is stored as a PBKDF2-SHA256 hash.
+- The management password is stored as a PBKDF2-SHA256 hash
+  (`[mgmt] password_hash`, `crates/auth`: `pbkdf2-sha256$<iterations>$<salt
+  hex>$<hash hex>`, 20000 iterations, about 0.1 s on the apu4). It is set
+  as `mgmt.password` in clear (web form: System page; serial CLI: `config
+  set mgmt.password = "…"`; at least 8 characters); the kernel hashes it
+  with a fresh salt before the config is stored or used, and ends every
+  login session. `rrstore put` refuses a clear `mgmt.password`; `rrstore
+  hash <password>` prints a hash for a config file. The boot argument
+  `mgmt_pass=` wins over the stored hash (development, recovery). Without
+  either, nothing can be changed through the web interface; the first
+  password is set over the serial console.
+- **Sessions:** `POST /api/login` (HTTP Basic, once) returns a token the
+  page sends as `Authorization: Bearer`; up to 8 at once, each valid while
+  used at least every 12 h; `POST /api/logout` ends one. Scripts may keep
+  using Basic auth: the last verified password is cached (HMAC under a
+  random key), so PBKDF2 runs once. A wrong password blocks password
+  checks for a second. Salts and tokens come from `kernel/src/entropy.rs`
+  (SHA-256 pool fed with boot time, boot arguments, MAC addresses and
+  request arrival times; the apu4 has no hardware RNG, so best effort).
 - Secrets that must be usable in clear (PPPoE password) are stored as
   is, like on other SOHO routers.
 - `GET /api/config` and the TOML export omit secret fields; an upload

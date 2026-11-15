@@ -266,6 +266,8 @@ fn optional_known(path: &str) -> bool {
             | "firewall.forward.*.src"
             | "firewall.forward.*.hairpin"
             | "dns.host"
+            | "mgmt.password"
+            | "mgmt.password_hash"
             | "wan"
             | "wan.port"
             | "wan.vlan"

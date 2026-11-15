@@ -212,6 +212,12 @@ fn put(path: &str, area: &str, file: &str, raw: bool, version: Option<u32>) -> R
     if area == "config" && !raw {
         let text = std::str::from_utf8(&payload).map_err(|_| format!("{file}: not UTF-8"))?;
         let c = config::parse(text).map_err(|e| format!("{file}: {e}"))?;
+        // A password in clear would be stored as is: the router hashes it.
+        if c.mgmt.password.is_some() {
+            return Err(format!(
+                "{file}: mgmt.password is clear text: set it on the router (CLI or web), or give mgmt.password_hash"
+            ));
+        }
         // The kernel refuses a stored config with settings it does not
         // implement yet: refuse it here already.
         let unsupported = c.unsupported();
@@ -296,10 +302,26 @@ fn corrupt(path: &str, area: &str, slot: Option<Slot>) -> Result<()> {
     Ok(())
 }
 
+/// `mgmt.password_hash` for a config file (salt from the OS).
+fn hash(password: &str) -> Result<()> {
+    if !(8..=128).contains(&password.chars().count()) {
+        return Err("the password must be 8–128 characters".into());
+    }
+    let mut seed = [0u8; 32];
+    std::io::Read::read_exact(
+        &mut std::fs::File::open("/dev/urandom").map_err(|e| format!("/dev/urandom: {e}"))?,
+        &mut seed,
+    )
+    .map_err(|e| format!("/dev/urandom: {e}"))?;
+    let mut pool = auth::Pool::new(&seed);
+    println!("{}", auth::hash_password(password, &mut pool, auth::ITERATIONS));
+    Ok(())
+}
+
 fn usage() -> String {
     "usage: rrstore create <img> [--mib N] | format <img> [--force] | show <img> | \
      put <img> <area> <file> [--raw] [--version N] | get <img> <area> | \
-     corrupt <img> <area> [--slot A|B]"
+     corrupt <img> <area> [--slot A|B] | hash <password>"
         .into()
 }
 
@@ -343,6 +365,7 @@ fn run(args: &[String]) -> Result<()> {
             num("--version")?.map(|v| v as u32),
         ),
         ["get", img, area] => get(img, area),
+        ["hash", password] => hash(password),
         ["corrupt", img, area] => {
             let slot = match opt("--slot") {
                 None => None,

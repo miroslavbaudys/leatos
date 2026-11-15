@@ -8,6 +8,7 @@ description = "Host tool for rrouter store partitions: create, format, write/rea
 [dependencies]
 config-store = { workspace = true }
 config = { workspace = true }
+auth = { workspace = true }
 
 [lints]
 workspace = true

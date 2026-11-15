@@ -549,6 +549,9 @@ pub async fn run(
             ),
             Some(CliAction::Save(cfg)) => match store.as_mut() {
                 Some(st) => {
+                    let mut cfg = cfg;
+                    // A new password in clear is stored as a hash only.
+                    crate::entropy::with(|p| cfg.hash_new_password(p));
                     let base = crate::config::base();
                     let reboot = cfg.needs_trial(&base) || cfg.needs_reboot(&base);
                     let op = StoreOp::Save {

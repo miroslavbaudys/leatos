@@ -59,6 +59,7 @@ check "status page" "1" "$(curl -s -m 5 "$URL/" | grep -c '<title>rrouter</title
 check "unknown path -> 404" 404 "$(code "$URL/nope")"
 check "upload without password -> 401" 401 "$(code -X POST --data-binary @"$WORK/new.elf" "$URL/api/upgrade")"
 check "upload with wrong password -> 401" 401 "$(code -u admin:wrong -X POST --data-binary @"$WORK/new.elf" "$URL/api/upgrade")"
+sleep 1.2 # a wrong password blocks password checks for a second (429)
 head -c 100000 /dev/urandom >"$WORK/garbage"
 check "garbage upload -> 422" 422 "$(code -u admin:test -X POST --data-binary @"$WORK/garbage" "$URL/api/upgrade")"
 # A whole kernel: as long as a real upload (the CRC is checked at the end).

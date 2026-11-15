@@ -645,9 +645,10 @@ pub struct Mgmt {
     /// Also listen on the WAN (`mgmt.on_wan`, boot argument `mgmt=wan`).
     /// Development only: a router's management belongs on the LAN.
     pub on_wan: bool,
-    /// HTTP Basic password (user `admin`), boot argument `mgmt_pass=`
-    /// (not part of the stored config yet). Without one, pages are
-    /// readable but upgrades are refused.
+    /// The password from the boot argument `mgmt_pass=` (user `admin`):
+    /// wins over the config's `mgmt.password_hash` (development,
+    /// recovery). Without either, pages are readable but nothing can be
+    /// changed.
     pub password: Option<&'static str>,
 }
 
@@ -656,6 +657,11 @@ pub fn mgmt() -> Mgmt {
         on_wan: get().mgmt.on_wan,
         password: arg(bootargs(), "mgmt_pass").filter(|p| !p.is_empty()),
     }
+}
+
+/// The stored management password hash (`mgmt.password_hash`), if any.
+pub fn password_hash() -> Option<String> {
+    get().mgmt.password_hash.clone().filter(|h| !h.is_empty())
 }
 
 /// SNTP servers (`time.ntp_servers`, boot argument `ntp=a,b`).

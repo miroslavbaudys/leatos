@@ -43,8 +43,17 @@
 //!   `WWW-Authenticate`, so the browser shows the page's login form
 //!   instead of its own password dialog.
 //!
-//! Upgrade, reboot, log and config changes need HTTP Basic auth (user `admin`, password from the
-//! `mgmt_pass=` boot argument); without a password they are refused.
+//! - `POST /api/login` (Basic auth): a session token for the page
+//!   (`{ok, token}`), sent as `Authorization: Bearer <token>`; it lasts
+//!   while used at least every 12 h. `POST /api/logout` ends it.
+//!
+//! Upgrade, reboot, log and config changes need auth: a session token, or
+//! HTTP Basic (user `admin`) with the password from the `mgmt_pass=` boot
+//! argument or else the config's `mgmt.password_hash` (PBKDF2-SHA256,
+//! checked once per login; scripts' repeats are cached). A wrong password
+//! blocks password attempts for a second. Without any password, changes
+//! are refused. A saved `mgmt.password` (clear text, from the form or the
+//! CLI) is hashed before it is stored, and ends all sessions.
 //! Listens on the LAN; on the WAN too only with `mgmt=wan` (development:
 //! a router's management belongs on the LAN). Plain HTTP: the password
 //! crosses the network unencrypted, acceptable on a lab network only.
@@ -72,6 +81,9 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 
 const PORT: u16 = 80;
+/// Login sessions at once, and how long one lasts unused.
+const SESSIONS: usize = 8;
+const SESSION_IDLE_MS: u64 = 12 * 3600 * 1000;
 const LAN_SOCKETS: usize = 4;
 const WAN_SOCKETS: usize = 4;
 const RX_BUF: usize = 64 * 1024;
@@ -119,6 +131,7 @@ enum Route {
     ConfigRevert,
     /// Credentials check for the page's login form.
     Login,
+    Logout,
     Log,
 }
 
@@ -238,7 +251,15 @@ pub struct Mgmt {
     staging: Option<&'static mut [u8]>,
     /// Connection index currently uploading into the staging area.
     uploader: Option<usize>,
-    password: Option<&'static str>,
+    /// `mgmt_pass=` (wins over the config's hash).
+    boot_pass: Option<&'static str>,
+    sessions: auth::Sessions,
+    /// The last password that verified against the stored hash.
+    pass_cache: auth::Cache,
+    /// After a wrong password: no password checks until then.
+    fail_until: Option<timer::Instant>,
+    /// The save being written changes the password: end the sessions.
+    password_changing: bool,
     on_wan: bool,
     wan_lease: String,
     wan_pppoe: Option<String>,
@@ -324,17 +345,22 @@ impl Mgmt {
             } else {
                 ""
             },
-            match (&staging, cfg.password) {
-                (None, _) => "unavailable (no staging area on this platform)",
-                (Some(_), None) => "disabled (boot with mgmt_pass=...)",
-                (Some(_), Some(_)) => "enabled (admin + mgmt_pass)",
+            match (&staging, cfg.password, config::password_hash()) {
+                (None, ..) => "unavailable (no staging area on this platform)",
+                (Some(_), None, None) => "disabled (no password: mgmt.password or mgmt_pass=)",
+                (Some(_), Some(_), _) => "enabled (admin + mgmt_pass)",
+                (Some(_), None, Some(_)) => "enabled (admin + the configured password)",
             }
         );
         Self {
             conns,
             staging,
             uploader: None,
-            password: cfg.password,
+            boot_pass: cfg.password,
+            sessions: auth::Sessions::new(SESSIONS, SESSION_IDLE_MS),
+            pass_cache: crate::entropy::with(auth::Cache::new),
+            fail_until: None,
+            password_changing: false,
             on_wan: cfg.on_wan,
             wan_lease: String::from("null"),
             wan_pppoe: None,
@@ -360,6 +386,11 @@ impl Mgmt {
         self.op_busy = false;
         let (status, body, reboot) = match (op, result) {
             (StoreOp::Save { flags, reboot, .. }, Ok(detail)) => {
+                // A new password: every session ends (log in again).
+                if core::mem::take(&mut self.password_changing) {
+                    self.sessions.clear();
+                    println!("  mgmt            : password changed: sessions ended");
+                }
                 // A trial must boot to be confirmed, a new network layout
                 // is built at boot; everything else was applied live by
                 // the services task.
@@ -469,20 +500,63 @@ impl Mgmt {
         self.wan_pppoe = json;
     }
 
-    fn authorized(&self, head: &Head) -> Result<(), (u16, &'static str)> {
-        let Some(pass) = self.password else {
-            return Err((403, "disabled: boot with mgmt_pass=<password>"));
-        };
-        match proto_http::basic_auth(head) {
-            Some((u, p)) if u == "admin" && proto_http::ct_eq(p.as_bytes(), pass.as_bytes()) => {
+    /// A management password exists (boot argument or config).
+    fn auth_configured(&self) -> bool {
+        self.boot_pass.is_some() || config::password_hash().is_some()
+    }
+
+    /// A session token, or Basic auth with the password: Ok, or the error
+    /// status and message.
+    fn authorized(&mut self, head: &Head) -> Result<(), (u16, &'static str)> {
+        if !self.auth_configured() {
+            return Err((
+                403,
+                "disabled: no password (serial CLI: config set mgmt.password = \"...\", or boot with mgmt_pass=)",
+            ));
+        }
+        let now = timer::uptime().as_millis() as u64;
+        if let Some(token) = head
+            .header("authorization")
+            .and_then(|a| a.trim().strip_prefix("Bearer "))
+        {
+            return if self.sessions.check(token.trim(), now) {
                 Ok(())
-            }
-            _ => Err((401, "wrong or missing credentials (user admin)")),
+            } else {
+                Err((401, "session expired: log in again"))
+            };
+        }
+        let Some((u, p)) = proto_http::basic_auth(head) else {
+            return Err((401, "wrong or missing credentials (user admin)"));
+        };
+        if self.fail_until.is_some_and(|t| timer::Instant::now() < t) {
+            return Err((429, "wrong password just now: wait a second"));
+        }
+        let ok = u == "admin"
+            && match (self.boot_pass, config::password_hash()) {
+                (Some(pass), _) => proto_http::ct_eq(p.as_bytes(), pass.as_bytes()),
+                (None, Some(hash)) => self.pass_cache.verify(&p, &hash),
+                (None, None) => false,
+            };
+        if ok {
+            Ok(())
+        } else {
+            self.fail_until = timer::Instant::now().checked_add(Duration::from_secs(1));
+            Err((401, "wrong or missing credentials (user admin)"))
+        }
+    }
+
+    /// Who the password comes from (status page).
+    fn auth_source(&self) -> &'static str {
+        match (self.boot_pass, config::password_hash()) {
+            (Some(_), _) => "boot argument",
+            (None, Some(_)) => "config",
+            (None, None) => "none",
         }
     }
 
     /// A request head arrived: route it, check auth, claim the staging area.
     fn on_head(&mut self, i: usize, head: Head) {
+        crate::entropy::mix(head.path.as_bytes());
         self.conns[i].no_prompt = head.header("x-rrouter-ui").is_some();
         let route = match (head.method, head.path.as_str()) {
             (Method::Get, "/" | "/index.html") => Ok(Route::Index),
@@ -500,6 +574,7 @@ impl Mgmt {
             (Method::Post, "/api/config/confirm") => Ok(Route::ConfigConfirm),
             (Method::Post, "/api/config/revert") => Ok(Route::ConfigRevert),
             (Method::Post, "/api/login") => Ok(Route::Login),
+            (Method::Post, "/api/logout") => Ok(Route::Logout),
             (Method::Get, "/api/log") => Ok(Route::Log),
             (
                 _,
@@ -507,7 +582,7 @@ impl Mgmt {
                 | "/api/upgrade/confirm" | "/api/upgrade/revert" | "/api/reboot"
                 | "/api/config" | "/api/config.json" | "/api/config/effective"
                 | "/api/config/effective.json" | "/api/config/confirm"
-                | "/api/config/revert" | "/api/login" | "/api/log",
+                | "/api/config/revert" | "/api/login" | "/api/logout" | "/api/log",
             ) => {
                 Err((405, "method not allowed"))
             }
@@ -630,7 +705,23 @@ impl Mgmt {
                 self.conns[i].respond_json(200, &json);
             }
             Route::ConfigPut => self.check_config(i),
-            Route::Login => self.conns[i].respond_json(200, "{\"ok\":true}"),
+            Route::Login => {
+                let now = timer::uptime().as_millis() as u64;
+                let token = crate::entropy::with(|p| self.sessions.create(p, now));
+                self.conns[i].respond_json(200, &format!("{{\"ok\":true,\"token\":{}}}", json_str(&token)));
+            }
+            Route::Logout => {
+                let token = self.conns[i]
+                    .head
+                    .as_ref()
+                    .and_then(|h| h.header("authorization"))
+                    .and_then(|a| a.trim().strip_prefix("Bearer "))
+                    .map(String::from);
+                if let Some(t) = token {
+                    self.sessions.remove(t.trim());
+                }
+                self.conns[i].respond_json(200, "{\"ok\":true}");
+            }
             Route::Log => {
                 let ram = crate::console::logging_to_ram();
                 let (text, dropped) = crate::console::log_tail(None, LOG_MAX);
@@ -703,6 +794,8 @@ impl Mgmt {
             Ok(mut cfg) => {
                 // What GET returned has no secrets: keep the stored ones.
                 cfg.keep_secrets(&config::base());
+                // A new password in clear is stored as a hash only.
+                self.password_changing = crate::entropy::with(|p| cfg.hash_new_password(p));
                 let flags = if cfg.needs_trial(&config::base()) {
                     config_store::FLAG_TRIAL
                 } else {
@@ -975,7 +1068,7 @@ fn status_json(
         "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"vlan_drops\":{},\"conntrack\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
-         \"drop_reasons\":{{{}}},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
+         \"drop_reasons\":{{{}}},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
         json_str(env!("CARGO_PKG_VERSION")),
         json_str(env!("RROUTER_BUILD")),
         json_str(if cfg!(target_arch = "x86_64") {
@@ -1014,9 +1107,10 @@ fn status_json(
             .collect::<Vec<_>>()
             .join(","),
         mgmt.on_wan,
-        mgmt.password.is_some(),
-        mgmt.password.is_some() && (mgmt.staging.is_some() || mgmt.uploader.is_some()),
-        mgmt.password.is_some()
+        mgmt.auth_configured(),
+        json_str(mgmt.auth_source()),
+        mgmt.auth_configured() && (mgmt.staging.is_some() || mgmt.uploader.is_some()),
+        mgmt.auth_configured()
             && mgmt.has_store
             && (mgmt.staging.is_some() || mgmt.uploader.is_some()),
     );

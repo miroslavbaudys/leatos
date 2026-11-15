@@ -143,6 +143,7 @@ pub fn bring_up(
             }
         };
         let mac = dev.mac();
+        crate::entropy::mix(&mac);
         let rate = qos.port_rate(i == 0);
         let ecn = if i == 0 { qos.ecn_up } else { qos.ecn_down };
         let aqm = Aqm::new(

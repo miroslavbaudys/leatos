@@ -415,11 +415,14 @@ In rough order of value:
      be dropped as invalid.
 8. **Small schema items the kernel still refuses:** `[[dns.host]]`
    (local A records), a static WAN (`mode = "static"`, `[wan.static]`).
-9. **Web interface gaps.** DHCP settings and reservations of networks
-   other than the first (the schema has them; the pages edit only the
-   first network's), a per-network clients view, the management password
-   in the config as a PBKDF2 hash (today only the `mgmt_pass=` boot
-   argument), sessions instead of Basic auth on every request.
+9. ✅ (2026-11-15) **Web interface gaps.** Every network's DHCP pool,
+   lease time and reservations (a DHCP panel per network on the Networks
+   page; "Reserve" on the Clients page for any network); the management
+   password in the config as a PBKDF2 hash (`mgmt.password_hash`, set as
+   `mgmt.password`, `crates/auth`); login sessions (Bearer tokens).
+   `store-test`: password from the config, 401/429/200, token saves, hash
+   never shown and kept, password change ends sessions, logout, negative
+   control without any password (403).
 10. **Live network changes.** Adding or changing a network reboots
    (`Config::needs_reboot`); doing it live means adding and removing
    forwarder interfaces, smoltcp interfaces and DHCP servers at run time.

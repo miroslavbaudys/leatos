@@ -122,6 +122,7 @@ pub(crate) fn check(c: &Config) -> Result<(), Vec<Issue>> {
         x.add("version", format!("must be {VERSION}"));
     }
     wan(c, &mut x);
+    mgmt(c, &mut x);
     networks(c, &mut x);
     zones(c, &mut x);
     rules(c, &mut x);
@@ -208,6 +209,24 @@ fn wan(c: &Config, x: &mut Issues) {
             }
         }
         _ => {}
+    }
+}
+
+fn mgmt(c: &Config, x: &mut Issues) {
+    let m = &c.mgmt;
+    if let Some(h) = &m.password_hash
+        && !h.is_empty()
+        && !auth::is_hash(h)
+    {
+        x.add("mgmt.password_hash", "not a password hash (set mgmt.password instead)");
+    }
+    if let Some(p) = &m.password {
+        if !(8..=128).contains(&p.chars().count()) {
+            x.add("mgmt.password", "must be 8–128 characters");
+        }
+        if p.chars().any(char::is_control) {
+            x.add("mgmt.password", "must not contain control characters");
+        }
     }
 }
 

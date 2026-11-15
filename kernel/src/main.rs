@@ -23,6 +23,7 @@ mod config;
 mod console;
 mod cpuload;
 mod drivers;
+mod entropy;
 mod executor;
 mod fatal;
 mod irq;
@@ -97,6 +98,7 @@ pub fn kmain(boot_arg: usize) -> ! {
     // must be the one to mark a config trial booted.
     upgrade::boot(store.as_mut(), &mut hw_watchdog);
     config::load(store.as_mut(), info.virtual_machine);
+    entropy::mix(config::bootargs().as_bytes());
     let qos = config::qos();
     let net = pci.as_mut().and_then(|p| net::stack::bring_up(p, &qos));
     let has_net = net.is_some();

@@ -1134,3 +1134,38 @@ fn network_layout_changes_reboot() {
     assert!(r(|c| { c.networks.pop(); }));
     assert!(r(|c| c.zones.push(Zone { name: "lab".into(), ..Zone::builtin_lan() })));
 }
+
+#[test]
+fn management_password_is_hashed_and_secret() {
+    let mut pool = auth::Pool::new(b"t");
+    let mut c = Config::default().with_assignment(r#"mgmt.password = "correct horse""#).unwrap();
+    assert_eq!(c.validate(), Ok(()));
+    assert!(c.hash_new_password(&mut pool));
+    assert!(c.mgmt.password.is_none());
+    let h = c.mgmt.password_hash.clone().unwrap();
+    assert!(auth::verify("correct horse", &h));
+    // Stored (version 2: older kernels do not know the field), never shown.
+    let t = c.to_toml();
+    assert!(t.starts_with("version = 2") && t.contains("password_hash") && !t.contains("correct horse"), "{t}");
+    assert_eq!(parse(&t).unwrap(), c);
+    let shown = c.without_secrets();
+    for text in [shown.to_toml(), shown.to_json(), flat_lines(&shown).join("\n")] {
+        assert!(!text.contains("pbkdf2") && !text.contains("correct horse"), "{text}");
+    }
+    // A form save without it keeps it; another one replaces it; "" removes it.
+    let mut back = parse_json(&shown.to_json()).unwrap();
+    back.keep_secrets(&c);
+    assert_eq!(back.mgmt.password_hash, c.mgmt.password_hash);
+    assert!(!back.hash_new_password(&mut pool));
+    let mut cleared = parse_json(r#"{"mgmt":{"password_hash":""}}"#).unwrap();
+    cleared.keep_secrets(&c);
+    cleared.hash_new_password(&mut pool);
+    assert_eq!(cleared.mgmt.password_hash, None);
+    // A password change is not a trial (on_wan still is).
+    assert!(!c.needs_trial(&Config::default()));
+    assert!(c.unsupported().is_empty(), "the kernel supports it");
+    // Validation.
+    assert_eq!(invalid(|c| c.mgmt.password = Some("short".into())), ["mgmt.password"]);
+    assert_eq!(paths(parse("version = 2\n[mgmt]\npassword_hash = \"plain\"\n").unwrap_err()), ["mgmt.password_hash"]);
+    assert_eq!(c.without("mgmt.password_hash").unwrap().mgmt.password_hash, None);
+}
