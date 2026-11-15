@@ -4,8 +4,8 @@ Status (2026-11-15): steps 1–3 done in QEMU: `crates/proto-mdns` (wire
 format + the filtered reflector, host tests incl. mutation fuzzing), the
 config (`[[mdns.reflect]]`, zone service `mdns`, validation) and the
 kernel (`net/mdns.rs`, counters on `/api/status` and the CLI), with a
-first lab check (`LAB_MDNS=1`, §7). Open: a browse test with real mDNS
-software, a web page section, the apu4 (§8).
+first lab check (`LAB_MDNS=1`, §7), and the web page section (§5).
+Open: a browse test with real mDNS software, the apu4 (§8).
 
 mDNS (RFC 6762) and DNS-SD (RFC 6763) are link-local: queries and
 announcements go to `224.0.0.251:5353` (IPv6 `ff02::fb`) with TTL 255, and
@@ -149,6 +149,14 @@ services = ["_airplay._tcp", "_raop._tcp", "_googlecast._tcp", "_ipp._tcp"]
   most 128 distinct types over the enabled entries. A config with
   `[mdns]` needs schema version 2. Applied live, no trial.
 - Default: no rules, nothing reflected.
+- Web page (Firewall, "mDNS across networks"): a row per entry (on, name,
+  "Services on" = `from`, "Discoverable on" = `to` as checkboxes of the
+  networks, service types with presets: AirPlay, Chromecast, printers,
+  scanners, HomeKit, Spotify Connect, file shares), the counters per
+  network from `/api/status`. Before saving it warns about a zone that
+  does not allow `mdns` (the router would refuse) and about clients that
+  could not open connections to the devices found (no `forward_to`, no
+  accept rule); network renames update the menus.
 
 ## 6. Pitfalls
 1. **Discovery is not reachability.** Answers carry the device's real
@@ -190,7 +198,7 @@ services = ["_airplay._tcp", "_raop._tcp", "_googlecast._tcp", "_ipp._tcp"]
 2. ✅ Config schema, `Service::Mdns`, validation.
 3. ✅ Kernel: smoltcp multicast, sockets, wiring, counters on
    `/api/status` and the CLI; first lab check (§7).
-4. Browse test with avahi (§7); web page section (reflect entries,
-   counters).
+4. ✅ Web page section (reflect entries, warnings, counters). Open: a
+   browse test with avahi (§7).
 5. On the apu4 with a real IoT VLAN.
 6. Later: IPv6 (`ff02::fb`, with M7), caching proxy, legacy unicast.

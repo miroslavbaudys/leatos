@@ -448,8 +448,8 @@ In rough order of value:
    network with RA/RDNSS, the zone firewall for IPv6 (inbound blocked by
    default), `[wan.ipv6]`.
 13. **mDNS across networks** (`docs/mdns.md`; reflector, config and
-   kernel done in QEMU, `LAB_MDNS=1 scripts/lab-test.sh`; open: avahi
-   browse test, web page section, apu4). A filtered reflector: `[[mdns.reflect]]` rules (from, to,
+   kernel and web page done in QEMU, `LAB_MDNS=1 scripts/lab-test.sh`;
+   open: avahi browse test, apu4). A filtered reflector: `[[mdns.reflect]]` rules (from, to,
    service types), `allow = ["mdns"]` for zones; caching proxy and
    `ff02::fb` later.
 

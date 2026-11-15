@@ -315,6 +315,14 @@
         <span class="hint">New connections to the router's WAN address on these ports go to a device inside; no extra rule needed. Applied at once.</span></div>
       <p class="hint">Target: <code>address</code> (same ports) or <code>address:port</code> (a range maps onto port, port+1, …). <b>Hairpin</b>: devices inside reach it through the WAN address too. Ports 60000–65535 are the router's own.</p>
     </form>
+    <form class="card cfg" autocomplete="off" id="mdnsform"><h3>mDNS across networks</h3>
+      <div class="tw"><table id="mdns"></table></div>
+      <div class="row"><button type="button" id="addmdns" class="plain">Add mDNS rule</button>
+        <span class="hint">Makes services on one network (printers, AirPlay, Chromecast, …) discoverable on others: their questions go to the "from" network, the answers come back, with only the listed service types. Applied at once.</span></div>
+      <div id="mdnswarn"></div>
+      <p class="hint">A network takes part only through a rule here, and its zone must accept everything or allow <b>mdns</b> (Zones above). Finding a device is not reaching it: clients still need the zones or a rule to open connections to it.</p>
+      <div class="tw"><table id="mdnsstats"></table></div>
+    </form>
     <div class="card"><h3>Dropped packets by reason</h3><div class="tw"><table id="drops"></table></div>
       <p class="hint">Counted since boot by the forwarding plane (packets the router forwards, not its own).</p></div>
   </section>
@@ -805,6 +813,7 @@ async function refresh() {
     : rows([["Networks", "none"]]);
   renderNetStatus();
   renderRuleHits();
+  renderMdnsStats();
 }
 
 // ================= Clients =================
@@ -924,6 +933,7 @@ function fillForm(c) {
   renderNets(c.network ?? []);
   renderRules(c.firewall?.rule ?? []);
   renderFwds(c.firewall?.forward ?? []);
+  renderMdns(c.mdns?.reflect ?? []);
 }
 function readForm() {
   const c = structuredClone(cfgOrig);
@@ -939,6 +949,8 @@ function readForm() {
   const fwds = readFwds();
   if (fwds.length) c.firewall.forward = fwds; else delete c.firewall.forward;
   if (!Object.keys(c.firewall).length) delete c.firewall;
+  const md = readMdns();
+  if (md.length) c.mdns = { ...(c.mdns ?? {}), reflect: md }; else delete c.mdns;
   for (const e of fields()) {
     let v;
     if (e.type === "checkbox") v = e.checked;
@@ -1093,6 +1105,7 @@ $("addnet").onclick = () => {
   updatePending();
 };
 $("nets").addEventListener("input", netPaths);
+$("nets").addEventListener("change", (ev) => { if (ev.target.dataset.key === "name") renderMdns(readMdns()); });
 
 // ---- Zones: the defined ones, editable; lan and wan are built in.
 let zoneOrig = [];
@@ -1136,6 +1149,7 @@ function rezone() {
   renderZones(zs);
   if (ns) renderNets([cfgOrig.network[0], ...ns]);
   renderRules(readRules());
+  renderMdns(readMdns());
   updatePending();
 }
 $("addzone").onclick = () => {
@@ -1256,6 +1270,117 @@ $("addfwd").onclick = () => {
 };
 $("fwds").addEventListener("input", fwdPaths);
 
+// ---- mDNS across networks (docs/mdns.md): reflect rules, by network.
+const MDNS_PRESETS = [
+  ["AirPlay", ["_airplay._tcp", "_raop._tcp"]],
+  ["Chromecast", ["_googlecast._tcp"]],
+  ["Printers", ["_ipp._tcp", "_ipps._tcp", "_pdl-datastream._tcp", "_printer._tcp"]],
+  ["Scanners", ["_uscan._tcp", "_uscans._tcp"]],
+  ["HomeKit", ["_hap._tcp"]],
+  ["Spotify Connect", ["_spotify-connect._tcp"]],
+  ["File shares", ["_smb._tcp", "_afpovertcp._tcp"]],
+];
+let mdnsOrig = [];
+// The networks of the working copy (the LAN page's first, then the others).
+function netNames() {
+  const rest = readNets() ?? (cfgOrig?.network ?? []).slice(1);
+  return [cfgOrig?.network?.[0]?.name ?? "lan", ...rest.map((n) => n.name)].filter((n) => n);
+}
+function renderMdns(list) {
+  mdnsOrig = list.map((r) => structuredClone(r));
+  const nets = netNames();
+  const t = $("mdns");
+  t.replaceChildren(el("tr", {}, ["On", "Name", "Services on", "Discoverable on", "Service types", ""].map((h) => el("th", { textContent: h }))));
+  list.forEach((r, i) => {
+    const tr = el("tr", { dataset: { orig: String(i) } });
+    const from = el("select", { dataset: { key: "from" } }, nets.map((n) => el("option", { value: n, textContent: n })));
+    if (r.from && !nets.includes(r.from)) from.append(el("option", { value: r.from, textContent: r.from + " (gone)" }));
+    from.value = r.from ?? nets[0];
+    const to = el("td", { dataset: { key: "to" } }, nets.map((n) =>
+      el("label", { className: "check", style: "display:inline-flex;margin:0 8px 0 0" }, [el("input", { type: "checkbox", value: n, checked: (r.to ?? []).includes(n) }), n])));
+    for (const g of (r.to ?? []).filter((n) => !nets.includes(n))) {
+      to.append(el("label", { className: "check", style: "display:inline-flex;margin:0 8px 0 0" }, [el("input", { type: "checkbox", value: g, checked: true }), g + " (gone)"]));
+    }
+    const svc = el("input", { value: (r.services ?? []).join(", "), placeholder: "_ipp._tcp, _airplay._tcp", size: 30, dataset: { key: "services" } });
+    const preset = el("select", { title: "Add the service types of a common device" },
+      [el("option", { value: "", textContent: "Add…" }), ...MDNS_PRESETS.map(([n]) => el("option", { value: n, textContent: n }))]);
+    preset.onchange = () => {
+      const p = MDNS_PRESETS.find(([n]) => n === preset.value);
+      preset.value = "";
+      if (!p) return;
+      const have = svc.value.split(",").map((x) => x.trim()).filter((x) => x);
+      svc.value = [...have, ...p[1].filter((x) => !have.includes(x))].join(", ");
+      updatePending();
+    };
+    tr.append(el("td", {}, [el("input", { type: "checkbox", checked: r.enabled !== false, dataset: { key: "enabled" } })]),
+      el("td", {}, [el("input", { value: r.name ?? "", placeholder: "iot-to-lan", size: 12, dataset: { key: "name" } })]),
+      el("td", {}, [from]), to, el("td", {}, [svc, " ", preset]),
+      el("td", {}, [el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); updatePending(); } })]));
+    t.append(tr);
+  });
+  mdnsPaths();
+  renderMdnsStats();
+}
+function mdnsPaths() {
+  for (const tr of [...$("mdns").rows].slice(1)) {
+    const name = tr.querySelector('[data-key="name"]').value.trim();
+    for (const e of tr.querySelectorAll("[data-key]")) e.dataset.path = `mdns.reflect.${name}.${e.dataset.key}`;
+  }
+}
+function readMdns() {
+  if (!$("mdns").rows.length) return cfgOrig?.mdns?.reflect ?? [];
+  return [...$("mdns").rows].slice(1).map((tr) => {
+    const o = structuredClone(mdnsOrig[Number(tr.dataset.orig)] ?? {});
+    const v = (k) => tr.querySelector(`[data-key="${k}"]`);
+    o.name = v("name").value.trim();
+    if (v("enabled").checked) delete o.enabled; else o.enabled = false;
+    o.from = v("from").value;
+    o.to = [...v("to").querySelectorAll("input:checked")].map((b) => b.value);
+    o.services = v("services").value.split(",").map((x) => x.trim()).filter((x) => x);
+    return o;
+  });
+}
+// Before saving: what the router would refuse (a zone without mdns) and
+// what would not work (clients that cannot open connections to the
+// devices found).
+function renderMdnsWarn(c) {
+  const defs = c.zone ?? [];
+  const zone = (n) => defs.find((z) => z.name === n) ?? (n === "lan" ? { name: "lan", input: "accept", forward_to: ["wan"] } : null);
+  const zoneOf = (net) => (c.network ?? []).find((x) => x.name === net)?.zone ?? "lan";
+  const takesMdns = (zn) => { const z = zone(zn); return !z || (z.input ?? "accept") === "accept" || (z.allow ?? []).includes("mdns"); };
+  const opens = (a, b) => a === b || (zone(a)?.forward_to ?? ["wan"]).includes(b)
+    || (c.firewall?.rule ?? []).some((r) => r.enabled !== false && r.action === "accept" && (r.from === a || r.from === "any") && (r.to === b || r.to === "any"));
+  const out = [];
+  for (const r of c.mdns?.reflect ?? []) {
+    if (r.enabled === false || !r.name) continue;
+    for (const net of [r.from, ...(r.to ?? [])]) {
+      if (net && !takesMdns(zoneOf(net))) out.push(`${r.name}: network ${net} is in zone ${zoneOf(net)}, which must allow mdns (the router refuses the save).`);
+    }
+    for (const t of r.to ?? []) {
+      const a = zoneOf(t), b = zoneOf(r.from);
+      if (!opens(a, b)) out.push(`${r.name}: devices on ${r.from} become visible on ${t}, but zone ${a} may not open connections to zone ${b}: add it to "May open connections to" or add an accept rule.`);
+    }
+  }
+  $("mdnswarn").replaceChildren(...out.map((m) => el("p", { className: "hint warn", textContent: m })));
+}
+function renderMdnsStats() {
+  const ms = st?.mdns ?? [];
+  $("mdnsstats").replaceChildren(...(!ms.length ? [] : [
+    el("tr", {}, ["Network", "Received", "Sent", "Filtered", "Duplicate", "Rate-limited", "Malformed", "Foreign"].map((h, i) => el("th", { textContent: h, className: i ? "num" : "" }))),
+    ...ms.map((m) => el("tr", {}, [el("td", { textContent: m.network }),
+      ...["received", "sent", "filtered", "duplicate", "rate_limited", "malformed", "foreign"].map((k) => el("td", { className: "num", textContent: n(m[k] ?? 0) }))])),
+  ]));
+}
+$("addmdns").onclick = () => {
+  const ms = readMdns(), nets = netNames();
+  const from = nets.find((x) => x !== nets[0]) ?? nets[0];
+  ms.push({ name: ms.some((m) => m.name === "printers") ? "" : "printers", from, to: [nets[0]].filter((x) => x !== from), services: ["_ipp._tcp", "_ipps._tcp"] });
+  renderMdns(ms);
+  [...$("mdns").rows].at(-1).querySelector('[data-key="name"]').focus();
+  updatePending();
+};
+$("mdns").addEventListener("input", mdnsPaths);
+
 // Zone matrix of the working copy: who may open connections to whom.
 function renderMatrix(c) {
   const defs = c.zone ?? [];
@@ -1281,7 +1406,7 @@ function renderMatrix(c) {
 
 // path → shown value; arrays of plain values stay one entry, entries with
 // a name are named by it (as in the router's validation messages).
-const KEYED = ["network", "zone", "firewall.rule", "firewall.forward"];
+const KEYED = ["network", "zone", "firewall.rule", "firewall.forward", "mdns.reflect"];
 function flatten(o, pre = "", out = {}, named = false) {
   if (Array.isArray(o) && o.some((x) => x && typeof x === "object")) {
     const byName = KEYED.includes(pre);
@@ -1303,7 +1428,7 @@ function changes() {
 }
 function updatePending() {
   const ch = changes();
-  if (cfgOrig) renderMatrix(readForm());
+  if (cfgOrig) { const c = readForm(); renderMatrix(c); renderMdnsWarn(c); }
   $("pending").hidden = !ch.length && !$("pmsg").textContent;
   $("pcount").textContent = ch.length ? `${ch.length} unsaved change${ch.length > 1 ? "s" : ""}` : "";
   const blocked = !st?.store ? "no store: changes cannot be saved" : st?.trial ? "confirm or revert the trial first"
