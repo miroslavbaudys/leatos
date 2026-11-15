@@ -58,7 +58,7 @@ wait_count() { # count pattern seconds
 }
 boots() { count "— bare metal"; }
 status() { # python expression over d = /api/status
-  curl -s -m 5 "$URL/api/status" 2>/dev/null | python3 -I -c "import json,sys; d=json.load(sys.stdin); print($1)" 2>/dev/null || true
+  curl -s -m 5 -u admin:test "$URL/api/status" 2>/dev/null | python3 -I -c "import json,sys; d=json.load(sys.stdin); print($1)" 2>/dev/null || true
 }
 code() { curl -s -m 60 -o /dev/null -w '%{http_code}' "$@" || true; }
 upload() { # file [endpoint] -> HTTP code

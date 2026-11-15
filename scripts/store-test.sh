@@ -15,8 +15,9 @@
 #   empty store -> defaults; stored config -> used; stored config that does
 #   not validate -> defaults; config=defaults -> store ignored.
 # Save (WAN on user networking, mgmt=wan, host port forwarded to :80):
-#   GET /api/config (TOML) and /api/config.json; POST without password ->
-#   401; invalid TOML -> 422, inconsistent config -> 422 naming the field,
+#   GET /api/info is public; status and config reads need the password
+#   (401 without, as a token-less page gets); GET /api/config (TOML) and
+#   /api/config.json; POST without password -> 401; invalid TOML -> 422, inconsistent config -> 422 naming the field,
 #   both leave the store unchanged; a change without a trial (JSON, as the
 #   page sends it) -> saved and applied live, no reboot: shaper rate, qdisc
 #   rebuild, DHCP/DNS reconfigured; a rate-only change keeps the queue.
@@ -117,18 +118,23 @@ json() { python3 -I -c 'import json,sys
 v=json.load(open(sys.argv[1]))
 for k in sys.argv[2].split("."): v=v[k] if not isinstance(v,list) else v[int(k)]
 print(json.dumps(v) if isinstance(v,(dict,list,bool)) or v is None else v)' "$@" 2>/dev/null || true; }
-status() { curl -s -m 10 -o "$WORK/status" "$URL/api/status" || true; json "$WORK/status" "$1"; }
+AUTH=admin:test # reads need the password too (the one of the running boot)
+status() { curl -s -m 10 -u "$AUTH" -o "$WORK/status" "$URL/api/status" || true; json "$WORK/status" "$1"; }
 slot() { "$RRSTORE" get "$IMG" config 2>&1 >/dev/null | sed -n 's/.*slot \([AB]\), seq \([0-9]*\), version [0-9]*, flags \([0-9]*\).*/\1 \2 \3/p'; }
 save_toml() { code -u admin:test -X POST -H 'Content-Type: application/toml' --data-binary @"$1" "$URL/api/config"; }
 lan_toml() { printf 'version = 1\n\n[lan]\nipv4 = "%s"\n\n[[lan.dhcp.static]]\nmac = "52:54:00:00:00:07"\nip = "%s"\nhostname = "printer"\n' "$1/24" "${1%.1}.7" >"$WORK/lan.toml"; }
 
-check "GET /api/config shows the stored LAN" 1 "$(curl -s -m 10 "$URL/api/config" | grep -c '^ipv4 = "10.20.0.1/24"' || true)"
-curl -s -m 10 -o "$WORK/cfg.json" "$URL/api/config.json" || true
+check "GET /api/info is public: a password exists" '{"auth":true}' "$(curl -s -m 10 "$URL/api/info" || true)"
+check "reads without password -> 401 (status, config, config.json, effective.json)" "401 401 401 401" \
+  "$(code "$URL/api/status") $(code "$URL/api/config") $(code "$URL/api/config.json") $(code "$URL/api/config/effective.json")"
+check "  ... with a made-up token -> 401" 401 "$(code -H "Authorization: Bearer 0123456789abcdef0123456789abcdef" "$URL/api/status")"
+check "GET /api/config shows the stored LAN" 1 "$(curl -s -m 10 -u "$AUTH" "$URL/api/config" | grep -c '^ipv4 = "10.20.0.1/24"' || true)"
+curl -s -m 10 -u "$AUTH" -o "$WORK/cfg.json" "$URL/api/config.json" || true
 check "GET /api/config.json shows the stored LAN (schema v2)" "10.20.0.1/24" "$(json "$WORK/cfg.json" network.0.ipv4)"
 check "status reports the config source" "stored (slot A, seq 1)" "$(status config)"
 check "status: no trial" "null" "$(json "$WORK/status" trial)"
 check "status lists the boot-argument overrides (mgmt=wan only)" '{"mgmt.on_wan": "mgmt=wan"}' "$(json "$WORK/status" overrides)"
-curl -s -m 10 -o "$WORK/eff.json" "$URL/api/config/effective.json" || true
+curl -s -m 10 -u "$AUTH" -o "$WORK/eff.json" "$URL/api/config/effective.json" || true
 check "effective config = stored + boot arguments (on_wan from mgmt=wan)" "10.20.0.1/24 true false" \
   "$(json "$WORK/eff.json" network.0.ipv4) $(json "$WORK/eff.json" mgmt.on_wan) $(json "$WORK/cfg.json" mgmt.on_wan)"
 lan_toml 10.30.0.1
@@ -163,7 +169,7 @@ check "download shaper changed live" 50000 "$(json "$WORK/status" interfaces.1.q
 check "  ... upload shaper untouched" null "$(json "$WORK/status" interfaces.0.qdisc.shaped_kbit)"
 check "qdisc rebuilt as FQ-CoDel" 1 "$(count 'qos lan0       : now shaped 50000 kbit/s, overhead 0 B, FQ-CoDel')"
 check "DHCP and DNS reconfigured (1 reservation, cache 1000)" 1 "$(count 'lan services    : reconfigured: .*(1 static, 0 lease(s) dropped).*cache 1000')"
-curl -s -m 10 -o "$WORK/cfg.json" "$URL/api/config.json" || true
+curl -s -m 10 -u "$AUTH" -o "$WORK/cfg.json" "$URL/api/config.json" || true
 check "saved values read back" "1000 tv" "$(json "$WORK/cfg.json" dns.cache_entries) $(json "$WORK/cfg.json" network.0.dhcp.static.0.hostname)"
 check "no trial after a harmless save" "0 null" "$(count 'config          : trial (') $(status trial)"
 check "kernel stored canonical TOML (defaults written out)" 1 "$("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c '^cache_entries = 1000' || true)"
@@ -235,7 +241,7 @@ echo "== networks change live (docs/config-v2.md §7)"
 "$RRSTORE" create "$IMG" --mib "$STORE_MIB" >/dev/null
 boot net "mgmt=wan mgmt_pass=test" QEMU_NET=user QEMU_WAN_HOSTFWD="tcp:127.0.0.1:$PORT-:80"
 up 1 || true
-curl -s -m 10 -o "$WORK/cfg.json" "$URL/api/config.json" || true
+curl -s -m 10 -u "$AUTH" -o "$WORK/cfg.json" "$URL/api/config.json" || true
 python3 -I -c 'import json,sys
 c=json.load(open(sys.argv[1]))
 c["network"].append({"name":"guest","vlan":20,"ipv4":"10.20.0.1/24","zone":"guest"})
@@ -255,7 +261,7 @@ check "  ... removed again, live" "200 false 1 1" "$(code -u admin:test -X POST 
 # Back to the two networks for the rule checks below.
 code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/net.json" "$URL/api/config" >/dev/null
 # A forwarding rule applies live (no reboot, no trial); the status lists it.
-curl -s -m 10 -o "$WORK/cfg.json" "$URL/api/config.json" || true
+curl -s -m 10 -u "$AUTH" -o "$WORK/cfg.json" "$URL/api/config.json" || true
 python3 -I -c 'import json,sys
 c=json.load(open(sys.argv[1]))
 c["firewall"]={"rule":[{"name":"no-smtp","from":"lan","to":"wan","proto":"tcp","dst_port":25,"action":"drop"}],
@@ -271,6 +277,8 @@ printf 'version = 2\n\n[mgmt]\non_wan = true\npassword_hash = "%s"\n' "$("$RRSTO
 "$RRSTORE" put "$IMG" config "$WORK/pw.toml" >/dev/null
 boot pw "" QEMU_NET=user QEMU_WAN_HOSTFWD="tcp:127.0.0.1:$PORT-:80"   # no mgmt_pass=
 up 1 || true
+AUTH=admin:s3cret-pass
+check "reads without password -> 401 (password from the config)" "401 200" "$(code "$URL/api/status") $(code -u "$AUTH" "$URL/api/status")"
 check "password from the config" "true config" "$(status mgmt.auth) $(status mgmt.password)"
 check "wrong password -> 401" 401 "$(code -u admin:wrong -X POST "$URL/api/login")"
 check "  ... the right one at once -> 429 (one try per second)" 429 "$(code -u admin:s3cret-pass -X POST "$URL/api/login")"
@@ -278,7 +286,7 @@ sleep 1.2
 check "right password -> 200" 200 "$(code -u admin:s3cret-pass -X POST "$URL/api/login")"
 TOKEN="$(json "$WORK/resp" token)"
 check "  ... with a 32-digit token" 32 "${#TOKEN}"
-curl -s -m 10 -o "$WORK/cfg.json" "$URL/api/config.json" || true
+curl -s -m 10 -u "$AUTH" -o "$WORK/cfg.json" "$URL/api/config.json" || true
 check "the hash is never shown" 0 "$(grep -c pbkdf2 "$WORK/cfg.json" || true)"
 check "save with the token -> 200" 200 "$(code -H "Authorization: Bearer $TOKEN" -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/cfg.json" "$URL/api/config")"
 check "  ... the hash is kept" 1 "$("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c '^password_hash = "pbkdf2-sha256' || true)"
@@ -290,6 +298,7 @@ check "password change -> 200, live" "200 true" "$(code -H "Authorization: Beare
 check "  ... the session ends" 401 "$(code -H "Authorization: Bearer $TOKEN" -X POST "$URL/api/login")"
 check "  ... stored as a hash only" "1 0" "$("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c '^password_hash = "pbkdf2-sha256' || true) $("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c 'n3w-password' || true)"
 check "  ... the new password works" 200 "$(code -u admin:n3w-password -X POST "$URL/api/login")"
+AUTH=admin:n3w-password
 TOKEN="$(json "$WORK/resp" token)"
 check "  ... the old one not" 401 "$(code -u admin:s3cret-pass -X POST "$URL/api/login")"
 check "logout ends the session" "200 401" "$(code -H "Authorization: Bearer $TOKEN" -X POST "$URL/api/logout") $(code -H "Authorization: Bearer $TOKEN" -X POST "$URL/api/login")"
@@ -298,6 +307,7 @@ stop
 boot nopw "mgmt=wan" QEMU_NET=user QEMU_WAN_HOSTFWD="tcp:127.0.0.1:$PORT-:80"
 up 1 || true
 check "control, no password anywhere: login refused" "403 false none" "$(code -u admin:anything -X POST "$URL/api/login") $(status mgmt.auth) $(status mgmt.password)"
+check "  ... reads are public then (info, status, config.json)" '{"auth":false} 200 200' "$(curl -s -m 10 "$URL/api/info" || true) $(code "$URL/api/status") $(code "$URL/api/config.json")"
 stop
 
 WHAT="$ARCH, ${QEMU_STORE_BUS:-virtio}, $STORE_MIB MiB"

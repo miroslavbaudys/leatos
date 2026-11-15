@@ -280,14 +280,22 @@ restore, firmware, reboot) and Logs (`GET /api/log`). All pages' forms
 edit one working copy of the config. A bar at the bottom counts the
 changes; Review shows the diff (setting, saved, new) and, after a refused
 save, the validation issues with links to their pages; Save posts the
-whole document. Login: a form checked by `POST /api/login`, then the
-password is kept in the tab's `sessionStorage` and sent as Basic auth;
-the page's requests carry `X-Rrouter-UI: 1`, so a 401 has no
+whole document. Login (as in OpenWrt's LuCI): with a password, a login
+screen covers the page until `POST /api/login` (Basic auth, once) returns
+a session token; the page keeps it in `localStorage` (shared by tabs,
+kept across browser restarts) and sends it as `Authorization: Bearer`.
+Everything but the page itself and `GET /api/info` (`{auth}`: whether a
+password exists) needs auth then, status and config reads included; a
+401 (session unused for 12 h, logout, reboot, password change) brings the
+login screen back, pending changes kept, and the request is sent again
+after the login. Without a password the page is read-only, its reads
+public. The page's requests carry `X-Rrouter-UI: 1`, so a 401 has no
 `WWW-Authenticate` and the browser shows no password dialog of its own.
+Scripts use Basic auth on every request (checked once, then cached).
 Networks, zones, rules and port forwards are designed in
 `docs/config-v2.md`.
 
-- `GET /api/config`: current config as TOML (secrets omitted), without
+- `GET /api/config` (auth once a password exists): current config as TOML (secrets omitted), without
   boot-argument overrides (what a save starts from). `GET
   /api/config.json`: the same as JSON (the form).
 - `POST /api/config` (Basic auth): TOML, or JSON with `Content-Type:

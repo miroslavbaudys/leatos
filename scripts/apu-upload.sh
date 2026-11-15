@@ -60,15 +60,15 @@ if [[ -z "$PASS" && -f target/apu4/mgmt-pass ]]; then PASS="$(cat target/apu4/mg
 URL="http://$HOST"
 
 status_line() { # prints "version uptime_s" or nothing
-  curl -s -m 3 "$URL/api/status" 2>/dev/null |
+  curl -s -m 3 -u "admin:$PASS" "$URL/api/status" 2>/dev/null |
     python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(d["version"], d["uptime_s"])' 2>/dev/null || true
 }
 image_line() { # prints "build|trial seq or -|source" or nothing
-  curl -s -m 3 "$URL/api/status" 2>/dev/null |
+  curl -s -m 3 -u "admin:$PASS" "$URL/api/status" 2>/dev/null |
     python3 -I -c 'import json,sys; d=json.load(sys.stdin); i=d.get("image") or {}; t=i.get("trial"); print("%s|%s|%s" % (d.get("build","?"), t["seq"] if t else "-", i.get("source","?")))' 2>/dev/null || true
 }
 trial_state() { # prints "uptime_s trial_seq remaining_s" ("-" for no trial), or nothing
-  curl -s -m 3 "$URL/api/status" 2>/dev/null |
+  curl -s -m 3 -u "admin:$PASS" "$URL/api/status" 2>/dev/null |
     python3 -I -c 'import json,sys; d=json.load(sys.stdin); t=(d.get("image") or {}).get("trial"); print(d["uptime_s"], t["seq"] if t else "-", t["remaining_s"] if t else "-")' 2>/dev/null || true
 }
 trial_op() { # confirm | revert

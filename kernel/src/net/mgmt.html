@@ -109,10 +109,29 @@
          padding:6px 8px; font-size:12px; font-variant-numeric:tabular-nums; white-space:nowrap; box-shadow:0 2px 8px rgba(0,0,0,.12); }
   .tip i { display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:5px; }
   details { margin-top:6px; color:var(--muted); }
+  /* ---- login screen: covers the page until logged in (the page keeps its state) */
+  body.locked > .top, body.locked > .shell, body.locked > .pending { display:none; }
+  .gate { min-height:100vh; display:grid; place-items:center; padding:16px; }
+  .gate[hidden], .gate form[hidden] { display:none; }
+  .gate .card { width:min(360px, 100%); margin:0; padding:20px; }
+  .gate h1 { margin:0 0 4px; font-size:20px; }
+  .gate button { width:100%; margin-top:6px; }
   pre.log { margin:0; max-height:65vh; overflow:auto; font:12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
 </style>
 </head>
-<body>
+<body class="locked">
+<div class="gate" id="gate">
+  <div class="card">
+    <h1>rrouter</h1>
+    <p class="hint" id="gatemsg">Connecting to the router…</p>
+    <form id="loginform" hidden>
+      <input type="text" name="username" autocomplete="username" value="admin" hidden>
+      <label>Password<input id="loginpass" type="password" autocomplete="current-password"></label>
+      <div id="loginmsg" class="msg err"></div>
+      <button id="loginok">Log in</button>
+    </form>
+  </div>
+</div>
 <div class="top">
   <h1>rrouter</h1>
   <div class="meta"><span id="wanstate"><i class="dot"></i>WAN …</span><span id="up"></span><span id="ver" class="opt">…</span><span id="wanwarn" class="warn"></span></div>
@@ -381,15 +400,6 @@
   <button id="save">Save</button>
 </div>
 
-<dialog id="logindlg">
-  <form method="dialog" id="loginform">
-    <h3>Log in</h3>
-    <p class="hint">User <b>admin</b>: the configured password, or the boot argument <code>mgmt_pass=</code>. The tab keeps a session token, not the password.</p>
-    <label>Password<input id="loginpass" type="password" autocomplete="current-password"></label>
-    <div id="loginmsg" class="msg err"></div>
-    <div class="row"><button id="loginok" value="ok">Log in</button><button type="button" class="plain" id="logincancel">Cancel</button></div>
-  </form>
-</dialog>
 <dialog id="reviewdlg">
   <h3>Unsaved changes</h3>
   <div id="issues" class="msg err"></div>
@@ -410,8 +420,8 @@ const rows = (pairs) => pairs.map(([k, v]) => `<tr><th>${esc(k)}</th><td>${v}</t
 const dur = (s) => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + "d " : "") + h + "h " + m + "m " + (s % 60) + "s"; };
 const bits = (bps) => bps >= 1e9 ? (bps / 1e9).toFixed(2) + " Gbit/s" : bps >= 1e6 ? (bps / 1e6).toFixed(1) + " Mbit/s" : bps >= 1e3 ? (bps / 1e3).toFixed(0) + " kbit/s" : Math.round(bps) + " bit/s";
 const bytes = (b) => b >= 1 << 30 ? (b / (1 << 30)).toFixed(2) + " GiB" : b >= 1 << 20 ? (b / (1 << 20)).toFixed(1) + " MiB" : b >= 1024 ? (b / 1024).toFixed(0) + " KiB" : b + " B";
-const store = { get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
-                set(k, v) { try { v === null ? sessionStorage.removeItem(k) : sessionStorage.setItem(k, v); } catch {} } };
+const store = { get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+                set(k, v) { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} } };
 
 // ================= Pages (hash routing) =================
 const PAGES = [...document.querySelectorAll(".page")].map((p) => p.dataset.page);
@@ -447,28 +457,41 @@ function ask(title, text, ok = "OK", danger = false) {
   });
 }
 
-// ================= Login: a session token per tab =================
-// POST /api/login with the password (HTTP Basic, once) returns a token;
-// every later request sends "Authorization: Bearer <token>", so the
-// password is not kept and the router checks its hash once per login.
+// ================= Login screen and session =================
+// With a password, everything but the page and /api/info needs a login
+// (as in LuCI): the login screen covers the page until there is a
+// session. POST /api/login with the password (HTTP Basic, once) returns a
+// token; every later request sends "Authorization: Bearer <token>", so
+// the password is not kept. The token is kept across tabs and restarts of
+// the browser (localStorage); the router forgets it after 12 h unused, at
+// a logout, a reboot or a password change, and the page then asks again.
+// Without a password the page is read-only and needs no login.
 let token = store.get("rrouter-token");
-let authAvailable = true;
+let authAvailable = false;
 const b64 = (s) => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
 const authHeaders = () => ({ "X-Rrouter-UI": "1", ...(token ? { Authorization: "Bearer " + token } : {}) });
 function setToken(t) { token = t; store.set("rrouter-token", t); showLogin(); }
 function showLogin() {
-  $("loginbtn").textContent = !authAvailable ? "Read-only" : token ? "Log out" : "Log in";
+  $("loginbtn").textContent = authAvailable ? "Log out" : "Read-only";
   $("loginbtn").disabled = !authAvailable;
   $("loginbtn").title = authAvailable ? "" : "Changes are disabled: no password yet (serial CLI: config set mgmt.password = \"…\", or boot with mgmt_pass=)";
 }
-let loginWaiter = null;
-function openLogin(why = "") {
+const locked = () => document.body.classList.contains("locked");
+let loginWaiters = [];
+// Show the login screen; resolves once logged in. Pending changes stay.
+function lock(why = "") {
+  for (const d of document.querySelectorAll("dialog[open]")) d.close();
+  document.body.classList.add("locked");
+  $("gate").hidden = false; $("loginform").hidden = false;
+  $("gatemsg").innerHTML = "Log in as <b>admin</b> with the router's password (or the boot argument <code>mgmt_pass=</code>).";
   $("loginmsg").textContent = why; $("loginpass").value = "";
-  if (!$("logindlg").open) $("logindlg").showModal();
   $("loginpass").focus();
-  return new Promise((resolve) => { loginWaiter = resolve; });
+  return new Promise((resolve) => loginWaiters.push(resolve));
 }
-function closeLogin(ok) { $("logindlg").close(); if (loginWaiter) { loginWaiter(ok); loginWaiter = null; } }
+function unlock() {
+  document.body.classList.remove("locked"); $("gate").hidden = true;
+  for (const w of loginWaiters.splice(0)) w(true);
+}
 $("loginform").onsubmit = async (ev) => {
   ev.preventDefault();
   const p = $("loginpass").value;
@@ -476,31 +499,33 @@ $("loginform").onsubmit = async (ev) => {
   try {
     const r = await fetch("/api/login", { method: "POST", headers: { "X-Rrouter-UI": "1", Authorization: "Basic " + b64("admin:" + p) } });
     const j = await r.json().catch(() => ({}));
-    if (r.ok && j.token) { setToken(j.token); closeLogin(true); return; }
-    $("loginmsg").textContent = r.status === 401 ? "Wrong password." : (j.error ?? `Refused (${r.status})`);
+    if (r.ok && j.token) { setToken(j.token); unlock(); return; }
+    $("loginmsg").textContent = r.status === 401 ? "Wrong password." : r.status === 429 ? "Too fast: wait a second and try again." : (j.error ?? `Refused (${r.status})`);
   } catch (e) { $("loginmsg").textContent = "Request failed: " + e; }
 };
-$("logincancel").onclick = () => closeLogin(false);
-$("logindlg").oncancel = () => closeLogin(false);
 $("loginbtn").onclick = async () => {
-  if (token) {
-    try { await fetch("/api/logout", { method: "POST", headers: authHeaders() }); } catch {}
-    setToken(null);
-    if (page === "logs") loadLog();
-  } else openLogin();
+  try { await fetch("/api/logout", { method: "POST", headers: authHeaders() }); } catch {}
+  setToken(null);
+  lock("Logged out.");
 };
 async function ensureLogin() {
   if (!authAvailable) return false;
-  return token ? true : openLogin();
+  return token ? true : lock();
 }
-// One API call with the session; a 401 (expired, or the password changed)
-// asks to log in again.
+// One API call with the session. A 401 (no session, expired, the router
+// rebooted, the password changed) shows the login screen; once logged in
+// the call is sent again.
 async function api(method, path, { body, type, headers = {} } = {}) {
-  const r = await fetch(path, { method, cache: "no-store", body,
-    headers: { ...authHeaders(), ...(type ? { "Content-Type": type } : {}), ...headers } });
-  const j = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
-  if (r.status === 401) { setToken(null); }
-  return { r, j };
+  for (;;) {
+    const r = await fetch(path, { method, cache: "no-store", body,
+      headers: { ...authHeaders(), ...(type ? { "Content-Type": type } : {}), ...headers } });
+    const j = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
+    if (r.status !== 401) return { r, j };
+    authAvailable = true; // a 401 means there is a password
+    const had = token !== null;
+    setToken(null);
+    await lock(had ? "Session ended: log in again." : "");
+  }
 }
 
 // ================= CPU load per core =================
@@ -672,8 +697,12 @@ const DROP_TEXT = {
 let savedReboot = false;
 let st = null, lastUptime = null, failures = 0;
 async function refresh() {
-  try { st = await (await fetch("/api/status", { cache: "no-store" })).json(); }
-  catch (e) {
+  if (locked()) return;
+  try {
+    const { r, j } = await api("GET", "/api/status");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    st = j;
+  } catch (e) {
     // The router serves few connections at once: one failed poll (e.g.
     // while the page loads) is retried soon; offline after two in a row.
     if (++failures >= 2) { $("offline").hidden = false; $("up").textContent = "offline"; }
@@ -1315,8 +1344,9 @@ function markIssues(issues) {
 }
 async function loadConfig() {
   try {
-    const r = await fetch("/api/config.json", { cache: "no-store" });
-    cfgOrig = await r.json();
+    const { r, j } = await api("GET", "/api/config.json");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    cfgOrig = j;
     fillForm(cfgOrig); markIssues([]);
     cfgBase = readForm(); // what the forms make of the saved config
     updatePending();
@@ -1347,7 +1377,6 @@ async function postConfig(body, type) {
   catch (e) { pSay("Request failed: " + e, true); return false; }
   if (!j.ok) {
     markIssues(j.issues ?? []);
-    if (r.status === 401) { pSay("Log in to save.", true); return false; }
     if (j.issues?.length) { pSay(`Not saved (${r.status}): ${j.issues.length} problem(s), see Review.`, true); showReview(j.issues); }
     else pSay(`Not saved (${r.status}): ${j.error}`, true);
     return false;
@@ -1362,7 +1391,7 @@ async function postConfig(body, type) {
   } else {
     const pwChanged = changes().some((c) => c.path === "mgmt.password");
     pSay(`${j.detail[0].toUpperCase() + j.detail.slice(1)}: in effect now.` + (pwChanged ? " The password changed: log in again with the new one." : ""));
-    if (pwChanged) { setToken(null); $("newpass").value = ""; $("newpass2").value = ""; }
+    if (pwChanged) { $("newpass").value = ""; $("newpass2").value = ""; setToken(null); lock("The password changed: log in with the new one."); }
     setTimeout(() => { if (!changes().length) pSay(""); }, 6000);
     await loadConfig(); refresh();
   }
@@ -1389,7 +1418,8 @@ function showOverrides(ov) {
 }
 $("effective").onclick = async () => {
   try {
-    const eff = await (await fetch("/api/config/effective.json", { cache: "no-store" })).json();
+    const { r, j: eff } = await api("GET", "/api/config/effective.json");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     fillForm(eff); markIssues([]); updatePending();
     $("bkmsg").textContent = "The forms now hold the values in effect. Save them, then remove the boot arguments marked in red.";
   } catch (e) { $("bkmsg").textContent = "Could not load the values in effect: " + e; }
@@ -1458,11 +1488,6 @@ async function loadLog() {
   clearTimeout(logTimer);
   if (page !== "logs") return;
   if (!authAvailable) { $("loginfo").textContent = "The log needs a login, and logins are disabled (boot with mgmt_pass=…)."; return; }
-  if (!token) {
-    $("loginfo").innerHTML = 'Log in to read the log. <button class="plain" id="loglogin">Log in</button>';
-    $("loglogin").onclick = async () => { if (await openLogin()) loadLog(); };
-    return;
-  }
   try {
     const { r, j } = await api("GET", "/api/log");
     if (r.ok) {
@@ -1470,8 +1495,7 @@ async function loadLog() {
       $("loginfo").textContent = !j.ram ? "Log messages go to the serial console (boot argument log=console); nothing is kept in RAM."
         : `RAM log, ${n(j.text.length)} bytes` + (j.dropped ? `; ${n(j.dropped)} older lines dropped (64 KiB kept)` : "");
       showLog();
-    } else if (r.status === 401) { loadLog(); return; }
-    else $("loginfo").textContent = `Refused (${r.status}): ${j.error}`;
+    } else $("loginfo").textContent = `Refused (${r.status}): ${j.error}`;
   } catch (e) { $("loginfo").textContent = "Request failed: " + e; }
   if ($("logfollow").checked) logTimer = setTimeout(loadLog, 3000);
 }
@@ -1479,11 +1503,25 @@ $("logq").oninput = showLog;
 $("logload").onclick = loadLog;
 $("logfollow").onchange = loadLog;
 
-showLogin();
-route();
-loadConfig();
-refresh();
-setInterval(refresh, 2000);
+// Start: ask whether there is a password (retrying while the router does
+// not answer), then the login screen or the page.
+(async () => {
+  for (;;) {
+    try {
+      const r = await fetch("/api/info", { cache: "no-store" });
+      authAvailable = !!(await r.json()).auth;
+      break;
+    } catch { $("gatemsg").textContent = "The router does not answer. This page keeps trying."; }
+    await new Promise((res) => setTimeout(res, 2000));
+  }
+  showLogin();
+  if (authAvailable && !token) await lock();
+  else unlock();
+  route();
+  loadConfig();
+  refresh();
+  setInterval(refresh, 2000);
+})();
 </script>
 </body>
 </html>

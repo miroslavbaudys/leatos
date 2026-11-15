@@ -1,7 +1,10 @@
 //! Management web interface: HTTP on port 80 (smoltcp TCP ↔ `proto_http`).
 //!
-//! - `GET /`: the status page (`mgmt.html`, compiled in), which polls
+//! - `GET /`: the page (`mgmt.html`, compiled in): a login screen first
+//!   when a password exists, then the interface, which polls
 //! - `GET /api/status`: JSON (interfaces, link, qdisc, DHCP leases, memory)
+//! - `GET /api/info`: `{auth}`, without auth: whether a password exists
+//!   (the page shows its login screen then). Nothing else is public.
 //! - `POST /api/upgrade`: body = a kernel ELF; streamed straight into the
 //!   staging area (`mm::heap::take_staging`), checked (`crate::upgrade`,
 //!   optional `X-Image-CRC32` header), then the network task hands over to
@@ -36,23 +39,22 @@
 //!   erases it and reboots into the previous record. No save while a trial
 //!   is pending (it would overwrite the only confirmed record).
 //!
-//! - `POST /api/login`: checks the credentials and does nothing else (the
-//!   page's login form). `GET /api/log`: the RAM log's tail as JSON
-//!   (`{ram, dropped, text}`), with auth: it names hosts and addresses.
+//! - `GET /api/log`: the RAM log's tail as JSON (`{ram, dropped, text}`),
+//!   always with auth: it names hosts and addresses.
+//! - `POST /api/login` (Basic auth, the page's login screen): a session
+//!   token (`{ok, token}`), sent as `Authorization: Bearer <token>`; it
+//!   lasts while used at least every 12 h. `POST /api/logout` ends it.
 //! - Requests with `X-Rrouter-UI: 1` (the page's own) get a 401 without
-//!   `WWW-Authenticate`, so the browser shows the page's login form
+//!   `WWW-Authenticate`, so the browser shows the page's login screen
 //!   instead of its own password dialog.
 //!
-//! - `POST /api/login` (Basic auth): a session token for the page
-//!   (`{ok, token}`), sent as `Authorization: Bearer <token>`; it lasts
-//!   while used at least every 12 h. `POST /api/logout` ends it.
-//!
-//! Upgrade, reboot, log and config changes need auth: a session token, or
-//! HTTP Basic (user `admin`) with the password from the `mgmt_pass=` boot
-//! argument or else the config's `mgmt.password_hash` (PBKDF2-SHA256,
-//! checked once per login; scripts' repeats are cached). A wrong password
-//! blocks password attempts for a second. Without any password, changes
-//! are refused. A saved `mgmt.password` (clear text, from the form or the
+//! With a password, everything but the page itself and `/api/info` needs
+//! auth, status and config reads included (as in OpenWrt's LuCI); without
+//! one, reads are public and changes refused. Auth is a session token, or
+//! HTTP Basic (user `admin`, scripts) with the password from the
+//! `mgmt_pass=` boot argument or else the config's `mgmt.password_hash`
+//! (PBKDF2-SHA256, checked once per login; scripts' repeats are cached).
+//! A wrong password blocks password attempts for a second. A saved `mgmt.password` (clear text, from the form or the
 //! CLI) is hashed before it is stored, and ends all sessions.
 //! Listens on the LAN; on the WAN too only with `mgmt=wan` (development:
 //! a router's management belongs on the LAN). Plain HTTP: the password
@@ -132,6 +134,8 @@ pub enum Action {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Route {
     Index,
+    /// Public: whether a password exists.
+    Info,
     Status,
     Upgrade,
     UpgradePersist,
@@ -580,6 +584,7 @@ impl Mgmt {
         self.conns[i].no_prompt = head.header("x-rrouter-ui").is_some();
         let route = match (head.method, head.path.as_str()) {
             (Method::Get, "/" | "/index.html") => Ok(Route::Index),
+            (Method::Get, "/api/info") => Ok(Route::Info),
             (Method::Get, "/api/status") => Ok(Route::Status),
             (Method::Post, "/api/upgrade") => Ok(Route::Upgrade),
             (Method::Post, "/api/upgrade/persist") => Ok(Route::UpgradePersist),
@@ -598,7 +603,7 @@ impl Mgmt {
             (Method::Get, "/api/log") => Ok(Route::Log),
             (
                 _,
-                "/" | "/index.html" | "/api/status" | "/api/upgrade" | "/api/upgrade/persist"
+                "/" | "/index.html" | "/api/info" | "/api/status" | "/api/upgrade" | "/api/upgrade/persist"
                 | "/api/upgrade/confirm" | "/api/upgrade/revert" | "/api/reboot"
                 | "/api/config" | "/api/config.json" | "/api/config/effective"
                 | "/api/config/effective.json" | "/api/config/confirm"
@@ -613,6 +618,18 @@ impl Mgmt {
                 matches!(r, Route::ConfigPut | Route::ConfigConfirm | Route::ConfigRevert);
             let changes_image =
                 matches!(r, Route::UpgradePersist | Route::UpgradeConfirm | Route::UpgradeRevert);
+            // Reads are public only while there is no password at all.
+            let reads = matches!(
+                r,
+                Route::Status
+                    | Route::ConfigGet
+                    | Route::ConfigJson
+                    | Route::EffectiveGet
+                    | Route::EffectiveJson
+            );
+            if reads && self.auth_configured() {
+                self.authorized(&head)?;
+            }
             if changes_config
                 || changes_image
                 || matches!(r, Route::Upgrade | Route::Reboot | Route::Login | Route::Log)
@@ -696,6 +713,10 @@ impl Mgmt {
         match route {
             Route::Index => {
                 self.conns[i].respond(200, "text/html; charset=utf-8", &[], PAGE.as_bytes())
+            }
+            Route::Info => {
+                let body = format!("{{\"auth\":{}}}", self.auth_configured());
+                self.conns[i].respond_json(200, &body);
             }
             Route::Status => {
                 let s = status_json();

@@ -202,7 +202,7 @@ fi
 # the main LAN. Negative control: LAB_GUEST_ZONE=lan (the network in the
 # main zone) must fail "web interface blocked" and "main LAN refused".
 guest=$($bb sed -n 's/.*lab_guest=\([a-z]*\).*/\1/p' /proc/cmdline)
-fwdrops() { $bb wget -q -T 5 -O - "http://192.168.1.1/api/status" 2>/dev/null | $bb grep -o '"firewall":[0-9]*' | $bb cut -d: -f2; }
+fwdrops() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb grep -o '"firewall":[0-9]*' | $bb cut -d: -f2; }
 if [ -n "$guest" ]; then
   for m in virtio_blk squashfs; do modprobe "$m" 2>/dev/null || $bb modprobe "$m" 2>/dev/null; done
   $bb mkdir -p /.modloop
@@ -244,7 +244,7 @@ if [ -n "$guest" ]; then
     # (no host there: the proof is the rule's hit counter, and no firewall
     # drop); guest-no-isp-web refuses guest TCP 80 to the WAN while guest
     # ICMP to the ISP passed above. lab_guest_rules=0: the negative control.
-    hits() { $bb wget -q -T 5 -O - "http://192.168.1.1/api/status" 2>/dev/null | $bb tr '{' '\n' | $bb grep "\"name\":\"$1\"" | $bb sed -n 's/.*"hits":\([0-9]*\).*/\1/p'; }
+    hits() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb tr '{' '\n' | $bb grep "\"name\":\"$1\"" | $bb sed -n 's/.*"hits":\([0-9]*\).*/\1/p'; }
     before=$(fwdrops); h0=$(hits guest-ping-nas)
     $bb ping -c 3 -W 1 -I "$gip" 192.168.1.10 >/dev/null 2>&1
     $bb sleep 2   # hit counters are published once a second

@@ -54,7 +54,8 @@ QPID=$!
 wait_for 1 "dhcp lease" 90 || { echo "  [FAIL] router did not boot"; exit 1; }
 
 code() { curl -s -m 20 -o /dev/null -w '%{http_code}' "$@" || true; }
-check "status JSON" "x86_64" "$(curl -s -m 5 "$URL/api/status" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["arch"])' 2>/dev/null || true)"
+check "status without password -> 401, /api/info public" '401 {"auth":true}' "$(code "$URL/api/status") $(curl -s -m 5 "$URL/api/info" || true)"
+check "status JSON" "x86_64" "$(curl -s -m 5 -u admin:test "$URL/api/status" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["arch"])' 2>/dev/null || true)"
 check "status page" "1" "$(curl -s -m 5 "$URL/" | grep -c '<title>rrouter</title>' || true)"
 check "unknown path -> 404" 404 "$(code "$URL/nope")"
 check "upload without password -> 401" 401 "$(code -X POST --data-binary @"$WORK/new.elf" "$URL/api/upgrade")"
@@ -71,7 +72,7 @@ for gen in 2 3; do
   ok=0
   wait_for "$gen" "dhcp lease" 90 && grep -aq "bootargs .*gen=$gen" "$LOG" && ok=1
   check "upgrade $((gen - 1)): new kernel booted with gen=$gen and got DHCP" 1 "$ok"
-  check "upgrade $((gen - 1)): API answers again" x86_64 "$(curl -s -m 5 "$URL/api/status" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["arch"])' 2>/dev/null || true)"
+  check "upgrade $((gen - 1)): API answers again" x86_64 "$(curl -s -m 5 -u admin:test "$URL/api/status" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["arch"])' 2>/dev/null || true)"
 done
 check "password masked in the log" 0 "$(grep -ac 'mgmt_pass=test' "$LOG" || true)"
 
