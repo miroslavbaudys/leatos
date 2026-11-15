@@ -393,5 +393,46 @@ pointing at the right row while the user edits.
    client reaches itself through the WAN address (hairpin); negative
    control `LAB_FORWARD=0` (both fail). `store-test`: a forward saved
    through the API applies live.
-6. Multi-port bridge (M10), static WAN, IPv6 (M7, `[wan.ipv6]` and
-   per-network RA).
+   On the apu4 (2026-11-15): build 16bf581 persisted and confirmed; the
+   v1 config from the SD store runs as one network `lan`. VLAN networks,
+   zones, rules and forwards are not yet tried on hardware.
+
+### What is left (as of 2026-11-15)
+In rough order of value:
+
+6. **Hardware check on the apu4.** Before more features, verify on real
+   hardware: a guest VLAN through a managed switch or VLAN-capable AP
+   (lease, internet, isolation from the main LAN), a port forward from
+   outside, and hairpin. Nothing tested on hardware yet beyond one
+   untagged network.
+7. **Firewall polish.**
+   - `reject` sends a TCP RST / ICMP port unreachable (rate-limited)
+     instead of dropping.
+   - When rules or zones change, tracked connections the new policy
+     refuses are removed (today they run until they end).
+   - ICMP errors about forwarded and hairpin connections: `shard_of` has
+     no hint for them yet, so they can miss their connection's shard and
+     be dropped as invalid.
+8. **Small schema items the kernel still refuses:** `[[dns.host]]`
+   (local A records), a static WAN (`mode = "static"`, `[wan.static]`).
+9. **Web interface gaps.** DHCP settings and reservations of networks
+   other than the first (the schema has them; the pages edit only the
+   first network's), a per-network clients view, the management password
+   in the config as a PBKDF2 hash (today only the `mgmt_pass=` boot
+   argument), sessions instead of Basic auth on every request.
+10. **Live network changes.** Adding or changing a network reboots
+   (`Config::needs_reboot`); doing it live means adding and removing
+   forwarder interfaces, smoltcp interfaces and DHCP servers at run time.
+11. **Multi-port LAN (M10).** The apu4's other two i211 ports: a software
+   bridge with MAC learning, `network.ports` with per-port tagged or
+   untagged membership, and **WAN ingress shaping** (CAKE ingress mode),
+   because LAN egress no longer equals the download once traffic can stay
+   between LAN ports.
+12. **IPv6 (M7).** DHCPv6-PD over DHCP and PPPoE (IPv6CP), a /64 per
+   network with RA/RDNSS, the zone firewall for IPv6 (inbound blocked by
+   default), `[wan.ipv6]`.
+
+Outside this document (`docs/roadmap.md`): PPPoE long-run stability and a
+bufferbloat run on the PPPoE line with the right shaper overhead (M5),
+CAKE tuning on hardware (M6: DiffServ tins, ACK filter, ingress mode),
+per-packet cost on the apu4 and a 72 h soak (M10).
