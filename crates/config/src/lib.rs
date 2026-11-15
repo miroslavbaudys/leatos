@@ -860,19 +860,20 @@ impl Config {
         out
     }
 
-    /// The kernel builds its interfaces at boot: a change to the networks
-    /// (added, removed, renamed, another VLAN, address, port or zone) or to
-    /// the set of zone names is applied by rebooting into the saved config.
-    /// Zone policies, DHCP settings and everything else apply live.
+    /// Applied by rebooting into the saved config: which physical ports
+    /// the networks use (the port layout is built at boot). Networks
+    /// themselves (added, removed, VLAN, address, zone), zones, DHCP and
+    /// everything else apply live (docs/config-v2.md §7).
     pub fn needs_reboot(&self, old: &Config) -> bool {
-        let layout = |c: &Config| -> Vec<(String, Vec<String>, u16, Cidr, String)> {
-            c.networks
-                .iter()
-                .map(|n| (n.name.clone(), n.ports.clone(), n.vlan, n.ipv4, n.zone.clone()))
-                .collect()
+        let ports = |c: &Config| -> Vec<(String, Vec<String>)> {
+            c.networks.iter().map(|n| (n.name.clone(), n.ports.clone())).collect()
         };
-        let zones = |c: &Config| -> Vec<String> { c.zones.iter().map(|z| z.name.clone()).collect() };
-        layout(self) != layout(old) || zones(self) != zones(old)
+        let mut a = ports(self);
+        let mut b = ports(old);
+        // A network added or removed on lan0 changes nothing at boot.
+        a.retain(|(_, p)| p.len() != 1 || p[0] != PORT_LAN);
+        b.retain(|(_, p)| p.len() != 1 || p[0] != PORT_LAN);
+        a != b
     }
 
     /// The first network: version 1's `[lan]`, where boot argument `lan=`

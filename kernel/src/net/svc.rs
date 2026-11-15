@@ -316,16 +316,18 @@ fn restart_wan(
 /// PPPoE and DNS are reconfigured in place. Returns the WAN change when
 /// the WAN link was restarted.
 fn apply_saved(
-    cfg: crate::config::schema::Config,
-    source: String,
+    (cfg, source): (crate::config::schema::Config, String),
     sh: &Shared,
-    wan: &mut HostIf,
+    hosts: &mut [HostIf],
     pppoe: &mut Option<Pppoe>,
     services: Option<&mut LanServices>,
+    mgmt: &mut Mgmt,
+    slots: &mut Vec<Option<String>>,
 ) -> Option<LeaseChange> {
     let old = crate::config::qos();
     let old_tag = crate::config::wan_tci();
     let old_pppoe = crate::config::pppoe();
+    let old_nets = crate::config::networks();
     crate::config::apply(cfg, source);
     let tag = crate::config::wan_tci();
     let new_pppoe = crate::config::pppoe();
@@ -340,15 +342,31 @@ fn apply_saved(
             tag.map_or(String::from("untagged"), stack::vlan_text),
             if new_pppoe.is_some() { "PPPoE" } else { "DHCP" }
         );
-        change = restart_wan(sh, wan, pppoe, new_pppoe);
+        change = restart_wan(sh, &mut hosts[0], pppoe, new_pppoe);
     }
     // Also picks up the WAN tag's 4 bytes and PPPoE's 8 of shaper overhead.
     stack::apply_qos(sh, &old, &crate::config::qos());
-    // Zone policies (new flows; the zones themselves only change by a
-    // reboot, `Config::needs_reboot`).
-    sh.post_policy(crate::config::firewall());
-    if let Some(svc) = services {
-        svc.reconfigure();
+    // Networks and firewall, live (docs/config-v2.md §7): a network keeps
+    // its slot while its name stays; addresses for the router stack, the
+    // rest for the datapath.
+    if sh.links.len() > 1 {
+        let (placed, links, msg) = stack::place_networks(slots);
+        *slots = placed;
+        let nets = crate::config::networks();
+        stack::set_host_addrs(hosts, &nets, &links);
+        let shape = |v: &[crate::config::Lan]| -> Vec<(String, u16, core::net::Ipv4Addr, u8, u8)> {
+            v.iter().map(|n| (n.name.clone(), n.vid, n.addr, n.prefix, n.zone)).collect()
+        };
+        if shape(&old_nets) != shape(&nets) {
+            stack::log_networks(sh.ports[1].name, &nets);
+        }
+        sh.post_networks(msg);
+        if let Some(svc) = services {
+            svc.reconfigure(hosts, &links);
+        }
+        mgmt.add_sockets(hosts, &links);
+    } else if let Some(svc) = services {
+        svc.reconfigure(hosts, &[]);
     }
     change
 }
@@ -463,8 +481,11 @@ pub async fn run(
     mut store: Option<crate::store::Store>,
 ) {
     let mut pinger = Pinger::new(&mut hosts[0].sockets);
-    let mut services = LanServices::new(&mut hosts);
-    let mut mgmt = Mgmt::new(&mut hosts, store.is_some());
+    // Network slots as bring_up placed them (`stack::place_networks`).
+    let (mut slots, links, _) = stack::place_networks(&[]);
+    let links = if sh.links.len() > 1 { links } else { Vec::new() };
+    let mut services = LanServices::new(&mut hosts, &links);
+    let mut mgmt = Mgmt::new(&mut hosts, &links, store.is_some());
     let mut cli = Cli::new(store.is_some());
     let mut pppoe = crate::config::pppoe().map(|c| Pppoe::new(c, &sh.ports[0]));
     // Serial input wakes the task too (the CLI).
@@ -525,9 +546,9 @@ pub async fn run(
             ) = (&r, &op)
             {
                 // Saved without a trial: run it now, no reboot.
-                let (wan, svc) = (&mut hosts[0], services.as_mut());
                 let cfg = (**cfg).clone();
-                if let Some(c) = apply_saved(cfg, source.clone(), sh, wan, &mut pppoe, svc) {
+                let svc = services.as_mut();
+                if let Some(c) = apply_saved((cfg, source.clone()), sh, &mut hosts, &mut pppoe, svc, &mut mgmt, &mut slots) {
                     publish_wan(&c, sh, &mut mgmt, &mut cli, services.as_mut());
                 }
             }
@@ -567,8 +588,8 @@ pub async fn run(
                             if reboot {
                                 action = Some(crate::net::mgmt::Action::Reboot);
                             } else if let Some(source) = source {
-                                let (wan, svc) = (&mut hosts[0], services.as_mut());
-                                if let Some(c) = apply_saved(*cfg, source, sh, wan, &mut pppoe, svc) {
+                                let svc = services.as_mut();
+                                if let Some(c) = apply_saved((*cfg, source), sh, &mut hosts, &mut pppoe, svc, &mut mgmt, &mut slots) {
                                     publish_wan(&c, sh, &mut mgmt, &mut cli, services.as_mut());
                                 }
                             }

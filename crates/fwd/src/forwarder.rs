@@ -581,6 +581,11 @@ impl Forwarder {
         }
     }
 
+    /// Move an interface to another firewall zone (new flows only).
+    pub fn set_zone(&mut self, ifx: IfIndex, zone: u8) {
+        self.ifs[ifx as usize].zone = zone;
+    }
+
     /// Largest IP packet `ifx` sends; bigger forwarded packets get ICMP
     /// "fragmentation needed" (DF) or are dropped, and TCP SYNs through
     /// it have their MSS clamped to fit.

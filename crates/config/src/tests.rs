@@ -1116,7 +1116,7 @@ fn what_the_kernel_supports() {
 }
 
 #[test]
-fn network_layout_changes_reboot() {
+fn only_port_changes_reboot() {
     let old = parse(FULL_V2).unwrap();
     let r = |f: fn(&mut Config)| {
         let mut c = old.clone();
@@ -1128,11 +1128,14 @@ fn network_layout_changes_reboot() {
     assert!(!r(|c| c.zones[0].allow.push(Service::Ntp)), "zone policy: live");
     assert!(!r(|c| c.zones[1].forward_to = vec!["wan".into()]));
     assert!(!r(|c| c.dns.cache_entries = 100));
-    assert!(r(|c| c.networks[1].vlan = 21));
-    assert!(r(|c| c.networks[1].ipv4.prefix = 16));
-    assert!(r(|c| c.networks[1].zone = "lan".into()));
-    assert!(r(|c| { c.networks.pop(); }));
-    assert!(r(|c| c.zones.push(Zone { name: "lab".into(), ..Zone::builtin_lan() })));
+    // Networks and zones change live now (docs/config-v2.md §7).
+    assert!(!r(|c| c.networks[1].vlan = 21));
+    assert!(!r(|c| c.networks[1].ipv4.prefix = 16));
+    assert!(!r(|c| c.networks[1].zone = "lan".into()));
+    assert!(!r(|c| { c.networks.pop(); }));
+    assert!(!r(|c| c.zones.push(Zone { name: "lab".into(), ..Zone::builtin_lan() })));
+    // Other physical ports: built at boot.
+    assert!(r(|c| c.networks[1].ports = vec!["lan1".into()]));
 }
 
 #[test]

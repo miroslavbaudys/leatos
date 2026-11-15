@@ -426,7 +426,7 @@ fn status(ctx: &Ctx, wan: &str) {
                 h.iface
                     .ip_addrs()
                     .iter()
-                    .map(|a| match l.vid {
+                    .map(|a| match l.vid() {
                         0 => alloc::format!("{a}"),
                         v => alloc::format!("{a} (vlan {v})"),
                     })

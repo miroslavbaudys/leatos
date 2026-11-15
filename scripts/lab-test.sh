@@ -72,6 +72,11 @@
 #                        with hairpin; the ISP fetches through it and the
 #                        client through the WAN address. Negative control:
 #                        LAB_FORWARD=0 (no forward: both fail).
+#   LAB_GUEST_LIVE=1     the same, but added live: the router boots with the
+#                        main LAN only (and mgmt_pass=lab-pass); the client
+#                        POSTs the guest config (in its initrd) to
+#                        /api/config first, expects it applied without a
+#                        reboot, then runs every check against it.
 #
 # SNTP: the router syncs from the ISP's ntpd (ntp=ntp.isp.example: resolved
 # through the router's DNS forwarder) and its clock must then be within 5 s
@@ -99,6 +104,8 @@ if [[ -n "$ISP_PPPOE" ]]; then
   BIG_PING="${LAB_BIG_PING:-1464}"
 fi
 GUEST="${LAB_GUEST:-}"
+GUEST_LIVE="${LAB_GUEST_LIVE:-}"
+[[ -n "$GUEST_LIVE" ]] && GUEST=1
 GUEST_ZONE="${LAB_GUEST_ZONE:-guest}"
 GUEST_RULES="${LAB_GUEST_RULES:-1}"
 FORWARD="${LAB_FORWARD:-1}"
@@ -187,8 +194,21 @@ CFG
   cargo build -q -p rrstore --release
   target/release/rrstore create "$WORK/store.img" --mib 32 >/dev/null
   target/release/rrstore put "$WORK/store.img" config "$WORK/config.toml" >/dev/null
+  if [[ -n "$GUEST_LIVE" ]]; then
+    # Boot with the main LAN only (everything before the second network);
+    # the client adds the rest live.
+    awk '/^\[\[network\]\]$/ { n++ } n < 2' "$WORK/config.toml" >"$WORK/boot.toml"
+    target/release/rrstore create "$WORK/store.img" --mib 32 >/dev/null
+    target/release/rrstore put "$WORK/store.img" config "$WORK/boot.toml" >/dev/null
+    ROUTER_ARGS="$ROUTER_ARGS mgmt_pass=lab-pass"
+    # The full config goes into the client's initrd (an extra cpio archive).
+    mkdir -p "$WORK/extra"; cp "$WORK/config.toml" "$WORK/extra/guest.toml"
+    ( cd "$WORK/extra" && echo guest.toml | cpio -o -H newc 2>/dev/null | gzip -9 ) >"$WORK/extra.cpio.gz"
+    cat "$CLIENT_INITRD" "$WORK/extra.cpio.gz" >"$WORK/client-initrd.img"
+    CLIENT_INITRD="$WORK/client-initrd.img"
+  fi
   ROUTER_STORE="$WORK/store.img"
-  echo "== router config: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")"
+  echo "== router config${GUEST_LIVE:+ (added live by the client)}: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")"
 fi
 
 echo "== start rrouter${ROUTER_ARGS:+ ($(echo "$ROUTER_ARGS" | sed 's/pppoe_pass=[^ ]*/pppoe_pass=***/'))}"
@@ -203,7 +223,7 @@ PIDS+=($!)
 
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD}"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD}${GUEST_LIVE:+ lab_guest_live=1}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so

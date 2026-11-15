@@ -105,6 +105,23 @@ const PAGE: &str = include_str!("mgmt.html");
 /// `GET /api/log`: at most this much of the RAM log's tail (all of it).
 const LOG_MAX: usize = 64 * 1024;
 
+/// Listening sockets on each network that reaches the web interface and
+/// has none yet (`LAN_SOCKETS` per link). Returns the networks' names.
+fn add_lan_sockets(conns: &mut Vec<Conn>, ifs: &mut [HostIf], links: &[usize]) -> Vec<String> {
+    let nets = config::networks();
+    let mut on = Vec::new();
+    for (net, &link) in nets.iter().zip(links) {
+        if !net.mgmt || conns.iter().any(|c| c.ifx == link) {
+            continue;
+        }
+        for _ in 0..LAN_SOCKETS {
+            conns.push(Conn::new(link, ifs[link].sockets.add(tcp_socket())));
+        }
+        on.push(net.name.clone());
+    }
+    on
+}
+
 /// What the network task must do after [`Mgmt::step`].
 pub enum Action {
     /// Stop the devices and enter the prepared kernel.
@@ -315,27 +332,18 @@ fn tcp_socket() -> tcp::Socket<'static> {
 }
 
 impl Mgmt {
-    /// `hosts[0]` = WAN, `hosts[1]` = LAN.
-    pub fn new(ifs: &mut [HostIf], has_store: bool) -> Self {
+    /// `ifs[0]` is the WAN; network `k` of `config::networks` is on
+    /// `ifs[links[k]]`.
+    pub fn new(ifs: &mut [HostIf], links: &[usize], has_store: bool) -> Self {
         let cfg = config::mgmt();
-        let nets = config::networks();
         let mut conns = Vec::new();
-        let mut on = Vec::new();
-        for (ifx, nif) in ifs.iter_mut().enumerate() {
-            // The WAN only with mgmt=wan; a network if its zone lets the
-            // web interface be reached (the forwarder enforces it too).
-            let n = match ifx.checked_sub(1).map(|i| nets.get(i)) {
-                None if cfg.on_wan => WAN_SOCKETS,
-                Some(Some(net)) if net.mgmt => {
-                    on.push(net.name.clone());
-                    LAN_SOCKETS
-                }
-                _ => 0,
-            };
-            for _ in 0..n {
-                conns.push(Conn::new(ifx, nif.sockets.add(tcp_socket())));
+        // The WAN only with mgmt=wan.
+        if cfg.on_wan {
+            for _ in 0..WAN_SOCKETS {
+                conns.push(Conn::new(0, ifs[0].sockets.add(tcp_socket())));
             }
         }
+        let on = add_lan_sockets(&mut conns, ifs, links);
         let staging = crate::mm::heap::take_staging();
         println!(
             "  mgmt            : http :{PORT} on {}{}, upgrade {}",
@@ -372,6 +380,18 @@ impl Mgmt {
                 .map(|(slot, header)| Trial::new(upgrade::AREA, slot, header)),
             reboot_pending: false,
             saved_lan: None,
+        }
+    }
+
+    /// Networks changed (live): listen on those whose zone now lets the
+    /// web interface be reached. Sockets are never taken away (connection
+    /// indices stay valid); the forwarder's input policy refuses what a
+    /// zone may no longer reach, and a slot without a network has no
+    /// address.
+    pub fn add_sockets(&mut self, ifs: &mut [HostIf], links: &[usize]) {
+        let on = add_lan_sockets(&mut self.conns, ifs, links);
+        if !on.is_empty() {
+            println!("  mgmt            : http :{PORT} now also on {}", on.join(" + "));
         }
     }
 

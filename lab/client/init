@@ -34,6 +34,19 @@ else
   echo "LAB DONE fails=$fails"; $bb poweroff -f
 fi
 
+# --- live config (scripts/lab-test.sh LAB_GUEST_LIVE=1) -----------------------
+# The router booted with the main LAN only; add the guest network, zone,
+# rules and forward from /guest.toml without a reboot, before every check.
+if $bb grep -q 'lab_guest_live=1' /proc/cmdline; then
+  r=$($bb wget -q -T 20 -O - --header "Content-Type: application/toml" --post-data="$($bb cat /guest.toml)" \
+      "http://admin:lab-pass@192.168.1.1/api/config" 2>&1)
+  case "$r" in
+    *'"applied":true'*) pass "live config: guest network, zone, rules and forward applied without a reboot" ;;
+    *) fail "live config: $r" ;;
+  esac
+  $bb sleep 2
+fi
+
 # --- DNS ------------------------------------------------------------------
 lookup() { # name expect-substring description
   out=$($bb nslookup "$1" 192.168.1.1 2>&1)

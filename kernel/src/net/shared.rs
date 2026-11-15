@@ -28,7 +28,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::net::Ipv4Addr;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
 /// Bound on frames waiting for the router stack.
@@ -107,23 +107,32 @@ impl PortShared {
     }
 }
 
-/// A router interface: the WAN, or a network (docs/config-v2.md). Its
-/// index is the forwarder's `IfIndex` and the services' `HostIf` index.
+/// Router interfaces: the WAN, and one slot per possible network.
+pub const MAX_LINKS: usize = 1 + crate::config::schema::MAX_NETWORKS;
+
+/// A router interface: the WAN (link 0), or a slot for a network on the
+/// LAN port (docs/config-v2.md). Its index is the forwarder's `IfIndex`
+/// and the services' `HostIf` index. Network slots exist from boot and
+/// are switched on, retagged and readdressed when the config changes
+/// (live), so nothing indexed by link ever moves.
 pub struct LinkShared {
     /// Index into [`Shared::ports`].
     pub port: usize,
     /// 802.1Q VLAN ID on the port (networks), 0 = untagged. The WAN's tag
     /// is the port's own ([`PortShared::vlan`]).
-    pub vid: u16,
+    vid: AtomicU16,
+    /// The slot holds a network (the WAN: always).
+    active: AtomicBool,
     /// Frames for the router stack, filled by the datapath.
     pub local_rx: Mutex<VecDeque<PacketBuf>>,
 }
 
 impl LinkShared {
-    pub fn new(port: usize, vid: u16) -> Self {
+    pub fn new(port: usize, active: bool) -> Self {
         LinkShared {
             port,
-            vid,
+            vid: AtomicU16::new(0),
+            active: AtomicBool::new(active),
             local_rx: Mutex::new(VecDeque::with_capacity(LOCAL_RX_MAX)),
         }
     }
@@ -133,16 +142,73 @@ impl LinkShared {
     pub fn detached() -> Self {
         LinkShared {
             port: 0,
-            vid: 0,
+            vid: AtomicU16::new(0),
+            active: AtomicBool::new(false),
             local_rx: Mutex::new(VecDeque::new()),
         }
+    }
+
+    pub fn vid(&self) -> u16 {
+        self.vid.load(Ordering::Relaxed)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    /// The datapath (re)configures a network slot.
+    pub fn set(&self, active: bool, vid: u16) {
+        self.vid.store(vid, Ordering::Relaxed);
+        self.active.store(active, Ordering::Relaxed);
     }
 
     /// The tag frames of this link carry on its port (`None`: untagged,
     /// or the port's own tag applies).
     pub fn tci(&self) -> Option<u16> {
-        (self.vid != 0).then(|| fwd::wire::vlan_tci_of(self.vid, 0))
+        let vid = self.vid();
+        (vid != 0).then(|| fwd::wire::vlan_tci_of(vid, 0))
     }
+}
+
+/// A network in its link slot, for the datapath.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetSlot {
+    pub link: usize,
+    pub vid: u16,
+    pub addr: (Ipv4Addr, u8),
+    pub zone: u8,
+}
+
+/// The networks and the firewall, as the datapath applies them together
+/// (zone numbers belong to both).
+#[derive(Clone, Debug)]
+pub struct Networks {
+    pub nets: Vec<NetSlot>,
+    pub policy: fwd::forwarder::Policy,
+}
+
+/// Which network each slot holds (`slots[i]` = link `1 + i`), keeping a
+/// network in its slot while its name stays: `prev` is the last
+/// assignment, `names` the networks now. Returns the new assignment and,
+/// per network in `names`' order, its link.
+pub fn assign_slots(prev: &[Option<alloc::string::String>], names: &[&str]) -> (Vec<Option<alloc::string::String>>, Vec<usize>) {
+    let n = MAX_LINKS - 1;
+    let mut slots: Vec<Option<alloc::string::String>> = (0..n)
+        .map(|i| prev.get(i).cloned().flatten().filter(|p| names.contains(&p.as_str())))
+        .collect();
+    let mut links = Vec::new();
+    for name in names {
+        let i = match slots.iter().position(|s| s.as_deref() == Some(*name)) {
+            Some(i) => i,
+            None => {
+                let i = slots.iter().position(Option::is_none).expect("at most MAX_NETWORKS networks");
+                slots[i] = Some(alloc::string::String::from(*name));
+                i
+            }
+        };
+        links.push(1 + i);
+    }
+    (slots, links)
 }
 
 /// A WAN lease change for the forwarder: address/prefix and gateway.
@@ -157,15 +223,16 @@ pub struct WanChange {
 #[derive(Default)]
 pub struct Control {
     pub wan: Option<WanChange>,
-    /// A new zone firewall (a saved config).
-    pub policy: Option<fwd::forwarder::Policy>,
+    /// New networks and firewall (a saved config).
+    pub networks: Option<Networks>,
     pub action: Option<Action>,
 }
 
 pub struct Shared {
     /// `ports[0]` = WAN, `ports[1]` = LAN.
     pub ports: Vec<PortShared>,
-    /// `links[0]` = the WAN (port 0), then the networks (port 1).
+    /// `links[0]` = the WAN (port 0), then [`MAX_LINKS`]` - 1` network
+    /// slots on port 1 (none without a LAN port).
     pub links: Vec<LinkShared>,
     /// Services → the primary datapath task: a control message.
     pub dp_kick: &'static IrqEvent,
@@ -211,8 +278,8 @@ impl Shared {
         self.dp_kick.signal();
     }
 
-    pub fn post_policy(&self, policy: fwd::forwarder::Policy) {
-        self.control.lock().policy = Some(policy);
+    pub fn post_networks(&self, networks: Networks) {
+        self.control.lock().networks = Some(networks);
         self.dp_kick.signal();
     }
 

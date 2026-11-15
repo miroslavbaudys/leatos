@@ -339,11 +339,22 @@ is enough, as on OpenWrt.
 - **Live:** shaping, DNS, DHCP pools and reservations, zone policies
   (`input`, `allow`, `forward_to`; new flows only), later rules and
   forwards.
-- **Reboot** (`Config::needs_reboot`, implemented): the interfaces are
-  built at boot, so a change to the networks (added, removed, renamed,
-  VLAN, address, ports, zone) or to the set of zone names is saved and
-  then rebooted into (`reboot: true` in the save response; the CLI
-  reboots too). Live network changes can follow later.
+- **Networks live** ✅ (2026-11-15): the kernel has a link slot per
+  possible network from boot (`net::shared::MAX_LINKS`: a forwarder
+  interface, ARP table and smoltcp interface each, inactive until used).
+  A save places the networks in slots (`shared::assign_slots`: a network
+  keeps its slot while its name stays), gives the router stack its
+  addresses (`stack::set_host_addrs`), sends the datapath the slots with
+  VID, address and zone plus the firewall (`Control::networks` →
+  `Datapath::apply`: one snapshot of VID → link, prefixes and forwards,
+  read per RX batch; a changed slot forgets its neighbors), opens or
+  closes DHCP and DNS per network (`LanServices::reconfigure`; a network
+  that keeps name and slot keeps its leases), and listens for the web
+  interface on networks that newly reach it (`Mgmt::add_sockets`; sockets
+  are never taken away, the input policy guards them). Connections
+  through a removed network find no route and expire.
+- **Reboot** (`Config::needs_reboot`): only a change to the physical
+  ports of networks (other than `lan0`; not supported yet anyway).
 - **Trial** (`Config::needs_trial`): any change to the network or zone
   that serves management, i.e. its address, VLAN, ports or zone. Also
   `input`/`allow` of a zone that can reach management, rules with
@@ -423,9 +434,11 @@ In rough order of value:
    `store-test`: password from the config, 401/429/200, token saves, hash
    never shown and kept, password change ends sessions, logout, negative
    control without any password (403).
-10. **Live network changes.** Adding or changing a network reboots
-   (`Config::needs_reboot`); doing it live means adding and removing
-   forwarder interfaces, smoltcp interfaces and DHCP servers at run time.
+10. ✅ (2026-11-15) **Live network changes** (§7 "Networks live").
+   `store-test`: a network added, re-tagged and removed through the API
+   in one boot; `LAB_GUEST_LIVE=1 scripts/lab-test.sh`: the router boots
+   with the main LAN only, the client adds the guest network, zone, rules
+   and forward live, then every guest, rule and forward check runs.
 11. **Multi-port LAN (M10).** The apu4's other two i211 ports: a software
    bridge with MAC learning, `network.ports` with per-port tagged or
    untagged membership, and **WAN ingress shaping** (CAKE ingress mode),

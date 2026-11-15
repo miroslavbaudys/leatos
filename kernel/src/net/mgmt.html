@@ -199,7 +199,7 @@
       <div class="tw"><table id="nets"></table></div>
       <div class="row"><button type="button" id="addnet" class="plain">Add network</button>
         <span class="hint">The first network is the main LAN: edit it under <a href="#/lan">LAN &amp; DHCP</a>.</span></div>
-      <p class="hint">Adding, removing or changing a network (VLAN, address, zone) reboots the router into the new layout when saved. A VLAN needs a switch or access point that tags it on the LAN cable.</p>
+      <p class="hint">Adding, removing or changing a network (VLAN, address, zone) applies at once, without a reboot; changing the address of the network you use for this page boots as a trial. A VLAN needs a switch or access point that tags it on the LAN cable.</p>
     </form>
   </section>
 
@@ -282,7 +282,7 @@
       <div class="tw"><table id="zones"></table></div>
       <div class="row"><button type="button" id="addzone" class="plain">Add zone</button>
         <span class="hint">Built in: <b>wan</b>, and <b>lan</b> (everything to the router, forwards to the WAN) until you define a zone named lan.</span></div>
-      <p class="hint">"To the router: drop" refuses everything from that zone except the services ticked (DHCP is needed for clients to get an address). Policy changes apply to new connections at once; adding or removing a zone reboots the router.</p>
+      <p class="hint">"To the router: drop" refuses everything from that zone except the services ticked (DHCP is needed for clients to get an address). Changes apply to new connections at once.</p>
     </form>
     <form class="card cfg" autocomplete="off" id="rulesform"><h3>Rules</h3>
       <div class="tw"><table id="rules"></table></div>

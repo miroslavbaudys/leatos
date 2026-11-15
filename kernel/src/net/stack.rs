@@ -180,7 +180,7 @@ pub fn bring_up(
         // The port's links, each with its router-stack interface.
         let port_ix = shared_ports.len();
         if i == 0 {
-            let link = LinkShared::new(port_ix, 0);
+            let link = LinkShared::new(port_ix, true);
             let iface = new_iface(&port);
             let mut sockets = SocketSet::new(Vec::new());
             if !pppoe {
@@ -189,16 +189,17 @@ pub fn bring_up(
             hosts.push(HostIf { iface, sockets });
             links.push(link);
         } else {
-            for n in &nets {
-                let link = LinkShared::new(port_ix, n.vid);
-                let mut iface = new_iface(&port);
-                iface.update_ip_addrs(|a| a.push(IpCidr::Ipv4(cidr(n))).expect("network addr"));
+            // Every network slot, with an interface without addresses;
+            // `set_host_addrs` gives the config's networks theirs.
+            for _ in 1..shared::MAX_LINKS {
+                links.push(LinkShared::new(port_ix, false));
                 hosts.push(HostIf {
-                    iface,
+                    iface: new_iface(&port),
                     sockets: SocketSet::new(Vec::new()),
                 });
-                links.push(link);
             }
+            let (_, placed, _) = place_networks(&[]);
+            set_host_addrs(&mut hosts, &nets, &placed);
         }
         // Legacy INTx where the platform routes it (aarch64 DTB), otherwise
         // MSI-X (x86_64: INTx routing would need ACPI AML).
@@ -226,19 +227,7 @@ pub fn bring_up(
             }
         );
         if i == 1 {
-            for n in &nets {
-                println!(
-                    "  net {name}       : {} {} ({}, zone {})",
-                    n.name,
-                    cidr(n),
-                    if n.vid == 0 {
-                        alloc::string::String::from("untagged")
-                    } else {
-                        alloc::format!("vlan {}", n.vid)
-                    },
-                    n.zone
-                );
-            }
+            log_networks(name, &nets);
         }
         if let Some(tci) = port.vlan() {
             println!("  net {name}       : {}", vlan_text(tci));
@@ -369,7 +358,68 @@ pub fn apply_qos(sh: &Shared, old: &crate::config::Qos, new: &crate::config::Qos
 }
 
 pub fn new_datapath(sh: &'static Shared) -> SharedDatapath {
-    alloc::boxed::Box::leak(alloc::boxed::Box::new(Datapath::new(sh)))
+    let (_, _, initial) = place_networks(&[]);
+    alloc::boxed::Box::leak(alloc::boxed::Box::new(Datapath::new(sh, initial)))
+}
+
+/// The config's networks in link slots: a network keeps its slot while
+/// its name stays (`prev`: the last placement, empty at boot). Returns
+/// the new placement, each network's link (in `config::networks` order)
+/// and the datapath's view.
+pub fn place_networks(
+    prev: &[Option<alloc::string::String>],
+) -> (Vec<Option<alloc::string::String>>, Vec<usize>, shared::Networks) {
+    let nets = crate::config::networks();
+    let names: Vec<&str> = nets.iter().map(|n| n.name.as_str()).collect();
+    let (slots, links) = shared::assign_slots(prev, &names);
+    let msg = shared::Networks {
+        nets: nets
+            .iter()
+            .zip(&links)
+            .map(|(n, &link)| shared::NetSlot {
+                link,
+                vid: n.vid,
+                addr: (n.addr, n.prefix),
+                zone: n.zone,
+            })
+            .collect(),
+        policy: crate::config::firewall(),
+    };
+    (slots, links, msg)
+}
+
+/// The router stack's addresses: each network's on its slot's interface,
+/// none on the others.
+pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: &[usize]) {
+    for (i, host) in hosts.iter_mut().enumerate().skip(1) {
+        let want = links.iter().position(|&l| l == i).map(|k| cidr(&nets[k]));
+        let have = host.iface.ip_addrs().first().copied();
+        if have != want.map(IpCidr::Ipv4) {
+            host.iface.update_ip_addrs(|a| {
+                a.clear();
+                if let Some(c) = want {
+                    let _ = a.push(IpCidr::Ipv4(c));
+                }
+            });
+        }
+    }
+}
+
+/// One line per network (boot, and after a change).
+pub fn log_networks(port: &str, nets: &[crate::config::Lan]) {
+    for n in nets {
+        println!(
+            "  net {port}       : {} {} ({}, zone {})",
+            n.name,
+            cidr(n),
+            if n.vid == 0 {
+                alloc::string::String::from("untagged")
+            } else {
+                alloc::format!("vlan {}", n.vid)
+            },
+            n.zone
+        );
+    }
 }
 
 /// Wait forever (the NICs were stopped; the primary task is rebooting).
@@ -457,12 +507,12 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
         // Step 3 (primary): control messages, housekeeping, status.
         let mut next_hk = u64::MAX;
         if d.primary {
-            let (wan, policy, action) = {
+            let (wan, networks, action) = {
                 let mut c = sh.control.lock();
-                (c.wan.take(), c.policy.take(), c.action.take())
+                (c.wan.take(), c.networks.take(), c.action.take())
             };
-            if let Some(p) = policy {
-                dp.set_policy(p);
+            if let Some(n) = networks {
+                dp.apply(n);
             }
             if let Some(action) = action {
                 // End the PPPoE session first, so the ISP does not keep

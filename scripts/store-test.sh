@@ -231,7 +231,7 @@ check "newest record corrupt -> previous record" "stored (slot B, seq 4), lan 10
 r="$(boot_config both "")"
 check "both records corrupt -> defaults" "defaults (store has no valid config)" "${r%%,*}"
 
-echo "== a new network: saved, then rebooted into (docs/config-v2.md §7)"
+echo "== networks change live (docs/config-v2.md §7)"
 "$RRSTORE" create "$IMG" --mib "$STORE_MIB" >/dev/null
 boot net "mgmt=wan mgmt_pass=test" QEMU_NET=user QEMU_WAN_HOSTFWD="tcp:127.0.0.1:$PORT-:80"
 up 1 || true
@@ -241,11 +241,19 @@ c=json.load(open(sys.argv[1]))
 c["network"].append({"name":"guest","vlan":20,"ipv4":"10.20.0.1/24","zone":"guest"})
 c["zone"]=[{"name":"guest","input":"drop","allow":["dhcp","dns"]}]
 open(sys.argv[2],"w").write(json.dumps(c))' "$WORK/cfg.json" "$WORK/net.json"
-check "network added -> 200, reboot, no trial" "200 true false" "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/net.json" "$URL/api/config") $(json "$WORK/resp" reboot) $(json "$WORK/resp" trial)"
+check "network added -> 200, live: no reboot, no trial" "200 true false false" "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/net.json" "$URL/api/config") $(json "$WORK/resp" applied) $(json "$WORK/resp" reboot) $(json "$WORK/resp" trial)"
 check "  ... stored as version 2" "1 1" "$("$RRSTORE" show "$IMG" 2>/dev/null | grep -c 'seq 1 version 2 ' || true) $("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c -e '^version = 2$' || true)"
-up 2 || true
-check "  ... rebooted with both networks" "lan guest 20 guest" "$(status networks.0.name) $(status networks.1.name) $(status networks.1.vlan) $(status networks.1.zone)"
-check "  ... guest network up on VLAN 20" 1 "$(count 'net lan0       : guest 10.20.0.1/24 (vlan 20, zone 2)')"
+sleep 1
+check "  ... in effect, same boot" "lan guest 20 guest 1" "$(status networks.0.name) $(status networks.1.name) $(status networks.1.vlan) $(status networks.1.zone) $(count "$CFG_LINE")"
+check "  ... guest network up on VLAN 20, with services" "1 1" "$(count 'net lan0       : guest 10.20.0.1/24 (vlan 20, zone 2)') $(count 'lan services    : guest: dhcp 10.20.0.100')"
+# Changed live too: another VLAN, then gone again.
+python3 -I -c 'import json,sys
+c=json.load(open(sys.argv[1])); c["network"][1]["vlan"]=30
+open(sys.argv[2],"w").write(json.dumps(c))' "$WORK/net.json" "$WORK/net30.json"
+check "  ... VLAN 20 -> 30, live" "200 false 30" "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/net30.json" "$URL/api/config") $(json "$WORK/resp" reboot) $(sleep 1; status networks.1.vlan)"
+check "  ... removed again, live" "200 false 1 1" "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/cfg.json" "$URL/api/config") $(json "$WORK/resp" reboot) $(sleep 1; status networks | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)))') $(count 'lan services    : guest: removed')"
+# Back to the two networks for the rule checks below.
+code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/net.json" "$URL/api/config" >/dev/null
 # A forwarding rule applies live (no reboot, no trial); the status lists it.
 curl -s -m 10 -o "$WORK/cfg.json" "$URL/api/config.json" || true
 python3 -I -c 'import json,sys
@@ -254,7 +262,7 @@ c["firewall"]={"rule":[{"name":"no-smtp","from":"lan","to":"wan","proto":"tcp","
   "forward":[{"name":"nas","wan_port":8443,"to":"10.20.0.10:443"}]}
 open(sys.argv[2],"w").write(json.dumps(c))' "$WORK/cfg.json" "$WORK/rule.json"
 check "rule + port forward added -> 200, applied live" "200 true false" "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/rule.json" "$URL/api/config") $(json "$WORK/resp" applied) $(json "$WORK/resp" reboot)"
-check "  ... in effect (status)" "no-smtp 0 nas 0 2" "$(status rules.0.name) $(status rules.0.hits) $(status forwards.0.name) $(status forwards.0.hits) $(count "$CFG_LINE")"
+check "  ... in effect (status), still the same boot" "no-smtp 0 nas 0 1" "$(status rules.0.name) $(status rules.0.hits) $(status forwards.0.name) $(status forwards.0.hits) $(count "$CFG_LINE")"
 stop
 
 echo "== management password in the config, login sessions"
