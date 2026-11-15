@@ -288,6 +288,10 @@ name = "proto-http"
 version = "0.1.0"
 
 [[package]]
+name = "proto-mdns"
+version = "0.1.0"
+
+[[package]]
 name = "proto-pppoe"
 version = "0.1.0"
 dependencies = [

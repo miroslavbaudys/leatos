@@ -1,6 +1,8 @@
 # mDNS across networks (design)
 
-Status: design only (2026-11-15). Nothing below is implemented.
+Status (2026-11-15): step 1 done: `crates/proto-mdns` (wire format + the
+filtered reflector, 22 host tests incl. mutation fuzzing). Config, kernel
+wiring and the lab test are not done yet (§8).
 
 mDNS (RFC 6762) and DNS-SD (RFC 6763) are link-local: queries and
 announcements go to `224.0.0.251:5353` (IPv6 `ff02::fb`) with TTL 255, and
@@ -26,8 +28,10 @@ another.
   per-network service state in `net/services.rs` (`Net`): an mDNS socket
   per network fits the existing pattern.
 - No IPv6 in the kernel yet (M7): `ff02::fb` waits for it.
-- `crates/proto-dns::wire` already reads and writes names (with
-  compression) and walks records.
+- `crates/proto-dns::wire` cannot be reused for names: its `read_name`
+  rejects non-ASCII bytes and dots inside labels, and DNS-SD instance
+  names (`Living Room._airplay._tcp.local`) need both. `proto-mdns` keeps
+  names as raw labels.
 
 ## 2. Reflector first, proxy later
 | | Filtered reflector | Caching proxy (gateway) |
@@ -42,25 +46,43 @@ Build the reflector; keep the crate's interface so a cache can be added
 behind it without changing the kernel side.
 
 ## 3. `crates/proto-mdns` (sans-IO, `no_std`, `forbid(unsafe_code)`)
-- `Reflector::on_packet(now, from_net, &[u8]) -> Vec<(to_net, Vec<u8>)>`,
-  configured with the reflect rules (§5) and the router's own addresses.
+- `wire::Message`: a whole message parsed into owned parts (names as raw
+  labels, names inside PTR/CNAME/NS/MX/SRV/NSEC rdata decompressed) and
+  written back with compression (never inside NSEC). Pointers must point
+  strictly backwards (no loops); counts are checked against the length
+  before allocating.
+- `Reflector::handle(now_ms, from, src, &[u8]) -> Vec<Output>`, configured
+  with `Config { nets: [Option<Net { addr, prefix_len }>], rules }`;
+  `stats(net)`, `takes_part(net)`, `reconfigure` (keeps counters, forgets
+  learned hosts).
 - Accept only source port 5353, a valid header, opcode 0. Legacy unicast
   queries (source port ≠ 5353, RFC 6762 §6.7) are dropped in the first
   version (they would need ID mapping and a unicast reply path).
-- **Filter**: a rule allows `from` → `to` for listed service types
-  (`_airplay._tcp`, `_ipp._tcp`, …). A query passes if a question is
-  for an allowed type (or a name below one); a response passes if it
-  carries a PTR/SRV/TXT for an allowed type. Mixed messages are dropped
-  whole in the first version (no rewriting).
+- **Filter and rebuild**: a rule allows `from` → `to` for listed service
+  types (`_airplay._tcp`, `_ipp._tcp`, …). Devices announce many services
+  in one message, so each copy is **rebuilt** with only what is allowed
+  for its target network: names under an allowed type (instances,
+  subtypes, the browse name), and names of hosts learned from allowed SRV
+  records (per source network and type, for the SRV's TTL, at most 75 min,
+  128 entries; a goodbye (TTL 0) teaches nothing). A/AAAA records with
+  link-local addresses (169.254/16, fe80::/10) are always removed. A
+  response with no allowed answer, or a query with no allowed question,
+  is not sent. `_services._dns-sd._udp` (list everything) never passes.
 - **QU bit cleared** on reflected questions: otherwise the responder
   unicasts to the router's address and that answer would need relaying.
+  Queries lose their authority section (probes become plain questions, so
+  a name in use on the other network is still defended) and additional
+  records; known answers are filtered like records.
 - **Loops and duplicates**: packets from the router's own addresses are
   ignored; a hash of recently sent messages (about 1 s) catches a second
   reflector on a segment.
-- **Rate limit**: a token bucket per source network, so a storm is not
-  multiplied onto every other network.
-- Counters per network: in, reflected, filtered, duplicate, rate-limited,
-  malformed.
+- **Rate limit**: a token bucket per source network (50 messages/s, burst
+  100), so a storm is not multiplied onto every other network.
+- Copies over 1472 bytes (one unfragmented datagram at MTU 1500) are
+  dropped and counted.
+- Counters per network: received, sent, filtered, duplicate,
+  rate-limited, malformed, foreign (wrong port, off-subnet, the router),
+  oversize.
 - Host tests for each point above, plus a fuzz target (M9).
 
 ## 4. Kernel
@@ -105,8 +127,8 @@ services = ["_airplay._tcp", "_raop._tcp", "_googlecast._tcp", "_ipp._tcp"]
    default; only what a rule names.
 3. **Size**: mDNS allows up to 9000 B; without IPv4 reassembly in smoltcp
    fragmented messages are lost. Accepted (≤ MTU), counted as malformed.
-4. **Link-local AAAA** (`fe80::`) in answers is useless on another link;
-   removing it needs rewriting (with M7).
+4. **Link-local addresses** in answers are useless on another link; the
+   rebuild removes them (IPv6 transport for `ff02::fb` still waits for M7).
 5. **Name conflicts**: probes reflected across networks make names unique
    across them, so a host may rename itself (`Name (2)`) once. Known
    reflector behaviour.
@@ -123,7 +145,7 @@ services = ["_airplay._tcp", "_raop._tcp", "_googlecast._tcp", "_ipp._tcp"]
   input drop counter rises).
 
 ## 8. Order
-1. `crates/proto-mdns` reflector + tests.
+1. ✅ `crates/proto-mdns` reflector + tests.
 2. Config schema, `Service::Mdns`, validation.
 3. Kernel: smoltcp multicast, sockets, wiring, counters on `/api/status`.
 4. Lab test with negative controls; web page section and CLI status.

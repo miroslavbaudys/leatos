@@ -447,8 +447,8 @@ In rough order of value:
 12. **IPv6 (M7).** DHCPv6-PD over DHCP and PPPoE (IPv6CP), a /64 per
    network with RA/RDNSS, the zone firewall for IPv6 (inbound blocked by
    default), `[wan.ipv6]`.
-13. **mDNS across networks** (`docs/mdns.md`, design only). A filtered
-   reflector in `crates/proto-mdns`: `[[mdns.reflect]]` rules (from, to,
+13. **mDNS across networks** (`docs/mdns.md`; `crates/proto-mdns` done,
+   kernel and config not yet). A filtered reflector: `[[mdns.reflect]]` rules (from, to,
    service types), `allow = ["mdns"]` for zones; caching proxy and
    `ff02::fb` later.
 

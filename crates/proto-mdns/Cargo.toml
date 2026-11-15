@@ -1,0 +1,11 @@
+[package]
+name = "proto-mdns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "mDNS (RFC 6762) across networks: message parsing/rebuilding and a filtered reflector, sans-IO."
+
+[dependencies]
+
+[lints]
+workspace = true
