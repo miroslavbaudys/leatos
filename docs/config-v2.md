@@ -199,7 +199,13 @@ ports:
   the source port. A peer it contacts that then connects to the forward
   meets the same connection; before, the two collided and the peer's
   packets were dropped (now counted as drop reason `clash`, not
-  `table-full`).
+  `table-full`). A new policy (any config change) keeps these
+  connections (`Forwarder::recheck`) while the forward still points at
+  that endpoint.
+- **One endpoint, one shard:** all of a target endpoint's connections
+  (inbound to the forward, its own out, uTP and DHT on one UDP port) live
+  in one conntrack shard, so the shards share one connection budget
+  (`conntrack::Budget`, 16384 in all) instead of a fixed 1/16 each.
 - **Router-local ports (60000–65535):** the router's own client sockets
   (SNTP 60000–64999, DNS upstream 65000–65535) live here, and forwards
   may not use them (validation), so a reply to the router is never taken

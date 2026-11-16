@@ -291,6 +291,37 @@ if [ -n "$fw" ]; then
   else
     fail "forward target out: a connection from :8090 (ISP saw '$ue', want port=8090)"
   fi
+  # ... and that connection survives a live config change elsewhere (a
+  # rule added, Forwarder::recheck): the ISP's cgi-bin/slow answers after
+  # 12 s, the change is posted meanwhile, the original config after.
+  # lab_fwd_cut=1, the negative control: the rule rejects the ISP itself,
+  # so the connection is removed and the answer never arrives.
+  if [ "$fw" = 1 ]; then
+    if $bb grep -q 'lab_fwd_cut=1' /proc/cmdline; then cut_dst=$ISP; else cut_dst=198.18.0.1; fi
+    kpost() { $bb wget -q -T 20 -O - --header "Content-Type: application/toml" --post-data="$($bb cat "$1")" \
+      "http://admin:lab-pass@192.168.1.1/api/config" 2>&1; }
+    $bb wget -q -T 5 -O /tmp/kcfg-orig.toml "http://admin:lab-pass@192.168.1.1/api/config" 2>/dev/null
+    { $bb cat /tmp/kcfg-orig.toml; printf '\n[[firewall.rule]]\nname = "lab-keep"\nfrom = "any"\nto = "wan"\ndst = "%s"\naction = "reject"\n' "$cut_dst"; } >/tmp/kcfg-rule.toml
+    k0=$($bb date +%s)
+    printf 'GET /cgi-bin/slow HTTP/1.0\r\n\r\n' | $bb nc -p 8090 -w 25 "$ISP" 80 >/tmp/kslow 2>&1 &
+    kslow=$!
+    $bb sleep 2
+    r=$(kpost /tmp/kcfg-rule.toml)
+    k1=$(( $($bb date +%s) - k0 ))
+    wait "$kslow"
+    k2=$(( $($bb date +%s) - k0 ))
+    r2=$(kpost /tmp/kcfg-orig.toml)
+    ks=$($bb grep '^slow=' /tmp/kslow)
+    case "$r$r2" in
+      *'"applied":true'*'"applied":true'*)
+        if [ "$ks" = "slow=done port=8090" ]; then
+          pass "forward target out: its connection from :8090 survives a live rule change ($ks; rule to $cut_dst applied at ${k1} s, answer at ${k2} s)"
+        else
+          fail "forward target out: its connection from :8090 ended by a live rule change (ISP answer '$ks'; rule to $cut_dst applied at ${k1} s, nc done at ${k2} s)"
+        fi ;;
+      *) fail "forward target out: config not applied: $r / $r2" ;;
+    esac
+  fi
   # Anti-spoofing: the ISP connects to the forward from the forged source
   # 192.168.1.77 (our own network; ISP cgi-bin/spoof). The router must drop
   # it as "spoofed", and the forward must not take it. Negative control

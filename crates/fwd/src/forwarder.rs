@@ -799,6 +799,12 @@ impl Forwarder {
         }
     }
 
+    /// Count this shard's connections against `budget`, shared with the
+    /// other shards (`conntrack::Budget`). Call before the first packet.
+    pub fn set_conn_budget(&mut self, budget: alloc::sync::Arc<crate::conntrack::Budget>) {
+        self.ct.set_budget(budget);
+    }
+
     /// Use the zone firewall (`None`: the fixed LAN → WAN policy). Applies
     /// to new flows; [`Forwarder::recheck`] then removes the tracked ones
     /// it no longer allows.
@@ -867,10 +873,15 @@ impl Forwarder {
         if dnat_now.is_some() {
             return false; // a redirect takes it now
         }
+        // Its NAT port is a port forward now: only the forward's own target
+        // going out from it may keep it (`Conntrack::create_from`).
         let forwarded_port = Some(c.reply.dst) == self.wan_addr()
-            && self.policy.as_ref().is_some_and(|p| p.forwards.iter().any(|f| f.target(t.proto, c.reply.dport).is_some()));
+            && self.policy.as_ref().is_some_and(|p| {
+                p.forwards.iter().any(|f| f.target(t.proto, c.reply.dport).is_some())
+                    && !p.forwards.iter().any(|f| f.wan_port(t.proto, t.src, t.sport) == Some(c.reply.dport))
+            });
         if ported && forwarded_port {
-            return false; // its NAT port is a port forward now
+            return false;
         }
         let Some(route) = self.routes.lookup(t.dst) else {
             return true;
@@ -3006,6 +3017,22 @@ mod tests {
         assert_eq!(ports(&f[..len]).1, 20_005);
         with_forwards(&mut fw, vec![fwd(20_000, 20_010, None, None, false)]);
         assert_eq!(fw.recheck(), 1, "masquerade on a forwarded port");
+
+        // The forward's own target going out from its forwarded port (WAN
+        // :8443, Conntrack::create_from) keeps it across a new policy (a
+        // rule toggled elsewhere), until the forward points elsewhere.
+        let mut fw = router();
+        let web = PortForward { protos: proto::TCP | proto::UDP, ..web };
+        with_forwards(&mut fw, vec![web]);
+        let mut f = udp_frame(LAN_MAC, NAS, SERVER, 443, 6881);
+        let Verdict::Forward { len, .. } = run(&mut fw, 0, LAN, &mut f) else { panic!() };
+        assert_eq!(ports(&f[..len]).1, 8443);
+        let mut f = tcp_frame(LAN_MAC, NAS, SERVER, 443, 6882, TCP_SYN);
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward { .. }));
+        with_forwards(&mut fw, vec![web]);
+        assert_eq!(fw.recheck(), 0, "the target's own connections out stay");
+        with_forwards(&mut fw, vec![PortForward { to: HOST, ..web }]);
+        assert_eq!(fw.recheck(), 2, "the port is another target's now");
 
         // Redirects: one added takes NTP to the outside from now on.
         let mut fw = router();

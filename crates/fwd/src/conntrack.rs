@@ -15,14 +15,39 @@
 //!   to the forward's own target ([`Conntrack::create_from`]): its
 //!   connections out keep the forwarded port, so a peer it contacted that
 //!   then connects to the forward meets the same connection.
-//! - Bounded: at most `max_conns` entries; new connections beyond that are refused.
+//! - Bounded: at most `max_conns` entries, and with a shared [`Budget`] at
+//!   most its `max` across all shards (one endpoint's connections all live
+//!   in one shard: a torrent client's listen port); new connections beyond
+//!   that are refused.
 //! - TCP state is tracked loosely (enough for timeouts): SYN → established
 //!   on the reply SYN+ACK, FIN/RST → closing.
 
 use crate::wire::{PROTO_ICMP, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::net::Ipv4Addr;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// A connection limit shared by the shards of one table
+/// ([`Conntrack::set_budget`]). Checked before a connection is created,
+/// so concurrent shards may overshoot it by a connection each.
+#[derive(Debug)]
+pub struct Budget {
+    used: AtomicUsize,
+    max: usize,
+}
+
+impl Budget {
+    pub fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self { used: AtomicUsize::new(0), max })
+    }
+
+    /// Connections tracked by all shards.
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+}
 
 /// Inclusive NAT port range. Router-local sockets use ports >= 60000
 /// (`forwarder::ROUTER_CLIENT_PORTS`); port forwards may use the rest.
@@ -137,6 +162,7 @@ pub struct Conntrack {
     /// (proto, lo, hi): ports never allocated (port forwards).
     reserved: Vec<(u8, u16, u16)>,
     max_conns: usize,
+    budget: Option<Arc<Budget>>,
     hash_key: u64,
     /// This table is shard `shard` of `shards` (`forwarder::shard_of`): it
     /// only allocates NAT ports `p` with `p % shards == shard`, so a reply
@@ -184,11 +210,28 @@ impl Conntrack {
             used_ports: BTreeMap::new(),
             reserved: Vec::new(),
             max_conns,
+            budget: None,
             hash_key,
             shards,
             shard,
             stats: Stats::default(),
         }
+    }
+
+    /// Also count against `budget` (shared with the other shards). Call
+    /// before the first connection.
+    pub fn set_budget(&mut self, budget: Arc<Budget>) {
+        debug_assert!(self.is_empty(), "conntrack: budget set on a used table");
+        self.budget = Some(budget);
+    }
+
+    /// No room for another connection (counted as table-full).
+    fn full(&mut self) -> bool {
+        let full = self.len() >= self.max_conns || self.budget.as_ref().is_some_and(|b| b.used() >= b.max);
+        if full {
+            self.stats.table_full += 1;
+        }
+        full
     }
 
     /// `(shards, shard)` of this table.
@@ -292,6 +335,9 @@ impl Conntrack {
         };
         self.index.insert(orig, (id, Dir::Original));
         self.index.insert(reply, (id, Dir::Reply));
+        if let Some(b) = &self.budget {
+            b.used.fetch_add(1, Ordering::Relaxed);
+        }
         self.stats.created += 1;
         Some(id)
     }
@@ -308,8 +354,7 @@ impl Conntrack {
         masq: Option<Ipv4Addr>,
         tcp_flags: u8,
     ) -> Option<ConnId> {
-        if self.len() >= self.max_conns {
-            self.stats.table_full += 1;
+        if self.full() {
             return None;
         }
         let (dst, dport) = match masq {
@@ -356,8 +401,7 @@ impl Conntrack {
         fixed: Option<u16>,
         tcp_flags: u8,
     ) -> Option<ConnId> {
-        if self.len() >= self.max_conns {
-            self.stats.table_full += 1;
+        if self.full() {
             return None;
         }
         let (reply, nat) = match nat_ip {
@@ -406,6 +450,16 @@ impl Conntrack {
         let t = match c.orig.proto {
             PROTO_TCP => {
                 let st = c.tcp.get_or_insert(TcpState::SynSent);
+                if tcp_flags & (TCP_SYN | TCP_ACK | TCP_RST) == TCP_SYN
+                    && matches!(*st, TcpState::Closing | TcpState::Closed)
+                {
+                    // The tuple reused by a new connection (a peer
+                    // reconnecting from the same port): start over, else
+                    // it lives on the closing timeout and its packets are
+                    // invalid once that runs out while it idles.
+                    *st = TcpState::SynSent;
+                    c.replied = dir == Dir::Reply;
+                }
                 if tcp_flags & TCP_RST != 0 {
                     *st = TcpState::Closed;
                 } else if tcp_flags & TCP_FIN != 0 {
@@ -439,6 +493,9 @@ impl Conntrack {
         };
         self.index.remove(&c.orig);
         self.index.remove(&c.reply);
+        if let Some(b) = &self.budget {
+            b.used.fetch_sub(1, Ordering::Relaxed);
+        }
         if c.mapped {
             let key = (c.orig.proto, c.orig.src, c.orig.sport);
             if let Some(m) = self.mappings.get_mut(&key) {
@@ -584,6 +641,38 @@ mod tests {
     }
 
     #[test]
+    fn a_new_syn_reopens_a_closed_connection() {
+        let mut ct = Conntrack::new(100, 1);
+        for end in [TCP_RST, TCP_FIN | TCP_ACK] {
+            let id = ct
+                .create(0, t(PROTO_TCP, LAN_A, 40000, REMOTE, 6881), Some(WAN), TCP_SYN)
+                .unwrap();
+            ct.update(0, id, Dir::Original, TCP_SYN, 60);
+            ct.update(1, id, Dir::Reply, TCP_SYN | TCP_ACK, 60);
+            ct.update(2, id, Dir::Original, end, 60);
+            assert_ne!(ct.get(id).unwrap().tcp, Some(TcpState::Established));
+            // The same tuple again: SYN, SYN+ACK, ACK.
+            ct.update(3, id, Dir::Original, TCP_SYN, 60);
+            assert_eq!(ct.get(id).unwrap().tcp, Some(TcpState::SynSent));
+            ct.update(4, id, Dir::Reply, TCP_SYN | TCP_ACK, 60);
+            ct.update(5, id, Dir::Original, TCP_ACK, 60);
+            let c = ct.get(id).unwrap();
+            assert_eq!(c.tcp, Some(TcpState::Established));
+            assert_eq!(c.expires, 5 + timeout::TCP_ESTABLISHED);
+            ct.remove(id);
+        }
+        // A SYN arriving from the other side (the responder now connects).
+        let id = ct
+            .create(0, t(PROTO_TCP, LAN_A, 40000, REMOTE, 6881), Some(WAN), TCP_SYN)
+            .unwrap();
+        ct.update(0, id, Dir::Original, TCP_RST, 40);
+        ct.update(1, id, Dir::Reply, TCP_SYN, 60);
+        ct.update(2, id, Dir::Original, TCP_SYN | TCP_ACK, 60);
+        ct.update(3, id, Dir::Reply, TCP_ACK, 60);
+        assert_eq!(ct.get(id).unwrap().tcp, Some(TcpState::Established));
+    }
+
+    #[test]
     fn udp_becomes_assured_after_reply() {
         let mut ct = Conntrack::new(100, 1);
         let id = ct
@@ -625,6 +714,26 @@ mod tests {
                 .is_none()
         );
         assert_eq!(ct.stats.table_full, 1);
+    }
+
+    #[test]
+    fn shards_share_one_budget() {
+        // Each shard may take the whole table (one endpoint's connections
+        // all go to one shard), the shards together no more than it.
+        let budget = Budget::new(3);
+        let mut a = Conntrack::new_shard(3, 1, 2, 0);
+        let mut b = Conntrack::new_shard(3, 1, 2, 1);
+        a.set_budget(budget.clone());
+        b.set_budget(budget.clone());
+        let ids: Vec<_> = (0..3)
+            .map(|i| a.create(0, t(PROTO_UDP, LAN_A, 5000, REMOTE, 1000 + i), Some(WAN), 0).unwrap())
+            .collect();
+        assert!(b.create(0, t(PROTO_UDP, LAN_B, 1, REMOTE, 1), Some(WAN), 0).is_none());
+        assert_eq!((b.stats.table_full, budget.used()), (1, 3));
+        a.remove(ids[0]);
+        assert!(b.create(0, t(PROTO_UDP, LAN_B, 1, REMOTE, 1), Some(WAN), 0).is_some());
+        assert_eq!(a.expire(timeout::UDP_UNREPLIED) + b.expire(timeout::UDP_UNREPLIED), 3);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]

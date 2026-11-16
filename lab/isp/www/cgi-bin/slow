@@ -1,0 +1,7 @@
+#!/usr/bin/busybox sh
+# A connection that idles before its answer (the forward-target check:
+# it must survive a live config change on the router meanwhile).
+/usr/bin/busybox sleep 12
+echo "Content-Type: text/plain"
+echo
+echo "slow=done port=$REMOTE_PORT"

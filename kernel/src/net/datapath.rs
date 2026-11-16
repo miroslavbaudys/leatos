@@ -60,6 +60,7 @@ use spin::Mutex;
 pub const RX_BUDGET: usize = 64;
 /// Forwarder (conntrack) shards.
 pub const SHARDS: usize = 16;
+/// Tracked connections, all shards together (`fwd::conntrack::Budget`).
 const MAX_CONNS: usize = 16_384;
 const HOUSEKEEPING_MS: u64 = 1_000;
 
@@ -246,10 +247,14 @@ impl Datapath {
                 zone: if i == WAN as usize { 0 } else { 1 },
             })
             .collect();
+        // One budget for all shards: every connection of one endpoint (a
+        // torrent client's forwarded port: inbound peers, uTP, DHT) lives in
+        // one shard, which may therefore take the whole table.
+        let budget = fwd::conntrack::Budget::new(MAX_CONNS);
         let shards = (0..SHARDS)
             .map(|k| {
-                let mut f =
-                    Forwarder::new_shard(MAX_CONNS / SHARDS, hash_key, SHARDS as u16, k as u16);
+                let mut f = Forwarder::new_shard(MAX_CONNS, hash_key, SHARDS as u16, k as u16);
+                f.set_conn_budget(budget.clone());
                 for iface in &ifaces {
                     f.add_interface(*iface);
                 }

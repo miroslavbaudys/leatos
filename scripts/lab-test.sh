@@ -93,7 +93,10 @@
 #                        client :8090); a connection from the client's
 #                        :8090 leaves from the WAN's :8090 (ISP
 #                        cgi-bin/srcport reports the port); LAB_FORWARD=0
-#                        fails it (a NAPT port).
+#                        fails it (a NAPT port). Such a connection survives
+#                        a live config change elsewhere (a rule added while
+#                        cgi-bin/slow idles 12 s); negative control
+#                        LAB_FWD_CUT=1 (the rule rejects the ISP: it ends).
 #                        Anti-spoofing: the ISP opens a connection to the
 #                        forward from the forged source 192.168.1.77
 #                        (cgi-bin/spoof): dropped as "spoofed", forward
@@ -198,6 +201,7 @@ GUEST_ZONE="${LAB_GUEST_ZONE:-guest}"
 GUEST_RULES="${LAB_GUEST_RULES:-1}"
 GUEST_REJECT="${LAB_GUEST_REJECT:-reject}"
 FORWARD="${LAB_FORWARD:-1}"
+FWD_CUT="${LAB_FWD_CUT:-}"
 REDIRECT="${LAB_REDIRECT:-1}"
 GUEST_DOMAIN="${LAB_GUEST_DOMAIN:-1}"
 DOT="${LAB_DOT:-}"
@@ -392,7 +396,7 @@ PIDS+=($!)
 
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so
