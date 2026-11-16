@@ -5,6 +5,11 @@
 //! clients never see stale TTLs. Eviction removes the soonest-expiring
 //! entry when full (O(log n)).
 //!
+//! Entries are keyed by the question and the client's DNSSEC flags
+//! ([`Key`]): an answer for a client without DO has no RRSIGs, and one for
+//! a client with CD may have failed validation upstream; neither may reach
+//! a client asking otherwise.
+//!
 //! Prefetch: each entry keeps the upstream query that filled it. A hit in
 //! the last [`PREFETCH_DIVISOR`]th of the entry's lifetime is marked
 //! [`Hit::refresh`], and the resolver sends that query again, so popular
@@ -27,6 +32,29 @@ pub const PREFETCH_DIVISOR: u64 = 10;
 /// Entries with a shorter TTL (seconds) are never refreshed early.
 pub const PREFETCH_MIN_TTL: u32 = 10;
 
+/// What a cached answer is for: the question, and the DNSSEC flags of the
+/// query that got it (they change what the upstream puts in the answer).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Key {
+    pub question: Question,
+    /// DO (RFC 3225): DNSSEC records wanted.
+    pub dnssec_ok: bool,
+    /// CD (RFC 4035): unvalidated answers accepted.
+    pub checking_disabled: bool,
+}
+
+impl Key {
+    /// The key of `query` (a client's or an upstream query), whose question
+    /// is `question`.
+    pub fn of(query: &[u8], question: Question) -> Self {
+        Key {
+            question,
+            dnssec_ok: wire::dnssec_ok(query),
+            checking_disabled: wire::Header::parse(query).is_ok_and(|h| h.checking_disabled()),
+        }
+    }
+}
+
 struct Entry {
     response: Vec<u8>,
     /// The upstream query that got `response` (for prefetch).
@@ -48,8 +76,8 @@ pub struct Hit {
 
 pub struct Cache {
     max_entries: usize,
-    entries: BTreeMap<Question, Entry>,
-    by_expiry: BTreeSet<(u64, Question)>,
+    entries: BTreeMap<Key, Entry>,
+    by_expiry: BTreeSet<(u64, Key)>,
     pub hits: u64,
     pub misses: u64,
 }
@@ -85,7 +113,7 @@ impl Cache {
         self.entries.is_empty()
     }
 
-    fn remove(&mut self, q: &Question) {
+    fn remove(&mut self, q: &Key) {
         if let Some(e) = self.entries.remove(q) {
             self.by_expiry.remove(&(e.expires_ms, q.clone()));
         }
@@ -93,7 +121,7 @@ impl Cache {
 
     /// Store an upstream response (already validated for `q`) and the
     /// upstream `query` it answered.
-    pub fn insert(&mut self, now_ms: u64, q: Question, response: &[u8], query: &[u8]) {
+    pub fn insert(&mut self, now_ms: u64, q: Key, response: &[u8], query: &[u8]) {
         let Ok(recs) = wire::records(response) else {
             return;
         };
@@ -148,7 +176,7 @@ impl Cache {
     }
 
     /// A cached response for `q` with `id` and aged TTLs, if still valid.
-    pub fn get(&mut self, now_ms: u64, q: &Question, id: u16) -> Option<Hit> {
+    pub fn get(&mut self, now_ms: u64, q: &Key, id: u16) -> Option<Hit> {
         let Some(e) = self.entries.get(q) else {
             self.misses += 1;
             return None;

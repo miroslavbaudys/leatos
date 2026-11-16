@@ -9,7 +9,12 @@
 //! responses are accepted only from the server that was asked and only if
 //! the question matches. Identical in-flight questions are merged (one
 //! upstream query, many waiters). Pending queries are bounded.
-
+//!
+//! DNSSEC is passed through, not validated: queries keep their DO bit and
+//! CD flag upstream, answers keep their RRSIGs and AD flag. Merging and the
+//! cache are per question *and* those flags ([`Key`]), so a validating
+//! client never gets an answer fetched without DNSSEC records, and a
+//! client without CD never one that failed validation upstream.
 //!
 //! Prefetch ([`Config::prefetch`]): a cache hit close to expiry
 //! ([`crate::cache`]) is answered from the cache and the entry renewed by
@@ -23,8 +28,8 @@
 //! spoofing resistance relies on the 16-bit ID only. Per-query source ports
 //! are planned.
 
-use crate::cache::Cache;
-use crate::wire::{self, Question, Rdata};
+use crate::cache::{Cache, Key};
+use crate::wire::{self, Rdata};
 use crate::zone::{Lookup, Zone};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -92,7 +97,9 @@ pub struct Stats {
 }
 
 struct Pending {
-    question: Question,
+    /// The question and the client's DNSSEC flags: queries are merged and
+    /// answers cached per key.
+    key: Key,
     /// The upstream query (with our ID).
     query: Vec<u8>,
     /// Client, its query ID, the largest answer it takes.
@@ -110,7 +117,7 @@ pub struct Resolver {
     cache: Cache,
     upstreams: Vec<Ipv4Addr>,
     pending: BTreeMap<u16, Pending>,
-    by_question: BTreeMap<Question, u16>,
+    by_question: BTreeMap<Key, u16>,
     rng: u32,
     pub stats: Stats,
 }
@@ -226,8 +233,8 @@ impl Resolver {
             return alloc::vec![Action::Reply { to: client, data }];
         }
 
-        // 2. Cache.
-        let key = q;
+        // 2. Cache, per question and DNSSEC flags.
+        let key = Key::of(query, q);
         let limit = wire::udp_limit(query, MAX_UDP_REPLY);
         if let Some(hit) = self.cache.get(now_ms, &key, h.id) {
             self.stats.cache_hits += 1;
@@ -239,7 +246,8 @@ impl Resolver {
             return out;
         }
 
-        // 3. Upstream (merge identical in-flight questions).
+        // 3. Upstream (merge identical in-flight questions with the same
+        // DNSSEC flags).
         if let Some(id) = self.by_question.get(&key)
             && let Some(p) = self.pending.get_mut(id)
         {
@@ -258,7 +266,7 @@ impl Resolver {
         self.pending.insert(
             id,
             Pending {
-                question: key,
+                key,
                 query: up.clone(),
                 waiters: alloc::vec![(client, h.id, limit)],
                 sent_ms: now_ms,
@@ -274,7 +282,7 @@ impl Resolver {
     /// Renew the cache entry for `q` with its upstream `query`, unless
     /// switched off, already under way, or the pending queries are a
     /// quarter full.
-    fn prefetch(&mut self, now_ms: u64, key: Question, mut query: Vec<u8>) -> Option<Action> {
+    fn prefetch(&mut self, now_ms: u64, key: Key, mut query: Vec<u8>) -> Option<Action> {
         let busy = self.pending.values().filter(|p| p.prefetch).count();
         if !self.cfg.prefetch
             || self.upstreams.is_empty()
@@ -291,7 +299,7 @@ impl Resolver {
         self.pending.insert(
             id,
             Pending {
-                question: key,
+                key,
                 query: query.clone(),
                 waiters: Vec::new(),
                 sent_ms: now_ms,
@@ -315,19 +323,19 @@ impl Resolver {
         };
         // Anti-spoofing: right server, right question.
         let asked = self.upstreams.get(p.upstream).copied();
-        let matches = wire::parse_query(response).is_ok_and(|(_, q, _)| q == p.question);
+        let matches = wire::parse_query(response).is_ok_and(|(_, q, _)| q == p.key.question);
         if !h.is_response() || asked != Some(from) || !matches {
             self.stats.ignored_responses += 1;
             return Vec::new();
         }
         let p = self.pending.remove(&h.id).expect("checked above");
-        self.by_question.remove(&p.question);
+        self.by_question.remove(&p.key);
 
         if p.prefetch && !matches!(h.rcode(), wire::RCODE_NOERROR | wire::RCODE_NXDOMAIN) {
             self.stats.prefetch_failed += 1;
         }
         let mut data = response.to_vec();
-        let in_local_domain = self.zone.is_local_name(&p.question.name);
+        let in_local_domain = self.zone.is_local_name(&p.key.question.name);
         if self.cfg.rebind_protection && !in_local_domain {
             let recs = wire::records(response).unwrap_or_default();
             if wire::answer_ipv4s(response, &recs)
@@ -337,10 +345,10 @@ impl Resolver {
                 self.stats.rebind_blocked += 1;
                 data = wire::error_response(&p.query, wire::RCODE_REFUSED).unwrap_or_default();
             } else {
-                self.cache.insert(now_ms, p.question.clone(), response, &p.query);
+                self.cache.insert(now_ms, p.key.clone(), response, &p.query);
             }
         } else {
-            self.cache.insert(now_ms, p.question.clone(), response, &p.query);
+            self.cache.insert(now_ms, p.key.clone(), response, &p.query);
         }
 
         p.waiters
@@ -384,7 +392,7 @@ impl Resolver {
                     data: p.query.clone(),
                 });
             } else if let Some(p) = self.pending.remove(&id) {
-                self.by_question.remove(&p.question);
+                self.by_question.remove(&p.key);
                 if p.prefetch {
                     self.stats.prefetch_failed += 1;
                 }
@@ -804,5 +812,54 @@ mod tests {
             let q = build_query(3, &alloc::format!("n{i}.example"), TYPE_A);
             upstream(&r.handle_query(95_000, client(2), &q));
         }
+    }
+
+    /// `name` with EDNS (1232 B) and the DO bit when `dnssec_ok`, CD set
+    /// when `cd`.
+    fn dnssec_query(id: u16, name: &str, dnssec_ok: bool, cd: bool) -> Vec<u8> {
+        let mut q = build_query(id, name, TYPE_A);
+        if cd {
+            q[3] |= 0x10;
+        }
+        q[11] = 1; // ARCOUNT
+        let flags = if dnssec_ok { 0x80 } else { 0 };
+        q.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, flags, 0, 0, 0]);
+        q
+    }
+
+    #[test]
+    fn dnssec_flags_keep_queries_and_cache_entries_apart() {
+        let mut r = resolver();
+        let plain = dnssec_query(1, "signed.example", false, false);
+        let dnssec = dnssec_query(2, "signed.example", true, false);
+        let cd = dnssec_query(3, "signed.example", true, true);
+        assert!(!wire::dnssec_ok(&plain) && wire::dnssec_ok(&dnssec));
+        assert!(wire::Header::parse(&cd).unwrap().checking_disabled());
+        // Three in-flight queries, not merged: the upstream answers each
+        // differently (with and without RRSIGs, validated or not).
+        let mut ups = Vec::new();
+        for (i, q) in [&plain, &dnssec, &cd].into_iter().enumerate() {
+            let (_, up) = upstream(&r.handle_query(0, client(i as u16), q));
+            assert_eq!(wire::dnssec_ok(&up), wire::dnssec_ok(q), "DO kept upstream");
+            assert_eq!(up[2..4], q[2..4], "flags (CD) kept upstream");
+            ups.push(up);
+        }
+        assert_eq!((r.stats.forwarded, r.stats.merged), (3, 0));
+        for (i, up) in ups.iter().enumerate() {
+            reply(&r.handle_upstream(10, UP1, &answer(up, Ipv4Addr::new(93, 184, 216, i as u8), 300)));
+        }
+        // Each kind of client gets its own answer from the cache.
+        for (i, q) in [&plain, &dnssec, &cd].into_iter().enumerate() {
+            let a = r.handle_query(1000, client(9), q);
+            let (_, d) = reply(&a);
+            let recs = wire::records(d).unwrap();
+            assert_eq!(wire::answer_ipv4s(d, &recs), vec![Ipv4Addr::new(93, 184, 216, i as u8)], "client kind {i}");
+        }
+        assert_eq!(r.stats.cache_hits, 3);
+        // Same flags: merged as before.
+        let other = dnssec_query(4, "other.example", true, false);
+        upstream(&r.handle_query(0, client(1), &other));
+        assert!(r.handle_query(0, client(2), &dnssec_query(5, "other.example", true, false)).is_empty());
+        assert_eq!(r.stats.merged, 1);
     }
 }

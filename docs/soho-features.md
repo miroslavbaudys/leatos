@@ -105,6 +105,11 @@ Counters (`queries`, `cache_hits`, `forwarded`, `prefetches`,
 `prefetch_failed`, …) in `/api/status` `dns` and the CLI `status`; lab
 check in `scripts/lab-test.sh` (negative control
 `LAB_ROUTER_ARGS=dns_prefetch=0`).
+DNSSEC is passed through, not validated: DO bit and CD flag go upstream,
+RRSIGs and AD come back; merging and the cache are per question **and**
+those flags (`cache::Key`), so validating clients behind the router never
+get an answer fetched without DNSSEC records (and clients without CD never
+one that failed validation upstream).
 **Open:** serve-stale (RFC 8767), TCP port 53 from clients, randomised upstream source port
 per query (Kaminsky hardening; one fixed random port today), DoH,
 blocklists, DNSSEC.

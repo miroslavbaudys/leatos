@@ -31,6 +31,11 @@ const FLAG_AA: u16 = 0x0400;
 const FLAG_TC: u16 = 0x0200;
 const FLAG_RD: u16 = 0x0100;
 const FLAG_RA: u16 = 0x0080;
+/// Checking Disabled (RFC 4035 §3.2.2): the client validates itself and
+/// wants answers that failed validation upstream too.
+const FLAG_CD: u16 = 0x0010;
+/// DNSSEC OK (RFC 3225), the top bit of the OPT record's flags.
+const EDNS_DO: u8 = 0x80;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -76,6 +81,19 @@ impl Header {
     pub fn recursion_desired(&self) -> bool {
         self.flags & FLAG_RD != 0
     }
+    pub fn checking_disabled(&self) -> bool {
+        self.flags & FLAG_CD != 0
+    }
+}
+
+/// The DO bit of `msg`'s OPT record: the sender wants DNSSEC records
+/// (RRSIG, NSEC, …) in the answer. False without EDNS or when malformed.
+pub fn dnssec_ok(msg: &[u8]) -> bool {
+    records(msg).is_ok_and(|recs| {
+        recs.iter()
+            .find(|r| r.section == 2 && r.rtype == TYPE_OPT)
+            .is_some_and(|r| msg[r.ttl_offset + 2] & EDNS_DO != 0)
+    })
 }
 
 /// The question of a message, with the name lowercased (for cache keys).
