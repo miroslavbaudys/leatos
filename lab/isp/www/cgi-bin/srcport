@@ -1,0 +1,6 @@
+#!/usr/bin/busybox sh
+# Forward-target check: the caller's source port as it arrives here (the
+# router's NAT port; a port forward's target keeps its forwarded port).
+echo "Content-Type: text/plain"
+echo
+echo "port=$REMOTE_PORT"

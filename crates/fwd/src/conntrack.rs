@@ -11,7 +11,10 @@
 //! - **DNAT** (port forwards, [`Conntrack::create_dnat`]): a connection to
 //!   the WAN address is sent on to an internal target; with hairpin, the
 //!   source is translated to the router too, so the target answers through
-//!   it. Forwarded ports are reserved: NAPT never allocates them.
+//!   it. Forwarded ports are reserved: NAPT never allocates them, except
+//!   to the forward's own target ([`Conntrack::create_from`]): its
+//!   connections out keep the forwarded port, so a peer it contacted that
+//!   then connects to the forward meets the same connection.
 //! - Bounded: at most `max_conns` entries; new connections beyond that are refused.
 //! - TCP state is tracked loosely (enough for timeouts): SYN → established
 //!   on the reply SYN+ACK, FIN/RST → closing.
@@ -111,6 +114,9 @@ pub struct Stats {
     pub expired: u64,
     pub table_full: u64,
     pub nat_exhausted: u64,
+    /// New connections refused because a tracked one already has one of
+    /// their tuples.
+    pub clashes: u64,
 }
 
 /// Endpoint-independent NAT mapping: internal endpoint → external port.
@@ -248,6 +254,7 @@ impl Conntrack {
 
     fn insert(&mut self, now: u64, orig: Tuple, reply: Tuple, nat: bool, mapped: bool, tcp_flags: u8) -> Option<ConnId> {
         if self.index.contains_key(&orig) || self.index.contains_key(&reply) {
+            self.stats.clashes += 1;
             return None; // clash (e.g. two internal hosts, same remote, same EIM port race)
         }
         if mapped {
@@ -334,6 +341,21 @@ impl Conntrack {
         nat_ip: Option<Ipv4Addr>,
         tcp_flags: u8,
     ) -> Option<ConnId> {
+        self.create_from(now, orig, nat_ip, None, tcp_flags)
+    }
+
+    /// [`Conntrack::create`], and with NAT a new mapping takes external
+    /// port `fixed` when it is free, reserved or not (a port forward's
+    /// target going out: the forwarded port). The source's existing mapping
+    /// wins; a taken `port` falls back to allocation.
+    pub fn create_from(
+        &mut self,
+        now: u64,
+        orig: Tuple,
+        nat_ip: Option<Ipv4Addr>,
+        fixed: Option<u16>,
+        tcp_flags: u8,
+    ) -> Option<ConnId> {
         if self.len() >= self.max_conns {
             self.stats.table_full += 1;
             return None;
@@ -341,9 +363,11 @@ impl Conntrack {
         let (reply, nat) = match nat_ip {
             Some(ip) => {
                 let key = (orig.proto, orig.src, orig.sport);
-                let port = match self.mappings.get(&key) {
-                    Some(m) => m.port,
-                    None => match self.alloc_port(orig.proto, orig.sport) {
+                let free = fixed.filter(|p| !self.used_ports.contains_key(&(orig.proto, *p)));
+                let port = match (self.mappings.get(&key), free) {
+                    (Some(m), _) => m.port,
+                    (None, Some(p)) => p,
+                    (None, None) => match self.alloc_port(orig.proto, orig.sport) {
                         Some(p) => p,
                         None => {
                             self.stats.nat_exhausted += 1;

@@ -717,6 +717,7 @@ const DROP_TEXT = {
   "too-big": "larger than the outgoing MTU without DF (no fragmentation)",
   "input": "to the router, refused by the zone's input policy",
   "spoofed": "from the WAN with a source in one of our networks or loopback (forged)",
+  "clash": "new connection whose addresses and ports a tracked one already uses",
 };
 let savedReboot = false;
 let st = null, lastUptime = null, failures = 0;

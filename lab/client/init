@@ -279,6 +279,18 @@ if [ -n "$fw" ]; then
   else
     fail "hairpin: http://$wanip:8080/ from inside ('$body')"
   fi
+  # Forward target going out: a connection from this client's forwarded
+  # port 8090 (forward lab-src: WAN :8090 -> here :8090) leaves from the
+  # WAN's :8090, so a peer it contacts can connect to the forward as the
+  # same connection (it used to clash: dropped as table-full). The ISP's
+  # cgi-bin/srcport reports the source port it sees. Negative control
+  # LAB_FORWARD=0 (no forward: a NAPT port).
+  ue=$(printf 'GET /cgi-bin/srcport HTTP/1.0\r\n\r\n' | $bb nc -p 8090 -w 3 "$ISP" 80 2>&1 | $bb grep '^port=')
+  if [ "$ue" = "port=8090" ]; then
+    pass "forward target out: a connection from :8090 leaves from the WAN's :8090 ($ue)"
+  else
+    fail "forward target out: a connection from :8090 (ISP saw '$ue', want port=8090)"
+  fi
   # Anti-spoofing: the ISP connects to the forward from the forged source
   # 192.168.1.77 (our own network; ISP cgi-bin/spoof). The router must drop
   # it as "spoofed", and the forward must not take it. Negative control

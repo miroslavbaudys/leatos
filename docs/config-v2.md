@@ -193,6 +193,13 @@ ports:
 - **NAPT ports (10000–39999):** forwarded ports in this range are skipped
   when NAPT allocates a source port, so a mapping never shadows a forward
   (`Conntrack::set_reserved`).
+- **The target going out:** connections from a forward's target endpoint
+  (`to`, e.g. a torrent client's listen port) leave from the forward's
+  WAN port (`Conntrack::create_from`), any range, as Linux's NAT keeps
+  the source port. A peer it contacts that then connects to the forward
+  meets the same connection; before, the two collided and the peer's
+  packets were dropped (now counted as drop reason `clash`, not
+  `table-full`).
 - **Router-local ports (60000–65535):** the router's own client sockets
   (SNTP 60000–64999, DNS upstream 65000–65535) live here, and forwards
   may not use them (validation), so a reply to the router is never taken

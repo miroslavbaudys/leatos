@@ -155,6 +155,13 @@ impl PortForward {
     fn is_target(&self, p: u8, ip: Ipv4Addr, port: u16) -> bool {
         dnat_is_target(self.protos, (self.lo, self.hi), self.to, self.to_port, p, ip, port)
     }
+
+    /// The WAN port a target `ip:port` is reached on: its connections out
+    /// leave from it, so both directions are one connection.
+    fn wan_port(&self, p: u8, ip: Ipv4Addr, port: u16) -> Option<u16> {
+        self.is_target(p, ip, port)
+            .then(|| self.to_port.map_or(port, |t| self.lo.wrapping_add(port - t)))
+    }
 }
 
 /// A redirect (`[[firewall.redirect]]`), compiled: new connections from
@@ -341,9 +348,12 @@ pub enum DropReason {
     /// From the WAN with a source that cannot come from there: loopback or
     /// one of our own networks (ingress filtering, RFC 2827 / RFC 3704).
     Spoofed,
+    /// A new connection whose tuple a tracked one already has (e.g. two
+    /// internal hosts racing for one external port); not a full table.
+    Clash,
 }
 
-pub const DROP_REASONS: usize = 13;
+pub const DROP_REASONS: usize = 14;
 
 impl DropReason {
     pub fn index(self) -> usize {
@@ -364,6 +374,7 @@ impl DropReason {
             Self::TooBig => "too-big",
             Self::Input => "input",
             Self::Spoofed => "spoofed",
+            Self::Clash => "clash",
         }
     }
     pub fn all() -> [DropReason; DROP_REASONS] {
@@ -382,6 +393,7 @@ impl DropReason {
             TooBig,
             Input,
             Spoofed,
+            Clash,
         ]
     }
 }
@@ -1254,6 +1266,7 @@ impl Forwarder {
                 }
                 // Masquerade towards the WAN only; between networks
                 // addresses stay as they are.
+                let clashes = self.ct.stats.clashes;
                 let created = match dnat {
                     // Port forward: to the target; hairpin (an internal
                     // client) also from the router's address there.
@@ -1284,11 +1297,19 @@ impl Forwarder {
                             Role::Wan => egress_if.addr.map(|(a, _)| a),
                             Role::Lan => None,
                         };
-                        self.ct.create(now, t, nat_ip, flags)
+                        // A port forward's target going out: from its
+                        // forwarded port, so a peer it contacts can also
+                        // connect to the forward (one connection, no clash).
+                        let port = nat_ip.and_then(|_| {
+                            let fwds = &self.policy.as_ref()?.forwards;
+                            fwds.iter().find_map(|f| f.wan_port(t.proto, t.src, t.sport))
+                        });
+                        self.ct.create_from(now, t, nat_ip, port, flags)
                     }
                 };
                 match created {
                     Some(id) => (id, Dir::Original),
+                    None if self.ct.stats.clashes != clashes => return self.drop(DropReason::Clash),
                     None => return self.drop(DropReason::TableFull),
                 }
             }
@@ -2602,6 +2623,73 @@ mod tests {
             assert_eq!(shard_of(Role::Lan, &r[..len], SHARDS, 42, &hints), k, "hairpin reply {i}");
             assert!(matches!(fws[k].process(1, LAN, &mut r, len), Verdict::Forward { egress: LAN, .. }));
         }
+    }
+
+    #[test]
+    fn forward_target_goes_out_from_its_forwarded_port() {
+        let mut fw = router();
+        with_forwards(&mut fw, vec![fwd(8443, 8443, Some(443), None, true)]);
+        // The NAS opens a connection from its forwarded port 443: it leaves
+        // from WAN :8443 (reserved for everyone else), not a NAPT port.
+        let mut f = tcp_frame(LAN_MAC, NAS, SERVER, 443, 6881, TCP_SYN);
+        let Verdict::Forward { egress: WAN, len, .. } = run(&mut fw, 0, LAN, &mut f) else { panic!("out") };
+        assert_eq!(ports(&f[..len]), (ROUTER_WAN, 8443, SERVER, 6881));
+        // The peer now connects to the forward from that same port: the
+        // same connection, delivered (it used to clash: dropped).
+        let mut r = tcp_frame(WAN_MAC, SERVER, ROUTER_WAN, 6881, 8443, TCP_SYN | TCP_ACK);
+        let Verdict::Forward { egress: LAN, len, .. } = run(&mut fw, 1, WAN, &mut r) else { panic!("in") };
+        assert_eq!(ports(&r[..len]), (SERVER, 6881, NAS, 443));
+        assert_eq!(fw.ct.stats.clashes, 0);
+        // Its other ports, and other hosts, still get NAPT ports.
+        let mut f = tcp_frame(LAN_MAC, NAS, SERVER, 444, 6881, TCP_SYN);
+        let Verdict::Forward { len, .. } = run(&mut fw, 2, LAN, &mut f) else { panic!() };
+        assert!((10_000..40_000).contains(&ports(&f[..len]).1));
+        let mut f = tcp_frame(LAN_MAC, HOST, SERVER, 443, 6881, TCP_SYN);
+        let Verdict::Forward { len, .. } = run(&mut fw, 3, LAN, &mut f) else { panic!() };
+        assert_ne!(ports(&f[..len]).1, 8443, "the reserved port only for the target");
+    }
+
+    #[test]
+    fn a_clash_is_not_a_full_table() {
+        let mut fw = router();
+        // The NAS goes out before the forward exists: a NAPT port.
+        let mut f = tcp_frame(LAN_MAC, NAS, SERVER, 443, 6881, TCP_SYN);
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward { .. }));
+        with_forwards(&mut fw, vec![fwd(8443, 8443, Some(443), None, true)]);
+        // The peer connects to the new forward: its DNAT reply tuple is the
+        // tracked connection's original one.
+        let mut r = tcp_frame(WAN_MAC, SERVER, ROUTER_WAN, 6881, 8443, TCP_SYN);
+        assert_eq!(run(&mut fw, 1, WAN, &mut r), Verdict::Drop(DropReason::Clash));
+        assert_eq!((fw.ct.stats.clashes, fw.ct.stats.table_full), (1, 0));
+    }
+
+    #[test]
+    fn forward_target_going_out_keeps_one_shard() {
+        let forwards = [PortForward { protos: proto::TCP | proto::UDP, ..fwd(8443, 8443, Some(443), None, true) }];
+        let internal = [(ROUTER_LAN, 24)];
+        let hints = ShardHints { internal: &internal, wan: Some(ROUTER_WAN), forwards: &forwards, redirects: &[] };
+        let mut fws = shards();
+        for fw in &mut fws {
+            with_forwards(fw, forwards.to_vec());
+        }
+        for i in 0..32u16 {
+            let peer = Ipv4Addr::new(198, 51, 100, 1 + i as u8);
+            let d = udp_datagram(NAS, peer, 443, 6881 + i, b"q");
+            let mut f = to(LAN_MAC, ipv4_frame(NAS, peer, PROTO_UDP, 64, &d));
+            let len = f.len() - 64;
+            let k = shard_of(Role::Lan, &f[..len], SHARDS, 42, &hints);
+            let Verdict::Forward { len, .. } = fws[k].process(0, LAN, &mut f, len) else { panic!("out {i}") };
+            assert_eq!(ports(&f[..len]).1, 8443, "from the forwarded port {i}");
+            // The peer, to the forward: same shard, same connection.
+            let d = udp_datagram(peer, ROUTER_WAN, 6881 + i, 8443, b"a");
+            let mut r = to(WAN_MAC, ipv4_frame(peer, ROUTER_WAN, PROTO_UDP, 64, &d));
+            let len = r.len() - 64;
+            assert_eq!(shard_of(Role::Wan, &r[..len], SHARDS, 42, &hints), k, "peer {i}");
+            let Verdict::Forward { egress: LAN, len, .. } = fws[k].process(1, WAN, &mut r, len) else { panic!("in {i}") };
+            assert_eq!(ports(&r[..len]), (peer, 6881 + i, NAS, 443));
+        }
+        assert!(fws.iter().all(|f| f.ct.stats.clashes == 0));
+        assert_eq!(fws.iter().map(|f| f.ct.len()).sum::<usize>(), 32, "one connection per peer");
     }
 
     /// An ICMP error (`kind`, `code`) from `src` to `dst` about the

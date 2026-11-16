@@ -89,6 +89,11 @@
 #                        with hairpin; the ISP fetches through it and the
 #                        client through the WAN address. Negative control:
 #                        LAB_FORWARD=0 (no forward: both fail).
+#                        Forward target out: forward lab-src (WAN :8090 ->
+#                        client :8090); a connection from the client's
+#                        :8090 leaves from the WAN's :8090 (ISP
+#                        cgi-bin/srcport reports the port); LAB_FORWARD=0
+#                        fails it (a NAPT port).
 #                        Anti-spoofing: the ISP opens a connection to the
 #                        forward from the forged source 192.168.1.77
 #                        (cgi-bin/spoof): dropped as "spoofed", forward
@@ -318,6 +323,11 @@ CFG
 name = "lab-web"
 wan_port = 8080
 to = "192.168.1.100:8080"
+
+[[firewall.forward]]
+name = "lab-src"
+wan_port = 8090
+to = "192.168.1.100:8090"
 CFG
   [[ "$REDIRECT" == 1 ]] && cat >>"$WORK/config.toml" <<'CFG'
 
