@@ -202,6 +202,61 @@ ports:
   listens on from the WAN (`:80` with `mgmt.on_wan`). Validation rejects
   it.
 
+### `[[firewall.redirect]]`
+Redirects (DNAT inside, the UniFi/OpenWrt "NTP/DNS redirect"): new
+connections from the networks to an outside server go to a device inside
+instead. For devices with hard-coded servers, e.g. every NTP query to the
+LAN's own time server. The clients keep thinking they talk to the server
+they chose (the answers carry its address).
+
+| Field | Default | Notes |
+|---|---|---|
+| `name` | required | key; unique |
+| `enabled` | `true` | |
+| `from` | required | zone name or `any` (every network; not `wan`) |
+| `proto` | `"udp"` | `tcp`, `udp`, `tcp+udp` |
+| `dst_port` | required | port or range |
+| `to` | required | `ip` or `ip:port`; `ip` must be inside a network's subnet (not the router itself) |
+
+```toml
+[[firewall.redirect]]
+name = "ntp"
+from = "any"
+dst_port = 123
+to = "192.168.1.200"
+```
+
+What is redirected (`fwd::forwarder::Redirect`):
+- New TCP/UDP connections arriving from a network of zone `from`, to
+  `dst_port` of an address outside every network (the internet), or of a
+  router address for a port the router does not serve itself: DHCP (67),
+  DNS (53), mDNS (5353) and the web interface (TCP 80) stay the router's
+  (`router_serves`), so NTP to the router (it serves none) is redirected.
+- Never: the target's own connections (its upstream queries go out as
+  addressed), connections to the target or to any other address inside
+  the networks (a client that picked a local server keeps it),
+  broadcast and multicast.
+- A port forward wins over a redirect for the same connection.
+
+How: the forwarder translates the destination (`Conntrack::create_dnat`)
+and lets the connection through the firewall, like a port forward (no
+rule needed, also when the zones would refuse it). A client on the
+target's own network is also translated to the router's address there
+(as hairpin forwards are), because the target would otherwise answer it
+directly, from its own address, and the client would drop the answer.
+Clients on other networks keep their address (the target sees who asks;
+its answers go back through the router, their gateway). Counted per
+redirect (`redirects` in `/api/status`, the Firewall page).
+
+Sharding: `shard_of` cannot see zones, so every connection a redirect
+may take (its ports, outside or at a router address, not from the
+target), every connection to the target's ports and the target's packets
+from them to inside live in the target endpoint's shard
+(`ShardHints::redirects`). ICMP errors from inside follow the connection
+they are about. A zone-limited redirect thus also puts the other zones'
+connections to those ports in that shard (their NAT ports come from it,
+so the WAN side finds them); keep redirects to small services.
+
 ### `[[dns.host]]`
 Static A records in the local zone (`name` + `ip`), beside the DHCP-derived
 names. A name is relative to `dns.domain` unless it contains a dot.
@@ -382,7 +437,7 @@ control `LAB_GUEST_DOMAIN=0`).
 |---|---|
 | Networks | `[[network]]` list + editor (VLAN, subnet, DHCP, zone), port membership view |
 | WAN | `[wan]` |
-| Firewall | zone matrix (rows from, columns to), zone input/allow, rules (ordered, enable toggle, hit counters), port forwards |
+| Firewall | zone matrix (rows from, columns to), zone input/allow, rules (ordered, enable toggle, hit counters), port forwards, redirects |
 | DHCP & DNS | leases (all networks), reservations, `[[dns.host]]`, `[dns]` |
 | SQM | `[shaping]` |
 | System | `[time]`, `[mgmt]`, backup/restore, upgrade, reboot |

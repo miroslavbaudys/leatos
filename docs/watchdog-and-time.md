@@ -93,6 +93,10 @@ Tests (`scripts/smoke-test.sh`; each passes only if a second boot is seen):
   passes `ntp=ntp.isp.example` and checks the router's time against the
   host's (±5 s). Negative control: `LAB_ROUTER_ARGS=ntp=203.0.113.99`.
 
+Clients' NTP can be sent to a time server on the LAN with a redirect
+(`[[firewall.redirect]]`, docs/config-v2.md), also NTP addressed to the
+router, which serves none.
+
 Open: an NTP server for the LAN (DHCP option 42), DHCP-provided NTP servers
 on the WAN, and slewing instead of stepping (not needed while nothing
 measures intervals in wall-clock time).

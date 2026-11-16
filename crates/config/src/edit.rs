@@ -3,7 +3,7 @@
 //!
 //! List entries with a name are addressed by it: the config is edited as
 //! a table in which `[[network]]`, `[[zone]]`, `[[firewall.rule]]` and
-//! `[[firewall.forward]]`, `[[mdns.reflect]]` are keyed by `name` (`network.guest.vlan = 20`,
+//! `[[firewall.forward]]`, `[[firewall.redirect]]`, `[[mdns.reflect]]` are keyed by `name` (`network.guest.vlan = 20`,
 //! `firewall.rule.ssh = { from = "wan", to = "router", … }`). The order
 //! of existing entries is kept; new ones go last. `lan.…` means the first
 //! network (version 1's `[lan]`), `lan.domain` is `dns.domain`.
@@ -15,7 +15,14 @@ use alloc::vec::Vec;
 use toml::{Table, Value};
 
 /// Lists keyed by `name`, as paths.
-const KEYED: [&[&str]; 5] = [&["network"], &["zone"], &["firewall", "rule"], &["firewall", "forward"], &["mdns", "reflect"]];
+const KEYED: [&[&str]; 6] = [
+    &["network"],
+    &["zone"],
+    &["firewall", "rule"],
+    &["firewall", "forward"],
+    &["firewall", "redirect"],
+    &["mdns", "reflect"],
+];
 
 fn syntax(e: impl ToString) -> Error {
     Error::Syntax(e.to_string())
@@ -62,6 +69,7 @@ fn from_table(mut t: Table, order: &Config) -> Result<Config, Error> {
             ["zone"] => order.zones.iter().map(|z| z.name.clone()).collect(),
             ["firewall", "rule"] => order.firewall.rules.iter().map(|r| r.name.clone()).collect(),
             ["mdns", "reflect"] => order.mdns.reflect.iter().map(|r| r.name.clone()).collect(),
+            ["firewall", "redirect"] => order.firewall.redirects.iter().map(|r| r.name.clone()).collect(),
             _ => order.firewall.forwards.iter().map(|f| f.name.clone()).collect(),
         }
     };
@@ -234,7 +242,7 @@ fn template(list: &[&str]) -> Option<Table> {
     let mut t = match list {
         ["network"] => Table::try_from(Network::default()),
         ["zone"] => Table::try_from(Zone::builtin_lan()),
-        _ => return Some(Table::new()), // rules, forwards: required fields only
+        _ => return Some(Table::new()), // rules, forwards, redirects: required fields only
     }
     .ok()?;
     t.remove("name");
@@ -266,6 +274,9 @@ fn optional_known(path: &str) -> bool {
             | "firewall.forward.*.proto"
             | "firewall.forward.*.src"
             | "firewall.forward.*.hairpin"
+            | "firewall.redirect"
+            | "firewall.redirect.*.enabled"
+            | "firewall.redirect.*.proto"
             | "dns.host"
             | "mgmt.password"
             | "mgmt.password_hash"

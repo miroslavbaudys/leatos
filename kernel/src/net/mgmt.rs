@@ -1286,6 +1286,19 @@ fn status_json(
         );
     }
     s.push(']');
+    // Redirects in effect and the connections they took.
+    s.push_str(",\"redirects\":[");
+    let hits = sh.redirect_hits.lock().clone();
+    for (n, name) in config::redirect_names().iter().enumerate() {
+        let _ = write!(
+            s,
+            "{}{{\"name\":{},\"hits\":{}}}",
+            if n > 0 { "," } else { "" },
+            json_str(name),
+            hits.get(n).copied().unwrap_or(0)
+        );
+    }
+    s.push(']');
     // mDNS reflector, per network taking part.
     s.push_str(",\"mdns\":[");
     for (n, (name, m)) in services.map(LanServices::mdns_status).unwrap_or_default().iter().enumerate() {

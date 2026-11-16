@@ -160,6 +160,9 @@ forward to the current upstream (the upstream list is swapped atomically on `Wan
 - Firewall: new flows only LAN→WAN; TCP must start with SYN; WAN→LAN only
   for tracked connections; hairpin, fragments and unknown protocols dropped.
 - Port forwarding (DNAT) and hairpin NAT ✅ (2026-11-15, docs/config-v2.md).
+- Redirects ✅ (2026-11-16, `[[firewall.redirect]]`, docs/config-v2.md): the
+  networks' connections to an outside server on given ports go to a device
+  inside (NTP to the LAN's time server, as UniFi's NTP redirect).
 - Open: IP fragment reassembly
   (fragments are dropped today), ICMP unreachable for no-route, MSS
   clamping + PMTU (M5, with PPPoE), UPnP/NAT-PMP, faster conntrack

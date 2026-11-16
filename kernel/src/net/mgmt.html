@@ -323,6 +323,12 @@
         <span class="hint">New connections to the router's WAN address on these ports go to a device inside; no extra rule needed. Applied at once.</span></div>
       <p class="hint">Target: <code>address</code> (same ports) or <code>address:port</code> (a range maps onto port, port+1, …). <b>Hairpin</b>: devices inside reach it through the WAN address too. Ports 60000–65535 are the router's own.</p>
     </form>
+    <form class="card cfg" autocomplete="off" id="redirsform"><h3>Redirects</h3>
+      <div class="tw"><table id="redirs"></table></div>
+      <div class="row"><button type="button" id="addredir" class="plain">Add redirect</button>
+        <span class="hint">New connections from the networks of a zone to these ports of an outside server (or of the router, for ports it does not serve) go to a device inside instead, for devices with hard-coded servers (NTP, DNS). They still think they talk to the server they chose. No extra rule needed. Applied at once.</span></div>
+      <p class="hint">The target's own connections, and connections addressed to it or to other devices inside, are left alone. Clients on the target's network reach it through the router's address there. Target: <code>address</code> (same ports) or <code>address:port</code>.</p>
+    </form>
     <form class="card cfg" autocomplete="off" id="mdnsform"><h3>mDNS across networks</h3>
       <div class="tw"><table id="mdns"></table></div>
       <div class="row"><button type="button" id="addmdns" class="plain">Add mDNS rule</button>
@@ -949,6 +955,7 @@ function fillForm(c) {
   renderNets(c.network ?? []);
   renderRules(c.firewall?.rule ?? []);
   renderFwds(c.firewall?.forward ?? []);
+  renderRedirs(c.firewall?.redirect ?? []);
   renderMdns(c.mdns?.reflect ?? []);
 }
 function readForm() {
@@ -964,6 +971,8 @@ function readForm() {
   if (rules.length) c.firewall.rule = rules; else delete c.firewall.rule;
   const fwds = readFwds();
   if (fwds.length) c.firewall.forward = fwds; else delete c.firewall.forward;
+  const redirs = readRedirs();
+  if (redirs.length) c.firewall.redirect = redirs; else delete c.firewall.redirect;
   if (!Object.keys(c.firewall).length) delete c.firewall;
   const md = readMdns();
   if (md.length) c.mdns = { ...(c.mdns ?? {}), reflect: md }; else delete c.mdns;
@@ -1171,6 +1180,7 @@ function rezone() {
   renderZones(zs);
   if (ns) renderNets([cfgOrig.network[0], ...ns]);
   renderRules(readRules());
+  renderRedirs(readRedirs());
   renderMdns(readMdns());
   updatePending();
 }
@@ -1231,6 +1241,8 @@ function renderRuleHits() {
   for (const td of document.querySelectorAll("#rules [data-hits]")) td.textContent = td.dataset.hits in by ? n(by[td.dataset.hits]) : "–";
   const fb = Object.fromEntries((st?.forwards ?? []).map((r) => [r.name, r.hits]));
   for (const td of document.querySelectorAll("#fwds [data-fhits]")) td.textContent = td.dataset.fhits in fb ? n(fb[td.dataset.fhits]) : "–";
+  const rb = Object.fromEntries((st?.redirects ?? []).map((r) => [r.name, r.hits]));
+  for (const td of document.querySelectorAll("#redirs [data-rhits]")) td.textContent = td.dataset.rhits in rb ? n(rb[td.dataset.rhits]) : "–";
 }
 $("addrule").onclick = () => {
   const rs = readRules();
@@ -1291,6 +1303,55 @@ $("addfwd").onclick = () => {
   updatePending();
 };
 $("fwds").addEventListener("input", fwdPaths);
+
+// ---- Redirects: connections to outside servers, to a device inside.
+let redirOrig = [];
+function renderRedirs(list) {
+  redirOrig = list.map((r) => structuredClone(r));
+  const t = $("redirs");
+  t.replaceChildren(el("tr", {}, ["On", "Name", "From zone", "Protocol", "Port", "To", "Connections", ""].map((h) => el("th", { textContent: h }))));
+  list.forEach((r, i) => {
+    const tr = el("tr", { dataset: { orig: String(i) } });
+    const inp = (key, v, ph, size) => el("td", {}, [el("input", { value: v ?? "", placeholder: ph, size, dataset: { key } })]);
+    const sel = (key, opts, v) => { const x = el("select", { dataset: { key } }, opts.map((o) => el("option", { value: o, textContent: o }))); x.value = v; return el("td", {}, [x]); };
+    tr.append(el("td", {}, [el("input", { type: "checkbox", checked: r.enabled !== false, dataset: { key: "enabled" } })]),
+      inp("name", r.name, "ntp", 12), sel("from", ["any", ...zoneNames()], r.from ?? "any"),
+      sel("proto", ["udp", "tcp", "tcp+udp"], r.proto ?? "udp"), inp("dst_port", r.dst_port, "123", 9),
+      inp("to", r.to, "192.168.1.200", 18), el("td", { className: "num", dataset: { rhits: r.name ?? "" } }),
+      el("td", {}, [el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); updatePending(); } })]));
+    t.append(tr);
+  });
+  redirPaths();
+  renderRuleHits();
+}
+function redirPaths() {
+  for (const tr of [...$("redirs").rows].slice(1)) {
+    const name = tr.querySelector('[data-key="name"]').value.trim();
+    for (const e of tr.querySelectorAll("[data-key]")) e.dataset.path = `firewall.redirect.${name}.${e.dataset.key}`;
+  }
+}
+function readRedirs() {
+  if (!$("redirs").rows.length) return cfgOrig?.firewall?.redirect ?? [];
+  return [...$("redirs").rows].slice(1).map((tr) => {
+    const o = structuredClone(redirOrig[Number(tr.dataset.orig)] ?? {});
+    const v = (k) => tr.querySelector(`[data-key="${k}"]`);
+    o.name = v("name").value.trim();
+    if (v("enabled").checked) delete o.enabled; else o.enabled = false;
+    o.from = v("from").value;
+    if (v("proto").value === "udp") delete o.proto; else o.proto = v("proto").value;
+    o.dst_port = v("dst_port").value.trim();
+    o.to = v("to").value.trim();
+    return o;
+  });
+}
+$("addredir").onclick = () => {
+  const rs = readRedirs();
+  rs.push({ name: rs.length ? "" : "ntp", from: "any", dst_port: "123", to: "" });
+  renderRedirs(rs);
+  [...$("redirs").rows].at(-1).querySelector('[data-key="to"]').focus();
+  updatePending();
+};
+$("redirs").addEventListener("input", redirPaths);
 
 // ---- mDNS across networks (docs/mdns.md): reflect rules, by network.
 const MDNS_PRESETS = [
@@ -1428,7 +1489,7 @@ function renderMatrix(c) {
 
 // path → shown value; arrays of plain values stay one entry, entries with
 // a name are named by it (as in the router's validation messages).
-const KEYED = ["network", "zone", "firewall.rule", "firewall.forward", "mdns.reflect"];
+const KEYED = ["network", "zone", "firewall.rule", "firewall.forward", "firewall.redirect", "mdns.reflect"];
 function flatten(o, pre = "", out = {}, named = false) {
   if (Array.isArray(o) && o.some((x) => x && typeof x === "object")) {
     const byName = KEYED.includes(pre);

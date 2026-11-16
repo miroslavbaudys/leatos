@@ -386,6 +386,33 @@ pub struct Forward {
     pub hairpin: bool,
 }
 
+fn proto_udp() -> Proto {
+    Proto::Udp
+}
+fn is_udp(p: &Proto) -> bool {
+    *p == Proto::Udp
+}
+
+/// A redirect (DNAT inside): new connections from the networks of zone
+/// `from` to `dst_port` of an address outside them (the internet, or the
+/// router itself) go to `to` instead; clients keep thinking they talk to
+/// the server they chose. For devices with hard-coded servers (NTP, DNS).
+/// The target's own connections and connections to it are left alone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Redirect {
+    pub name: String,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    /// A zone or `any` (every network; never the WAN).
+    pub from: String,
+    #[serde(default = "proto_udp", skip_serializing_if = "is_udp")]
+    pub proto: Proto,
+    pub dst_port: PortRange,
+    /// `ip` (same ports) or `ip:port` (a range maps onto port..).
+    pub to: Target,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Firewall {
@@ -393,11 +420,13 @@ pub struct Firewall {
     pub rules: Vec<Rule>,
     #[serde(rename = "forward", skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<Forward>,
+    #[serde(rename = "redirect", skip_serializing_if = "Vec::is_empty")]
+    pub redirects: Vec<Redirect>,
 }
 
 impl Firewall {
     pub fn is_empty(&self) -> bool {
-        self.rules.is_empty() && self.forwards.is_empty()
+        self.rules.is_empty() && self.forwards.is_empty() && self.redirects.is_empty()
     }
 }
 
@@ -962,6 +991,9 @@ impl Config {
         if !self.zones.is_empty() {
             add("zone".into(), "firewall zones");
         }
+        if !self.firewall.is_empty() {
+            add("firewall".into(), "firewall rules, port forwards or redirects");
+        }
         if !self.dns.hosts.is_empty() {
             add("dns.host".into(), "local DNS records");
         }
@@ -998,7 +1030,7 @@ impl Config {
     /// Settings this kernel does not implement yet (docs/config-v2.md §9):
     /// a save or a stored config with them is refused. Implemented:
     /// networks on `lan0` (untagged or VLANs), zones, DHCP per network,
-    /// rules, port forwards, mDNS reflection. Not yet: other ports
+    /// rules, port forwards, redirects, mDNS reflection. Not yet: other ports
     /// (bridging), DNS hosts,
     /// another WAN port, a static WAN.
     pub fn unsupported(&self) -> Vec<Issue> {

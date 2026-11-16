@@ -22,6 +22,7 @@ pub const MAX_NETWORKS: usize = 16;
 pub const MAX_ZONES: usize = 16;
 pub const MAX_RULES: usize = 256;
 pub const MAX_FORWARDS: usize = 128;
+pub const MAX_REDIRECTS: usize = 32;
 pub const MAX_DNS_HOSTS: usize = 256;
 /// `dns.upstreams` entries.
 pub const MAX_DNS_UPSTREAMS: usize = 4;
@@ -133,6 +134,7 @@ pub(crate) fn check(c: &Config) -> Result<(), Vec<Issue>> {
     zones(c, &mut x);
     rules(c, &mut x);
     forwards(c, &mut x);
+    redirects(c, &mut x);
     dns(c, &mut x);
     mdns(c, &mut x);
     let s = &c.shaping;
@@ -547,23 +549,12 @@ fn forwards(c: &Config, x: &mut Issues) {
         if !fw.proto.has_ports() {
             x.add(format!("{p}.proto"), "must be \"tcp\", \"udp\" or \"tcp+udp\"");
         }
-        match c.networks.iter().find(|n| n.ipv4.prefix <= 30 && n.ipv4.is_host(fw.to.ip)) {
-            None => x.add(format!("{p}.to"), format!("{} is in none of the networks", fw.to.ip)),
-            Some(n) if n.ipv4.addr == fw.to.ip => {
-                x.add(format!("{p}.to"), "is the router's own address")
-            }
-            Some(_) => {}
-        }
+        target_ok(c, x, format!("{p}.to"), &fw.to, fw.wan_port.span());
         if fw.wan_port.hi >= ROUTER_PORTS {
             x.add(
                 format!("{p}.wan_port"),
                 format!("{ROUTER_PORTS}–65535 are the router's own (DNS, time)"),
             );
-        }
-        if let Some(tp) = fw.to.port
-            && u32::from(tp) + u32::from(fw.wan_port.span()) > 65535
-        {
-            x.add(format!("{p}.to"), "the port range would end above 65535");
         }
         net_ok(x, format!("{p}.src"), &fw.src);
         if c.mgmt.on_wan && fw.proto.overlaps(&Proto::Tcp) && fw.wan_port.contains(80) {
@@ -578,6 +569,46 @@ fn forwards(c: &Config, x: &mut Issues) {
                     format!("{p}.wan_port"),
                     format!("overlaps {}", paths[j]),
                 );
+            }
+        }
+    }
+}
+
+/// The target must be a host on one of the networks (not the router).
+fn target_ok(c: &Config, x: &mut Issues, path: String, to: &crate::Target, span: u16) {
+    match c.networks.iter().find(|n| n.ipv4.prefix <= 30 && n.ipv4.is_host(to.ip)) {
+        None => x.add(path.clone(), format!("{} is in none of the networks", to.ip)),
+        Some(n) if n.ipv4.addr == to.ip => x.add(path.clone(), "is the router's own address"),
+        Some(_) => {}
+    }
+    if let Some(tp) = to.port
+        && u32::from(tp) + u32::from(span) > 65535
+    {
+        x.add(path, "the port range would end above 65535");
+    }
+}
+
+fn redirects(c: &Config, x: &mut Issues) {
+    let r = &c.firewall.redirects;
+    if r.len() > MAX_REDIRECTS {
+        x.add("firewall.redirect", format!("at most {MAX_REDIRECTS} redirects"));
+    }
+    let paths = entry_paths("firewall.redirect", r.iter().map(|r| r.name.as_str()), 32);
+    check_names(x, &paths, r.iter().map(|r| r.name.as_str()), 32, &[]);
+    for (i, (rd, p)) in r.iter().zip(&paths).enumerate() {
+        if rd.from == crate::ZONE_WAN {
+            x.add(format!("{p}.from"), "redirects are for the networks, not the WAN");
+        } else if rd.from != "any" && c.zone(&rd.from).is_none() {
+            x.add(format!("{p}.from"), format!("no zone \"{}\" (or \"any\")", rd.from));
+        }
+        if !rd.proto.has_ports() {
+            x.add(format!("{p}.proto"), "must be \"tcp\", \"udp\" or \"tcp+udp\"");
+        }
+        target_ok(c, x, format!("{p}.to"), &rd.to, rd.dst_port.span());
+        for (j, other) in r.iter().enumerate().take(i) {
+            let zones = rd.from == "any" || other.from == "any" || rd.from == other.from;
+            if zones && rd.proto.overlaps(&other.proto) && rd.dst_port.overlaps(&other.dst_port) {
+                x.add(format!("{p}.dst_port"), format!("overlaps {}", paths[j]));
             }
         }
     }

@@ -50,6 +50,15 @@ pub struct Interface {
     pub zone: u8,
 }
 
+/// Which kind of destination NAT a new connection takes.
+#[derive(Clone, Copy, Debug)]
+enum Dnat {
+    /// Port forward (index into [`Policy::forwards`]).
+    Forward(usize),
+    /// Redirect (index into [`Policy::redirects`]).
+    Redirect(usize),
+}
+
 /// Router services a zone may reach when its input is restricted
 /// ([`Policy::input`]): bits of a mask.
 pub mod svc {
@@ -80,6 +89,9 @@ pub struct Policy {
     pub rules: Vec<Rule>,
     /// Port forwards from the WAN address ([`Forwarder::forward_hits`]).
     pub forwards: Vec<PortForward>,
+    /// Redirects of the networks' connections to outside servers
+    /// ([`Forwarder::redirect_hits`]).
+    pub redirects: Vec<Redirect>,
     /// TCP servers the router itself connects to (DNS over TLS): segments
     /// from one of these (address, port) to [`ROUTER_CLIENT_PORTS`] are
     /// replies to the router's client and pass like UDP replies do. Any
@@ -114,21 +126,76 @@ fn proto_bit(p: u8) -> u8 {
     }
 }
 
+/// Where a DNAT maps port `dport` of `lo..=hi`: `to`, at `to_port + (dport
+/// - lo)` or the same port.
+fn dnat_target(protos: u8, (lo, hi): (u16, u16), to: Ipv4Addr, to_port: Option<u16>, p: u8, dport: u16) -> Option<(Ipv4Addr, u16)> {
+    (protos & proto_bit(p) != 0 && (lo..=hi).contains(&dport))
+        .then(|| (to, to_port.map_or(dport, |t| t.wrapping_add(dport - lo))))
+}
+
+/// `ip:port` is one of a DNAT's targets.
+fn dnat_is_target(protos: u8, (lo, hi): (u16, u16), to: Ipv4Addr, to_port: Option<u16>, p: u8, ip: Ipv4Addr, port: u16) -> bool {
+    let (lo, hi) = match to_port {
+        Some(t) => (t, t.saturating_add(hi - lo)),
+        None => (lo, hi),
+    };
+    protos & proto_bit(p) != 0 && ip == to && (lo..=hi).contains(&port)
+}
+
 impl PortForward {
     /// The target of a connection to `dport`, if this forward covers it.
     pub fn target(&self, p: u8, dport: u16) -> Option<(Ipv4Addr, u16)> {
-        (self.protos & proto_bit(p) != 0 && (self.lo..=self.hi).contains(&dport))
-            .then(|| (self.to, self.to_port.map_or(dport, |t| t.wrapping_add(dport - self.lo))))
+        dnat_target(self.protos, (self.lo, self.hi), self.to, self.to_port, p, dport)
     }
 
     /// `ip:port` is one of this forward's targets.
     fn is_target(&self, p: u8, ip: Ipv4Addr, port: u16) -> bool {
-        let (lo, hi) = match self.to_port {
-            Some(t) => (t, t.saturating_add(self.hi - self.lo)),
-            None => (self.lo, self.hi),
-        };
-        self.protos & proto_bit(p) != 0 && ip == self.to && (lo..=hi).contains(&port)
+        dnat_is_target(self.protos, (self.lo, self.hi), self.to, self.to_port, p, ip, port)
     }
+}
+
+/// A redirect (`[[firewall.redirect]]`), compiled: new connections from
+/// zone `from` (`None` = any network) to ports `lo..=hi` of an address
+/// outside the networks (the internet), or of the router itself for a
+/// port it does not serve ([`router_serves`]), go to `to` instead (port
+/// `to_port + (p - lo)`, or the same port). Clients on the target's own
+/// network are also translated to the router's address there, so the
+/// answer comes back through it. The target's own connections and the
+/// ones addressed to it are left alone. A redirect lets its connections
+/// through the firewall.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Redirect {
+    pub from: Option<u8>,
+    /// [`proto::TCP`] and/or [`proto::UDP`].
+    pub protos: u8,
+    pub lo: u16,
+    pub hi: u16,
+    pub to: Ipv4Addr,
+    pub to_port: Option<u16>,
+}
+
+impl Redirect {
+    /// The target of a connection to `dport`, if this redirect covers it.
+    pub fn target(&self, p: u8, dport: u16) -> Option<(Ipv4Addr, u16)> {
+        dnat_target(self.protos, (self.lo, self.hi), self.to, self.to_port, p, dport)
+    }
+
+    /// `ip:port` is one of this redirect's targets.
+    fn is_target(&self, p: u8, ip: Ipv4Addr, port: u16) -> bool {
+        dnat_is_target(self.protos, (self.lo, self.hi), self.to, self.to_port, p, ip, port)
+    }
+}
+
+/// Ports the router itself serves to its networks (DHCP, DNS, mDNS, the
+/// web interface): connections to a router address there are never
+/// redirected.
+pub fn router_serves(p: u8, dport: u16) -> bool {
+    matches!((p, dport), (PROTO_UDP, 67) | (PROTO_UDP | PROTO_TCP, 53) | (PROTO_UDP, 5353) | (PROTO_TCP, 80))
+}
+
+/// Broadcast, multicast and 0.0.0.0: never redirected.
+fn not_unicast(ip: Ipv4Addr) -> bool {
+    ip.is_broadcast() || ip.is_multicast() || ip.is_unspecified()
 }
 
 /// What [`shard_of`] needs to keep both directions of every connection in
@@ -140,6 +207,9 @@ pub struct ShardHints<'a> {
     pub internal: &'a [(Ipv4Addr, u8)],
     pub wan: Option<Ipv4Addr>,
     pub forwards: &'a [PortForward],
+    /// The redirects: their connections, and everything to and from their
+    /// targets' ports, live in the target endpoint's shard.
+    pub redirects: &'a [Redirect],
 }
 
 /// Where a [`Rule`] applies.
@@ -350,6 +420,8 @@ pub struct Forwarder {
     pub rule_hits: Vec<u64>,
     /// New connections each port forward took (reset by a new policy).
     pub forward_hits: Vec<u64>,
+    /// New connections each redirect took (reset by a new policy).
+    pub redirect_hits: Vec<u64>,
 }
 
 fn broadcast_of(addr: Ipv4Addr, len: u8) -> Ipv4Addr {
@@ -481,6 +553,13 @@ pub fn endpoint_shard(proto: u8, ip: Ipv4Addr, port: u16, shards: usize, hash_ke
 ///   the WAN address (from the WAN, or hairpin from inside), and the
 ///   target's packets to a router address (hairpin replies): the target
 ///   endpoint; its replies to the outside are its own endpoint already
+/// - redirects (`hints.redirects`): a connection a redirect may take (to
+///   its ports outside the networks or at a router address; the zone is
+///   not known here, so also ones it then leaves alone: their NAT port
+///   comes from that shard, so the WAN side finds them), connections to
+///   the target's ports and the target's packets from them to inside: the
+///   target endpoint. ICMP errors from inside go where the connection
+///   they are about, seen from the sender, does.
 ///
 /// Everything else (ARP, non-IPv4, fragments, untracked protocols) → 0;
 /// those frames are local, dropped, or never tracked.
@@ -516,6 +595,20 @@ pub fn shard_of(role: Role, frame: &[u8], shards: usize, hash_key: u64, hints: &
             return endpoint_shard(t.proto, t.src, t.sport, shards, hash_key);
         }
     }
+    // Port forwards first: they win over redirects in the forwarder too.
+    if role == Role::Lan && !hints.redirects.is_empty() {
+        let router = |ip: Ipv4Addr| hints.wan == Some(ip) || internal.iter().any(|&(a, _)| a == ip);
+        let flow = match &key {
+            Key::Flow(t, _) => Some(*t),
+            Key::Related { inner, .. } => Some(inner.inverse()),
+            Key::Other => None,
+        };
+        if let Some(t) = flow
+            && let Some(to) = redirect_endpoint(hints.redirects, &t, &router, &inside)
+        {
+            return endpoint_shard(t.proto, to.0, to.1, shards, hash_key);
+        }
+    }
     match (role, key) {
         (Role::Lan, Key::Flow(t, _)) if inside(t.dst) => pair_shard(&t, shards, hash_key),
         (Role::Lan, Key::Related { inner, .. }) if inside(inner.src) => {
@@ -529,6 +622,26 @@ pub fn shard_of(role: Role, frame: &[u8], shards: usize, hash_key: u64, hints: &
         (Role::Wan, Key::Related { inner, .. }) => inner.sport as usize % shards,
         (_, Key::Other) => 0,
     }
+}
+
+/// [`shard_of`] for redirects: the target endpoint whose shard a flow `t`
+/// from inside belongs to, if a redirect involves it.
+fn redirect_endpoint(
+    redirects: &[Redirect],
+    t: &Tuple,
+    router: &impl Fn(Ipv4Addr) -> bool,
+    inside: &impl Fn(Ipv4Addr) -> bool,
+) -> Option<(Ipv4Addr, u16)> {
+    redirects.iter().find_map(|r| {
+        if r.is_target(t.proto, t.dst, t.dport) {
+            return Some((t.dst, t.dport));
+        }
+        if r.is_target(t.proto, t.src, t.sport) && inside(t.dst) {
+            return Some((t.src, t.sport));
+        }
+        let candidate = t.src != r.to && !not_unicast(t.dst) && (router(t.dst) || !inside(t.dst));
+        candidate.then(|| r.target(t.proto, t.dport)).flatten()
+    })
 }
 
 impl Forwarder {
@@ -551,6 +664,7 @@ impl Forwarder {
             policy: None,
             rule_hits: Vec::new(),
             forward_hits: Vec::new(),
+            redirect_hits: Vec::new(),
         }
     }
 
@@ -622,6 +736,7 @@ impl Forwarder {
         self.rule_hits = alloc::vec![0; policy.as_ref().map_or(0, |p| p.rules.len())];
         let fwds = policy.as_ref().map_or(&[][..], |p| &p.forwards[..]);
         self.forward_hits = alloc::vec![0; fwds.len()];
+        self.redirect_hits = alloc::vec![0; policy.as_ref().map_or(0, |p| p.redirects.len())];
         let mut reserved = Vec::new();
         for f in fwds {
             for (bit, p) in [(proto::TCP, PROTO_TCP), (proto::UDP, PROTO_UDP)] {
@@ -653,6 +768,31 @@ impl Forwarder {
                 Role::Lan => f.hairpin,
             };
             ok.then(|| f.target(t.proto, t.dport)).flatten().map(|to| (i, to))
+        })
+    }
+
+    /// A redirect for a new connection `t` from a network on `iface`:
+    /// (redirect index, target).
+    fn redirect_for(&self, iface: &Interface, t: &Tuple) -> Option<(usize, (Ipv4Addr, u16))> {
+        if iface.role != Role::Lan || !matches!(t.proto, PROTO_TCP | PROTO_UDP) || not_unicast(t.dst) {
+            return None;
+        }
+        let rds = &self.policy.as_ref()?.redirects;
+        if rds.is_empty() {
+            return None;
+        }
+        if self.ifs.iter().any(|i| i.addr.is_some_and(|(a, _)| a == t.dst)) {
+            if router_serves(t.proto, t.dport) {
+                return None;
+            }
+        } else if self.ifs.iter().any(|i| {
+            i.role == Role::Lan && i.addr.is_some_and(|(a, l)| broadcast_of(a, l) == broadcast_of(t.dst, l))
+        }) {
+            return None; // inside a network (the target itself included)
+        }
+        rds.iter().enumerate().find_map(|(i, r)| {
+            let ok = r.from.is_none_or(|z| z == iface.zone) && t.src != r.to;
+            ok.then(|| r.target(t.proto, t.dport)).flatten().map(|to| (i, to))
         })
     }
 
@@ -789,21 +929,26 @@ impl Forwarder {
             Key::Other => None,
         };
 
-        // A new connection to a port forward (from the WAN, or hairpin).
-        let forward = match (&key, hit) {
-            (Key::Flow(t, _), None) => self.forward_for(&iface, t),
+        // A new connection to a port forward (from the WAN, or hairpin),
+        // or one a redirect takes.
+        let dnat = match (&key, hit) {
+            (Key::Flow(t, _), None) => self
+                .forward_for(&iface, t)
+                .map(|(i, to)| (Dnat::Forward(i), to))
+                .or_else(|| self.redirect_for(&iface, t).map(|(i, to)| (Dnat::Redirect(i), to))),
             _ => None,
         };
         // Addressed to the router, and neither a translated connection
-        // (NAT reply, port forward) nor a new one to a forward: local.
+        // (NAT reply, port forward, redirect) nor a new one to translate:
+        // local.
         let nat_conn = hit.is_some_and(|(id, _)| self.ct.get(id).is_some_and(|c| c.nat));
-        if to_us && !nat_conn && forward.is_none() {
+        if to_us && !nat_conn && dnat.is_none() {
             return self.input(ingress, f, &v);
         }
 
         // Route on the destination after translation.
         let conn: Option<Conn> = hit.and_then(|(id, _)| self.ct.get(id).cloned());
-        let out_dst = match (&conn, hit, forward) {
+        let out_dst = match (&conn, hit, dnat) {
             (Some(c), Some((_, d)), _) if c.nat => c.translated(d).dst,
             (_, _, Some((_, to))) => to.0,
             _ => dst,
@@ -812,8 +957,9 @@ impl Forwarder {
             return self.drop(DropReason::NoRoute);
         };
         // Back out where it came from: only a translated connection
-        // (hairpin through the WAN address) may.
-        if route.egress == ingress && !nat_conn && forward.is_none() {
+        // (hairpin through the WAN address, a redirect to the same
+        // network) may.
+        if route.egress == ingress && !nat_conn && dnat.is_none() {
             return self.drop(DropReason::Hairpin);
         }
         let egress_if = self.ifs[route.egress as usize];
@@ -830,9 +976,9 @@ impl Forwarder {
                     });
                 };
                 let ports = matches!(t.proto, PROTO_TCP | PROTO_UDP).then_some(t.dport);
-                // A port forward lets its connections in (no rule or zone
-                // needed, like OpenWrt redirects).
-                let rule = match forward {
+                // A port forward or redirect lets its connections in (no
+                // rule or zone needed, like OpenWrt redirects).
+                let rule = match dnat {
                     Some(_) => Some(true),
                     None => self.decide(iface.zone, RuleTo::Zone(egress_if.zone), t.proto, t.src, t.dst, ports),
                 };
@@ -856,17 +1002,26 @@ impl Forwarder {
                 }
                 // Masquerade towards the WAN only; between networks
                 // addresses stay as they are.
-                let created = match forward {
+                let created = match dnat {
                     // Port forward: to the target; hairpin (an internal
                     // client) also from the router's address there.
-                    Some((i, to)) => {
-                        let masq = match iface.role {
-                            Role::Lan => egress_if.addr.map(|(a, _)| a),
-                            Role::Wan => None,
+                    // Redirect: to the target; from the router's address
+                    // when the client is on the target's network (else
+                    // the target would answer it directly).
+                    Some((kind, to)) => {
+                        let masq = match (kind, iface.role) {
+                            (Dnat::Forward(_), Role::Lan) => egress_if.addr.map(|(a, _)| a),
+                            (Dnat::Forward(_), Role::Wan) => None,
+                            (Dnat::Redirect(_), _) if route.egress == ingress => egress_if.addr.map(|(a, _)| a),
+                            (Dnat::Redirect(_), _) => None,
                         };
                         let id = self.ct.create_dnat(now, t, to, masq, flags);
+                        let hits = match kind {
+                            Dnat::Forward(i) => self.forward_hits.get_mut(i),
+                            Dnat::Redirect(i) => self.redirect_hits.get_mut(i),
+                        };
                         if id.is_some()
-                            && let Some(h) = self.forward_hits.get_mut(i)
+                            && let Some(h) = hits
                         {
                             *h += 1;
                         }
@@ -2131,7 +2286,7 @@ mod tests {
     fn forwarded_and_hairpin_connections_keep_one_shard() {
         let forwards = [fwd(8443, 8443, Some(443), None, true)];
         let internal = [(ROUTER_LAN, 24)];
-        let hints = ShardHints { internal: &internal, wan: Some(ROUTER_WAN), forwards: &forwards };
+        let hints = ShardHints { internal: &internal, wan: Some(ROUTER_WAN), forwards: &forwards, redirects: &[] };
         let mut fws = shards();
         for fw in &mut fws {
             with_forwards(fw, forwards.to_vec());
@@ -2158,6 +2313,209 @@ mod tests {
             let len = r.len() - 64;
             assert_eq!(shard_of(Role::Lan, &r[..len], SHARDS, 42, &hints), k, "hairpin reply {i}");
             assert!(matches!(fws[k].process(1, LAN, &mut r, len), Verdict::Forward { egress: LAN, .. }));
+        }
+    }
+
+    // ---- redirects (docs/config-v2.md, [[firewall.redirect]]) ---------
+
+    fn ntp_to(to: Ipv4Addr, from: Option<u8>) -> Redirect {
+        Redirect { from, protos: proto::UDP, lo: 123, hi: 123, to, to_port: None }
+    }
+
+    /// The zoned router (guest: WAN only, input DHCP + DNS) with redirects.
+    fn with_redirects(fw: &mut Forwarder, redirects: Vec<Redirect>) {
+        zoned(fw);
+        fw.set_policy(Some(Policy {
+            forward: vec![0, 0b101, 0b001],
+            input: vec![None, None, Some(svc::DHCP | svc::DNS)],
+            redirects,
+            ..Policy::default()
+        }));
+    }
+
+    fn udp_frame(mac: Mac, src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16) -> Vec<u8> {
+        let d = udp_datagram(src, dst, sport, dport, b"ntp");
+        to(mac, ipv4_frame(src, dst, PROTO_UDP, 64, &d))
+    }
+
+    #[test]
+    fn redirect_from_another_network_both_ways() {
+        let mut fw = router();
+        with_redirects(&mut fw, vec![ntp_to(NAS, None)]);
+        // Guest → an NTP server on the internet: to the NAS on the LAN,
+        // although guest may not reach the LAN; the source stays.
+        let mut f = udp_frame(GUEST_MAC, GUEST_HOST, SERVER, 40_123, 123);
+        let Verdict::Forward { egress, next_hop, len, .. } = run(&mut fw, 0, GUEST, &mut f) else {
+            panic!("not redirected")
+        };
+        assert_eq!((egress, next_hop), (LAN, NAS));
+        assert_eq!(ports(&f[..len]), (GUEST_HOST, 40_123, NAS, 123));
+        assert!(checksums_ok(&f[..len]));
+        let mut r = udp_frame(LAN_MAC, NAS, GUEST_HOST, 123, 40_123);
+        let Verdict::Forward { egress, next_hop, len, .. } = run(&mut fw, 1, LAN, &mut r) else {
+            panic!("reply not forwarded")
+        };
+        assert_eq!((egress, next_hop), (GUEST, GUEST_HOST));
+        assert_eq!(ports(&r[..len]), (SERVER, 123, GUEST_HOST, 40_123), "looks like the server answered");
+        assert!(checksums_ok(&r[..len]));
+        assert_eq!(fw.redirect_hits, [1]);
+        // Control: the NAS itself on another port stays out of reach.
+        let mut f = udp_frame(GUEST_MAC, GUEST_HOST, NAS, 40_124, 124);
+        assert_eq!(run(&mut fw, 2, GUEST, &mut f), Verdict::Drop(DropReason::Firewall));
+    }
+
+    #[test]
+    fn redirect_on_the_targets_network_answers_through_the_router() {
+        let mut fw = router();
+        with_redirects(&mut fw, vec![ntp_to(NAS, None)]);
+        let mut f = udp_frame(LAN_MAC, HOST, SERVER, 40_123, 123);
+        let Verdict::Forward { egress, next_hop, len, .. } = run(&mut fw, 0, LAN, &mut f) else {
+            panic!("not redirected")
+        };
+        assert_eq!((egress, next_hop), (LAN, NAS), "back out of the LAN");
+        let (src, sport, dst, dport) = ports(&f[..len]);
+        assert_eq!((src, dst, dport), (ROUTER_LAN, NAS, 123), "from the router, else the NAS answers directly");
+        assert!(checksums_ok(&f[..len]));
+        let mut r = udp_frame(LAN_MAC, NAS, ROUTER_LAN, 123, sport);
+        let Verdict::Forward { egress, next_hop, len, .. } = run(&mut fw, 1, LAN, &mut r) else {
+            panic!("reply not forwarded")
+        };
+        assert_eq!((egress, next_hop), (LAN, HOST));
+        assert_eq!(ports(&r[..len]), (SERVER, 123, HOST, 40_123));
+        assert!(checksums_ok(&r[..len]));
+        // To the router's address: it serves no NTP, so redirected too.
+        let mut f = udp_frame(LAN_MAC, HOST, ROUTER_LAN, 40_125, 123);
+        let Verdict::Forward { next_hop, len, .. } = run(&mut fw, 2, LAN, &mut f) else {
+            panic!("router address not redirected")
+        };
+        assert_eq!((next_hop, ports(&f[..len]).2), (NAS, NAS));
+        assert_eq!(fw.redirect_hits, [2]);
+    }
+
+    #[test]
+    fn redirect_leaves_other_traffic_alone() {
+        let mut fw = router();
+        with_redirects(&mut fw, vec![ntp_to(NAS, None)]);
+        // The target's own queries go out to the internet.
+        let mut f = udp_frame(LAN_MAC, NAS, SERVER, 40_123, 123);
+        let Verdict::Forward { egress: WAN, len, .. } = run(&mut fw, 0, LAN, &mut f) else {
+            panic!("target's query not to the WAN")
+        };
+        assert_eq!(ports(&f[..len]).2, SERVER);
+        // Inside another network: as addressed.
+        let mut f = udp_frame(LAN_MAC, HOST, GUEST_HOST, 40_124, 123);
+        let Verdict::Forward { egress: GUEST, len, .. } = run(&mut fw, 0, LAN, &mut f) else {
+            panic!("LAN → guest host not forwarded")
+        };
+        assert_eq!(ports(&f[..len]).2, GUEST_HOST);
+        // Other ports and protocols.
+        let mut f = udp_frame(LAN_MAC, HOST, SERVER, 40_125, 124);
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward { egress: WAN, .. }));
+        let mut f = tcp_frame(LAN_MAC, HOST, SERVER, 40_126, 123, TCP_SYN);
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward { egress: WAN, .. }));
+        // Broadcast and the router's own services stay local.
+        let mut f = udp_frame(LAN_MAC, HOST, Ipv4Addr::BROADCAST, 40_127, 123);
+        assert_eq!(run(&mut fw, 0, LAN, &mut f), Verdict::Local);
+        let all = Redirect { protos: proto::TCP | proto::UDP, lo: 1, hi: 1000, ..ntp_to(NAS, None) };
+        with_redirects(&mut fw, vec![all]);
+        for (p, port) in [(PROTO_UDP, 53), (PROTO_UDP, 67), (PROTO_TCP, 80), (PROTO_TCP, 53)] {
+            let mut f = match p {
+                PROTO_UDP => udp_frame(LAN_MAC, HOST, ROUTER_LAN, 40_128, port),
+                _ => tcp_frame(LAN_MAC, HOST, ROUTER_LAN, 40_128, port, TCP_SYN),
+            };
+            assert_eq!(run(&mut fw, 0, LAN, &mut f), Verdict::Local, "router's {p}/{port}");
+        }
+        // …but to the internet the same ports are redirected.
+        let mut f = udp_frame(LAN_MAC, HOST, SERVER, 40_129, 53);
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward { egress: LAN, next_hop: NAS, .. }));
+        assert_eq!(fw.redirect_hits, [1]);
+    }
+
+    #[test]
+    fn redirect_only_from_its_zone() {
+        let mut fw = router();
+        with_redirects(&mut fw, vec![ntp_to(NAS, Some(2))]);
+        let mut f = udp_frame(LAN_MAC, HOST, SERVER, 40_123, 123);
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward { egress: WAN, .. }), "LAN zone: as addressed");
+        let mut f = udp_frame(GUEST_MAC, GUEST_HOST, SERVER, 40_123, 123);
+        assert!(matches!(run(&mut fw, 0, GUEST, &mut f), Verdict::Forward { egress: LAN, next_hop: NAS, .. }));
+        // Control: without redirects guest NTP goes to the internet.
+        with_redirects(&mut fw, vec![]);
+        let mut f = udp_frame(GUEST_MAC, GUEST_HOST, SERVER, 40_124, 123);
+        assert!(matches!(run(&mut fw, 0, GUEST, &mut f), Verdict::Forward { egress: WAN, .. }));
+    }
+
+    #[test]
+    fn redirected_connections_keep_one_shard() {
+        // Target on the guest network; the LAN zone may reach it directly.
+        let target = Ipv4Addr::new(10, 20, 0, 10);
+        let internal = [(ROUTER_LAN, 24), (ROUTER_GUEST, 24)];
+        for from in [None, Some(2)] {
+            let redirects = [ntp_to(target, from)];
+            let hints = ShardHints { internal: &internal, wan: Some(ROUTER_WAN), forwards: &[], redirects: &redirects };
+            let mut fws = shards();
+            for fw in &mut fws {
+                with_redirects(fw, redirects.to_vec());
+            }
+            let shard = |role, f: &[u8]| shard_of(role, &f[..f.len() - 64], SHARDS, 42, &hints);
+            for i in 0..32u16 {
+                let host = Ipv4Addr::new(192, 168, 1, 100 + i as u8);
+                let sport = 41_000 + i;
+                // LAN host → the internet's NTP: redirected (from = any) to
+                // the guest target without SNAT, or (from = guest) NATed
+                // out to the WAN.
+                let mut f = udp_frame(LAN_MAC, host, SERVER, sport, 123);
+                let k = shard(Role::Lan, &f);
+                let len = f.len() - 64;
+                match (from, fws[k].process(0, LAN, &mut f, len)) {
+                    (None, Verdict::Forward { egress: GUEST, .. }) => {
+                        let mut r = udp_frame(GUEST_MAC, target, host, 123, sport);
+                        assert_eq!(shard(Role::Lan, &r), k, "redirect reply {i}");
+                        let len = r.len() - 64;
+                        assert!(matches!(fws[k].process(1, GUEST, &mut r, len), Verdict::Forward { egress: LAN, .. }));
+                        // The target's ICMP error about the query.
+                        let q = udp_frame(GUEST_MAC, host, target, sport, 123);
+                        let mut icmp = vec![wire::ICMP_DEST_UNREACH, 3, 0, 0, 0, 0, 0, 0];
+                        icmp.extend_from_slice(&q[ETH_HDR..ETH_HDR + 28]);
+                        let c = wire::checksum(&icmp);
+                        icmp[2..4].copy_from_slice(&c.to_be_bytes());
+                        let mut e = to(GUEST_MAC, ipv4_frame(target, host, PROTO_ICMP, 64, &icmp));
+                        assert_eq!(shard(Role::Lan, &e), k, "ICMP error {i}");
+                        let len = e.len() - 64;
+                        assert!(matches!(fws[k].process(2, GUEST, &mut e, len), Verdict::Forward { egress: LAN, .. }));
+                    }
+                    (Some(_), Verdict::Forward { egress: WAN, len, .. }) => {
+                        let natport = ports(&f[..len]).1;
+                        let mut r = udp_frame(WAN_MAC, SERVER, ROUTER_WAN, 123, natport);
+                        assert_eq!(shard(Role::Wan, &r), k, "NAT reply {i}");
+                        let len = r.len() - 64;
+                        assert!(matches!(fws[k].process(1, WAN, &mut r, len), Verdict::Forward { egress: LAN, .. }));
+                    }
+                    (_, v) => panic!("{from:?} flow {i}: {v:?}"),
+                }
+                // LAN host → the target directly (the zones allow it).
+                let mut f = udp_frame(LAN_MAC, host, target, sport + 100, 123);
+                let k = shard(Role::Lan, &f);
+                let len = f.len() - 64;
+                assert!(matches!(fws[k].process(3, LAN, &mut f, len), Verdict::Forward { egress: GUEST, .. }));
+                let mut r = udp_frame(GUEST_MAC, target, host, 123, sport + 100);
+                assert_eq!(shard(Role::Lan, &r), k, "direct reply {i}");
+                let len = r.len() - 64;
+                assert!(matches!(fws[k].process(3, GUEST, &mut r, len), Verdict::Forward { egress: LAN, .. }));
+                // Guest host on the target's network: through the router.
+                let ghost = Ipv4Addr::new(10, 20, 0, 100 + i as u8);
+                let mut f = udp_frame(GUEST_MAC, ghost, SERVER, sport, 123);
+                let k = shard(Role::Lan, &f);
+                let len = f.len() - 64;
+                let Verdict::Forward { egress: GUEST, len, .. } = fws[k].process(4, GUEST, &mut f, len) else {
+                    panic!("guest {i} not redirected")
+                };
+                let natport = ports(&f[..len]).1;
+                let mut r = udp_frame(GUEST_MAC, target, ROUTER_GUEST, 123, natport);
+                assert_eq!(shard(Role::Lan, &r), k, "SNAT reply {i}");
+                let len = r.len() - 64;
+                assert!(matches!(fws[k].process(5, GUEST, &mut r, len), Verdict::Forward { egress: GUEST, .. }));
+            }
         }
     }
 }

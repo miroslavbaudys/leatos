@@ -424,6 +424,45 @@ if [ -n "$guest" ]; then
     else
       fail "guest: rule guest-no-isp-web: http://$ISP/ $web from the guest (hits ${h0:-none} -> ${h1:-none})"
     fi
+    # Redirect (docs/config-v2.md, scripts/lab-test.sh LAB_REDIRECT): lab-ntp
+    # sends NTP to any outside server to 192.168.1.101 (a second address
+    # here, busybox ntpd -l). Queries to 203.0.113.99 (no such host) must
+    # be answered, from the main LAN (the router answers through its own
+    # address) and from the guest (no source translation: the reply from
+    # .101 to the guest address must go through the router, so a rule
+    # ahead of the local table routes it there). lab_redirect=0 (no
+    # redirect): the negative control, both get no answer.
+    redir=$($bb sed -n 's/.*lab_redirect=\([01]\).*/\1/p' /proc/cmdline)
+    if [ -n "$redir" ]; then
+      rhits() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb sed -n 's/.*"redirects":\[\([^]]*\)\].*/\1/p' | $bb tr '{' '\n' | $bb grep '"name":"lab-ntp"' | $bb sed -n 's/.*"hits":\([0-9]*\).*/\1/p'; }
+      $bb ip addr add 192.168.1.101/24 dev eth0
+      $bb ip route add 10.20.0.0/24 via 192.168.1.1 dev eth0 table 101
+      $bb ip rule add pref 10 table 255 && $bb ip rule del pref 0 table 255
+      $bb ip rule add from 192.168.1.101 to 10.20.0.0/24 table 101 pref 5
+      $bb ntpd -n -l 2>/tmp/ntpd-l &
+      ntpd_pid=$!
+      $bb sleep 1
+      # A 48-byte NTP v4 client request; the answer's length.
+      ntpq() { $bb printf '\043\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000' \
+        | $bb nc -u -w 2 -s "$1" 203.0.113.99 123 2>/tmp/ntpq-nc | $bb wc -c; }
+      h0=$(rhits)
+      lan_n=$(ntpq 192.168.1.100); guest_n=$(ntpq "$gip")
+      h1=$(rhits)
+      if [ "$lan_n" -ge 48 ] && [ -n "$h1" ] && [ "$h1" -gt "${h0:-0}" ]; then
+        pass "redirect: NTP from the main LAN to 203.0.113.99 answered by 192.168.1.101 ($lan_n bytes; lab-ntp hits ${h0:-0} -> $h1)"
+      else
+        fail "redirect: NTP from the main LAN to 203.0.113.99: $lan_n bytes, lab-ntp hits ${h0:-none} -> ${h1:-none} $($bb cat /tmp/ntpq-nc /tmp/ntpd-l)"
+      fi
+      if [ "$guest_n" -ge 48 ]; then
+        pass "redirect: NTP from the guest ($gip) to 203.0.113.99 answered by 192.168.1.101 on the main LAN ($guest_n bytes)"
+      else
+        fail "redirect: NTP from the guest ($gip) to 203.0.113.99: $guest_n bytes"
+      fi
+      kill "$ntpd_pid" 2>/dev/null
+      $bb ip rule del from 192.168.1.101 to 10.20.0.0/24 table 101 pref 5
+      $bb ip rule add pref 0 table 255 && $bb ip rule del pref 10 table 255
+      $bb ip addr del 192.168.1.101/24 dev eth0
+    fi
     # mDNS (docs/mdns.md, scripts/lab-test.sh LAB_MDNS=1): a printer
     # announced on the guest VLAN (_ipp._tcp, reflected to the main LAN by
     # the rule guest-printers, and _ssh._tcp, which no rule allows). The

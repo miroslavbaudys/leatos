@@ -49,7 +49,7 @@ use alloc::vec::Vec;
 use core::net::Ipv4Addr;
 use core::sync::atomic::{AtomicU64, Ordering};
 use fwd::forwarder::{
-    Classification, Forwarder, Interface, PortForward, Role, ShardHints, Verdict, shard_of,
+    Classification, Forwarder, Interface, PortForward, Redirect, Role, ShardHints, Verdict, shard_of,
 };
 use fwd::neigh::{NeighTable, Resolve};
 use fwd::{IfIndex, wire};
@@ -159,6 +159,9 @@ struct Topo {
     /// The port forwards (`shard_of`: DNAT and hairpin connections live in
     /// their target's shard).
     forwards: Vec<PortForward>,
+    /// The redirects (`shard_of`: their connections live in their
+    /// target's shard).
+    redirects: Vec<Redirect>,
 }
 
 pub struct Datapath {
@@ -319,6 +322,7 @@ impl Datapath {
             port_links,
             internal: n.nets.iter().map(|x| x.addr).collect(),
             forwards: n.policy.forwards,
+            redirects: n.policy.redirects,
         });
     }
 
@@ -452,6 +456,7 @@ impl Datapath {
             internal: &topo.internal,
             wan: self.addrs[WAN as usize].lock().map(|(a, _)| a),
             forwards: &topo.forwards,
+            redirects: &topo.redirects,
         };
         for mut pkt in batch.drain(..) {
             let Some((ifx, want_vid)) = self.link_of(&topo, port_ix, pkt.data()) else {
@@ -568,6 +573,7 @@ impl Datapath {
         let mut conns = 0;
         let mut hits: Vec<u64> = Vec::new();
         let mut fhits: Vec<u64> = Vec::new();
+        let mut rhits: Vec<u64> = Vec::new();
         let add = |into: &mut Vec<u64>, from: &[u64]| {
             into.resize(into.len().max(from.len()), 0);
             for (h, n) in into.iter_mut().zip(from) {
@@ -580,10 +586,12 @@ impl Datapath {
             conns += f.ct.len();
             add(&mut hits, &f.rule_hits);
             add(&mut fhits, &f.forward_hits);
+            add(&mut rhits, &f.redirect_hits);
         }
         self.sh.conntrack.store(conns, Ordering::Relaxed);
         *self.sh.rule_hits.lock() = hits;
         *self.sh.forward_hits.lock() = fhits;
+        *self.sh.redirect_hits.lock() = rhits;
         for (i, n) in self.neigh.iter().enumerate() {
             let retries = n.lock().poll(now);
             for (ifx, ip) in retries {

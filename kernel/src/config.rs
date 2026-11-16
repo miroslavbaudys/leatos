@@ -598,6 +598,24 @@ pub fn firewall() -> fwd::forwarder::Policy {
             hairpin: f.hairpin,
         })
         .collect();
+    let redirects = c
+        .firewall
+        .redirects
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| fwd::forwarder::Redirect {
+            from: (r.from != "any").then(|| zone_index(&names, &r.from)),
+            protos: match r.proto {
+                schema::Proto::Tcp => proto::TCP,
+                schema::Proto::TcpUdp => proto::TCP | proto::UDP,
+                _ => proto::UDP,
+            },
+            lo: r.dst_port.lo,
+            hi: r.dst_port.hi,
+            to: r.to.ip,
+            to_port: r.to.port,
+        })
+        .collect();
     // Replies from the DNS-over-TLS servers to the router's connections.
     let router_tcp_peers = if c.dns.tls {
         c.dns.upstream_list().iter().map(|u| (u.ip, u.port(true))).collect()
@@ -609,6 +627,7 @@ pub fn firewall() -> fwd::forwarder::Policy {
         input,
         rules,
         forwards,
+        redirects,
         router_tcp_peers,
     }
 }
@@ -642,6 +661,18 @@ pub fn forward_names() -> Vec<String> {
         .iter()
         .filter(|f| f.enabled)
         .map(|f| f.name.clone())
+        .collect()
+}
+
+/// Names of the enabled redirects, in the order of the forwarder's
+/// `redirect_hits` (status page).
+pub fn redirect_names() -> Vec<String> {
+    get()
+        .firewall
+        .redirects
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.name.clone())
         .collect()
 }
 

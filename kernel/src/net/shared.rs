@@ -249,6 +249,8 @@ pub struct Shared {
     pub rule_hits: Mutex<Vec<u64>>,
     /// New connections each port forward took (`config::forward_names`).
     pub forward_hits: Mutex<Vec<u64>>,
+    /// New connections each redirect took (`config::redirect_names`).
+    pub redirect_hits: Mutex<Vec<u64>>,
 }
 
 static SHARED: Once<&'static Shared> = Once::new();
@@ -267,6 +269,7 @@ pub fn init(ports: Vec<PortShared>, links: Vec<LinkShared>) -> &'static Shared {
             conntrack: AtomicUsize::new(0),
             rule_hits: Mutex::new(Vec::new()),
             forward_hits: Mutex::new(Vec::new()),
+            redirect_hits: Mutex::new(Vec::new()),
         }))
     })
 }

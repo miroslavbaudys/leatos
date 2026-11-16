@@ -910,6 +910,12 @@ wan_port = "27000-27010"
 to = "10.10.0.30"
 hairpin = false
 
+[[firewall.redirect]]
+name = "ntp"
+from = "any"
+dst_port = 123
+to = "10.10.0.10"
+
 [dns]
 domain = "home"
 [[dns.host]]
@@ -935,6 +941,8 @@ fn v2_document_parses_and_round_trips() {
     let f = &c.firewall.forwards;
     assert_eq!((f[0].proto, f[0].wan_port, f[0].to), (Proto::Tcp, PortRange::one(8443), Target { ip: ip(10, 10, 0, 10), port: Some(443) }));
     assert_eq!((f[1].proto, f[1].wan_port.span(), f[1].hairpin), (Proto::TcpUdp, 10, false));
+    let rd = &c.firewall.redirects[0];
+    assert_eq!((rd.from.as_str(), rd.proto, rd.dst_port, rd.to), ("any", Proto::Udp, PortRange::one(123), Target { ip: ip(10, 10, 0, 10), port: None }), "UDP by default");
     assert_eq!(c.dns.domain, "home");
     assert!(!c.fits_v1());
 
@@ -943,7 +951,7 @@ fn v2_document_parses_and_round_trips() {
     assert_eq!(parse(&text).unwrap(), c, "{text}");
     assert_eq!(parse_json(&c.to_json()).unwrap(), c);
     // Defaults stay out of the canonical form.
-    for absent in ["enabled = true", "hairpin = true", "proto = \"any\"", "vlan = 0"] {
+    for absent in ["enabled = true", "hairpin = true", "proto = \"any\"", "proto = \"udp\"", "vlan = 0"] {
         assert!(!text.contains(absent), "{absent} in {text}");
     }
 }
@@ -1094,6 +1102,57 @@ fn zone_rule_and_forward_checks() {
 }
 
 #[test]
+fn redirect_checks() {
+    let rd = |f: fn(&mut Config)| with_v2(f);
+    fn ntp(c: &mut Config) -> &mut Redirect {
+        &mut c.firewall.redirects[0]
+    }
+    assert_eq!(rd(|c| ntp(c).from = "wan".into()), ["firewall.redirect.ntp.from"], "not from the WAN");
+    assert_eq!(rd(|c| ntp(c).from = "nosuch".into()), ["firewall.redirect.ntp.from"]);
+    assert!(rd(|c| ntp(c).from = "guest".into()).is_empty());
+    assert!(rd(|c| ntp(c).from = "lan".into()).is_empty(), "the built-in lan zone");
+    assert_eq!(rd(|c| ntp(c).proto = Proto::Icmp), ["firewall.redirect.ntp.proto"]);
+    assert_eq!(rd(|c| ntp(c).to.ip = ip(192, 0, 2, 1)), ["firewall.redirect.ntp.to"], "outside the networks");
+    assert_eq!(rd(|c| ntp(c).to.ip = ip(10, 10, 0, 1)), ["firewall.redirect.ntp.to"], "the router");
+    assert_eq!(rd(|c| { ntp(c).dst_port = PortRange { lo: 100, hi: 200 }; ntp(c).to.port = Some(65500) }), ["firewall.redirect.ntp.to"]);
+    assert!(rd(|c| ntp(c).to.port = Some(1123)).is_empty());
+    // Overlaps: same port from zones that meet.
+    let second = |from: &str, proto: Proto| {
+        let from = String::from(from);
+        with_v2(move |c| {
+            let mut r = c.firewall.redirects[0].clone();
+            r.name = "ntp2".into();
+            r.from = from;
+            r.proto = proto;
+            c.firewall.redirects.push(r);
+        })
+    };
+    assert_eq!(second("any", Proto::Udp), ["firewall.redirect.ntp2.dst_port"]);
+    assert_eq!(second("guest", Proto::TcpUdp), ["firewall.redirect.ntp2.dst_port"], "any covers guest");
+    assert!(second("guest", Proto::Tcp).is_empty(), "another protocol");
+    assert_eq!(rd(|c| { let r = c.firewall.redirects[0].clone(); c.firewall.redirects.push(r) }), ["firewall.redirect[1].name", "firewall.redirect[1].dst_port"]);
+    assert!(parse(&FULL_V2.replace("dst_port = 123\n", "")).is_err(), "dst_port is required");
+}
+
+#[test]
+fn firewall_needs_version_2() {
+    // The built-in zones only, but a port forward or redirect: version 1
+    // has no place for them, so the document must be version 2.
+    for entry in [
+        "[[firewall.forward]]\nname = \"web\"\nwan_port = 8080\nto = \"192.168.1.10:80\"\n",
+        "[[firewall.redirect]]\nname = \"ntp\"\nfrom = \"any\"\ndst_port = 123\nto = \"192.168.1.10\"\n",
+        "[[firewall.rule]]\nname = \"ssh\"\nfrom = \"lan\"\nto = \"router\"\naction = \"drop\"\n",
+    ] {
+        let c = parse(&alloc::format!("version = 2\n{entry}")).unwrap();
+        assert_eq!(c.validate(), Ok(()));
+        assert!(!c.fits_v1(), "{entry}");
+        let text = c.to_toml();
+        assert!(text.starts_with("version = 2"), "{text}");
+        assert_eq!(parse(&text).unwrap(), c, "kept: {text}");
+    }
+}
+
+#[test]
 fn trials_in_version_2() {
     let old = parse(FULL_V2).unwrap();
     let t = |f: fn(&mut Config)| {
@@ -1170,6 +1229,16 @@ fn cli_edits_list_entries_by_name() {
     assert_eq!(r.without("firewall.rule.a.dst_port").unwrap().firewall.rules[1].dst_port, None);
     assert!(matches!(c.with_assignment(r#"firewall.rule.x = { from = "lan" }"#), Err(Error::Syntax(_))), "missing fields");
     assert_eq!(r.without("firewall").unwrap(), c);
+    // Redirects: keyed by name, UDP by default.
+    let d = c
+        .with_assignment(r#"firewall.redirect.ntp = { from = "any", dst_port = 123, to = "192.168.1.10" }"#)
+        .unwrap();
+    assert_eq!(d.validate(), Ok(()));
+    assert_eq!(d.firewall.redirects[0].proto, Proto::Udp);
+    let d2 = d.with_assignment(r#"firewall.redirect.ntp.proto = "tcp+udp""#).unwrap();
+    assert_eq!(d2.without("firewall.redirect.ntp.proto").unwrap(), d);
+    assert!(diff_lines(&c, &d).contains(&"+ firewall.redirect.ntp.dst_port = \"123\"".to_string()), "{:?}", diff_lines(&c, &d));
+    assert_eq!(d.without("firewall.redirect.ntp").unwrap(), c);
     assert_eq!(c.without("zone").unwrap(), c);
 }
 
