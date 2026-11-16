@@ -110,7 +110,24 @@ RRSIGs and AD come back; merging and the cache are per question **and**
 those flags (`cache::Key`), so validating clients behind the router never
 get an answer fetched without DNSSEC records (and clients without CD never
 one that failed validation upstream).
-**Open:** serve-stale (RFC 8767), TCP port 53 from clients, randomised upstream source port
+**Serve-stale** (RFC 8767; `dns.stale_secs`, default 86400 = one day,
+0 = off; boot argument `dns_stale=`): expired entries are kept that long.
+A client asking for one is forwarded as usual but gets the stale answer
+(TTL 30 s) when the upstream has not answered within 1.8 s (the resolution
+goes on and refreshes the cache), when it fails (all tries timed out,
+SERVFAIL/REFUSED), or at once without upstreams (WAN down) or pending
+room; after a failure the name is answered stale for 30 s without asking
+(failure recheck timer). Our own refusals (rebind protection) are never
+replaced by stale data. Counter `stale_answers`; lab check (the ISP's DNS
+stopped, negative control `LAB_ROUTER_ARGS=dns_stale=0`).
+**Extended DNS Errors** (RFC 8914), to clients that sent EDNS: Stale
+Answer (3) / Stale NXDOMAIN Answer (19) on stale answers, No Reachable
+Authority (22) on our SERVFAIL when no upstream answered or there is none,
+Blocked (15) with a reason on rebind-protection refusals; errors from the
+upstream pass through unchanged (with its EDE). Added only where nothing
+moves (OPT last, or a new OPT); lab check: the stale answer to a crafted
+EDNS query carries EDE 3.
+**Open:** TCP port 53 from clients, randomised upstream source port
 per query (Kaminsky hardening; one fixed random port today), DoH,
 blocklists, DNSSEC.
 

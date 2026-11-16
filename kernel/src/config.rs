@@ -248,6 +248,7 @@ pub fn overrides() -> Vec<(String, &'static str)> {
         ("dns", "dns.upstreams"),
         ("dns_tls", "dns.tls"),
         ("dns_prefetch", "dns.prefetch"),
+        ("dns_stale", "dns.stale_secs"),
     ];
     let args = bootargs();
     let mut v = Vec::new();
@@ -377,6 +378,10 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
     }
     if let Some(v) = arg_u64(args, "dns_prefetch") {
         c.dns.prefetch = v != 0;
+    }
+    // Seconds; validated with the rest (at most a week).
+    if let Some(v) = arg_u64(args, "dns_stale") {
+        c.dns.stale_secs = v.min(schema::MAX_STALE_SECS as u64) as u32;
     }
     // Strict fails closed: servers without a certificate name cannot be
     // used over TLS and are left out, never asked in plain text; with none
@@ -686,6 +691,7 @@ pub struct Dns {
     pub cache_entries: usize,
     pub rebind_protection: bool,
     pub prefetch: bool,
+    pub stale_secs: u32,
     /// Servers of its own (`dns.upstreams`); empty = the WAN lease's.
     pub upstreams: Vec<schema::Upstream>,
     /// Strict DNS over TLS to `upstreams` (`dns.tls`).
@@ -701,6 +707,7 @@ pub fn dns() -> Dns {
         cache_entries: d.cache_entries as usize,
         rebind_protection: d.rebind_protection,
         prefetch: d.prefetch,
+        stale_secs: d.stale_secs,
         upstreams: d.upstream_list(),
         tls: d.tls,
         tls_ca: d.tls_ca.clone(),

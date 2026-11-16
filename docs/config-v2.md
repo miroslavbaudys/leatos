@@ -97,6 +97,7 @@ hairpin = true              # also from inside, via the WAN address
 cache_entries = 4096
 rebind_protection = true
 prefetch = true             # default; false needs version 2
+stale_secs = 86400          # serve-stale window (RFC 8767), 0 = off, max a week
 [[dns.host]]                # local records beside DHCP names
 name = "router"
 ip = "10.10.0.1"

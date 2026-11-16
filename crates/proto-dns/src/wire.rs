@@ -36,6 +36,16 @@ const FLAG_RA: u16 = 0x0080;
 const FLAG_CD: u16 = 0x0010;
 /// DNSSEC OK (RFC 3225), the top bit of the OPT record's flags.
 const EDNS_DO: u8 = 0x80;
+/// UDP payload size announced in an OPT record we add (DNS flag day 2020).
+const EDNS_UDP_SIZE: u16 = 1232;
+
+/// Extended DNS Errors (RFC 8914): EDNS option code and the INFO-CODEs we
+/// send.
+pub const EDNS_OPTION_EDE: u16 = 15;
+pub const EDE_STALE_ANSWER: u16 = 3;
+pub const EDE_BLOCKED: u16 = 15;
+pub const EDE_STALE_NXDOMAIN: u16 = 19;
+pub const EDE_NO_REACHABLE_AUTHORITY: u16 = 22;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -84,6 +94,85 @@ impl Header {
     pub fn checking_disabled(&self) -> bool {
         self.flags & FLAG_CD != 0
     }
+}
+
+/// Whether `msg` carries an OPT record (EDNS, RFC 6891): only then may an
+/// answer to it carry one.
+pub fn has_edns(msg: &[u8]) -> bool {
+    records(msg).is_ok_and(|recs| recs.iter().any(|r| r.section == 2 && r.rtype == TYPE_OPT))
+}
+
+/// Add an Extended DNS Error (RFC 8914) to `msg`: an option in its OPT
+/// record, or a new OPT record (with DO when `dnssec_ok`) if it has none.
+/// Only where nothing has to move: the OPT record (or, for a new one, the
+/// message) must end the message, since compressed names may point into
+/// what follows. False if it was left unchanged (malformed, OPT not last,
+/// too long).
+pub fn add_ede(msg: &mut Vec<u8>, code: u16, text: &str, dnssec_ok: bool) -> bool {
+    let Ok((h, _, q_end)) = parse_query(msg) else {
+        return false;
+    };
+    let Ok(recs) = records(msg) else {
+        return false;
+    };
+    let end = recs.last().map_or(q_end, |r| r.rdata_offset + r.rdata_len);
+    if end != msg.len() {
+        return false; // trailing bytes
+    }
+    let mut option = Vec::with_capacity(6 + text.len());
+    option.extend_from_slice(&EDNS_OPTION_EDE.to_be_bytes());
+    option.extend_from_slice(&((2 + text.len()) as u16).to_be_bytes());
+    option.extend_from_slice(&code.to_be_bytes());
+    option.extend_from_slice(text.as_bytes());
+    let opts: Vec<&RecordInfo> = recs.iter().filter(|r| r.section == 2 && r.rtype == TYPE_OPT).collect();
+    match opts[..] {
+        [] => {
+            if h.arcount == u16::MAX {
+                return false;
+            }
+            msg.push(0); // root
+            msg.extend_from_slice(&TYPE_OPT.to_be_bytes());
+            msg.extend_from_slice(&EDNS_UDP_SIZE.to_be_bytes());
+            msg.extend_from_slice(&[0, 0, if dnssec_ok { EDNS_DO } else { 0 }, 0]);
+            msg.extend_from_slice(&(option.len() as u16).to_be_bytes());
+            msg.extend_from_slice(&option);
+            msg[10..12].copy_from_slice(&(h.arcount + 1).to_be_bytes());
+        }
+        [o] if o.rdata_offset + o.rdata_len == msg.len() => {
+            let Ok(len) = u16::try_from(o.rdata_len + option.len()) else {
+                return false;
+            };
+            msg[o.rdata_offset - 2..o.rdata_offset].copy_from_slice(&len.to_be_bytes());
+            msg.extend_from_slice(&option);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// The Extended DNS Error codes in `msg`'s OPT record.
+pub fn ede_codes(msg: &[u8]) -> Vec<u16> {
+    let mut out = Vec::new();
+    let Ok(recs) = records(msg) else {
+        return out;
+    };
+    for r in recs.iter().filter(|r| r.section == 2 && r.rtype == TYPE_OPT) {
+        let mut pos = r.rdata_offset;
+        let end = r.rdata_offset + r.rdata_len;
+        while pos + 4 <= end {
+            let code = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
+            let len = u16::from_be_bytes([msg[pos + 2], msg[pos + 3]]) as usize;
+            let data = pos + 4;
+            if data + len > end {
+                break;
+            }
+            if code == EDNS_OPTION_EDE && len >= 2 {
+                out.push(u16::from_be_bytes([msg[data], msg[data + 1]]));
+            }
+            pos = data + len;
+        }
+    }
+    out
 }
 
 /// The DO bit of `msg`'s OPT record: the sender wants DNSSEC records
@@ -432,7 +521,7 @@ mod tests {
     fn fuzz_never_panics() {
         let q = build_query(3, "www.example.com", TYPE_A);
         let (_, _, end) = parse_query(&q).unwrap();
-        let base = build_response(
+        let mut base = build_response(
             &q,
             end,
             0,
@@ -442,6 +531,8 @@ mod tests {
             ],
             false,
         );
+        // With an OPT record carrying an EDE, so the EDNS walkers see one.
+        assert!(add_ede(&mut base, EDE_STALE_ANSWER, "x", true));
         let mut seed = 0x1234_5678_u32;
         for _ in 0..20_000 {
             let mut b = base.clone();
@@ -460,6 +551,42 @@ mod tests {
             let _ = error_response(&b, RCODE_FORMERR);
             let _ = udp_limit(&b, 1472);
             let _ = fit(&b, 20);
+            let _ = (dnssec_ok(&b), has_edns(&b), ede_codes(&b));
+            let _ = add_ede(&mut b.clone(), EDE_BLOCKED, "fuzz", false);
         }
+    }
+
+    #[test]
+    fn extended_dns_errors_are_added_where_nothing_moves() {
+        let q = build_query(5, "x.example", TYPE_A);
+        let (_, _, end) = parse_query(&q).unwrap();
+        // No OPT yet: one is added (DO echoed on request), ARCOUNT + 1.
+        let mut m = error_response(&q, RCODE_SERVFAIL).unwrap();
+        assert!(add_ede(&mut m, EDE_NO_REACHABLE_AUTHORITY, "no upstream", true));
+        assert_eq!(Header::parse(&m).unwrap().arcount, 1);
+        assert!(dnssec_ok(&m) && has_edns(&m));
+        assert_eq!(ede_codes(&m), vec![EDE_NO_REACHABLE_AUTHORITY]);
+        // An OPT at the end: the option is appended to it.
+        assert!(add_ede(&mut m, EDE_STALE_ANSWER, "", true));
+        assert_eq!(ede_codes(&m), vec![EDE_NO_REACHABLE_AUTHORITY, EDE_STALE_ANSWER]);
+        assert_eq!(Header::parse(&m).unwrap().arcount, 1);
+        // An answer with records keeps them intact.
+        let mut a = build_response(&q, end, RCODE_NOERROR, &[(Rdata::A(Ipv4Addr::new(1, 2, 3, 4)), 60)], false);
+        assert!(add_ede(&mut a, EDE_STALE_ANSWER, "", false));
+        assert_eq!(answer_ipv4s(&a, &records(&a).unwrap()), vec![Ipv4Addr::new(1, 2, 3, 4)]);
+        assert!(!dnssec_ok(&a));
+        // OPT not last, trailing bytes, garbage: unchanged.
+        let mut not_last = m.clone();
+        not_last.extend_from_slice(&[0, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]); // root A
+        not_last[11] += 1;
+        let before = not_last.clone();
+        assert!(!add_ede(&mut not_last, EDE_STALE_ANSWER, "", false));
+        assert_eq!(not_last, before);
+        let mut trailing = error_response(&q, RCODE_SERVFAIL).unwrap();
+        trailing.push(0);
+        assert!(!add_ede(&mut trailing, EDE_STALE_ANSWER, "", false));
+        let mut junk = vec![1, 2, 3];
+        assert!(!add_ede(&mut junk, EDE_STALE_ANSWER, "", false));
+        assert!(ede_codes(&junk).is_empty());
     }
 }

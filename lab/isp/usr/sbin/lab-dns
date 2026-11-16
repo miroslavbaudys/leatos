@@ -1,0 +1,25 @@
+#!/usr/bin/busybox sh
+# The ISP's DNS servers: lab-dns start|stop. dnsd (plain DNS on
+# 203.0.113.1:53) always; with DNS over TLS (/etc/dot/server.pem) also the
+# dnsmasq behind stunnel. TTL 12 s: short enough for the client's DNS
+# prefetch and serve-stale checks to see entries expire.
+bb=/usr/bin/busybox
+bx=/usr/bin/busybox-extras
+case "$1" in
+  start)
+    $bx dnsd -c /etc/dnsd.conf -i 203.0.113.1 -t 12 >/dev/console 2>&1 </dev/null &
+    echo $! >/tmp/dnsd.pid
+    if [ -f /etc/dot/server.pem ]; then
+      /usr/sbin/dnsmasq --conf-file=/dev/null --no-resolv --no-hosts --addn-hosts=/tmp/dot-hosts \
+        --listen-address=127.0.0.1 --bind-interfaces --port=5300 --user=root --local-ttl=12 \
+        --pid-file=/tmp/dnsmasq.pid --log-queries --log-facility=/tmp/dot.log || exit 1
+    fi
+    ;;
+  stop)
+    for f in /tmp/dnsd.pid /tmp/dnsmasq.pid; do
+      [ -f "$f" ] && $bb kill "$($bb cat "$f")" 2>/dev/null
+      $bb rm -f "$f"
+    done
+    ;;
+  *) echo "usage: lab-dns start|stop" >&2; exit 2 ;;
+esac

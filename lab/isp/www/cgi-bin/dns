@@ -1,0 +1,9 @@
+#!/usr/bin/busybox sh
+# DNS lab helpers (the client's serve-stale check): ?stop / ?start the
+# ISP's DNS servers (lab-dns).
+echo "Content-Type: text/plain"
+echo
+case "$QUERY_STRING" in
+  stop | start) /usr/sbin/lab-dns "$QUERY_STRING" >/dev/null 2>&1 </dev/null && echo "$QUERY_STRING=OK" || echo "$QUERY_STRING=FAIL" ;;
+  *) echo "unknown" ;;
+esac

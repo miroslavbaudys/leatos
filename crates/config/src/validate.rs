@@ -590,6 +590,9 @@ fn dns(c: &Config, x: &mut Issues) {
     if !(16..=65536).contains(&d.cache_entries) {
         x.add("dns.cache_entries", "must be 16–65536");
     }
+    if d.stale_secs > crate::MAX_STALE_SECS {
+        x.add("dns.stale_secs", "must be 0 (off) to 604800 (a week)");
+    }
     if !is_domain(&d.domain) {
         x.add(
             "dns.domain",

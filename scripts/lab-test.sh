@@ -6,7 +6,7 @@
 #   runs all checks                  DHCP srv, DNS, NAT, firewall       udhcpd, httpd, dnsd
 #
 # The client (lab/client/init) checks LAN services (DHCP, DNS zone,
-# upstream DNS via the ISP, cache prefetch) and forwarding (TCP/ICMP through NAT, NATed
+# upstream DNS via the ISP, cache prefetch, serve-stale) and forwarding (TCP/ICMP through NAT, NATed
 # source, traceroute = TTL + ICMP-error NAT, 20 connections, firewall probe
 # from the ISP side), printing "LAB PASS/FAIL" lines.
 # Exit code 0 = all checks passed.
@@ -27,7 +27,9 @@
 #                        CoDel queue: the negative control for the flow-
 #                        isolation latency check), or dns_prefetch=0 (the
 #                        negative control for the DNS prefetch check: a
-#                        second forwarded query, no renewal)
+#                        second forwarded query, no renewal), or dns_stale=0
+#                        (the negative control for the serve-stale check:
+#                        SERVFAIL with the ISP's DNS stopped)
 #   LAB_EXPECT_ECN=U:D   ECN the check expects per direction (1 = marks, 0 =
 #                        drops; default: derived from the router arguments,
 #                        i.e. 0:1). Set it against the router's real setting

@@ -1297,7 +1297,7 @@ fn status_json(
         let (st, cached) = svc.dns_stats();
         let _ = write!(
             s,
-            ",\"dns\":{{\"source\":{},\"upstreams\":[{}],\"tls\":{},\"cached\":{},\"queries\":{},\"local\":{},\"cache_hits\":{},\"forwarded\":{},\"merged\":{},\"timeouts\":{},\"servfails\":{},\"rebind_blocked\":{},\"prefetches\":{},\"prefetch_failed\":{}}}",
+            ",\"dns\":{{\"source\":{},\"upstreams\":[{}],\"tls\":{},\"cached\":{},\"queries\":{},\"local\":{},\"cache_hits\":{},\"forwarded\":{},\"merged\":{},\"timeouts\":{},\"servfails\":{},\"rebind_blocked\":{},\"prefetches\":{},\"prefetch_failed\":{},\"stale_answers\":{}}}",
             json_str(svc.upstream_source()),
             ups.join(","),
             svc.dot_status_json().unwrap_or_else(|| "null".into()),
@@ -1311,7 +1311,8 @@ fn status_json(
             st.servfails,
             st.rebind_blocked,
             st.prefetches,
-            st.prefetch_failed
+            st.prefetch_failed,
+            st.stale_answers
         );
     }
     // Wall clock (SNTP) and watchdog.

@@ -132,6 +132,14 @@ fn zone_lan() -> String {
 fn is_zero(v: &u16) -> bool {
     *v == 0
 }
+/// `dns.stale_secs` by default: one day.
+pub const DEFAULT_STALE_SECS: u32 = 86_400;
+/// Upper bound of `dns.stale_secs`: a week (RFC 8767 suggests 1–3 days;
+/// RRSIGs of stale answers may expire beyond).
+pub const MAX_STALE_SECS: u32 = 604_800;
+fn is_default_stale(v: &u32) -> bool {
+    *v == DEFAULT_STALE_SECS
+}
 fn is_true(v: &bool) -> bool {
     *v
 }
@@ -435,6 +443,11 @@ pub struct Dns {
     /// the last tenth of the TTL sends the query again in the background).
     #[serde(skip_serializing_if = "is_true")]
     pub prefetch: bool,
+    /// Serve-stale (RFC 8767): keep expired answers this long (seconds) and
+    /// give them, with TTL 30 s, when the upstream fails or takes over
+    /// 1.8 s; 0 = off. Default one day, RFC 8767's lower bound.
+    #[serde(skip_serializing_if = "is_default_stale")]
+    pub stale_secs: u32,
     /// Local DNS zone of all networks: DHCP clients become
     /// `<hostname>.<domain>` (version 1: `lan.domain`).
     pub domain: String,
@@ -466,6 +479,7 @@ impl Default for Dns {
             cache_entries: 4096,
             rebind_protection: true,
             prefetch: true,
+            stale_secs: DEFAULT_STALE_SECS,
             domain: "lan".into(),
             hosts: Vec::new(),
             upstreams: Vec::new(),
@@ -956,6 +970,9 @@ impl Config {
         }
         if !self.dns.prefetch {
             add("dns.prefetch".into(), "DNS prefetch switched off");
+        }
+        if self.dns.stale_secs != DEFAULT_STALE_SECS {
+            add("dns.stale_secs".into(), "a serve-stale window of its own");
         }
         if self.dns.tls {
             add("dns.tls".into(), "DNS over TLS");

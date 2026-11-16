@@ -463,8 +463,17 @@ fn status(ctx: &Ctx, wan: &str) {
         );
         let (st, cached) = svc.dns_stats();
         println!(
-            "dns      : {} queries: {} local, {} cache hits, {} forwarded, {} merged, {} timeouts; {} cached; prefetch {} sent, {} failed",
-            st.queries, st.local_answers, st.cache_hits, st.forwarded, st.merged, st.timeouts, cached, st.prefetches, st.prefetch_failed
+            "dns      : {} queries: {} local, {} cache hits, {} forwarded, {} merged, {} timeouts; {} cached; prefetch {} sent, {} failed; {} stale",
+            st.queries,
+            st.local_answers,
+            st.cache_hits,
+            st.forwarded,
+            st.merged,
+            st.timeouts,
+            cached,
+            st.prefetches,
+            st.prefetch_failed,
+            st.stale_answers
         );
         for l in svc.dot_status_lines() {
             println!("dns-tls  : {l}");

@@ -24,6 +24,22 @@
 //! A failed renewal changes nothing: the old entry expires as it would
 //! have.
 //!
+//! Serve-stale (RFC 8767, [`Config::max_stale_secs`]): an expired entry is
+//! kept that long. A client asking for it is forwarded as usual, but gets
+//! the stale answer (TTL 30 s) if the upstream has not answered within
+//! [`STALE_CLIENT_TIMEOUT_MS`] (the resolution goes on and refreshes the
+//! cache), when it fails (every try timed out, or SERVFAIL/REFUSED from
+//! upstream), or at once when there is no upstream to ask (WAN down) or no
+//! room for a pending query. After a failure the name is answered stale
+//! without asking for 30 s (failure recheck timer). Answers we refuse
+//! ourselves (rebind protection) are never replaced by stale data.
+//!
+//! Extended DNS Errors (RFC 8914), to clients that sent EDNS: Stale Answer
+//! (3) / Stale NXDOMAIN Answer (19) on stale answers, No Reachable
+//! Authority (22) on our SERVFAIL when no upstream answered or there is
+//! none, Blocked (15) on rebind-protection refusals. Errors from the
+//! upstream go to the client as they came (with its own EDE, if any).
+//!
 //! Known gap: one fixed upstream source port (chosen by the caller), so
 //! spoofing resistance relies on the 16-bit ID only. Per-query source ports
 //! are planned.
@@ -43,6 +59,11 @@ pub const LOCAL_TTL: u32 = 60;
 /// TCP/TLS upstream) are cut to the question with TC set
 /// ([`wire::fit`]).
 pub const MAX_UDP_REPLY: usize = 1472;
+
+/// A client whose question has a stale answer to fall back on waits at
+/// most this long for the upstream (RFC 8767 §5, client response timer:
+/// 1.8 s).
+pub const STALE_CLIENT_TIMEOUT_MS: u64 = 1800;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -64,6 +85,9 @@ pub struct Config {
     pub max_pending: usize,
     /// Renew popular cache entries shortly before they expire.
     pub prefetch: bool,
+    /// Keep expired entries this long to answer stale when the upstream
+    /// fails or is slow (RFC 8767); 0 = off.
+    pub max_stale_secs: u32,
 }
 
 impl Default for Config {
@@ -75,6 +99,7 @@ impl Default for Config {
             max_tries: 3,
             max_pending: 256,
             prefetch: true,
+            max_stale_secs: 86_400,
         }
     }
 }
@@ -94,6 +119,45 @@ pub struct Stats {
     pub prefetches: u64,
     /// Renewals that timed out or got an answer that is not cached.
     pub prefetch_failed: u64,
+    /// Stale answers given (RFC 8767).
+    pub stale_answers: u64,
+}
+
+/// An Extended DNS Error (RFC 8914): INFO-CODE and EXTRA-TEXT.
+type Ede = (u16, &'static str);
+
+const EDE_NO_UPSTREAM_ANSWERED: Ede = (wire::EDE_NO_REACHABLE_AUTHORITY, "no upstream server answered");
+const EDE_NO_UPSTREAM: Ede = (wire::EDE_NO_REACHABLE_AUTHORITY, "no upstream server");
+const EDE_REBIND: Ede = (wire::EDE_BLOCKED, "rebind protection: a private address for a public name");
+
+/// The EDE of a stale answer `data`.
+fn stale_ede(data: &[u8]) -> Ede {
+    match wire::Header::parse(data).map(|h| h.rcode()) {
+        Ok(wire::RCODE_NXDOMAIN) => (wire::EDE_STALE_NXDOMAIN, ""),
+        _ => (wire::EDE_STALE_ANSWER, ""),
+    }
+}
+
+/// `data` for a client: with `ede` if it sent EDNS (RFC 6891: no OPT
+/// record otherwise), cut to `limit`.
+fn for_client(mut data: Vec<u8>, edns: bool, dnssec_ok: bool, ede: Option<Ede>, limit: usize) -> Vec<u8> {
+    if edns && let Some((code, text)) = ede {
+        wire::add_ede(&mut data, code, text, dnssec_ok);
+    }
+    wire::fit(&data, limit)
+}
+
+/// A client waiting for an upstream answer.
+struct Waiter {
+    to: SocketAddr,
+    /// Its query ID.
+    id: u16,
+    /// Its query had EDNS (so the answer may carry an EDE).
+    edns: bool,
+    /// The largest answer it takes.
+    limit: usize,
+    /// When it gets the stale answer instead, if there is one.
+    stale_at: Option<u64>,
 }
 
 struct Pending {
@@ -102,8 +166,7 @@ struct Pending {
     key: Key,
     /// The upstream query (with our ID).
     query: Vec<u8>,
-    /// Client, its query ID, the largest answer it takes.
-    waiters: Vec<(SocketAddr, u16, usize)>,
+    waiters: Vec<Waiter>,
     sent_ms: u64,
     tries: u8,
     upstream: usize,
@@ -132,7 +195,8 @@ impl Resolver {
     /// `seed` initialises the transaction-ID generator (use a hardware
     /// counter or RNG; never 0).
     pub fn new(cfg: Config, zone: Zone, seed: u32) -> Self {
-        let cache = Cache::new(cfg.cache_entries);
+        let mut cache = Cache::new(cfg.cache_entries);
+        cache.set_max_stale_secs(cfg.max_stale_secs);
         Self {
             cfg,
             zone,
@@ -149,6 +213,7 @@ impl Resolver {
     /// size; pending queries continue.
     pub fn reconfigure(&mut self, cfg: Config) {
         self.cache.set_max_entries(cfg.cache_entries);
+        self.cache.set_max_stale_secs(cfg.max_stale_secs);
         self.cfg = cfg;
     }
 
@@ -188,6 +253,17 @@ impl Resolver {
             .map(|data| Action::Reply { to, data })
             .into_iter()
             .collect()
+    }
+
+    /// A stale answer (already with the client's ID) to `to`, marked as
+    /// such (EDE 3 or 19) for EDNS clients.
+    fn reply_stale(&mut self, to: SocketAddr, data: Vec<u8>, limit: usize, edns: bool, dnssec_ok: bool) -> Action {
+        self.stats.stale_answers += 1;
+        let ede = stale_ede(&data);
+        Action::Reply {
+            to,
+            data: for_client(data, edns, dnssec_ok, Some(ede), limit),
+        }
     }
 
     /// A query datagram from a LAN client.
@@ -246,17 +322,47 @@ impl Resolver {
             return out;
         }
 
-        // 3. Upstream (merge identical in-flight questions with the same
+        // 3. Stale, at once: the last refresh failed moments ago, or there
+        // is nobody to ask.
+        let edns = wire::has_edns(query);
+        let stale = self.cache.stale(now_ms, &key, h.id);
+        if let Some(data) = &stale
+            && (self.cache.failed_recently(now_ms, &key) || self.upstreams.is_empty())
+        {
+            let dnssec_ok = key.dnssec_ok;
+            return alloc::vec![self.reply_stale(client, data.clone(), limit, edns, dnssec_ok)];
+        }
+        let waiter = Waiter {
+            to: client,
+            id: h.id,
+            edns,
+            limit,
+            stale_at: stale.is_some().then_some(now_ms + STALE_CLIENT_TIMEOUT_MS),
+        };
+
+        // 4. Upstream (merge identical in-flight questions with the same
         // DNSSEC flags).
         if let Some(id) = self.by_question.get(&key)
             && let Some(p) = self.pending.get_mut(id)
         {
-            p.waiters.push((client, h.id, limit));
+            p.waiters.push(waiter);
             self.stats.merged += 1;
             return Vec::new();
         }
         if self.upstreams.is_empty() || self.pending.len() >= self.cfg.max_pending {
-            return self.reply_error(client, query, wire::RCODE_SERVFAIL);
+            let dnssec_ok = key.dnssec_ok;
+            if let Some(data) = stale {
+                return alloc::vec![self.reply_stale(client, data, limit, edns, dnssec_ok)];
+            }
+            if !self.upstreams.is_empty() {
+                return self.reply_error(client, query, wire::RCODE_SERVFAIL);
+            }
+            self.stats.servfails += 1;
+            let Some(data) = wire::error_response(query, wire::RCODE_SERVFAIL) else {
+                return Vec::new();
+            };
+            let data = for_client(data, edns, dnssec_ok, Some(EDE_NO_UPSTREAM), limit);
+            return alloc::vec![Action::Reply { to: client, data }];
         }
         let id = self.next_id();
         let mut up = query.to_vec();
@@ -268,7 +374,7 @@ impl Resolver {
             Pending {
                 key,
                 query: up.clone(),
-                waiters: alloc::vec![(client, h.id, limit)],
+                waiters: alloc::vec![waiter],
                 sent_ms: now_ms,
                 tries: 1,
                 upstream: 0,
@@ -331,10 +437,21 @@ impl Resolver {
         let p = self.pending.remove(&h.id).expect("checked above");
         self.by_question.remove(&p.key);
 
-        if p.prefetch && !matches!(h.rcode(), wire::RCODE_NOERROR | wire::RCODE_NXDOMAIN) {
-            self.stats.prefetch_failed += 1;
+        if !matches!(h.rcode(), wire::RCODE_NOERROR | wire::RCODE_NXDOMAIN) {
+            // The upstream failed (SERVFAIL, REFUSED, …): not cached; stale
+            // answers where there are any, else its answer.
+            if p.prefetch {
+                self.stats.prefetch_failed += 1;
+            }
+            let as_sent = |q: &[u8]| {
+                let mut d = response.to_vec();
+                wire::set_id(&mut d, wire::Header::parse(q).map_or(0, |h| h.id));
+                (d, None)
+            };
+            return self.failed(now_ms, p, as_sent);
         }
         let mut data = response.to_vec();
+        let mut ede = None;
         let in_local_domain = self.zone.is_local_name(&p.key.question.name);
         if self.cfg.rebind_protection && !in_local_domain {
             let recs = wire::records(response).unwrap_or_default();
@@ -344,6 +461,7 @@ impl Resolver {
             {
                 self.stats.rebind_blocked += 1;
                 data = wire::error_response(&p.query, wire::RCODE_REFUSED).unwrap_or_default();
+                ede = Some(EDE_REBIND);
             } else {
                 self.cache.insert(now_ms, p.key.clone(), response, &p.query);
             }
@@ -351,18 +469,74 @@ impl Resolver {
             self.cache.insert(now_ms, p.key.clone(), response, &p.query);
         }
 
+        let dnssec_ok = p.key.dnssec_ok;
         p.waiters
             .into_iter()
-            .map(|(to, id, limit)| {
-                let mut d = wire::fit(&data, limit);
-                wire::set_id(&mut d, id);
-                Action::Reply { to, data: d }
+            .map(|w| {
+                let mut d = data.clone();
+                wire::set_id(&mut d, w.id);
+                Action::Reply {
+                    to: w.to,
+                    data: for_client(d, w.edns, dnssec_ok, ede, w.limit),
+                }
             })
             .collect()
     }
 
-    /// Retry or fail timed-out queries.
+    /// `p`'s resolution failed: each waiter gets the stale answer if there
+    /// is one, else `error(query with its ID)` (an answer and its EDE);
+    /// the stale entry is then answered without asking for a while.
+    fn failed(&mut self, now_ms: u64, p: Pending, error: impl Fn(&[u8]) -> (Vec<u8>, Option<Ede>)) -> Vec<Action> {
+        self.cache.mark_failed(now_ms, &p.key);
+        let dnssec_ok = p.key.dnssec_ok;
+        let mut out = Vec::new();
+        for w in p.waiters {
+            if let Some(data) = self.cache.stale(now_ms, &p.key, w.id) {
+                out.push(self.reply_stale(w.to, data, w.limit, w.edns, dnssec_ok));
+            } else {
+                let mut q = p.query.clone();
+                wire::set_id(&mut q, w.id);
+                let (data, ede) = error(&q);
+                if wire::Header::parse(&data).is_ok_and(|h| h.rcode() == wire::RCODE_SERVFAIL) {
+                    self.stats.servfails += 1;
+                }
+                if !data.is_empty() {
+                    out.push(Action::Reply {
+                        to: w.to,
+                        data: for_client(data, w.edns, dnssec_ok, ede, w.limit),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Stale answers to clients that waited long enough, then retry or fail
+    /// timed-out queries.
     pub fn poll(&mut self, now_ms: u64) -> Vec<Action> {
+        let mut out = Vec::new();
+        // Client response timer: the stale answer now, the resolution goes
+        // on (and refreshes the cache when it succeeds).
+        let (cache, stats) = (&self.cache, &mut self.stats);
+        for p in self.pending.values_mut() {
+            p.waiters.retain_mut(|w| {
+                if w.stale_at.is_none_or(|t| t > now_ms) {
+                    return true;
+                }
+                w.stale_at = None;
+                let Some(data) = cache.stale(now_ms, &p.key, w.id) else {
+                    return true; // gone meanwhile: wait for the upstream
+                };
+                stats.stale_answers += 1;
+                let ede = stale_ede(&data);
+                out.push(Action::Reply {
+                    to: w.to,
+                    data: for_client(data, w.edns, p.key.dnssec_ok, Some(ede), w.limit),
+                });
+                false
+            });
+        }
+
         let timeout = self.cfg.timeout_ms;
         let due: Vec<u16> = self
             .pending
@@ -370,10 +544,10 @@ impl Resolver {
             .filter(|(_, p)| p.sent_ms + timeout <= now_ms)
             .map(|(&id, _)| id)
             .collect();
-        let mut out = Vec::new();
         for id in due {
-            // A renewal nobody waits for is not a client's timeout.
-            if self.pending.get(&id).is_some_and(|p| !p.prefetch || !p.waiters.is_empty()) {
+            // A query nobody waits for any more (a renewal, or its clients
+            // got stale answers) is not a client's timeout.
+            if self.pending.get(&id).is_some_and(|p| !p.waiters.is_empty()) {
                 self.stats.timeouts += 1;
             }
             let retry = self
@@ -396,11 +570,11 @@ impl Resolver {
                 if p.prefetch {
                     self.stats.prefetch_failed += 1;
                 }
-                for (to, orig, _) in p.waiters {
-                    let mut q = p.query.clone();
-                    wire::set_id(&mut q, orig);
-                    out.extend(self.reply_error(to, &q, wire::RCODE_SERVFAIL));
-                }
+                let servfail = |q: &[u8]| {
+                    let d = wire::error_response(q, wire::RCODE_SERVFAIL).unwrap_or_default();
+                    (d, Some(EDE_NO_UPSTREAM_ANSWERED))
+                };
+                out.extend(self.failed(now_ms, p, servfail));
             }
         }
         out
@@ -410,7 +584,10 @@ impl Resolver {
     pub fn next_deadline(&self) -> Option<u64> {
         self.pending
             .values()
-            .map(|p| p.sent_ms + self.cfg.timeout_ms)
+            .flat_map(|p| {
+                let stale = p.waiters.iter().filter_map(|w| w.stale_at);
+                core::iter::once(p.sent_ms + self.cfg.timeout_ms).chain(stale)
+            })
             .min()
     }
 }
@@ -861,5 +1038,187 @@ mod tests {
         upstream(&r.handle_query(0, client(1), &other));
         assert!(r.handle_query(0, client(2), &dnssec_query(5, "other.example", true, false)).is_empty());
         assert_eq!(r.stats.merged, 1);
+    }
+
+    use crate::cache::STALE_TTL;
+
+    fn resolver_with(cfg: Config) -> Resolver {
+        let z = Zone::new("lan", Ipv4Addr::new(192, 168, 1, 1), (Ipv4Addr::new(192, 168, 1, 0), 24));
+        let mut r = Resolver::new(cfg, z, 0xdead_beef);
+        r.set_upstreams(&[UP1, UP2]);
+        r
+    }
+
+    fn ttls(d: &[u8]) -> Vec<u32> {
+        wire::records(d).unwrap().iter().map(|r| r.ttl).collect()
+    }
+
+    #[test]
+    fn stale_answer_when_the_upstream_is_slow_then_refreshed() {
+        let mut r = resolver_with(Config {
+            timeout_ms: 3000,
+            ..Config::default()
+        });
+        let q = build_query(7, "slow.example", TYPE_A);
+        fill(&mut r, &q, 100);
+        // Expired: forwarded as usual, the client waits up to 1.8 s.
+        let t = 100_000;
+        let (_, up) = upstream(&r.handle_query(t, client(2), &q));
+        assert_eq!(r.next_deadline(), Some(t + STALE_CLIENT_TIMEOUT_MS));
+        // A second client joins later, with its own timer.
+        assert!(r.handle_query(t + 1000, client(3), &build_query(8, "slow.example", TYPE_A)).is_empty());
+        assert!(r.poll(t + 1799).is_empty());
+        let a = r.poll(t + 1800);
+        let (to, d) = reply(&a);
+        assert_eq!((*to, wire::Header::parse(d).unwrap().id, rcode(d)), (client(2), 7, RCODE_NOERROR));
+        assert_eq!(ttls(d), vec![STALE_TTL]);
+        let a = r.poll(t + 2800);
+        assert_eq!(reply(&a).0, &client(3));
+        assert_eq!(r.stats.stale_answers, 2);
+        // The upstream answers late: nobody waits any more, the cache is
+        // fresh again.
+        assert!(r.handle_upstream(t + 2900, UP1, &answer(&up, Ipv4Addr::new(1, 2, 3, 9), 100)).is_empty());
+        let a = r.handle_query(t + 3000, client(4), &q);
+        let (_, d) = reply(&a);
+        assert_eq!(ttls(d), vec![100], "the fresh answer");
+        assert_eq!(r.stats.timeouts, 0);
+    }
+
+    #[test]
+    fn stale_answer_when_the_upstream_fails_then_no_recheck_for_30_s() {
+        let mut r = resolver();
+        let q = build_query(7, "broken.example", TYPE_A);
+        fill(&mut r, &q, 100);
+        let t = 200_000;
+        let (_, up) = upstream(&r.handle_query(t, client(2), &q));
+        let (_, _, end) = wire::parse_query(&up).unwrap();
+        let fail = wire::build_response(&up, end, RCODE_SERVFAIL, &[], false);
+        let a = r.handle_upstream(t + 50, UP1, &fail);
+        let (_, d) = reply(&a);
+        assert_eq!((rcode(d), ttls(d)), (RCODE_NOERROR, vec![STALE_TTL]));
+        // Failure recheck timer: stale at once, nothing sent upstream.
+        let a = r.handle_query(t + 29_000, client(3), &q);
+        assert!(matches!(&a[..], [Action::Reply { .. }]));
+        assert_eq!((r.stats.forwarded, r.stats.stale_answers), (2, 2));
+        // Then asked again.
+        assert!(matches!(&r.handle_query(t + 30_100, client(3), &q)[..], [Action::Upstream { .. }]));
+    }
+
+    #[test]
+    fn stale_answer_when_every_try_times_out() {
+        let mut r = resolver_with(Config {
+            timeout_ms: 500,
+            max_tries: 2,
+            ..Config::default()
+        });
+        let q = build_query(7, "gone.example", TYPE_A);
+        fill(&mut r, &q, 100);
+        let t = 100_000;
+        upstream(&r.handle_query(t, client(2), &q));
+        upstream(&r.poll(t + 500));
+        let a = r.poll(t + 1000);
+        let (_, d) = reply(&a);
+        assert_eq!((rcode(d), ttls(d)), (RCODE_NOERROR, vec![STALE_TTL]));
+        assert_eq!((r.stats.servfails, r.stats.stale_answers), (0, 1));
+    }
+
+    #[test]
+    fn stale_answer_at_once_without_upstreams_until_the_window_ends() {
+        let mut r = resolver_with(Config {
+            max_stale_secs: 3600,
+            ..Config::default()
+        });
+        let q = build_query(7, "wan-down.example", TYPE_A);
+        fill(&mut r, &q, 100);
+        r.set_upstreams(&[]);
+        let a = r.handle_query(100_000, client(2), &q);
+        let (_, d) = reply(&a);
+        assert_eq!((rcode(d), ttls(d)), (RCODE_NOERROR, vec![STALE_TTL]));
+        // Kept for 1 h after expiry, not longer.
+        let a = r.handle_query(100_000 + 3_599_000, client(2), &q);
+        assert_eq!(rcode(reply(&a).1), RCODE_NOERROR);
+        let a = r.handle_query(100_000 + 3_600_000, client(2), &q);
+        assert_eq!(rcode(reply(&a).1), RCODE_SERVFAIL);
+        // Switched off: SERVFAIL as soon as the entry expired.
+        let mut r = resolver_with(Config {
+            max_stale_secs: 0,
+            ..Config::default()
+        });
+        fill(&mut r, &q, 100);
+        r.set_upstreams(&[]);
+        assert_eq!(rcode(reply(&r.handle_query(100_000, client(2), &q)).1), RCODE_SERVFAIL);
+        assert_eq!(r.stats.stale_answers, 0);
+    }
+
+    #[test]
+    fn stale_data_never_replaces_our_own_refusal() {
+        let mut r = resolver();
+        let q = build_query(7, "rebind.example", TYPE_A);
+        fill(&mut r, &q, 100);
+        let (_, up) = upstream(&r.handle_query(100_000, client(2), &q));
+        // The name now points into the LAN: refused (rebind protection),
+        // not answered with the old public address.
+        let a = r.handle_upstream(100_050, UP1, &answer(&up, Ipv4Addr::new(192, 168, 1, 50), 100));
+        assert_eq!(rcode(reply(&a).1), RCODE_REFUSED);
+        assert_eq!(r.stats.stale_answers, 0);
+    }
+
+    #[test]
+    fn extended_dns_errors_tell_edns_clients_why() {
+        use crate::wire::{EDE_BLOCKED, EDE_NO_REACHABLE_AUTHORITY, EDE_STALE_ANSWER, EDE_STALE_NXDOMAIN, ede_codes, has_edns};
+        let mut r = resolver();
+        let edns = with_edns("ede.example");
+        let plain = build_query(9, "ede.example", TYPE_A);
+        fill(&mut r, &edns, 100);
+        r.set_upstreams(&[]);
+        // Stale: EDE 3 for the EDNS client, no OPT at all for the other.
+        let a = r.handle_query(100_000, client(2), &edns);
+        let (_, d) = reply(&a);
+        assert_eq!((rcode(d), ede_codes(d)), (RCODE_NOERROR, vec![EDE_STALE_ANSWER]));
+        let a = r.handle_query(100_000, client(2), &plain);
+        let (_, d) = reply(&a);
+        assert!(!has_edns(d) && ede_codes(d).is_empty());
+        // Stale NXDOMAIN: EDE 19.
+        r.set_upstreams(&[UP1]);
+        let nx = with_edns("gone.example");
+        let (_, up) = upstream(&r.handle_query(0, client(1), &nx));
+        let (_, _, end) = wire::parse_query(&up).unwrap();
+        reply(&r.handle_upstream(0, UP1, &wire::build_response(&up, end, RCODE_NXDOMAIN, &[], false)));
+        r.set_upstreams(&[]);
+        let a = r.handle_query(61_000, client(2), &nx);
+        let (_, d) = reply(&a);
+        assert_eq!((rcode(d), ede_codes(d)), (RCODE_NXDOMAIN, vec![EDE_STALE_NXDOMAIN]));
+        // Nothing cached and nobody to ask: SERVFAIL with EDE 22.
+        let a = r.handle_query(0, client(2), &with_edns("new.example"));
+        let (_, d) = reply(&a);
+        assert_eq!((rcode(d), ede_codes(d)), (RCODE_SERVFAIL, vec![EDE_NO_REACHABLE_AUTHORITY]));
+
+        // Every try timed out: SERVFAIL with EDE 22 (EDNS clients only).
+        let mut r = resolver();
+        upstream(&r.handle_query(0, client(1), &with_edns("down.example")));
+        assert!(r.handle_query(0, client(2), &build_query(3, "down.example", TYPE_A)).is_empty());
+        upstream(&r.poll(1500));
+        upstream(&r.poll(3000));
+        let a = r.poll(4500);
+        let [Action::Reply { data: d1, .. }, Action::Reply { data: d2, .. }] = &a[..] else { panic!("{a:?}") };
+        assert_eq!((rcode(d1), ede_codes(d1)), (RCODE_SERVFAIL, vec![EDE_NO_REACHABLE_AUTHORITY]));
+        assert_eq!((rcode(d2), has_edns(d2)), (RCODE_SERVFAIL, false));
+
+        // Rebind protection: REFUSED with EDE 15.
+        let mut r = resolver();
+        let (_, up) = upstream(&r.handle_query(0, client(1), &with_edns("evil.example")));
+        let a = r.handle_upstream(5, UP1, &answer(&up, Ipv4Addr::new(10, 1, 2, 3), 60));
+        let (_, d) = reply(&a);
+        assert_eq!((rcode(d), ede_codes(d)), (RCODE_REFUSED, vec![EDE_BLOCKED]));
+
+        // An upstream's own error goes through as it came (its ID aside).
+        let mut r = resolver();
+        let (_, up) = upstream(&r.handle_query(0, client(1), &with_edns("fail.example")));
+        let (_, _, end) = wire::parse_query(&up).unwrap();
+        let mut fail = wire::build_response(&up, end, RCODE_SERVFAIL, &[], false);
+        assert!(wire::add_ede(&mut fail, 23, "upstream says so", false));
+        let a = r.handle_upstream(5, UP1, &fail);
+        let (_, d) = reply(&a);
+        assert_eq!((wire::Header::parse(d).unwrap().id, &d[2..]), (0x4242, &fail[2..]));
     }
 }

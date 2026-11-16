@@ -432,6 +432,19 @@ fn dns_prefetch_is_on_by_default_and_off_needs_v2() {
 }
 
 #[test]
+fn dns_serve_stale_window() {
+    let c = Config::default();
+    assert_eq!(c.dns.stale_secs, 86_400);
+    assert!(!c.to_toml().contains("stale"), "the default is written as nothing");
+    let off = parse("version = 2\n[dns]\nstale_secs = 0\n").unwrap();
+    assert_eq!(off.dns.stale_secs, 0);
+    assert!(!off.fits_v1());
+    assert_eq!(parse(&off.to_toml()).unwrap(), off);
+    assert_eq!(invalid(|c| c.dns.stale_secs = 604_801), ["dns.stale_secs"]);
+    assert!(issues(|c| c.dns.stale_secs = 604_800).is_empty());
+}
+
+#[test]
 fn dns_upstreams_and_tls() {
     // Cloudflare over TLS, as written by hand.
     let c = parse(

@@ -95,6 +95,7 @@ fn resolver_config(d: &config::Dns) -> resolver::Config {
         cache_entries: d.cache_entries,
         rebind_protection: d.rebind_protection,
         prefetch: d.prefetch,
+        max_stale_secs: d.stale_secs,
         // Over TLS the first query after a while also waits for TCP and
         // the TLS handshake (two more round trips).
         timeout_ms: if d.tls { 3000 } else { 1500 },

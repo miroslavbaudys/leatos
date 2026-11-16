@@ -110,17 +110,24 @@ lookup isp.example    "203.0.113.80"   "upstream isp.example -> 203.0.113.80 (vi
 # and at least one renewal is sent (router counters in /api/status).
 # Negative control: LAB_ROUTER_ARGS=dns_prefetch=0 (the entry expires: a
 # second forwarded query, no renewal).
-# The resolver's counters start at "cached" (other objects have a "forwarded" too).
-dnsc() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb grep -o '"cached":[0-9a-z_":,]*' | $bb grep -o "\"$1\":[0-9]*" | $bb head -1 | $bb cut -d: -f2; }
+# The resolver's counters, one /api/status per measurement (it carries the
+# CPU history: costly for svc under TCG, which the lab's CPU split check
+# sees): dnsstat fetches them, dnsc NAME reads one. They start at "cached"
+# (other objects have a "forwarded" too).
+dnsstat() { dns_st=$($bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb grep -o '"cached":[0-9a-z_":,]*'); }
+dnsc() { echo "$dns_st" | $bb grep -o "\"$1\":[0-9]*" | $bb head -1 | $bb cut -d: -f2; }
 pfq() { $bb nslookup -type=a prefetch.isp.example 192.168.1.1 2>&1 | $bb grep -q "203.0.113.81"; }
-f0=$(dnsc forwarded); p0=$(dnsc prefetches)
+# stale.isp.example (serve-stale check below) cached now, expired by the
+# end of the 15 s loop.
+$bb nslookup -type=a stale.isp.example 192.168.1.1 >/dev/null 2>&1
+dnsstat; f0=$(dnsc forwarded); p0=$(dnsc prefetches)
 pf_ok=1; n=1
 pfq || pf_ok=0
 t0=$($bb date +%s)
 while [ $(($($bb date +%s) - t0)) -lt 15 ]; do
   $bb sleep 0.5; pfq || pf_ok=0; n=$((n + 1))
 done
-f1=$(dnsc forwarded); p1=$(dnsc prefetches)
+dnsstat; f1=$(dnsc forwarded); p1=$(dnsc prefetches); s0=$(dnsc stale_answers)
 if [ -z "$f0" ] || [ -z "$f1" ] || [ -z "$p0" ] || [ -z "$p1" ]; then
   fail "dns prefetch: no counters in /api/status"
 else
@@ -131,6 +138,35 @@ else
     fail "dns prefetch: $n queries over 15 s (TTL 12 s): $df forwarded (want 1), $dp renewal(s) (want >= 1), all answered: $pf_ok"
   fi
 fi
+
+# Serve-stale (RFC 8767): the ISP's DNS stopped (cgi-bin/dns), then
+# stale.isp.example (cached before the prefetch loop, TTL 12 s, expired
+# since) asked again: the router answers from its stale entry (within
+# 1.8 s) and counts it. An EDNS query (crafted: ID 0x1234, RD, OPT 1232 B) must
+# get the same with Extended DNS Error 3, Stale Answer (RFC 8914: option
+# 00 0f, length 00 02, code 00 03). The ISP's DNS starts again afterwards.
+# Negative control: LAB_ROUTER_ARGS=dns_stale=0 (SERVFAIL once every try
+# has timed out, with EDE 22 instead: both checks fail).
+isp_dns() { $bb wget -q -T 5 -O - "http://$ISP/cgi-bin/dns?$1" 2>/dev/null; }
+stopped=$(isp_dns stop)
+out=$($bb nslookup -type=a stale.isp.example 192.168.1.1 2>&1)
+ede=$($bb printf '\022\064\001\000\000\001\000\000\000\000\000\001\005stale\003isp\007example\000\000\001\000\001\000\000\051\004\320\000\000\000\000\000\000' \
+  | $bb nc -u -w 4 192.168.1.1 53 2>/dev/null | $bb od -An -tx1 | $bb tr -s ' \n' ' ')
+dnsstat; s1=$(dnsc stale_answers)
+started=$(isp_dns start)
+if [ "$stopped" != "stop=OK" ] || [ "$started" != "start=OK" ]; then
+  fail "dns serve-stale: the ISP's DNS did not stop/start ('$stopped', '$started')"
+elif [ -z "$s0" ] || [ -z "$s1" ]; then
+  fail "dns serve-stale: no counters in /api/status"
+elif echo "$out" | $bb grep -q "203.0.113.82" && [ $((s1 - s0)) -ge 1 ]; then
+  pass "dns serve-stale: stale.isp.example answered from the expired entry with the ISP's DNS down ($((s1 - s0)) stale answer(s))"
+else
+  fail "dns serve-stale: $((s1 - s0)) stale answer(s), answer:"; echo "$out" | $bb sed 's/^/    | /'
+fi
+case "$ede" in
+  " 12 34 "*" cb 00 71 52 "*" 00 0f 00 02 00 03"*) pass "dns extended error: the stale answer to an EDNS query carries EDE 3 (Stale Answer)" ;;
+  *) fail "dns extended error: no EDE 3 in the answer to an EDNS query:${ede:- (none)}" ;;
+esac
 
 # DNS over TLS (scripts/lab-test.sh LAB_DOT=1): dot.isp.example is known
 # only to the ISP's DoT server, plain.isp.example only to its plain dnsd.
