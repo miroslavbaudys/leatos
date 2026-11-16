@@ -418,6 +418,20 @@ fn shaping_and_dns_checks() {
 }
 
 #[test]
+fn dns_prefetch_is_on_by_default_and_off_needs_v2() {
+    let c = Config::default();
+    assert!(c.dns.prefetch);
+    assert!(!c.to_toml().contains("prefetch"), "the default is written as nothing");
+    let off = parse("version = 2\n[dns]\nprefetch = false\n").unwrap();
+    assert!(!off.dns.prefetch);
+    assert!(!off.fits_v1());
+    let toml = off.to_toml();
+    assert!(toml.contains("prefetch = false"), "{toml}");
+    assert_eq!(parse(&toml).unwrap(), off);
+    assert!(parse("version = 1\n[dns]\nprefetch = false\n").is_err(), "not in version 1");
+}
+
+#[test]
 fn dns_upstreams_and_tls() {
     // Cloudflare over TLS, as written by hand.
     let c = parse(

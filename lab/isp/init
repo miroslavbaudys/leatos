@@ -83,12 +83,14 @@ fi
 $bx httpd -p 80 -h /www
 # Long single-connection upload sink (ECN/AQM check): replies with the byte count.
 $bx tcpsvd -E 0.0.0.0 5001 $bb wc -c &
-$bx dnsd -c /etc/dnsd.conf -i 203.0.113.1 &
+# TTL 12 s: short enough for the client's DNS prefetch check to see an entry
+# expire (and be renewed) within 15 s.
+$bx dnsd -c /etc/dnsd.conf -i 203.0.113.1 -t 12 &
 if [ -f /etc/dot/server.pem ]; then
   { $bb grep -v '^plain\.' /etc/dnsd.conf | $bb awk '{ print $2, $1 }'; echo "203.0.113.53 dot.isp.example"; } >/tmp/dot-hosts
   $bb touch /tmp/dot.log
   /usr/sbin/dnsmasq --conf-file=/dev/null --no-resolv --no-hosts --addn-hosts=/tmp/dot-hosts \
-    --listen-address=127.0.0.1 --bind-interfaces --port=5300 --user=root \
+    --listen-address=127.0.0.1 --bind-interfaces --port=5300 --user=root --local-ttl=12 \
     --log-queries --log-facility=/tmp/dot.log \
     || { echo "LAB FAIL: isp: dnsmasq did not start"; $bb poweroff -f; }
   $bb printf 'foreground = no\npid = /tmp/stunnel.pid\noutput = /tmp/dot.log\n[dot]\naccept = 203.0.113.1:853\nconnect = 127.0.0.1:5300\ncert = /etc/dot/server.pem\nkey = /etc/dot/server.key\n' >/tmp/stunnel.conf

@@ -431,6 +431,10 @@ pub struct Dns {
     pub cache_entries: u32,
     /// Drop upstream answers that point into private ranges.
     pub rebind_protection: bool,
+    /// Renew popular cache entries shortly before they expire (a hit in
+    /// the last tenth of the TTL sends the query again in the background).
+    #[serde(skip_serializing_if = "is_true")]
+    pub prefetch: bool,
     /// Local DNS zone of all networks: DHCP clients become
     /// `<hostname>.<domain>` (version 1: `lan.domain`).
     pub domain: String,
@@ -461,6 +465,7 @@ impl Default for Dns {
         Dns {
             cache_entries: 4096,
             rebind_protection: true,
+            prefetch: true,
             domain: "lan".into(),
             hosts: Vec::new(),
             upstreams: Vec::new(),
@@ -948,6 +953,9 @@ impl Config {
         }
         if !self.dns.upstreams.is_empty() {
             add("dns.upstreams".into(), "DNS servers of its own");
+        }
+        if !self.dns.prefetch {
+            add("dns.prefetch".into(), "DNS prefetch switched off");
         }
         if self.dns.tls {
             add("dns.tls".into(), "DNS over TLS");

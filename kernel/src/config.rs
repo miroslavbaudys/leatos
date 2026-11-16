@@ -247,6 +247,7 @@ pub fn overrides() -> Vec<(String, &'static str)> {
         ("ntp", "time.ntp_servers"),
         ("dns", "dns.upstreams"),
         ("dns_tls", "dns.tls"),
+        ("dns_prefetch", "dns.prefetch"),
     ];
     let args = bootargs();
     let mut v = Vec::new();
@@ -373,6 +374,9 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
     }
     if let Some(v) = arg_u64(args, "dns_tls") {
         c.dns.tls = v != 0;
+    }
+    if let Some(v) = arg_u64(args, "dns_prefetch") {
+        c.dns.prefetch = v != 0;
     }
     // Strict fails closed: servers without a certificate name cannot be
     // used over TLS and are left out, never asked in plain text; with none
@@ -681,6 +685,7 @@ pub fn pppoe() -> Option<proto_pppoe::Config> {
 pub struct Dns {
     pub cache_entries: usize,
     pub rebind_protection: bool,
+    pub prefetch: bool,
     /// Servers of its own (`dns.upstreams`); empty = the WAN lease's.
     pub upstreams: Vec<schema::Upstream>,
     /// Strict DNS over TLS to `upstreams` (`dns.tls`).
@@ -695,6 +700,7 @@ pub fn dns() -> Dns {
     Dns {
         cache_entries: d.cache_entries as usize,
         rebind_protection: d.rebind_protection,
+        prefetch: d.prefetch,
         upstreams: d.upstream_list(),
         tls: d.tls,
         tls_ca: d.tls_ca.clone(),

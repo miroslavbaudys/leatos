@@ -461,6 +461,11 @@ fn status(ctx: &Ctx, wan: &str) {
             if ups.is_empty() { String::from("no upstreams") } else { ups.join(", ") },
             svc.upstream_source()
         );
+        let (st, cached) = svc.dns_stats();
+        println!(
+            "dns      : {} queries: {} local, {} cache hits, {} forwarded, {} merged, {} timeouts; {} cached; prefetch {} sent, {} failed",
+            st.queries, st.local_answers, st.cache_hits, st.forwarded, st.merged, st.timeouts, cached, st.prefetches, st.prefetch_failed
+        );
         for l in svc.dot_status_lines() {
             println!("dns-tls  : {l}");
         }

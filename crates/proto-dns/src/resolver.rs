@@ -9,6 +9,15 @@
 //! responses are accepted only from the server that was asked and only if
 //! the question matches. Identical in-flight questions are merged (one
 //! upstream query, many waiters). Pending queries are bounded.
+
+//!
+//! Prefetch ([`Config::prefetch`]): a cache hit close to expiry
+//! ([`crate::cache`]) is answered from the cache and the entry renewed by
+//! an upstream query without waiters, at most one per question and on at
+//! most a quarter of [`Config::max_pending`], so client queries always find
+//! room. A client asking once the entry has expired joins the renewal.
+//! A failed renewal changes nothing: the old entry expires as it would
+//! have.
 //!
 //! Known gap: one fixed upstream source port (chosen by the caller), so
 //! spoofing resistance relies on the 16-bit ID only. Per-query source ports
@@ -48,6 +57,8 @@ pub struct Config {
     pub max_tries: u8,
     /// Bound on concurrently pending upstream queries.
     pub max_pending: usize,
+    /// Renew popular cache entries shortly before they expire.
+    pub prefetch: bool,
 }
 
 impl Default for Config {
@@ -58,6 +69,7 @@ impl Default for Config {
             timeout_ms: 1500,
             max_tries: 3,
             max_pending: 256,
+            prefetch: true,
         }
     }
 }
@@ -73,6 +85,10 @@ pub struct Stats {
     pub servfails: u64,
     pub rebind_blocked: u64,
     pub ignored_responses: u64,
+    /// Renewals sent ([`Config::prefetch`]); not counted in `forwarded`.
+    pub prefetches: u64,
+    /// Renewals that timed out or got an answer that is not cached.
+    pub prefetch_failed: u64,
 }
 
 struct Pending {
@@ -84,6 +100,8 @@ struct Pending {
     sent_ms: u64,
     tries: u8,
     upstream: usize,
+    /// A renewal of a cache entry (clients may have joined since).
+    prefetch: bool,
 }
 
 pub struct Resolver {
@@ -209,15 +227,20 @@ impl Resolver {
         }
 
         // 2. Cache.
+        let key = q;
         let limit = wire::udp_limit(query, MAX_UDP_REPLY);
-        if let Some(data) = self.cache.get(now_ms, &q, h.id) {
+        if let Some(hit) = self.cache.get(now_ms, &key, h.id) {
             self.stats.cache_hits += 1;
-            let data = wire::fit(&data, limit);
-            return alloc::vec![Action::Reply { to: client, data }];
+            let data = wire::fit(&hit.data, limit);
+            let mut out = alloc::vec![Action::Reply { to: client, data }];
+            if let Some(query) = hit.refresh {
+                out.extend(self.prefetch(now_ms, key, query));
+            }
+            return out;
         }
 
         // 3. Upstream (merge identical in-flight questions).
-        if let Some(id) = self.by_question.get(&q)
+        if let Some(id) = self.by_question.get(&key)
             && let Some(p) = self.pending.get_mut(id)
         {
             p.waiters.push((client, h.id, limit));
@@ -231,20 +254,54 @@ impl Resolver {
         let mut up = query.to_vec();
         wire::set_id(&mut up, id);
         let server = self.upstreams[0];
-        self.by_question.insert(q.clone(), id);
+        self.by_question.insert(key.clone(), id);
         self.pending.insert(
             id,
             Pending {
-                question: q,
+                question: key,
                 query: up.clone(),
                 waiters: alloc::vec![(client, h.id, limit)],
                 sent_ms: now_ms,
                 tries: 1,
                 upstream: 0,
+                prefetch: false,
             },
         );
         self.stats.forwarded += 1;
         alloc::vec![Action::Upstream { server, data: up }]
+    }
+
+    /// Renew the cache entry for `q` with its upstream `query`, unless
+    /// switched off, already under way, or the pending queries are a
+    /// quarter full.
+    fn prefetch(&mut self, now_ms: u64, key: Question, mut query: Vec<u8>) -> Option<Action> {
+        let busy = self.pending.values().filter(|p| p.prefetch).count();
+        if !self.cfg.prefetch
+            || self.upstreams.is_empty()
+            || self.by_question.contains_key(&key)
+            || busy >= (self.cfg.max_pending / 4).max(1)
+            || self.pending.len() >= self.cfg.max_pending
+        {
+            return None;
+        }
+        let id = self.next_id();
+        wire::set_id(&mut query, id);
+        let server = self.upstreams[0];
+        self.by_question.insert(key.clone(), id);
+        self.pending.insert(
+            id,
+            Pending {
+                question: key,
+                query: query.clone(),
+                waiters: Vec::new(),
+                sent_ms: now_ms,
+                tries: 1,
+                upstream: 0,
+                prefetch: true,
+            },
+        );
+        self.stats.prefetches += 1;
+        Some(Action::Upstream { server, data: query })
     }
 
     /// A response datagram from upstream server `from` (source port 53).
@@ -266,6 +323,9 @@ impl Resolver {
         let p = self.pending.remove(&h.id).expect("checked above");
         self.by_question.remove(&p.question);
 
+        if p.prefetch && !matches!(h.rcode(), wire::RCODE_NOERROR | wire::RCODE_NXDOMAIN) {
+            self.stats.prefetch_failed += 1;
+        }
         let mut data = response.to_vec();
         let in_local_domain = self.zone.is_local_name(&p.question.name);
         if self.cfg.rebind_protection && !in_local_domain {
@@ -277,10 +337,10 @@ impl Resolver {
                 self.stats.rebind_blocked += 1;
                 data = wire::error_response(&p.query, wire::RCODE_REFUSED).unwrap_or_default();
             } else {
-                self.cache.insert(now_ms, p.question.clone(), response);
+                self.cache.insert(now_ms, p.question.clone(), response, &p.query);
             }
         } else {
-            self.cache.insert(now_ms, p.question.clone(), response);
+            self.cache.insert(now_ms, p.question.clone(), response, &p.query);
         }
 
         p.waiters
@@ -304,7 +364,10 @@ impl Resolver {
             .collect();
         let mut out = Vec::new();
         for id in due {
-            self.stats.timeouts += 1;
+            // A renewal nobody waits for is not a client's timeout.
+            if self.pending.get(&id).is_some_and(|p| !p.prefetch || !p.waiters.is_empty()) {
+                self.stats.timeouts += 1;
+            }
             let retry = self
                 .pending
                 .get(&id)
@@ -322,6 +385,9 @@ impl Resolver {
                 });
             } else if let Some(p) = self.pending.remove(&id) {
                 self.by_question.remove(&p.question);
+                if p.prefetch {
+                    self.stats.prefetch_failed += 1;
+                }
                 for (to, orig, _) in p.waiters {
                     let mut q = p.query.clone();
                     wire::set_id(&mut q, orig);
@@ -590,5 +656,153 @@ mod tests {
             rcode(reply(&r.handle_query(0, client(1), &bad)).1),
             wire::RCODE_FORMERR
         );
+    }
+
+    /// Query `name` at t = 0 and answer it with TTL `ttl`.
+    fn fill(r: &mut Resolver, q: &[u8], ttl: u32) {
+        let (_, up) = upstream(&r.handle_query(0, client(1), q));
+        let a = r.handle_upstream(0, UP1, &answer(&up, Ipv4Addr::new(1, 2, 3, 4), ttl));
+        reply(&a);
+    }
+
+    fn with_edns(name: &str) -> Vec<u8> {
+        let mut q = build_query(0x4242, name, TYPE_A);
+        q[11] = 1; // ARCOUNT
+        q.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]); // OPT, 1232
+        q
+    }
+
+    #[test]
+    fn prefetch_renews_popular_entries_before_expiry() {
+        let mut r = resolver();
+        let q = with_edns("cdn.example");
+        fill(&mut r, &q, 100);
+        // Early in the TTL: from the cache only.
+        reply(&r.handle_query(50_000, client(2), &q));
+        // Last 10 %: answered from the cache and renewed, with the query
+        // that filled the entry (EDNS kept), under a new ID.
+        let a = r.handle_query(95_000, client(2), &q);
+        let [Action::Reply { to, .. }, Action::Upstream { server, data: up }] = &a[..] else {
+            panic!("expected reply + renewal, got {a:?}");
+        };
+        assert_eq!((*to, *server), (client(2), UP1));
+        assert_eq!(up[12..], q[12..], "same question and EDNS");
+        assert_eq!(wire::udp_limit(up, 1472), 1232);
+        // One renewal per question.
+        reply(&r.handle_query(96_000, client(3), &q));
+        assert_eq!((r.stats.prefetches, r.stats.forwarded, r.stats.cache_hits), (1, 1, 3));
+        // The answer goes to nobody and renews the entry.
+        let up = up.clone();
+        assert!(r.handle_upstream(96_500, UP1, &answer(&up, Ipv4Addr::new(1, 2, 3, 5), 100)).is_empty());
+        let a = r.handle_query(150_000, client(4), &q);
+        let (_, d) = reply(&a);
+        let recs = wire::records(d).unwrap();
+        assert_eq!(recs[0].ttl, 47, "aged from the renewal at 96.5 s");
+        assert_eq!(wire::answer_ipv4s(d, &recs), vec![Ipv4Addr::new(1, 2, 3, 5)]);
+        assert_eq!((r.stats.forwarded, r.stats.prefetch_failed), (1, 0));
+    }
+
+    #[test]
+    fn clients_join_a_renewal_once_the_entry_expired() {
+        let mut r = resolver();
+        let q = build_query(7, "short.example", TYPE_A);
+        fill(&mut r, &q, 100);
+        let a = r.handle_query(95_000, client(2), &q);
+        let up = match &a[..] {
+            [Action::Reply { .. }, Action::Upstream { data, .. }] => data.clone(),
+            other => panic!("expected reply + renewal, got {other:?}"),
+        };
+        // Expired before the renewal returned: the client waits for it.
+        assert!(r.handle_query(100_500, client(3), &q).is_empty());
+        assert_eq!(r.stats.merged, 1);
+        let a = r.handle_upstream(100_600, UP1, &answer(&up, Ipv4Addr::new(1, 2, 3, 4), 100));
+        let (to, d) = reply(&a);
+        assert_eq!((*to, wire::Header::parse(d).unwrap().id), (client(3), 7));
+    }
+
+    #[test]
+    fn a_failed_renewal_changes_nothing() {
+        let mut r = resolver();
+        let q = build_query(7, "down.example", TYPE_A);
+        fill(&mut r, &q, 100);
+        let a = r.handle_query(95_000, client(2), &q);
+        assert_eq!(a.len(), 2);
+        // Every try times out: retried like a client query, then dropped
+        // without replies and without counting as a client timeout.
+        let mut t = 95_000;
+        for server in [UP2, UP1] {
+            t += 1500;
+            assert_eq!(upstream(&r.poll(t)).0, server);
+        }
+        t += 1500;
+        assert!(r.poll(t).is_empty());
+        assert_eq!((r.stats.timeouts, r.stats.prefetch_failed), (0, 1));
+        // The old entry still answers until it expires (and the next hit
+        // tries a renewal again); once expired, a client query waits for
+        // that renewal.
+        let a = r.handle_query(99_900, client(2), &q);
+        assert!(matches!(&a[..], [Action::Reply { .. }, Action::Upstream { .. }]));
+        assert_eq!(r.stats.prefetches, 2);
+        assert!(r.handle_query(100_000, client(2), &q).is_empty());
+        assert_eq!(r.stats.merged, 1);
+        // SERVFAIL from upstream: counted, not cached.
+        let mut r = resolver();
+        fill(&mut r, &q, 100);
+        let a = r.handle_query(95_000, client(2), &q);
+        let [_, Action::Upstream { data: up, .. }] = &a[..] else { panic!() };
+        let (_, _, end) = wire::parse_query(up).unwrap();
+        let fail = wire::build_response(up, end, RCODE_SERVFAIL, &[], false);
+        assert!(r.handle_upstream(95_100, UP1, &fail).is_empty());
+        assert_eq!(r.stats.prefetch_failed, 1);
+        let a = r.handle_query(99_000, client(2), &q);
+        let Action::Reply { data, .. } = &a[0] else { panic!("{a:?}") };
+        assert_eq!(rcode(data), RCODE_NOERROR, "still the cached answer");
+    }
+
+    #[test]
+    fn prefetch_skips_short_ttls_and_can_be_switched_off() {
+        let mut r = resolver();
+        let q = build_query(7, "tiny.example", TYPE_A);
+        fill(&mut r, &q, 9);
+        reply(&r.handle_query(8_500, client(2), &q));
+        let mut r = Resolver::new(
+            Config {
+                prefetch: false,
+                ..Config::default()
+            },
+            Zone::new("lan", Ipv4Addr::new(192, 168, 1, 1), (Ipv4Addr::new(192, 168, 1, 0), 24)),
+            1,
+        );
+        r.set_upstreams(&[UP1]);
+        fill(&mut r, &q, 100);
+        reply(&r.handle_query(95_000, client(2), &q));
+        assert_eq!(r.stats.prefetches, 0);
+    }
+
+    #[test]
+    fn renewals_take_at_most_a_quarter_of_the_pending_slots() {
+        let mut r = Resolver::new(
+            Config {
+                max_pending: 8,
+                ..Config::default()
+            },
+            Zone::new("lan", Ipv4Addr::new(192, 168, 1, 1), (Ipv4Addr::new(192, 168, 1, 0), 24)),
+            1,
+        );
+        r.set_upstreams(&[UP1]);
+        let names = ["a.example", "b.example", "c.example"];
+        for n in names {
+            fill(&mut r, &build_query(1, n, TYPE_A), 100);
+        }
+        let sent: usize = names
+            .iter()
+            .map(|n| r.handle_query(95_000, client(2), &build_query(2, n, TYPE_A)).len() - 1)
+            .sum();
+        assert_eq!((sent, r.stats.prefetches), (2, 2));
+        // Client queries still get the remaining slots.
+        for i in 0..6 {
+            let q = build_query(3, &alloc::format!("n{i}.example"), TYPE_A);
+            upstream(&r.handle_query(95_000, client(2), &q));
+        }
     }
 }

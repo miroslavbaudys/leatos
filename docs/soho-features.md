@@ -95,7 +95,17 @@ timeout, rebind protection, bounded pending queries.
 Own upstreams (`dns.upstreams`) and strict DNS over TLS (`dns.tls`,
 `crates/proto-dot`, docs/dns-over-tls.md) are implemented; answers to LAN
 clients are cut to their EDNS size with TC.
-**Open:** TCP port 53 from clients, randomised upstream source port
+**Prefetch** (`dns.prefetch`, default on; boot argument `dns_prefetch=0`):
+a cache hit in the last tenth of an entry's TTL (TTLs of 10 s and more) is
+answered from the cache and renews the entry in the background with the
+query that filled it (EDNS kept), at most one renewal per question and on
+a quarter of the pending slots; a client asking once the entry has expired
+joins the renewal; a failed renewal leaves the entry to expire as before.
+Counters (`queries`, `cache_hits`, `forwarded`, `prefetches`,
+`prefetch_failed`, …) in `/api/status` `dns` and the CLI `status`; lab
+check in `scripts/lab-test.sh` (negative control
+`LAB_ROUTER_ARGS=dns_prefetch=0`).
+**Open:** serve-stale (RFC 8767), TCP port 53 from clients, randomised upstream source port
 per query (Kaminsky hardening; one fixed random port today), DoH,
 blocklists, DNSSEC.
 

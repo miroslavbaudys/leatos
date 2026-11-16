@@ -1294,12 +1294,24 @@ fn status_json(
     // DNS upstreams: where from, and the DNS-over-TLS connections.
     if let Some(svc) = services {
         let ups: Vec<String> = svc.upstreams().iter().map(|a| json_str(&format!("{a}"))).collect();
+        let (st, cached) = svc.dns_stats();
         let _ = write!(
             s,
-            ",\"dns\":{{\"source\":{},\"upstreams\":[{}],\"tls\":{}}}",
+            ",\"dns\":{{\"source\":{},\"upstreams\":[{}],\"tls\":{},\"cached\":{},\"queries\":{},\"local\":{},\"cache_hits\":{},\"forwarded\":{},\"merged\":{},\"timeouts\":{},\"servfails\":{},\"rebind_blocked\":{},\"prefetches\":{},\"prefetch_failed\":{}}}",
             json_str(svc.upstream_source()),
             ups.join(","),
-            svc.dot_status_json().unwrap_or_else(|| "null".into())
+            svc.dot_status_json().unwrap_or_else(|| "null".into()),
+            cached,
+            st.queries,
+            st.local_answers,
+            st.cache_hits,
+            st.forwarded,
+            st.merged,
+            st.timeouts,
+            st.servfails,
+            st.rebind_blocked,
+            st.prefetches,
+            st.prefetch_failed
         );
     }
     // Wall clock (SNTP) and watchdog.

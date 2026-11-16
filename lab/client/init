@@ -104,6 +104,34 @@ lookup ghost.lan      "NXDOMAIN\|can't find\|server can't" "unknown local name -
 # Upstream: the router forwards to the ISP's DNS server (from the WAN lease).
 lookup isp.example    "203.0.113.80"   "upstream isp.example -> 203.0.113.80 (via ISP dnsd)"
 
+# Prefetch: prefetch.isp.example (TTL 12 s at the ISP) asked every 0.5 s
+# for 15 s. The router answers all but the first from its cache and renews
+# the entry in the last tenth of its TTL, so only one query is forwarded
+# and at least one renewal is sent (router counters in /api/status).
+# Negative control: LAB_ROUTER_ARGS=dns_prefetch=0 (the entry expires: a
+# second forwarded query, no renewal).
+# The resolver's counters start at "cached" (other objects have a "forwarded" too).
+dnsc() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb grep -o '"cached":[0-9a-z_":,]*' | $bb grep -o "\"$1\":[0-9]*" | $bb head -1 | $bb cut -d: -f2; }
+pfq() { $bb nslookup -type=a prefetch.isp.example 192.168.1.1 2>&1 | $bb grep -q "203.0.113.81"; }
+f0=$(dnsc forwarded); p0=$(dnsc prefetches)
+pf_ok=1; n=1
+pfq || pf_ok=0
+t0=$($bb date +%s)
+while [ $(($($bb date +%s) - t0)) -lt 15 ]; do
+  $bb sleep 0.5; pfq || pf_ok=0; n=$((n + 1))
+done
+f1=$(dnsc forwarded); p1=$(dnsc prefetches)
+if [ -z "$f0" ] || [ -z "$f1" ] || [ -z "$p0" ] || [ -z "$p1" ]; then
+  fail "dns prefetch: no counters in /api/status"
+else
+  df=$((f1 - f0)); dp=$((p1 - p0))
+  if [ "$pf_ok" = 1 ] && [ "$df" -eq 1 ] && [ "$dp" -ge 1 ]; then
+    pass "dns prefetch: $n queries over 15 s (TTL 12 s): $df forwarded, $dp renewal(s)"
+  else
+    fail "dns prefetch: $n queries over 15 s (TTL 12 s): $df forwarded (want 1), $dp renewal(s) (want >= 1), all answered: $pf_ok"
+  fi
+fi
+
 # DNS over TLS (scripts/lab-test.sh LAB_DOT=1): dot.isp.example is known
 # only to the ISP's DoT server, plain.isp.example only to its plain dnsd.
 # Strict: the first must resolve, the second never (no plain DNS, also

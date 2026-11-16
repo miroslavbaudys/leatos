@@ -285,6 +285,7 @@
       <form class="card cfg" autocomplete="off"><h3>Forwarder</h3>
         <label>Cache entries<input data-path="dns.cache_entries" type="number" min="16" max="65536"></label>
         <label class="check"><input data-path="dns.rebind_protection" type="checkbox">Rebind protection (drop answers pointing into private ranges)</label>
+        <label class="check"><input data-path="dns.prefetch" type="checkbox">Prefetch (renew popular names shortly before they expire)</label>
       </form>
       <form class="card cfg" autocomplete="off"><h3>Upstream servers</h3>
         <label>Servers (comma-separated; empty = the WAN's)<input id="dnsups" data-x data-path="dns.upstreams" placeholder="1.1.1.1#cloudflare-dns.com, 1.0.0.1#cloudflare-dns.com"></label>

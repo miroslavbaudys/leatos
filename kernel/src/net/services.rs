@@ -94,6 +94,7 @@ fn resolver_config(d: &config::Dns) -> resolver::Config {
     resolver::Config {
         cache_entries: d.cache_entries,
         rebind_protection: d.rebind_protection,
+        prefetch: d.prefetch,
         // Over TLS the first query after a while also waits for TCP and
         // the TLS handshake (two more round trips).
         timeout_ms: if d.tls { 3000 } else { 1500 },
@@ -258,6 +259,11 @@ impl LanServices {
     /// The upstreams the resolver asks.
     pub fn upstreams(&self) -> &[Ipv4Addr] {
         self.dns.upstreams()
+    }
+
+    /// Resolver counters and the number of cached answers.
+    pub fn dns_stats(&self) -> (resolver::Stats, usize) {
+        (self.dns.stats, self.dns.cache_len())
     }
 
     /// DNS-over-TLS connections (`/api/status` `dns.tls`), if on.

@@ -6,7 +6,7 @@
 #   runs all checks                  DHCP srv, DNS, NAT, firewall       udhcpd, httpd, dnsd
 #
 # The client (lab/client/init) checks LAN services (DHCP, DNS zone,
-# upstream DNS via the ISP) and forwarding (TCP/ICMP through NAT, NATed
+# upstream DNS via the ISP, cache prefetch) and forwarding (TCP/ICMP through NAT, NATed
 # source, traceroute = TTL + ICMP-error NAT, 20 connections, firewall probe
 # from the ISP side), printing "LAB PASS/FAIL" lines.
 # Exit code 0 = all checks passed.
@@ -14,7 +14,7 @@
 #   LAB_VERBOSE=1        print all three consoles
 #   LAB_PCAP_DIR=dir     capture router WAN/LAN traffic to pcap
 #   LAB_KEEP_LOGS=1      keep console logs (path printed)
-#   LAB_TIMEOUT=120      seconds before giving up
+#   LAB_TIMEOUT=150      seconds before giving up
 #   QEMU_ACCEL=tcg       run without hardware acceleration
 #   RROUTER_ARCH=x86_64  run the x86_64 router kernel (QEMU q35, TCG); the
 #                        client and ISP VMs stay aarch64
@@ -25,7 +25,9 @@
 #                        set it with LAB_SHAPE_KBIT=0 as a negative control
 #   LAB_ROUTER_ARGS="…"  extra router boot arguments, e.g. qdisc=codel (single
 #                        CoDel queue: the negative control for the flow-
-#                        isolation latency check)
+#                        isolation latency check), or dns_prefetch=0 (the
+#                        negative control for the DNS prefetch check: a
+#                        second forwarded query, no renewal)
 #   LAB_EXPECT_ECN=U:D   ECN the check expects per direction (1 = marks, 0 =
 #                        drops; default: derived from the router arguments,
 #                        i.e. 0:1). Set it against the router's real setting
@@ -134,7 +136,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TIMEOUT="${LAB_TIMEOUT:-120}"
+TIMEOUT="${LAB_TIMEOUT:-150}"
 SHAPE_KBIT="${LAB_SHAPE_KBIT:-10000}"
 EXPECT_KBIT="${LAB_EXPECT_KBIT:-$SHAPE_KBIT}"
 ROUTER_ARGS=""

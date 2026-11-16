@@ -96,6 +96,7 @@ hairpin = true              # also from inside, via the WAN address
 [dns]
 cache_entries = 4096
 rebind_protection = true
+prefetch = true             # default; false needs version 2
 [[dns.host]]                # local records beside DHCP names
 name = "router"
 ip = "10.10.0.1"

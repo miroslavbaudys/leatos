@@ -4,6 +4,14 @@
 //! field; on a hit the TTLs are rewritten with the remaining lifetime, so
 //! clients never see stale TTLs. Eviction removes the soonest-expiring
 //! entry when full (O(log n)).
+//!
+//! Prefetch: each entry keeps the upstream query that filled it. A hit in
+//! the last [`PREFETCH_DIVISOR`]th of the entry's lifetime is marked
+//! [`Hit::refresh`], and the resolver sends that query again, so popular
+//! names are renewed before they expire. Resending the same query (EDNS
+//! included) means the answer fits as the cached one did: a truncated
+//! answer is never cached, so the query that filled an entry got a whole
+//! one.
 
 use crate::wire::{self, Question};
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -13,12 +21,29 @@ use alloc::vec::Vec;
 pub const MAX_TTL: u32 = 86_400;
 /// Negative answers (NXDOMAIN / NODATA) without SOA are cached this long.
 pub const DEFAULT_NEGATIVE_TTL: u32 = 60;
+/// A hit with less than 1/`PREFETCH_DIVISOR` of the TTL left asks for a
+/// refresh.
+pub const PREFETCH_DIVISOR: u64 = 10;
+/// Entries with a shorter TTL (seconds) are never refreshed early.
+pub const PREFETCH_MIN_TTL: u32 = 10;
 
 struct Entry {
     response: Vec<u8>,
+    /// The upstream query that got `response` (for prefetch).
+    query: Vec<u8>,
     ttl_offsets: Vec<usize>,
     stored_ms: u64,
     expires_ms: u64,
+}
+
+/// A cache hit.
+#[derive(Debug)]
+pub struct Hit {
+    /// The response with the client's ID and aged TTLs.
+    pub data: Vec<u8>,
+    /// Close to expiry: the upstream query to renew the entry with (the
+    /// ID still the old one's).
+    pub refresh: Option<Vec<u8>>,
 }
 
 pub struct Cache {
@@ -66,8 +91,9 @@ impl Cache {
         }
     }
 
-    /// Store an upstream response (already validated for `q`).
-    pub fn insert(&mut self, now_ms: u64, q: Question, response: &[u8]) {
+    /// Store an upstream response (already validated for `q`) and the
+    /// upstream `query` it answered.
+    pub fn insert(&mut self, now_ms: u64, q: Question, response: &[u8], query: &[u8]) {
         let Ok(recs) = wire::records(response) else {
             return;
         };
@@ -113,6 +139,7 @@ impl Cache {
             q,
             Entry {
                 response: response.to_vec(),
+                query: query.to_vec(),
                 ttl_offsets,
                 stored_ms: now_ms,
                 expires_ms,
@@ -121,7 +148,7 @@ impl Cache {
     }
 
     /// A cached response for `q` with `id` and aged TTLs, if still valid.
-    pub fn get(&mut self, now_ms: u64, q: &Question, id: u16) -> Option<Vec<u8>> {
+    pub fn get(&mut self, now_ms: u64, q: &Question, id: u16) -> Option<Hit> {
         let Some(e) = self.entries.get(q) else {
             self.misses += 1;
             return None;
@@ -139,6 +166,10 @@ impl Cache {
         }
         wire::set_id(&mut out, id);
         self.hits += 1;
-        Some(out)
+        let lifetime = e.expires_ms - e.stored_ms;
+        let left = e.expires_ms - now_ms;
+        let refresh = (lifetime >= PREFETCH_MIN_TTL as u64 * 1000 && left * PREFETCH_DIVISOR < lifetime)
+            .then(|| e.query.clone());
+        Some(Hit { data: out, refresh })
     }
 }
