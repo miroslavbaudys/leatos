@@ -1103,6 +1103,20 @@ fn status_json(
         });
         cpu.push(']');
     }
+    // Cumulative CPU time per task, as in the log's "cpu" line
+    // (scripts/lab-test.sh compares it before/after the load phase).
+    cpu.push_str("],\"tasks\":[");
+    let mut first = true;
+    crate::executor::task_ticks(|name, core, ticks| {
+        let _ = write!(
+            cpu,
+            "{}{{\"name\":{},\"core\":{core},\"ms\":{}}}",
+            if first { "" } else { "," },
+            json_str(name),
+            timer::ticks_to_duration(ticks).as_millis()
+        );
+        first = false;
+    });
     cpu.push_str("]}");
     let _ = write!(
         s,

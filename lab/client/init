@@ -290,6 +290,11 @@ if [ -n "$want" ] && [ "$want" != 0 ]; then
   # router's per-direction ECN setting decides between marks and drops
   # (scripts/lab-test.sh checks the router's counters).
   echo 1 >/proc/sys/net/ipv4/tcp_ecn || echo "LAB WARN: cannot enable tcp_ecn"
+  # The router's CPU time per task before and after the load phase
+  # (/api/status cpu.tasks): scripts/lab-test.sh checks the split on the
+  # difference, so the rest of the run (svc's idle work) does not count.
+  task_ms() { echo "$1" | $bb grep -o "\"name\":\"$2\",\"core\":[0-9]*,\"ms\":[0-9]*" | $bb sed 's/.*"ms"://'; }
+  cpu0=$($bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null)
   # Download 5 MB while pinging the router (latency under load).
   $bb ping -c 25 -i 0.2 192.168.1.1 >/tmp/ping-load 2>&1 &
   t0=$(now_ms)
@@ -322,6 +327,13 @@ if [ -n "$want" ] && [ "$want" != 0 ]; then
   # marks/drops for it are checked by scripts/lab-test.sh.
   got=$($bb head -c 3000000 /dev/zero | $bb nc -w 5 "$ISP" 5001 2>&1 | $bb tr -d ' ')
   echo "LAB INFO: long upload: ISP sink reports '${got}' bytes"
+  cpu1=$($bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null)
+  load=""
+  for t in dp_down dp_up svc; do
+    a=$(task_ms "$cpu0" $t); b=$(task_ms "$cpu1" $t)
+    [ -n "$a" ] && [ -n "$b" ] && load="$load $t=$((b - a))"
+  done
+  echo "LAB CPU load:$load"
   # Ping replies leave through the LAN egress shaper behind the download. With
   # flow isolation (CAKE, FQ-CoDel) they skip the download's queue: avg ~1 ms. One
   # CoDel queue (router arg qdisc=codel, the negative control) gives ~8 ms.

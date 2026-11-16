@@ -470,18 +470,31 @@ fi
 # CPU time per task (M11). Forwarding runs in the datapath tasks: dp_down
 # (WAN RX -> LAN TX) and dp_up (LAN RX -> WAN TX); DHCP/DNS/web in svc.
 # 1. split: svc did work, and each direction's task (loaded by the client's
-#    download resp. upload phase) more of it. Negative control: a kernel
-#    with one task doing everything (bdcf72e) has no svc/dp_* tasks.
+#    download resp. upload phase) more of it, counted over that load phase
+#    (the client's "LAB CPU load:" line, from /api/status before and after):
+#    over the whole run svc's idle work (~3 ms/s, ~35 ms/s under TCG) would
+#    decide it. Without a load phase (the client expects no shaping) the
+#    split is not checked, only that the counters exist.
+#    Negative control: a kernel with one task doing everything (bdcf72e)
+#    has no svc/dp_* tasks.
 # 2. placement: with QEMU_SMP >= 3 dp_up runs on core 1, else on core 0
 #    (LAB_EXPECT_UP_CORE overrides). Negative control: QEMU_SMP=4 with
 #    LAB_ROUTER_ARGS=cores=2 keeps dp_up on core 0 and fails.
 line=$(tr -d '\r' <"$WORK/router.log" | grep "  cpu  " | tail -1 || true)
 task_ms() { echo "$line" | sed -n "s/.*, $1@[0-9]* \([0-9]*\) ms.*/\1/p"; }
 task_core() { echo "$line" | sed -n "s/.*, $1@\([0-9]*\) .*/\1/p"; }
-down_ms=$(task_ms dp_down); up_ms=$(task_ms dp_up); svc_ms=$(task_ms svc)
-what="dp_down ${down_ms:-?} ms, dp_up ${up_ms:-?} ms, svc ${svc_ms:-?} ms"
+load=$(tr -d '\r' <"$WORK/client.log" | grep "^LAB CPU load:" | tail -1 || true)
+load_ms() { echo "$load" | sed -n "s/.* $1=\([0-9]*\).*/\1/p"; }
+if [[ -n "$(load_ms svc)" ]]; then
+  down_ms=$(load_ms dp_down); up_ms=$(load_ms dp_up); svc_ms=$(load_ms svc); span="load phase"
+else
+  down_ms=$(task_ms dp_down); up_ms=$(task_ms dp_up); svc_ms=$(task_ms svc); span="whole run"
+fi
+what="$span: dp_down ${down_ms:-?} ms, dp_up ${up_ms:-?} ms, svc ${svc_ms:-?} ms"
 if [[ -z "$down_ms" || -z "$up_ms" || -z "$svc_ms" ]]; then
   echo "  LAB FAIL: cpu split: $what (no per-task counters)"; router_fails=$((router_fails + 1))
+elif [[ -z "$load" ]]; then
+  echo "  LAB INFO: cpu split: not checked without a load phase ($what)"
 elif [[ "$svc_ms" -gt 0 && "$down_ms" -gt "$svc_ms" && "$up_ms" -gt "$svc_ms" ]]; then
   echo "  LAB PASS: cpu split: $what"
 else
