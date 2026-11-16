@@ -201,6 +201,14 @@ ports:
 - **Fixed router ports:** a forward may not use a port the router itself
   listens on from the WAN (`:80` with `mgmt.on_wan`). Validation rejects
   it.
+- **Forged sources:** packets from the WAN whose source is loopback or
+  inside one of the networks are dropped before anything else looks at
+  them (drop reason `spoofed`, RFC 2827 / RFC 3704 ingress filtering).
+  Without it, a forward would take a SYN "from" an internal host and its
+  target would answer that host directly on its own network. Addresses in
+  the WAN's own subnet stay allowed (an ISP's private gateway, such as
+  10.x over PPPoE, is not affected). Boot argument `wan_antispoof=0` turns
+  it off (the lab's negative control).
 
 ### `[[firewall.redirect]]`
 Redirects (DNAT inside, the UniFi/OpenWrt "NTP/DNS redirect"): new

@@ -279,6 +279,25 @@ if [ -n "$fw" ]; then
   else
     fail "hairpin: http://$wanip:8080/ from inside ('$body')"
   fi
+  # Anti-spoofing: the ISP connects to the forward from the forged source
+  # 192.168.1.77 (our own network; ISP cgi-bin/spoof). The router must drop
+  # it as "spoofed", and the forward must not take it. Negative control
+  # LAB_ROUTER_ARGS=wan_antispoof=0 (no drop, the forward's hits rise).
+  fst() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null; }
+  spoofed() { echo "$1" | $bb grep -o '"spoofed":[0-9]*' | $bb cut -d: -f2; }
+  webhits() { echo "$1" | $bb sed -n 's/.*"forwards":\[\([^]]*\)\].*/\1/p' | $bb tr '{' '\n' | $bb grep '"name":"lab-web"' | $bb sed -n 's/.*"hits":\([0-9]*\).*/\1/p'; }
+  $bb sleep 2   # forward hits are summed once a second: the checks above settle
+  s0=$(fst); sp0=$(spoofed "$s0"); wh0=$(webhits "$s0")
+  r=$($bb wget -q -T 15 -O - "http://$ISP/cgi-bin/spoof?8080" 2>&1)
+  $bb sleep 2   # forward hits are summed once a second
+  s1=$(fst); sp1=$(spoofed "$s1"); wh1=$(webhits "$s1")
+  if [ -z "$sp0" ] || [ -z "$sp1" ]; then
+    fail "anti-spoofing: no spoofed counter in /api/status ($r)"
+  elif echo "$r" | $bb grep -q "spoof=SENT" && [ "$sp1" -gt "$sp0" ] && [ "${wh1:-0}" = "${wh0:-0}" ]; then
+    pass "anti-spoofing: forged 192.168.1.77 from the WAN dropped ($((sp1 - sp0)) packet(s)), forward hits unchanged (${wh1:-none})"
+  else
+    fail "anti-spoofing: spoofed $sp0 -> $sp1 (want more), lab-web hits ${wh0:-none} -> ${wh1:-none} (want unchanged) ($r)"
+  fi
 fi
 
 # --- shaping (M6): throughput ~ shaped rate, latency stays low under load ------------

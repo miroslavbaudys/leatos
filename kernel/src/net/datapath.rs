@@ -253,6 +253,7 @@ impl Datapath {
                 for iface in &ifaces {
                     f.add_interface(*iface);
                 }
+                f.wan_antispoof = crate::config::wan_antispoof();
                 Mutex::new(f)
             })
             .collect();

@@ -89,6 +89,11 @@
 #                        with hairpin; the ISP fetches through it and the
 #                        client through the WAN address. Negative control:
 #                        LAB_FORWARD=0 (no forward: both fail).
+#                        Anti-spoofing: the ISP opens a connection to the
+#                        forward from the forged source 192.168.1.77
+#                        (cgi-bin/spoof): dropped as "spoofed", forward
+#                        hits unchanged; negative control
+#                        LAB_ROUTER_ARGS=wan_antispoof=0.
 #                        Redirect: lab-ntp sends NTP (UDP 123) to any outside
 #                        server to 192.168.1.101 (a second address on the
 #                        client, busybox ntpd -l); the client asks

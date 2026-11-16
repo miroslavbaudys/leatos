@@ -841,6 +841,12 @@ pub fn fw_recheck() -> bool {
     arg_u64(bootargs(), "fw_recheck") != Some(0)
 }
 
+/// `wan_antispoof=0`: WAN packets with a source in our own networks (or
+/// loopback) are not dropped: the negative control of the lab check.
+pub fn wan_antispoof() -> bool {
+    arg_u64(bootargs(), "wan_antispoof") != Some(0)
+}
+
 fn arg_u64(bootargs: &str, key: &str) -> Option<u64> {
     arg(bootargs, key).and_then(|v| v.parse().ok())
 }

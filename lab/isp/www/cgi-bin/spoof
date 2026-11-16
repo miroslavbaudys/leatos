@@ -1,0 +1,26 @@
+#!/usr/bin/busybox sh
+# Anti-spoofing check: open a connection to the caller's address (the
+# router's WAN address after NAT) :PORT with a forged source in the
+# router's main LAN, 192.168.1.77, as anyone on the internet could. The
+# router must drop it before its port forward takes it (drop reason
+# "spoofed"); the client compares the router's counters. Never answered
+# either way (the forward's target replies to .77 on its own network).
+# The source comes from a host route's src hint, removed again; ARP keeps
+# using our real address (arp_announce 2). Query string: the port.
+bb=/usr/bin/busybox
+addr=${REMOTE_ADDR#\[}; addr=${addr%\]}; addr=${addr#::ffff:}
+port=$(echo "$QUERY_STRING" | $bb tr -cd '0-9')
+echo "Content-Type: text/plain"
+echo
+dev=$($bb ip route get "$addr" | $bb sed -n 's/.* dev \([^ ]*\).*/\1/p')
+ann=/proc/sys/net/ipv4/conf/$dev/arp_announce
+a0=$($bb cat "$ann")
+echo 2 >"$ann"
+$bb ip addr add 192.168.1.77/32 dev "$dev" &&
+  $bb ip route add "$addr/32" dev "$dev" src 192.168.1.77 &&
+  ok=1
+$bb wget -q -T 3 -O /dev/null "http://$addr:${port:-8080}/" >/dev/null 2>&1
+$bb ip route del "$addr/32" dev "$dev" src 192.168.1.77 2>/dev/null
+$bb ip addr del 192.168.1.77/32 dev "$dev" 2>/dev/null
+echo "$a0" >"$ann"
+if [ -n "$ok" ]; then echo "spoof=SENT from 192.168.1.77 to $addr:$port on $dev"; else echo "spoof=FAILED on $dev"; fi

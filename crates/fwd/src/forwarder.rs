@@ -338,9 +338,12 @@ pub enum DropReason {
     TooBig,
     /// To the router itself, from a zone whose input policy refuses it.
     Input,
+    /// From the WAN with a source that cannot come from there: loopback or
+    /// one of our own networks (ingress filtering, RFC 2827 / RFC 3704).
+    Spoofed,
 }
 
-pub const DROP_REASONS: usize = 12;
+pub const DROP_REASONS: usize = 13;
 
 impl DropReason {
     pub fn index(self) -> usize {
@@ -360,6 +363,7 @@ impl DropReason {
             Self::Unsupported => "unsupported",
             Self::TooBig => "too-big",
             Self::Input => "input",
+            Self::Spoofed => "spoofed",
         }
     }
     pub fn all() -> [DropReason; DROP_REASONS] {
@@ -377,6 +381,7 @@ impl DropReason {
             Unsupported,
             TooBig,
             Input,
+            Spoofed,
         ]
     }
 }
@@ -449,6 +454,9 @@ pub struct Forwarder {
     pub forward_hits: Vec<u64>,
     /// New connections each redirect took (reset by a new policy).
     pub redirect_hits: Vec<u64>,
+    /// Drop WAN packets with a spoofed source ([`DropReason::Spoofed`]);
+    /// off only for the lab's negative control.
+    pub wan_antispoof: bool,
 }
 
 fn broadcast_of(addr: Ipv4Addr, len: u8) -> Ipv4Addr {
@@ -712,6 +720,7 @@ impl Forwarder {
             rule_hits: Vec::new(),
             forward_hits: Vec::new(),
             redirect_hits: Vec::new(),
+            wan_antispoof: true,
         }
     }
 
@@ -872,6 +881,18 @@ impl Forwarder {
     }
 
     /// The router's WAN address (of the first `Wan` interface).
+    /// A source no packet from the WAN may carry: loopback, or an address
+    /// in one of our networks (else a port forward would let it in and its
+    /// target answer that internal host directly). Addresses in the WAN's
+    /// own subnet stay allowed, so a WAN that overlaps a network (a
+    /// misconfiguration) keeps reaching its gateway.
+    fn spoofed_from_wan(&self, wan: &Interface, src: Ipv4Addr) -> bool {
+        let inside = |(a, l): (Ipv4Addr, u8)| broadcast_of(a, l) == broadcast_of(src, l);
+        src.is_loopback()
+            || (self.ifs.iter().any(|i| i.role == Role::Lan && i.addr.is_some_and(inside))
+                && !wan.addr.is_some_and(inside))
+    }
+
     fn wan_addr(&self) -> Option<Ipv4Addr> {
         self.ifs.iter().find(|i| i.role == Role::Wan).and_then(|i| i.addr).map(|(a, _)| a)
     }
@@ -1129,6 +1150,9 @@ impl Forwarder {
         let Some(v) = Ipv4View::parse(f, ETH_HDR) else {
             return self.drop(DropReason::Malformed);
         };
+        if iface.role == Role::Wan && self.wan_antispoof && self.spoofed_from_wan(&iface, v.src(f)) {
+            return self.drop(DropReason::Spoofed);
+        }
         let Some((my_ip, my_len)) = iface.addr else {
             return self.local();
         }; // e.g. WAN DHCP in progress
@@ -2468,6 +2492,41 @@ mod tests {
         let mut f = tcp_frame(WAN_MAC, other, ROUTER_WAN, 5555, 8007, TCP_SYN);
         let Verdict::Forward { len, .. } = run(&mut fw, 0, WAN, &mut f) else { panic!() };
         assert_eq!(ports(&f[..len]).3, 8007);
+    }
+
+    #[test]
+    fn wan_sources_of_our_own_networks_are_spoofed() {
+        let mut fw = router();
+        with_forwards(&mut fw, vec![fwd(8443, 8443, Some(443), None, true)]);
+        let syn = |src| tcp_frame(WAN_MAC, src, ROUTER_WAN, 5555, 8443, TCP_SYN);
+        // A LAN address, the router's own LAN address and loopback: dropped
+        // before the port forward, the router's stack or conntrack see them.
+        for src in [HOST, ROUTER_LAN, Ipv4Addr::new(127, 0, 0, 1)] {
+            assert_eq!(run(&mut fw, 0, WAN, &mut syn(src)), Verdict::Drop(DropReason::Spoofed), "{src}");
+        }
+        let mut f = tcp_frame(WAN_MAC, HOST, ROUTER_WAN, 5555, 80, TCP_SYN);
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), Verdict::Drop(DropReason::Spoofed), "to the router too");
+        assert_eq!(fw.forward_hits, [0]);
+        // Other private sources (an ISP's 10.x gateway) and the internet pass.
+        for src in [Ipv4Addr::new(10, 11, 5, 146), SERVER] {
+            assert!(matches!(run(&mut fw, 1, WAN, &mut syn(src)), Verdict::Forward { .. }), "{src}");
+        }
+        assert_eq!(fw.forward_hits, [2]);
+        // The same source from the LAN is fine (hairpin).
+        let mut f = tcp_frame(LAN_MAC, HOST, ROUTER_WAN, 5556, 8443, TCP_SYN);
+        assert!(matches!(run(&mut fw, 2, LAN, &mut f), Verdict::Forward { .. }));
+        // Switched off (the lab's negative control): forwarded.
+        fw.wan_antispoof = false;
+        assert!(matches!(run(&mut fw, 3, WAN, &mut syn(HOST)), Verdict::Forward { .. }));
+    }
+
+    #[test]
+    fn wan_overlapping_a_network_keeps_its_own_subnet() {
+        let mut fw = router();
+        // A misconfigured WAN in the LAN's /24: its neighbours still reach us.
+        fw.set_addr(WAN, Some((Ipv4Addr::new(192, 168, 1, 250), 24)));
+        let mut f = tcp_frame(WAN_MAC, HOST, Ipv4Addr::new(192, 168, 1, 250), 5555, 80, TCP_SYN);
+        assert_ne!(run(&mut fw, 0, WAN, &mut f), Verdict::Drop(DropReason::Spoofed));
     }
 
     #[test]
