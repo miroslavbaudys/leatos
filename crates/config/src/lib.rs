@@ -437,6 +437,23 @@ pub struct Dns {
     /// Local A records beside the DHCP names.
     #[serde(rename = "host", skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<DnsHost>,
+    /// Upstream resolvers instead of the WAN lease's, in order of
+    /// preference ([`Upstream`]): `ip`, `ip:port`, and with the name its
+    /// certificate must carry (DNS over TLS) `ip#name`, `ip:port#name`.
+    /// Empty = the servers from the WAN lease (DHCP or PPPoE).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub upstreams: Vec<String>,
+    /// Strict DNS over TLS (RFC 7858, RFC 8310 strict profile): every
+    /// upstream query goes through TLS to `upstreams` (port 853 unless
+    /// given), whose certificates must chain to Mozilla's roots (or
+    /// `tls_ca`) and carry the `#name`. Never plain DNS, also not when
+    /// TLS fails: clients then get SERVFAIL.
+    #[serde(skip_serializing_if = "core::ops::Not::not")]
+    pub tls: bool,
+    /// Extra trust anchors in PEM, beside Mozilla's (a private DNS-over-TLS
+    /// server with its own CA).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_ca: Option<String>,
 }
 
 impl Default for Dns {
@@ -446,7 +463,69 @@ impl Default for Dns {
             rebind_protection: true,
             domain: "lan".into(),
             hosts: Vec::new(),
+            upstreams: Vec::new(),
+            tls: false,
+            tls_ca: None,
         }
+    }
+}
+
+/// One entry of `dns.upstreams`: `ip[:port][#name]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Upstream {
+    pub ip: Ipv4Addr,
+    /// Unset: 53, or 853 for DNS over TLS.
+    pub port: Option<u16>,
+    /// The name the server's certificate must carry: a host name, or the
+    /// address itself (some resolvers have IP certificates).
+    pub name: Option<String>,
+}
+
+impl Upstream {
+    pub fn parse(s: &str) -> Result<Self, &'static str> {
+        let (addr, name) = match s.split_once('#') {
+            Some((a, n)) => (a, Some(n)),
+            None => (s, None),
+        };
+        let (ip, port) = match addr.split_once(':') {
+            Some((ip, p)) => (ip, Some(p.parse::<u16>().ok().filter(|&p| p != 0).ok_or("port must be 1–65535")?)),
+            None => (addr, None),
+        };
+        let ip: Ipv4Addr = ip.parse().map_err(|_| "must be an IPv4 address, e.g. 1.1.1.1 or 1.1.1.1#cloudflare-dns.com")?;
+        if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
+            return Err("not a server address");
+        }
+        let name = match name {
+            None => None,
+            Some(n) if n.parse::<Ipv4Addr>().is_ok() || validate::is_domain(n) => Some(n.to_ascii_lowercase()),
+            Some(_) => return Err("the name after '#' must be a DNS name (the server's certificate name)"),
+        };
+        Ok(Upstream { ip, port, name })
+    }
+
+    /// The port in use: given, else 853 with TLS, 53 without.
+    pub fn port(&self, tls: bool) -> u16 {
+        self.port.unwrap_or(if tls { 853 } else { 53 })
+    }
+}
+
+impl core::fmt::Display for Upstream {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.ip)?;
+        if let Some(p) = self.port {
+            write!(f, ":{p}")?;
+        }
+        if let Some(n) = &self.name {
+            write!(f, "#{n}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Dns {
+    /// `upstreams`, parsed (validated configs parse completely).
+    pub fn upstream_list(&self) -> Vec<Upstream> {
+        self.upstreams.iter().filter_map(|u| Upstream::parse(u).ok()).collect()
     }
 }
 
@@ -866,6 +945,15 @@ impl Config {
         }
         if !self.dns.hosts.is_empty() {
             add("dns.host".into(), "local DNS records");
+        }
+        if !self.dns.upstreams.is_empty() {
+            add("dns.upstreams".into(), "DNS servers of its own");
+        }
+        if self.dns.tls {
+            add("dns.tls".into(), "DNS over TLS");
+        }
+        if self.dns.tls_ca.is_some() {
+            add("dns.tls_ca".into(), "DNS-over-TLS trust anchors");
         }
         if !self.mdns.is_empty() {
             add("mdns.reflect".into(), "mDNS reflection");

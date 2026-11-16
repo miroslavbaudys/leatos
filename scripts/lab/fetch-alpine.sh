@@ -2,7 +2,8 @@
 # Download the Alpine Linux aarch64 netboot kernel + initramfs and the
 # busybox-extras package (udhcpd, httpd, dnsd) used by the lab VMs, plus
 # the ISP VM's PPPoE server (rp-pppoe's pppoe-server, pppd and their
-# libraries: scripts/lab-test.sh LAB_PPPOE=1), into lab/cache/
+# libraries: scripts/lab-test.sh LAB_PPPOE=1) and DNS-over-TLS server
+# (stunnel in front of dnsmasq: LAB_DOT=1), into lab/cache/
 # (gitignored), and verify pinned SHA-256s.
 #   Usage: fetch-alpine.sh [modloop]   (prints the directory)
 # `modloop` also fetches modloop-virt, the squashfs with all of the
@@ -23,6 +24,10 @@ EXTRAS_APK=busybox-extras-1.37.0-r31.apk
 # PPPoE, and the virt kernel has no pppoe module for kernel mode.
 RP_PPPOE_PKGS="https://dl-cdn.alpinelinux.org/alpine/v3.17/main/aarch64"
 PPPOE_APKS="rp-pppoe-3.15-r0.apk ppp-daemon-2.5.3-r0.apk libpcap-1.10.7-r0.apk libssl3-3.5.9-r0.apk libcrypto3-3.5.9-r0.apk"
+# stunnel (community; needs musl, libssl3, libcrypto3) terminates TLS in
+# front of dnsmasq (main; needs musl), which answers DNS over TCP.
+DOT_APKS="stunnel-5.82-r0.apk dnsmasq-2.92_p2-r0.apk"
+COMMUNITY_PKGS="https://dl-cdn.alpinelinux.org/alpine/$ALPINE_BRANCH/community/aarch64"
 DIR="lab/cache/alpine-${ALPINE_BRANCH#v}"
 # (macOS ships bash 3.2: no associative arrays)
 sha_for() {
@@ -36,10 +41,12 @@ sha_for() {
     libpcap-1.10.7-r0.apk) echo e0bcd33b4cf451476abbf0b61725ab0a4b61465a5bd427c7e7cb4bdadf65cee2 ;;
     libssl3-3.5.9-r0.apk) echo 20ac252b276d73f2c69c1d25f84537c7fba81caefc026c6be1094b394af2082e ;;
     libcrypto3-3.5.9-r0.apk) echo 2676a2b0b6e23ea2edccf3ee982b9842a665d52603d047de3d0a185dc316d983 ;;
+    stunnel-5.82-r0.apk) echo 1aae8f865f8adb97a80b24321d7134abcd7337afd2ca06d60c4dfd0c2d7888fa ;;
+    dnsmasq-2.92_p2-r0.apk) echo 47b47cda76dd7dcf360a73f51d1acf83896f820e2709529e2532296b140f9e5f ;;
   esac
 }
 
-FILES="vmlinuz-virt initramfs-virt $EXTRAS_APK $PPPOE_APKS"
+FILES="vmlinuz-virt initramfs-virt $EXTRAS_APK $PPPOE_APKS $DOT_APKS"
 [[ "${1:-}" == modloop ]] && FILES="$FILES modloop-virt"
 
 mkdir -p "$DIR"
@@ -47,6 +54,7 @@ for f in $FILES; do
   url="$BASE/$f"
   [[ "$f" == *.apk ]] && url="$PKGS/$f"
   [[ "$f" == rp-pppoe-* ]] && url="$RP_PPPOE_PKGS/$f"
+  [[ "$f" == stunnel-* ]] && url="$COMMUNITY_PKGS/$f"
   if [[ ! -f "$DIR/$f" ]]; then
     echo "fetch: $url" >&2
     curl -fsSL --max-time 300 -o "$DIR/$f.part" "$url"

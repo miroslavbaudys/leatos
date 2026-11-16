@@ -11,6 +11,7 @@ pub mod kexec;
 pub mod mmu;
 mod port;
 pub mod power;
+pub mod rtc;
 pub mod smp;
 pub mod timer;
 pub mod watchdog;

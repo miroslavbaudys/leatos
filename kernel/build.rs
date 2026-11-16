@@ -21,6 +21,25 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=RROUTER_BUILD={id}");
+    // When the built commit was made (Unix seconds): DNS over TLS refuses
+    // certificates that expired before it, even before SNTP has set the
+    // clock (`net::dot`). `SOURCE_DATE_EPOCH` wins (reproducible builds).
+    let time = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .or_else(|| {
+            std::process::Command::new("git")
+                .args(["log", "-1", "--format=%ct"])
+                .current_dir(&dir)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or_else(|| "0".into());
+    println!("cargo:rustc-env=RROUTER_BUILD_TIME={time}");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=../crates");
     println!("cargo:rerun-if-changed=../.git/HEAD");

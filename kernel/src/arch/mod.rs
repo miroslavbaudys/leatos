@@ -27,6 +27,8 @@
 //!   `leaf_desc`), `PLATFORM_MMIO`, `unsafe fn activate(root)`,
 //!   `sync_tables` (after adding entries to the live tables)
 //! - `power`: `init(PowerMethod)`, `off() -> !`, `reset() -> !`
+//! - `rtc`: `read() -> Option<wallclock::DateTime>`, `write(&DateTime)`: the
+//!   battery-backed clock in UTC (x86_64: CMOS; aarch64: none)
 //! - `watchdog`: `probe(smbus_rev) -> Option<Box<dyn HwWatchdog>>`: a
 //!   chipset watchdog (x86_64: the AMD FCH's, given the revision of its
 //!   SMBus function; aarch64: none)

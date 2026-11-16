@@ -454,6 +454,17 @@ fn status(ctx: &Ctx, wan: &str) {
             m.received, m.sent, m.filtered, m.duplicate, m.rate_limited, m.malformed, m.foreign
         );
     }
+    if let Some(svc) = ctx.services {
+        let ups: Vec<String> = svc.upstreams().iter().map(|a| alloc::format!("{a}")).collect();
+        println!(
+            "dns      : {} ({})",
+            if ups.is_empty() { String::from("no upstreams") } else { ups.join(", ") },
+            svc.upstream_source()
+        );
+        for l in svc.dot_status_lines() {
+            println!("dns-tls  : {l}");
+        }
+    }
     let ntp = ctx.services.and_then(LanServices::ntp_status);
     match (wallclock::now(), &ntp) {
         (Some(t), Some(n)) if n.synced.is_some() => {

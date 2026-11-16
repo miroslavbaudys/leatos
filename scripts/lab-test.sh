@@ -94,6 +94,30 @@
 #                        _ssh, plus the router's IGMP joins on both
 #                        networks. Negative control: LAB_MDNS_RULES=0 (the
 #                        rule disabled: every mDNS check fails).
+#   LAB_DOT=1            DNS over TLS, strict (docs/dns-over-tls.md): the
+#                        router boots from a store with dns.tls, upstream
+#                        203.0.113.1#dns.isp.example and a CA made for this
+#                        run in dns.tls_ca; the ISP serves DoT (stunnel +
+#                        dnsmasq) with that CA's certificate. Checks: the
+#                        client resolves dot.isp.example (only the DoT
+#                        server has it) but not plain.isp.example (only the
+#                        plain dnsd has it), the router's connection came
+#                        up (log), the ISP's DoT server saw the queries.
+#                        Negative controls: LAB_DOT_NAME=wrong.example (name
+#                        mismatch), LAB_DOT_CA=0 (lab CA not trusted: only
+#                        Mozilla's roots) and LAB_ROUTER_ARGS=dns_tls=0
+#                        (plain DNS to the same server): the checks fail,
+#                        the first two without any plain DNS either.
+#                        Certificate dates before SNTP: checked against the
+#                        battery-backed RTC on x86_64 (CMOS), at the
+#                        certificate's issue time on aarch64 (no RTC); the
+#                        check reads which from the router's log
+#                        (LAB_EXPECT_DATES=rtc|issue|expired overrides).
+#                        Control: RROUTER_ARCH=x86_64
+#                        QEMU_EXTRA="-rtc base=2040-01-01" with
+#                        LAB_EXPECT_DATES=expired: an RTC far ahead must not
+#                        break DNS (accepted until SNTP), and SNTP then
+#                        sets the RTC ("rtc ... was N s off, set").
 #   LAB_WAN_OPEN=1       (implies LAB_GUEST=1) negative control for the WAN
 #                        input check: a rule accepting wan -> router, so the
 #                        router answers the ISP's probes (RST, ping) again.
@@ -145,6 +169,9 @@ GUEST_ZONE="${LAB_GUEST_ZONE:-guest}"
 GUEST_RULES="${LAB_GUEST_RULES:-1}"
 FORWARD="${LAB_FORWARD:-1}"
 GUEST_DOMAIN="${LAB_GUEST_DOMAIN:-1}"
+DOT="${LAB_DOT:-}"
+DOT_NAME="${LAB_DOT_NAME:-dns.isp.example}"
+DOT_CA="${LAB_DOT_CA:-1}"
 LAN_PORT="${LAB_LAN_PORT:-10003}"
 WAN_PORT="${LAB_WAN_PORT:-10005}"
 WORK=$(mktemp -d -t rrouter-lab)
@@ -170,7 +197,26 @@ ALPINE_DIR=$(scripts/lab/fetch-alpine.sh $MODLOOP | tail -1)
 ISP_INITRD=$(scripts/lab/build-initrd.sh isp | tail -1)
 CLIENT_INITRD=$(scripts/lab/build-initrd.sh client | tail -1)
 
-echo "== start ISP (203.0.113.1${ISP_VLAN:+ on VLAN $ISP_VLAN}${ISP_PPPOE:+, PPPoE $ISP_PPPOE})"
+if [[ -n "$DOT" ]]; then
+  # A CA and the ISP's DoT certificate (RSA under an ECDSA CA), made per run
+  # and valid from now; the server's half goes into the ISP's initrd.
+  mkdir -p "$WORK/dot/etc/dot"; d="$WORK/dot"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$d/ca.key" -out "$d/ca.pem" -days 30 \
+    -subj "/CN=rrouter lab CA" -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
+  openssl req -newkey rsa:2048 -nodes -keyout "$d/etc/dot/server.key" -out "$d/server.csr" -subj "/CN=dns.isp.example" 2>/dev/null
+  printf 'subjectAltName=DNS:dns.isp.example\nbasicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' >"$d/ext.cnf"
+  openssl x509 -req -in "$d/server.csr" -CA "$d/ca.pem" -CAkey "$d/ca.key" -CAcreateserial -days 30 -extfile "$d/ext.cnf" -out "$d/etc/dot/server.pem" 2>/dev/null
+  ( cd "$d" && find etc | cpio -o -H newc 2>/dev/null | gzip -9 ) >"$WORK/isp-dot.cpio.gz"
+  cat "$ISP_INITRD" "$WORK/isp-dot.cpio.gz" >"$WORK/isp-initrd.img"
+  ISP_INITRD="$WORK/isp-initrd.img"
+fi
+# The router's [dns] section for LAB_DOT=1.
+dot_toml() {
+  printf '\n[dns]\ntls = true\nupstreams = ["203.0.113.1#%s"]\n' "$DOT_NAME"
+  if [[ "$DOT_CA" == 1 ]]; then printf 'tls_ca = """\n'; cat "$WORK/dot/ca.pem"; printf '"""\n'; fi
+}
+
+echo "== start ISP (203.0.113.1${ISP_VLAN:+ on VLAN $ISP_VLAN}${ISP_PPPOE:+, PPPoE $ISP_PPPOE}${DOT:+, DNS over TLS})"
 start_isp "$WAN_PORT" "$WORK/isp.log" || exit 1
 
 ROUTER_STORE=""
@@ -247,6 +293,7 @@ name = "lab-web"
 wan_port = 8080
 to = "192.168.1.100:8080"
 CFG
+  [[ -n "$DOT" ]] && dot_toml >>"$WORK/config.toml"
   cargo build -q -p rrstore --release
   target/release/rrstore create "$WORK/store.img" --mib 32 >/dev/null
   target/release/rrstore put "$WORK/store.img" config "$WORK/config.toml" >/dev/null
@@ -267,6 +314,27 @@ CFG
   echo "== router config${GUEST_LIVE:+ (added live by the client)}: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")$([[ "$GUEST_DOMAIN" == 1 ]] && echo ", domain guest.lan")$([[ -n "$MDNS" ]] && echo ", mdns reflect (enabled: $MDNS_RULES)")"
 fi
 
+if [[ -n "$DOT" && -z "$GUEST" ]]; then
+  # The main LAN as the VM defaults have it (the nas reservation), plus DNS over TLS.
+  cat >"$WORK/config.toml" <<'CFG'
+version = 2
+
+[[network]]
+name = "lan"
+ipv4 = "192.168.1.1/24"
+[[network.dhcp.static]]
+mac = "52:54:00:00:00:05"
+ip = "192.168.1.10"
+hostname = "nas"
+CFG
+  dot_toml >>"$WORK/config.toml"
+  cargo build -q -p rrstore --release
+  target/release/rrstore create "$WORK/store.img" --mib 32 >/dev/null
+  target/release/rrstore put "$WORK/store.img" config "$WORK/config.toml" >/dev/null
+  ROUTER_STORE="$WORK/store.img"
+fi
+[[ -n "$DOT" ]] && echo "== router config: DNS over TLS to 203.0.113.1#$DOT_NAME$([[ "$DOT_CA" == 1 ]] && echo ", lab CA trusted" || echo ", Mozilla's roots only")"
+
 echo "== start rrouter${ROUTER_ARGS:+ ($(echo "$ROUTER_ARGS" | sed 's/pppoe_pass=[^ ]*/pppoe_pass=***/'))}"
 QEMU_STORE="$ROUTER_STORE" QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" QEMU_PCAP_DIR="$PCAP_DIR" QEMU_ACCEL="$QEMU_ACCEL" QEMU_APPEND="$ROUTER_ARGS" \
   scripts/qemu-run.sh "target/$ARCH-unknown-none/debug/rrouter" >"$WORK/router.log" 2>&1 &
@@ -279,7 +347,7 @@ PIDS+=($!)
 
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so
@@ -299,7 +367,7 @@ if [[ "${LAB_VERBOSE:-0}" == "1" ]]; then
 fi
 
 echo "== router"
-tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|net lan0  |net wan0 .*(lease|vlan|PPPoE)|pppoe |net ping|qos |qdisc |cpu  |ntp  |watchdog  |vlan  " | sed 's/^/  /' || true
+tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|dns-over-tls|rtc  |dns upstreams|net lan0  |net wan0 .*(lease|vlan|PPPoE)|pppoe |net ping|qos |qdisc |cpu  |ntp  |watchdog  |vlan  " | sed 's/^/  /' || true
 echo "== results"
 tr -d '\r' <"$WORK/client.log" | grep -E "^LAB (PASS|FAIL|INFO|WARN)|^    \|" | sed 's/^/  /' || true
 
@@ -341,6 +409,39 @@ if [[ -n "$ISP_PPPOE" ]]; then
   else
     echo "  LAB FAIL: pppoe ($ISP_PPPOE): no session (${up:-no 'up' line in the router log})"
     tr -d '\r' <"$WORK/router.log" | grep "pppoe " | tail -3 | sed 's/^/    | /'
+    router_fails=$((router_fails + 1))
+  fi
+fi
+
+# DNS over TLS: the router's connection came up, and the ISP's DoT server
+# (dnsmasq behind stunnel) answered queries.
+if [[ -n "$DOT" ]]; then
+  up=$(tr -d '\r' <"$WORK/router.log" | grep "dns-over-tls    : 203.0.113.1#.* up:" | head -1 || true)
+  n=$(tr -d '\r' <"$WORK/isp.log" | grep -c "isp-dot: .*query\[" || true)
+  if [[ -n "$up" && "$n" -gt 0 ]]; then
+    echo "  LAB PASS: dns over tls: ${up##*: 203.0.113.1#} ($n queries at the ISP's DoT server)"
+    want=${LAB_EXPECT_DATES:-$([[ "$ARCH" == x86_64 ]] && echo rtc || echo issue)}
+    case "$want" in
+      rtc) pat="dates checked against the RTC" ;;
+      issue) pat="dates checked at issue time" ;;
+      expired) pat="expired by the RTC: accepted until SNTP" ;;
+    esac
+    if [[ "$up" == *"$pat"* ]]; then
+      echo "  LAB PASS: dns over tls dates before SNTP: $pat"
+    else
+      echo "  LAB FAIL: dns over tls dates before SNTP: expected '$pat' ($want)"; router_fails=$((router_fails + 1))
+    fi
+    if [[ "$want" == expired ]]; then
+      set_line=$(tr -d '\r' <"$WORK/router.log" | grep "rtc  .*: was .* s off, set to" | head -1 || true)
+      if [[ -n "$set_line" ]]; then
+        echo "  LAB PASS: rtc corrected after SNTP: ${set_line##*: }"
+      else
+        echo "  LAB FAIL: rtc not corrected after SNTP"; router_fails=$((router_fails + 1))
+      fi
+    fi
+  else
+    echo "  LAB FAIL: dns over tls: ${up:-no connection} ($n queries at the ISP's DoT server)"
+    tr -d '\r' <"$WORK/router.log" | grep "dns-over-tls" | tail -3 | sed 's/^/    | /'
     router_fails=$((router_fails + 1))
   fi
 fi

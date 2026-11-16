@@ -19,4 +19,12 @@ runner = "scripts/qemu-run.sh"
 runner = "scripts/qemu-run.sh"
 # The target defaults to a static PIE; the kernel is linked at a fixed
 # physical address (identity map), and boot.S uses absolute addresses.
-rustflags = ["-C", "relocation-model=static"]
+rustflags = [
+    "-C", "relocation-model=static",
+    # No SSE on this target (soft-float kernel): RustCrypto's SIMD
+    # backends (DNS over TLS, crates/proto-dot) must use their software
+    # versions; sha2 gets its `force-soft` feature there.
+    "--cfg", "aes_force_soft", "--cfg", "polyval_force_soft",
+    "--cfg", "poly1305_force_soft", "--cfg", "chacha20_force_soft",
+    "--cfg", 'curve25519_dalek_backend="serial"',
+]

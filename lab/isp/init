@@ -15,6 +15,11 @@
 #   password lab-secret, PAP or CHAP required, or none), the session gets
 #   203.0.113.50 and DNS 203.0.113.1; no DHCP server, so a router not
 #   speaking PPPoE gets no address.
+# /etc/dot/server.pem + server.key (scripts/lab-test.sh LAB_DOT=1 adds them,
+#   made per run under a lab CA): DNS over TLS on 203.0.113.1:853, stunnel
+#   in front of dnsmasq (TCP on 127.0.0.1:5300) with dnsd's names plus
+#   dot.isp.example, which only this server knows (plain.isp.example only
+#   dnsd does). Queries are logged as "isp-dot: ...".
 bb=/usr/bin/busybox
 bx=/usr/bin/busybox-extras
 export PATH=/usr/bin:/usr/sbin:/bin:/sbin
@@ -79,6 +84,18 @@ $bx httpd -p 80 -h /www
 # Long single-connection upload sink (ECN/AQM check): replies with the byte count.
 $bx tcpsvd -E 0.0.0.0 5001 $bb wc -c &
 $bx dnsd -c /etc/dnsd.conf -i 203.0.113.1 &
+if [ -f /etc/dot/server.pem ]; then
+  { $bb grep -v '^plain\.' /etc/dnsd.conf | $bb awk '{ print $2, $1 }'; echo "203.0.113.53 dot.isp.example"; } >/tmp/dot-hosts
+  $bb touch /tmp/dot.log
+  /usr/sbin/dnsmasq --conf-file=/dev/null --no-resolv --no-hosts --addn-hosts=/tmp/dot-hosts \
+    --listen-address=127.0.0.1 --bind-interfaces --port=5300 --user=root \
+    --log-queries --log-facility=/tmp/dot.log \
+    || { echo "LAB FAIL: isp: dnsmasq did not start"; $bb poweroff -f; }
+  $bb printf 'foreground = no\npid = /tmp/stunnel.pid\noutput = /tmp/dot.log\n[dot]\naccept = 203.0.113.1:853\nconnect = 127.0.0.1:5300\ncert = /etc/dot/server.pem\nkey = /etc/dot/server.key\n' >/tmp/stunnel.conf
+  /usr/bin/stunnel /tmp/stunnel.conf || { echo "LAB FAIL: isp: stunnel did not start"; $bb poweroff -f; }
+  $bb tail -F /tmp/dot.log 2>/dev/null | while IFS= read -r l; do echo "isp-dot: $l"; done &
+  echo "LAB isp: DNS over TLS on 203.0.113.1:853"
+fi
 $bb ntpd -n -l &
 echo "LAB isp ready"
 while :; do $bb sleep 3600; done

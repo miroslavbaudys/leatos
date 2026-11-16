@@ -37,6 +37,7 @@ proto-http.workspace = true
 config.workspace = true
 auth.workspace = true
 proto-mdns.workspace = true
+proto-dot.workspace = true
 cli.workspace = true
 config-store.workspace = true
 linked_list_allocator = "0.10"

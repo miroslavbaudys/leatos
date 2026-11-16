@@ -279,12 +279,18 @@
   <!-- ================= DNS ================= -->
   <section class="page" data-page="dns" data-title="DNS" hidden>
     <h2>DNS</h2>
-    <p class="lead">The router forwards LAN queries to the WAN's DNS servers and answers local names itself.</p>
+    <p class="lead">The router forwards LAN queries to the WAN's DNS servers, or to servers of your own (over TLS if you like), and answers local names itself.</p>
     <div class="grid">
       <div class="card"><h3>Status</h3><table class="kv" id="dnsst"></table></div>
       <form class="card cfg" autocomplete="off"><h3>Forwarder</h3>
         <label>Cache entries<input data-path="dns.cache_entries" type="number" min="16" max="65536"></label>
         <label class="check"><input data-path="dns.rebind_protection" type="checkbox">Rebind protection (drop answers pointing into private ranges)</label>
+      </form>
+      <form class="card cfg" autocomplete="off"><h3>Upstream servers</h3>
+        <label>Servers (comma-separated; empty = the WAN's)<input id="dnsups" data-x data-path="dns.upstreams" placeholder="1.1.1.1#cloudflare-dns.com, 1.0.0.1#cloudflare-dns.com"></label>
+        <p class="hint"><i>address</i>, <i>address:port</i>, and for TLS <i>address#name</i>: the name the server's certificate must carry. Cloudflare: <code>1.1.1.1#cloudflare-dns.com</code>, Quad9: <code>9.9.9.9#dns.quad9.net</code>, Google: <code>8.8.8.8#dns.google</code>.</p>
+        <label class="check"><input data-path="dns.tls" type="checkbox">DNS over TLS, strict (port 853; certificates checked against Mozilla's roots; never plain DNS, so a failing server means failing lookups)</label>
+        <label>Extra trust anchors (PEM, for a private server; usually empty)<textarea id="dnsca" data-x data-path="dns.tls_ca" rows="3" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----"></textarea></label>
       </form>
     </div>
   </section>
@@ -763,7 +769,13 @@ async function refresh() {
     ...(l ? [["Address", esc(l.addr)], ["Gateway", esc(l.gateway ?? "–")], ["DNS servers", l.dns.map(esc).join(", ") || "–"],
       ...(l.via ? [["Link", `${esc(l.via)}, MTU ${l.mtu}`]] : [])] : [["Lease", "none"]]), ...ppp,
     ...(st.pppoe_drops ? [["PPPoE drops", n(st.pppoe_drops)]] : [])]);
-  $("dnsst").innerHTML = rows([["Upstream", l?.dns?.length ? l.dns.map(esc).join(", ") : "none (no WAN lease)"],
+  const d = st.dns;
+  const ups = d ? (d.upstreams.length ? d.upstreams.map(esc).join(", ") + ` <span class=hint>(${esc(d.source)})</span>` : "none" + (d.source === "WAN lease" ? " (no WAN lease)" : ""))
+    : (l?.dns?.length ? l.dns.map(esc).join(", ") : "none (no WAN lease)");
+  const tls = (d?.tls ?? []).map((t) => [`TLS ${esc(t.server)}`, esc(t.state) + (t.tls ? ` · ${esc(t.tls)}` : "")
+    + ` · ${n(t.queries)} queries, ${n(t.answers)} answers, ${n(t.connects)} connects` + (t.failures ? `, ${n(t.failures)} failures` : "")
+    + (t.dropped ? `, ${n(t.dropped)} dropped while failing` : "") + (t.error ? ` · last error: ${esc(t.error)}` : "")]);
+  $("dnsst").innerHTML = rows([["Upstream", ups], ...tls,
     ["Local names", `DHCP host names and reservations, as <i>name</i>.${esc(cfgOrig?.dns?.domain ?? "lan")}`]]);
 
   // Firewall
@@ -926,6 +938,8 @@ function fillForm(c) {
   const ls = getp(c, lanPath("dhcp.lease_secs"));
   $("lease").value = ls === undefined ? "" : +(ls / 3600).toFixed(4);
   $("ntp").value = (c.time?.ntp_servers ?? []).join(", ");
+  $("dnsups").value = (c.dns?.upstreams ?? []).join(", ");
+  $("dnsca").value = c.dns?.tls_ca ?? "";
   staticHead();
   (getp(c, lanPath("dhcp.static")) ?? []).forEach((s) => staticRow(s));
   pppoeVisibility();
@@ -963,6 +977,10 @@ function readForm() {
   setp(c, lanPath("dhcp.range"), lo || hi ? [lo, hi] : undefined);
   setp(c, lanPath("dhcp.lease_secs"), Math.round(Number($("lease").value) * 3600));
   setp(c, "time.ntp_servers", $("ntp").value.split(",").map((x) => x.trim()).filter((x) => x));
+  const ups = $("dnsups").value.split(",").map((x) => x.trim()).filter((x) => x);
+  setp(c, "dns.upstreams", ups.length ? ups : undefined);
+  setp(c, "dns.tls_ca", $("dnsca").value.trim() ? $("dnsca").value.trim() + "\n" : undefined);
+  if (!c.dns?.tls) setp(c, "dns.tls", undefined);
   const sts = readStatics();
   setp(c, lanPath("dhcp.static"), sts.length ? sts : undefined);
   // A new password only when both fields agree.

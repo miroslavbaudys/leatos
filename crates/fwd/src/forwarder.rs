@@ -80,6 +80,11 @@ pub struct Policy {
     pub rules: Vec<Rule>,
     /// Port forwards from the WAN address ([`Forwarder::forward_hits`]).
     pub forwards: Vec<PortForward>,
+    /// TCP servers the router itself connects to (DNS over TLS): segments
+    /// from one of these (address, port) to [`ROUTER_CLIENT_PORTS`] are
+    /// replies to the router's client and pass like UDP replies do. Any
+    /// other TCP to those ports is input like everything else.
+    pub router_tcp_peers: Vec<(Ipv4Addr, u16)>,
 }
 
 /// A port forward (`[[firewall.forward]]`), compiled: new connections to
@@ -666,15 +671,20 @@ impl Forwarder {
     /// Replies to the router's own clients (ports from
     /// [`ROUTER_CLIENT_PORTS`], the DHCP client's 68, ICMP other than echo
     /// requests) always pass: rules and zone input are about what reaches
-    /// the router's services. The router's clients are all UDP (DNS
-    /// upstream, SNTP, DHCP), so TCP gets no such pass: a TCP client would
-    /// need it here first.
+    /// the router's services. Its UDP clients (DNS upstream, SNTP, DHCP)
+    /// get that pass by port; TCP only from the servers it connects to
+    /// ([`Policy::router_tcp_peers`]: DNS over TLS), so the client range
+    /// is no way in for anyone else.
     fn input(&mut self, ingress: IfIndex, f: &[u8], v: &Ipv4View) -> Verdict {
         let zone = self.ifs[ingress as usize].zone;
         let dport = (v.l4_len >= 4 && !v.is_fragment).then(|| wire::get16(f, v.l4 + 2));
         let icmp_type = (v.proto == PROTO_ICMP && v.l4_len >= 1 && !v.is_fragment).then(|| f[v.l4]);
         let reply = match v.proto {
             PROTO_UDP => dport.is_some_and(|d| d >= ROUTER_CLIENT_PORTS || d == 68),
+            PROTO_TCP => dport.is_some_and(|d| d >= ROUTER_CLIENT_PORTS) && {
+                let peer = (v.src(f), wire::get16(f, v.l4));
+                self.policy.as_ref().is_some_and(|p| p.router_tcp_peers.contains(&peer))
+            },
             PROTO_ICMP => icmp_type.is_some_and(|t| t != wire::ICMP_ECHO_REQUEST),
             _ => false,
         };
@@ -1777,8 +1787,7 @@ mod tests {
         fw.set_policy(Some(Policy {
             forward: vec![0, 0b101, 0b001],
             input: vec![None, None, Some(svc::DHCP | svc::DNS)],
-            rules: vec![],
-            forwards: vec![],
+            ..Policy::default()
         }));
     }
 
@@ -1816,7 +1825,7 @@ mod tests {
         let mut f = tcp_frame(WAN_MAC, SERVER, HOST, 443, 9000, TCP_SYN);
         assert_eq!(run(&mut fw, 0, WAN, &mut f), Verdict::Drop(DropReason::Firewall));
         // Two interfaces of one zone reach each other without a forward bit.
-        fw.set_policy(Some(Policy { forward: vec![0, 0b001, 0b001], input: vec![], rules: vec![], forwards: vec![] }));
+        fw.set_policy(Some(Policy { forward: vec![0, 0b001, 0b001], ..Policy::default() }));
         fw.ifs[GUEST as usize].zone = 1;
         let mut f = tcp_frame(GUEST_MAC, GUEST_HOST, HOST, 5001, 22, TCP_SYN);
         assert!(matches!(run(&mut fw, 0, GUEST, &mut f), Verdict::Forward { egress: LAN, .. }));
@@ -1892,6 +1901,28 @@ mod tests {
     }
 
     #[test]
+    fn tcp_replies_pass_only_from_the_routers_own_tcp_servers() {
+        let mut fw = router();
+        zoned(&mut fw);
+        let mut p = fw.policy.clone().unwrap();
+        p.input[0] = Some(0);
+        p.router_tcp_peers = vec![(SERVER, 853)];
+        fw.set_policy(Some(p));
+        let seg = |src, sport, dport| tcp_frame(WAN_MAC, src, ROUTER_WAN, sport, dport, TCP_SYN | TCP_ACK);
+        // The DNS-over-TLS server answering the router's connection.
+        assert_eq!(run(&mut fw, 0, WAN, &mut seg(SERVER, 853, 61_234)), Verdict::Local, "DoT reply");
+        // Not from that server and port, or not to a client port: input.
+        let other = Ipv4Addr::new(198, 51, 100, 99);
+        for (src, sport, dport) in [(other, 853, 61_234), (SERVER, 443, 61_234), (SERVER, 853, 22), (SERVER, 853, 59_999)] {
+            assert_eq!(
+                run(&mut fw, 0, WAN, &mut seg(src, sport, dport)),
+                Verdict::Drop(DropReason::Input),
+                "{src}:{sport} → {dport}"
+            );
+        }
+    }
+
+    #[test]
     fn flows_between_networks_keep_one_shard() {
         let internal = [(ROUTER_LAN, 24), (ROUTER_GUEST, 24)];
         let mut fws: Vec<Forwarder> = shards();
@@ -1923,7 +1954,7 @@ mod tests {
             forward: vec![0, 0b101, 0b001],
             input: vec![None, None, Some(svc::DHCP | svc::DNS)],
             rules,
-            forwards: vec![],
+            ..Policy::default()
         }));
     }
 
@@ -2000,8 +2031,8 @@ mod tests {
         fw.set_policy(Some(Policy {
             forward: vec![0, 0b001],
             input: vec![None, None],
-            rules: vec![],
             forwards,
+            ..Policy::default()
         }));
     }
 

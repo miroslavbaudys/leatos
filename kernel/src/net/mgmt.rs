@@ -1291,6 +1291,17 @@ fn status_json(
         );
     }
     s.push(']');
+    // DNS upstreams: where from, and the DNS-over-TLS connections.
+    if let Some(svc) = services {
+        let ups: Vec<String> = svc.upstreams().iter().map(|a| json_str(&format!("{a}"))).collect();
+        let _ = write!(
+            s,
+            ",\"dns\":{{\"source\":{},\"upstreams\":[{}],\"tls\":{}}}",
+            json_str(svc.upstream_source()),
+            ups.join(","),
+            svc.dot_status_json().unwrap_or_else(|| "null".into())
+        );
+    }
     // Wall clock (SNTP) and watchdog.
     let ntp = services.and_then(LanServices::ntp_status);
     let _ = write!(

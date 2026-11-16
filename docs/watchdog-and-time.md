@@ -77,9 +77,17 @@ Tests (`scripts/smoke-test.sh`; each passes only if a second boot is seen):
   and routes the answers back, so they share its cache and upstreams.
   smoltcp's DNS socket would use source ports in the NAT range.
 - The UDP socket sits on the WAN, port 60000–64999.
-- `wallclock` keeps the Unix time at monotonic 0. No clock discipline, no
-  RTC: the time is unknown until the first sync. It is shown on the status
-  page and in `/api/status` (`time`).
+- `wallclock` keeps the Unix time at monotonic 0. No clock discipline: the
+  time is unknown until the first sync. It is shown on the status page and
+  in `/api/status` (`time`).
+- RTC (`arch::rtc`: x86_64 CMOS, ports 0x70/0x71; none on aarch64): read
+  once at boot (`rtc : …` in the log) but never taken as the time; only
+  DNS over TLS uses it, as a hint for certificate dates before SNTP
+  (docs/dns-over-tls.md). After each sync it is set from the wall clock if
+  more than 2 s off (`rtc : was N s off, set to …`). Only the time
+  registers are written, never the rest of CMOS (coreboot's options); the
+  century is taken as 20. Lab: `RROUTER_ARCH=x86_64 LAB_DOT=1
+  QEMU_EXTRA="-rtc base=2040-01-01" LAB_EXPECT_DATES=expired`.
 - Lab: the ISP VM runs `busybox ntpd -l`, a stratum 1 server from the
   host's clock, and `dnsd` serves `ntp.isp.example`. `scripts/lab-test.sh`
   passes `ntp=ntp.isp.example` and checks the router's time against the

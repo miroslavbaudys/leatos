@@ -92,8 +92,11 @@ TTL aging and negative caching, upstreams from the WAN lease, random
 transaction IDs, response validation (server + question), merging of
 identical in-flight queries, retries across upstreams, SERVFAIL on
 timeout, rebind protection, bounded pending queries.
-**Open:** TCP port 53 and TC-bit retry, randomised upstream source port
-per query (Kaminsky hardening; one fixed random port today), DoT/DoH,
+Own upstreams (`dns.upstreams`) and strict DNS over TLS (`dns.tls`,
+`crates/proto-dot`, docs/dns-over-tls.md) are implemented; answers to LAN
+clients are cut to their EDNS size with TC.
+**Open:** TCP port 53 from clients, randomised upstream source port
+per query (Kaminsky hardening; one fixed random port today), DoH,
 blocklists, DNSSEC.
 
 | Function | Priority |
@@ -104,7 +107,7 @@ blocklists, DNSSEC.
 | **Never resolve for the WAN side** (bind to LAN only, plus a firewall rule) | required |
 | DNS rebind protection (drop public answers that contain private IPs) | recommended |
 | Bounded LRU cache (memory cap) | recommended |
-| DoT/DoH upstream | later (TLS on no_std is hard) |
+| DoT upstream | ✅ strict, `dns.tls` (docs/dns-over-tls.md); DoH later |
 | Blocklists (Pi-hole style) | later |
 | DNSSEC validation (needs correct time, so NTP) | optional |
 
@@ -136,7 +139,8 @@ forward to the current upstream (the upstream list is swapped atomically on `Wan
   that blocks inbound by default, and port forwarding.
 - SNTP client ✅ (`crates/proto-sntp`, `docs/watchdog-and-time.md`): servers
   from `time.ntp_servers` (default `pool.ntp.org`) resolved through the
-  router's DNS forwarder; no RTC is trusted. Open: serving NTP to the LAN.
+  router's DNS forwarder; the RTC (x86_64) is set after each sync but never
+  trusted as the time (only a hint for DoT certificate dates). Open: serving NTP to the LAN.
 - Persistent config storage: raw store partition with A/B record slots (`docs/config-and-storage.md`); virtio-blk in QEMU, SD on the apu4.
 
 ## Target configuration UX

@@ -4,19 +4,24 @@
 //! Thin glue between smoltcp UDP sockets and the sans-IO crates
 //! (`proto_dhcp::v4::server`, `proto_dns::resolver`): receive datagrams, feed
 //! them in with the current time, and send what comes out. DHCP lease events
-//! update the DNS zone (`host.lan`). WAN DHCP supplies the DNS upstreams.
+//! update the DNS zone (`host.lan`). The DNS upstreams are `dns.upstreams`
+//! if set, else the WAN lease's (DHCP or PPPoE); with `dns.tls` they are
+//! asked over TLS only (`net::dot`), never in plain text.
 //!
 //! Per network (`config::networks`): `0.0.0.0:67` (DHCP, unless switched
 //! off) and `:53` (DNS from clients) on its interface; one resolver and
 //! local zone for all of them. WAN `:<random high port>` (queries to
-//! upstream servers). `:5353` on networks taking part in mDNS reflection
+//! upstream servers over UDP), or TCP connections to port 853 for DNS
+//! over TLS. `:5353` on networks taking part in mDNS reflection
 //! (`net::mdns`).
 
 use crate::config;
+use crate::net::dot::Dot;
 use crate::net::mdns::Mdns;
 use crate::net::ntp::{self, Ntp};
 use crate::net::svc::HostIf;
 use crate::{println, timer};
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -50,6 +55,16 @@ pub struct LanServices {
     /// One forwarder and cache for all networks; one local zone.
     dns: Resolver,
     upstream_sock: Option<SocketHandle>,
+    /// The WAN lease's DNS servers (used without `dns.upstreams`).
+    lease_dns: Vec<Ipv4Addr>,
+    /// UDP port per configured upstream (53 unless given).
+    udp_ports: Vec<(Ipv4Addr, u16)>,
+    /// `dns.tls`: upstream queries only through `dot`; if that is `None`
+    /// (trust anchors failed to load), none at all.
+    tls: bool,
+    dot: Option<Dot>,
+    /// The WAN address changed: DNS-over-TLS connections start over.
+    wan_changed: bool,
     next_expire: u64,
     /// SNTP over the WAN (none without a WAN).
     ntp: Option<Ntp>,
@@ -79,6 +94,9 @@ fn resolver_config(d: &config::Dns) -> resolver::Config {
     resolver::Config {
         cache_entries: d.cache_entries,
         rebind_protection: d.rebind_protection,
+        // Over TLS the first query after a while also waits for TCP and
+        // the TLS handshake (two more round trips).
+        timeout_ms: if d.tls { 3000 } else { 1500 },
         ..Default::default()
     }
 }
@@ -185,14 +203,71 @@ impl LanServices {
         let ntp = Some(Ntp::new(wan));
         println!("  lan services    : dns cache {}", dns_cfg.cache_entries);
         let mdns = Mdns::new(hosts, links);
-        Some(Self {
+        let mut me = Self {
             nets,
             dns,
             upstream_sock,
+            lease_dns: Vec::new(),
+            udp_ports: Vec::new(),
+            tls: false,
+            dot: None,
+            wan_changed: false,
             next_expire: 0,
             ntp,
             mdns,
-        })
+        };
+        me.apply_upstreams(hosts);
+        Some(me)
+    }
+
+    /// The resolver's upstreams from the config (`dns.upstreams`,
+    /// `dns.tls`) or the WAN lease; DNS-over-TLS connections to match.
+    fn apply_upstreams(&mut self, hosts: &mut [HostIf]) {
+        let d = config::dns();
+        let own = !d.upstreams.is_empty() || d.tls;
+        let ips: Vec<Ipv4Addr> = if own { d.upstreams.iter().map(|u| u.ip).collect() } else { self.lease_dns.clone() };
+        self.dns.set_upstreams(&ips);
+        self.udp_ports = d.upstreams.iter().map(|u| (u.ip, u.port(false))).collect();
+        self.tls = d.tls;
+        match (d.tls, self.dot.as_mut()) {
+            (true, Some(dot)) => dot.reconfigure(&mut hosts[0], &d.upstreams, d.tls_ca.as_deref()),
+            (true, None) => self.dot = Dot::new(&d.upstreams, d.tls_ca.as_deref()),
+            (false, Some(dot)) => {
+                dot.shutdown(&mut hosts[0]);
+                self.dot = None;
+            }
+            (false, None) => {}
+        }
+        if d.tls && d.upstreams.is_empty() {
+            println!("  dns upstreams   : DNS over TLS without servers: every query fails (strict)");
+        } else if own && !d.tls {
+            let list: Vec<String> = d.upstreams.iter().map(|u| alloc::format!("{u}")).collect();
+            println!("  dns upstreams   : {} (plain DNS)", list.join(", "));
+        }
+    }
+
+    /// Where the upstreams come from (status page, CLI).
+    pub fn upstream_source(&self) -> &'static str {
+        match (self.tls, self.udp_ports.is_empty()) {
+            (true, _) => "dns.upstreams, DNS over TLS (strict)",
+            (false, false) => "dns.upstreams",
+            (false, true) => "WAN lease",
+        }
+    }
+
+    /// The upstreams the resolver asks.
+    pub fn upstreams(&self) -> &[Ipv4Addr] {
+        self.dns.upstreams()
+    }
+
+    /// DNS-over-TLS connections (`/api/status` `dns.tls`), if on.
+    pub fn dot_status_json(&self) -> Option<String> {
+        self.dot.as_ref().map(Dot::status_json)
+    }
+
+    /// DNS-over-TLS connections, one line each (CLI `status`).
+    pub fn dot_status_lines(&self) -> Vec<String> {
+        self.dot.as_ref().map(Dot::status_lines).unwrap_or_default()
     }
 
     /// Apply the current config (`config::apply`) without a restart: a
@@ -244,6 +319,7 @@ impl LanServices {
         }
         *self.dns.zone_mut() = build_zone(&cfgs, self.leases_by_network());
         self.dns.reconfigure(resolver_config(&dns_cfg));
+        self.apply_upstreams(hosts);
         if let Some(n) = self.ntp.as_mut() {
             n.reconfigure();
         }
@@ -307,17 +383,23 @@ impl LanServices {
         })
     }
 
-    /// The WAN lease changed: new upstream DNS servers.
+    /// The WAN lease changed: its DNS servers, used unless the config
+    /// names its own (`dns.upstreams`, `dns.tls`).
     pub fn set_upstreams(&mut self, servers: &[Ipv4Addr]) {
-        self.dns.set_upstreams(servers);
+        self.lease_dns = servers.to_vec();
+        if !self.tls && self.udp_ports.is_empty() {
+            self.dns.set_upstreams(servers);
+        }
     }
 
     /// The WAN got or lost its lease: SNTP starts or stops (IPv4 literals
-    /// work without DNS upstreams; names wait for them).
+    /// work without DNS upstreams; names wait for them); DNS-over-TLS
+    /// connections start over.
     pub fn set_wan_up(&mut self, up: bool) {
         if let Some(n) = self.ntp.as_mut() {
             n.set_wan(up);
         }
+        self.wan_changed = true;
     }
 
     /// SNTP state (status page).
@@ -352,6 +434,11 @@ impl LanServices {
         }
     }
 
+    /// The UDP port of an upstream: as configured, else 53.
+    fn udp_port(&self, server: Ipv4Addr) -> u16 {
+        self.udp_ports.iter().find(|(ip, _)| *ip == server).map_or(DNS_PORT, |&(_, p)| p)
+    }
+
     /// Send resolver output: answers to clients go out on the socket of
     /// the network the client is on.
     fn send_dns(&mut self, hosts: &mut [HostIf], actions: Vec<Action>) {
@@ -373,9 +460,15 @@ impl LanServices {
                         .get_mut::<udp::Socket>(net.dns_sock)
                         .send_slice(&data, ep);
                 }
+                // Strict: with `dns.tls` never UDP, also when TLS is unavailable.
+                Action::Upstream { server, data } if self.tls => {
+                    if let Some(dot) = self.dot.as_mut() {
+                        dot.send(&mut hosts[0], server, &data);
+                    }
+                }
                 Action::Upstream { server, data } => {
                     if let Some(h) = self.upstream_sock {
-                        let ep = IpEndpoint::new(IpAddr::V4(server).into(), DNS_PORT);
+                        let ep = IpEndpoint::new(IpAddr::V4(server).into(), self.udp_port(server));
                         let _ = hosts[0].sockets.get_mut::<udp::Socket>(h).send_slice(&data, ep);
                     }
                 }
@@ -426,18 +519,30 @@ impl LanServices {
                 self.send_dns(hosts, actions);
             }
         }
-        // DNS: upstream responses.
+        // DNS: upstream responses. Over TLS only from the TLS connections:
+        // a UDP datagram is never an answer then (no query went out by UDP,
+        // so one with a pending ID is spoofed).
         if let Some(h) = self.upstream_sock {
             let mut rbuf = [0u8; 4096]; // EDNS responses may exceed 1500 B
             while let Ok((n, meta)) = hosts[0].sockets.get_mut::<udp::Socket>(h).recv_slice(&mut rbuf) {
                 let from = match IpAddr::from(meta.endpoint.addr) {
-                    IpAddr::V4(a) if meta.endpoint.port == DNS_PORT => a,
+                    IpAddr::V4(a) if !self.tls && meta.endpoint.port == self.udp_port(a) => a,
                     _ => continue,
                 };
                 let actions = self.dns.handle_upstream(now_ms(), from, &rbuf[..n]);
                 self.send_dns(hosts, actions);
             }
         }
+        if let Some(dot) = self.dot.as_mut() {
+            if core::mem::take(&mut self.wan_changed) {
+                dot.wan_changed(&mut hosts[0]);
+            }
+            for (from, answer) in dot.step(&mut hosts[0]) {
+                let actions = self.dns.handle_upstream(now_ms(), from, &answer);
+                self.send_dns(hosts, actions);
+            }
+        }
+        self.wan_changed = false;
         // SNTP: our own name lookups, then the protocol.
         let queries = self.ntp.as_mut().map(|n| n.lookups(now_ms())).unwrap_or_default();
         for q in queries {
@@ -451,6 +556,10 @@ impl LanServices {
         // DNS: retries / timeouts.
         let actions = self.dns.poll(now_ms());
         self.send_dns(hosts, actions);
+        // Queries queued above go out with the next poll of the WAN.
+        if let Some(dot) = self.dot.as_mut() {
+            dot.flush(&mut hosts[0]);
+        }
 
         self.mdns.step(hosts, links);
     }
@@ -466,6 +575,9 @@ impl LanServices {
         }
         if self.mdns.wants_soon() {
             wait_ms = wait_ms.min(MDNS_RECHECK_MS);
+        }
+        if let Some(at) = self.dot.as_ref().and_then(Dot::next_deadline) {
+            wait_ms = wait_ms.min(at.saturating_duration_since(timer::Instant::now()).as_millis() as u64);
         }
         timer::Instant::now()
             .checked_add(core::time::Duration::from_millis(wait_ms))

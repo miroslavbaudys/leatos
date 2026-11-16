@@ -23,6 +23,11 @@ pub const MAX_ZONES: usize = 16;
 pub const MAX_RULES: usize = 256;
 pub const MAX_FORWARDS: usize = 128;
 pub const MAX_DNS_HOSTS: usize = 256;
+/// `dns.upstreams` entries.
+pub const MAX_DNS_UPSTREAMS: usize = 4;
+/// `dns.tls_ca`: size and certificates.
+pub const MAX_TLS_CA_LEN: usize = 16 * 1024;
+pub const MAX_TLS_CAS: usize = 8;
 pub const MAX_MDNS_RULES: usize = 32;
 /// Most ports a network may be on.
 pub const MAX_PORTS: usize = 8;
@@ -594,6 +599,7 @@ fn dns(c: &Config, x: &mut Issues) {
     if d.hosts.len() > MAX_DNS_HOSTS {
         x.add("dns.host", format!("at most {MAX_DNS_HOSTS} records"));
     }
+    upstreams(d, x);
     let mut seen = BTreeMap::new();
     for (i, h) in d.hosts.iter().enumerate() {
         if !is_domain(&h.name) {
@@ -604,6 +610,48 @@ fn dns(c: &Config, x: &mut Issues) {
                 format!("dns.host[{i}].name"),
                 format!("\"{}\" is already in dns.host[{j}]", h.name),
             );
+        }
+    }
+}
+
+/// `dns.upstreams`, `dns.tls`, `dns.tls_ca`.
+fn upstreams(d: &crate::Dns, x: &mut Issues) {
+    if d.upstreams.len() > MAX_DNS_UPSTREAMS {
+        x.add("dns.upstreams", format!("at most {MAX_DNS_UPSTREAMS} servers"));
+    }
+    let mut seen = BTreeMap::new();
+    for (i, u) in d.upstreams.iter().enumerate() {
+        let path = format!("dns.upstreams[{i}]");
+        match crate::Upstream::parse(u) {
+            Err(e) => x.add(path, e),
+            Ok(up) => {
+                if d.tls && up.name.is_none() {
+                    x.add(
+                        path,
+                        format!("DNS over TLS needs the name on the server's certificate: \"{}#dns.example\"", up.ip),
+                    );
+                } else if let Some(j) = seen.insert((up.ip, up.port(d.tls)), i) {
+                    x.add(path, format!("the same server as dns.upstreams[{j}]"));
+                }
+            }
+        }
+    }
+    if d.tls && d.upstreams.is_empty() {
+        x.add(
+            "dns.upstreams",
+            "DNS over TLS needs servers with their certificate names, e.g. \"1.1.1.1#cloudflare-dns.com\"",
+        );
+    }
+    if let Some(pem) = &d.tls_ca {
+        use rustls_pki_types::CertificateDer;
+        use rustls_pki_types::pem::PemObject;
+        let certs: Result<Vec<_>, _> = CertificateDer::pem_slice_iter(pem.as_bytes()).collect();
+        match certs {
+            _ if pem.len() > MAX_TLS_CA_LEN => x.add("dns.tls_ca", format!("at most {MAX_TLS_CA_LEN} bytes")),
+            Err(_) => x.add("dns.tls_ca", "must be PEM certificates (-----BEGIN CERTIFICATE-----)"),
+            Ok(c) if c.is_empty() => x.add("dns.tls_ca", "no certificate in it (-----BEGIN CERTIFICATE-----)"),
+            Ok(c) if c.len() > MAX_TLS_CAS => x.add("dns.tls_ca", format!("at most {MAX_TLS_CAS} certificates")),
+            Ok(_) => {}
         }
     }
 }
@@ -682,6 +730,6 @@ fn is_label(s: &str) -> bool {
         && b[b.len() - 1] != b'-'
 }
 
-fn is_domain(s: &str) -> bool {
+pub(crate) fn is_domain(s: &str) -> bool {
     (1..=253).contains(&s.len()) && s.split('.').all(is_label)
 }

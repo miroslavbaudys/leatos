@@ -300,6 +300,36 @@ pub fn is_truncated(msg: &[u8]) -> bool {
     Header::parse(msg).is_ok_and(|h| h.flags & FLAG_TC != 0)
 }
 
+/// The largest UDP answer `query`'s sender takes: its EDNS buffer size
+/// (RFC 6891 §6.2.3), 512 without EDNS, never more than `cap` (what fits
+/// in one datagram on the way back).
+pub fn udp_limit(query: &[u8], cap: usize) -> usize {
+    let edns = records(query).ok().and_then(|recs| {
+        recs.iter()
+            .find(|r| r.section == 2 && r.rtype == TYPE_OPT)
+            .map(|r| u16::from_be_bytes([query[r.ttl_offset - 2], query[r.ttl_offset - 1]]) as usize)
+    });
+    edns.unwrap_or(512).clamp(512, cap.max(512))
+}
+
+/// `msg` for a client that takes at most `limit` bytes: unchanged if it
+/// fits, else the header and question with TC set and no records
+/// (RFC 2181 §9), so the client knows the answer did not fit.
+pub fn fit(msg: &[u8], limit: usize) -> Vec<u8> {
+    if msg.len() <= limit {
+        return msg.to_vec();
+    }
+    let end = parse_query(msg).map_or(HEADER_LEN, |(_, _, end)| end).min(msg.len());
+    let mut out = msg[..end].to_vec();
+    if out.len() >= HEADER_LEN {
+        let flags = u16::from_be_bytes([out[2], out[3]]) | FLAG_TC;
+        out[2..4].copy_from_slice(&flags.to_be_bytes());
+        out[4..6].copy_from_slice(&u16::from(end > HEADER_LEN).to_be_bytes());
+        out[6..12].fill(0);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +375,33 @@ mod tests {
     }
 
     #[test]
+    fn udp_limits_and_fitting() {
+        let q = build_query(5, "big.example", TYPE_A);
+        assert_eq!(udp_limit(&q, 1472), 512, "no EDNS");
+        let mut e = q.clone();
+        e[11] = 1; // ARCOUNT
+        e.extend_from_slice(&[0, 0, 41, 0x10, 0x00, 0, 0, 0, 0, 0, 0]); // OPT, 4096
+        assert_eq!(udp_limit(&e, 1472), 1472, "capped");
+        let class = e.len() - 8..e.len() - 6;
+        e[class.clone()].copy_from_slice(&1232u16.to_be_bytes());
+        assert_eq!(udp_limit(&e, 1472), 1232);
+        e[class].copy_from_slice(&100u16.to_be_bytes());
+        assert_eq!(udp_limit(&e, 1472), 512, "never below 512");
+
+        let (_, _, end) = parse_query(&q).unwrap();
+        let answers: Vec<_> = (0..60).map(|i| (Rdata::A(Ipv4Addr::new(10, 0, 0, i)), 60)).collect();
+        let r = build_response(&q, end, RCODE_NOERROR, &answers, false);
+        assert!(r.len() > 512);
+        assert_eq!(fit(&r, 1472), r, "fits");
+        let t = fit(&r, 512);
+        assert!(is_truncated(&t));
+        let h = Header::parse(&t).unwrap();
+        assert_eq!((h.id, h.qdcount, h.ancount, h.nscount, h.arcount), (5, 1, 0, 0, 0));
+        assert_eq!(parse_query(&t).unwrap().1.name, "big.example");
+        assert_eq!(t.len(), end);
+    }
+
+    #[test]
     fn pointer_loops_are_rejected() {
         let mut m = build_query(1, "a", TYPE_A);
         // Replace the question name with a pointer to itself.
@@ -383,6 +440,8 @@ mod tests {
                 let _ = answer_ipv4s(&b, &recs);
             }
             let _ = error_response(&b, RCODE_FORMERR);
+            let _ = udp_limit(&b, 1472);
+            let _ = fit(&b, 20);
         }
     }
 }

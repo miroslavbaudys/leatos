@@ -122,7 +122,11 @@ P="$IMG@@$((PART_LBA * 512))"
 mformat -i "$P" -F -v RROUTER -T "$PART_SECTORS" -h 64 -s 32 -H "$PART_LBA" ::
 mmd -i "$P" ::/boot ::/boot/limine
 mcopy -i "$P" "$LIMINE_SHARE/limine-bios.sys" "$WORK/limine.conf" ::/boot/limine/
-mcopy -i "$P" "$KERNEL" ::/boot/rrouter
+# Without debug info (gdb uses the ELF in target/): the boot partition
+# holds at most 63 MiB, and a debug kernel with DNS over TLS is ~80 MB.
+OBJCOPY="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objcopy"
+if [[ -x "$OBJCOPY" ]]; then "$OBJCOPY" --strip-debug "$KERNEL" "$WORK/rrouter"; else cp "$KERNEL" "$WORK/rrouter"; fi
+mcopy -i "$P" "$WORK/rrouter" ::/boot/rrouter
 cargo build -p rrstore --release --quiet
 target/release/rrstore format "$IMG" >/dev/null
 # Validated by rrstore (the same checks as the kernel's): a config the

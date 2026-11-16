@@ -104,6 +104,20 @@ lookup ghost.lan      "NXDOMAIN\|can't find\|server can't" "unknown local name -
 # Upstream: the router forwards to the ISP's DNS server (from the WAN lease).
 lookup isp.example    "203.0.113.80"   "upstream isp.example -> 203.0.113.80 (via ISP dnsd)"
 
+# DNS over TLS (scripts/lab-test.sh LAB_DOT=1): dot.isp.example is known
+# only to the ISP's DoT server, plain.isp.example only to its plain dnsd.
+# Strict: the first must resolve, the second never (no plain DNS, also
+# when TLS fails).
+if $bb grep -q "lab_dot=1" /proc/cmdline; then
+  lookup dot.isp.example "203.0.113.53" "over TLS: dot.isp.example -> 203.0.113.53 (only the DoT server has it)"
+  out=$($bb nslookup plain.isp.example 192.168.1.1 2>&1)
+  if echo "$out" | $bb grep -q "203.0.113.54"; then
+    fail "dns over TLS: plain.isp.example resolved: the router asked plain DNS"; echo "$out" | $bb sed 's/^/    | /'
+  else
+    pass "dns over TLS: plain.isp.example not resolved (no plain DNS)"
+  fi
+fi
+
 # --- reachability -----------------------------------------------------------
 if $bb ping -c 2 -W 2 192.168.1.1 >/tmp/ping 2>&1; then
   pass "ping router ($($bb grep -o 'min/avg/max = [^ ]*' /tmp/ping))"

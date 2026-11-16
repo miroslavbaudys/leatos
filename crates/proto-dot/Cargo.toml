@@ -1,0 +1,38 @@
+[package]
+name = "proto-dot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DNS over TLS (RFC 7858) client connections: rustls (no_std, unbuffered) with a RustCrypto provider and the Mozilla roots."
+
+[dependencies]
+rustls = { version = "0.23.46", default-features = false, features = ["tls12"] }
+webpki-roots = "1"
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+# Crypto provider (src/provider.rs): RustCrypto, pure Rust.
+sha2 = { version = "0.10", default-features = false, features = ["oid"] }
+digest = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+chacha20poly1305 = { version = "0.10", default-features = false }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "arithmetic"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "arithmetic"] }
+ecdsa = { version = "0.16", default-features = false, features = ["verifying", "der"] }
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
+ed25519-dalek = { version = "2", default-features = false }
+signature = { version = "2", default-features = false }
+
+# x86_64-unknown-none has no SSE: the software SHA-2 (other crates: --cfg
+# flags in .cargo/config.toml).
+[target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
+sha2 = { version = "0.10", default-features = false, features = ["force-soft", "oid"] }
+
+[dev-dependencies]
+# A real TLS server for the tests (host only): rustls with ring, rcgen certificates.
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+time = "0.3"
+
+[lints]
+workspace = true

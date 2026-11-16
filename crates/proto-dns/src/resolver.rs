@@ -24,6 +24,12 @@ use core::net::{Ipv4Addr, SocketAddr};
 /// TTL for answers from the local zone.
 pub const LOCAL_TTL: u32 = 60;
 
+/// Largest answer to a client: one datagram on a 1500-byte link (IP and
+/// UDP headers off). Larger ones (an EDNS client's, or anything from a
+/// TCP/TLS upstream) are cut to the question with TC set
+/// ([`wire::fit`]).
+pub const MAX_UDP_REPLY: usize = 1472;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     /// Send `data` to the LAN client `to`.
@@ -73,7 +79,8 @@ struct Pending {
     question: Question,
     /// The upstream query (with our ID).
     query: Vec<u8>,
-    waiters: Vec<(SocketAddr, u16)>,
+    /// Client, its query ID, the largest answer it takes.
+    waiters: Vec<(SocketAddr, u16, usize)>,
     sent_ms: u64,
     tries: u8,
     upstream: usize,
@@ -202,8 +209,10 @@ impl Resolver {
         }
 
         // 2. Cache.
+        let limit = wire::udp_limit(query, MAX_UDP_REPLY);
         if let Some(data) = self.cache.get(now_ms, &q, h.id) {
             self.stats.cache_hits += 1;
+            let data = wire::fit(&data, limit);
             return alloc::vec![Action::Reply { to: client, data }];
         }
 
@@ -211,7 +220,7 @@ impl Resolver {
         if let Some(id) = self.by_question.get(&q)
             && let Some(p) = self.pending.get_mut(id)
         {
-            p.waiters.push((client, h.id));
+            p.waiters.push((client, h.id, limit));
             self.stats.merged += 1;
             return Vec::new();
         }
@@ -228,7 +237,7 @@ impl Resolver {
             Pending {
                 question: q,
                 query: up.clone(),
-                waiters: alloc::vec![(client, h.id)],
+                waiters: alloc::vec![(client, h.id, limit)],
                 sent_ms: now_ms,
                 tries: 1,
                 upstream: 0,
@@ -276,8 +285,8 @@ impl Resolver {
 
         p.waiters
             .into_iter()
-            .map(|(to, id)| {
-                let mut d = data.clone();
+            .map(|(to, id, limit)| {
+                let mut d = wire::fit(&data, limit);
                 wire::set_id(&mut d, id);
                 Action::Reply { to, data: d }
             })
@@ -313,7 +322,7 @@ impl Resolver {
                 });
             } else if let Some(p) = self.pending.remove(&id) {
                 self.by_question.remove(&p.question);
-                for (to, orig) in p.waiters {
+                for (to, orig, _) in p.waiters {
                     let mut q = p.query.clone();
                     wire::set_id(&mut q, orig);
                     out.extend(self.reply_error(to, &q, wire::RCODE_SERVFAIL));

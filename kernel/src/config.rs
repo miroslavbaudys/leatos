@@ -245,6 +245,8 @@ pub fn overrides() -> Vec<(String, &'static str)> {
         ("qdisc", "shaping.qdisc"),
         ("isolation", "shaping.isolation"),
         ("ntp", "time.ntp_servers"),
+        ("dns", "dns.upstreams"),
+        ("dns_tls", "dns.tls"),
     ];
     let args = bootargs();
     let mut v = Vec::new();
@@ -358,6 +360,25 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
             .filter(|n| !n.is_empty() && *n != "off")
             .map(String::from)
             .collect();
+    }
+    // `dns=1.1.1.1#cloudflare-dns.com,1.0.0.1#cloudflare-dns.com`; `dns=`
+    // alone: the WAN lease's servers again. Entries that do not parse are
+    // ignored.
+    if let Some(list) = arg(args, "dns") {
+        c.dns.upstreams = list
+            .split(',')
+            .filter(|u| schema::Upstream::parse(u).is_ok())
+            .map(String::from)
+            .collect();
+    }
+    if let Some(v) = arg_u64(args, "dns_tls") {
+        c.dns.tls = v != 0;
+    }
+    // Strict fails closed: servers without a certificate name cannot be
+    // used over TLS and are left out, never asked in plain text; with none
+    // left, every query gets SERVFAIL.
+    if c.dns.tls {
+        c.dns.upstreams.retain(|u| schema::Upstream::parse(u).is_ok_and(|u| u.name.is_some()));
     }
 }
 
@@ -568,11 +589,18 @@ pub fn firewall() -> fwd::forwarder::Policy {
             hairpin: f.hairpin,
         })
         .collect();
+    // Replies from the DNS-over-TLS servers to the router's connections.
+    let router_tcp_peers = if c.dns.tls {
+        c.dns.upstream_list().iter().map(|u| (u.ip, u.port(true))).collect()
+    } else {
+        Vec::new()
+    };
     fwd::forwarder::Policy {
         forward,
         input,
         rules,
         forwards,
+        router_tcp_peers,
     }
 }
 
@@ -653,6 +681,12 @@ pub fn pppoe() -> Option<proto_pppoe::Config> {
 pub struct Dns {
     pub cache_entries: usize,
     pub rebind_protection: bool,
+    /// Servers of its own (`dns.upstreams`); empty = the WAN lease's.
+    pub upstreams: Vec<schema::Upstream>,
+    /// Strict DNS over TLS to `upstreams` (`dns.tls`).
+    pub tls: bool,
+    /// Extra trust anchors, PEM (`dns.tls_ca`).
+    pub tls_ca: Option<String>,
 }
 
 pub fn dns() -> Dns {
@@ -661,6 +695,9 @@ pub fn dns() -> Dns {
     Dns {
         cache_entries: d.cache_entries as usize,
         rebind_protection: d.rebind_protection,
+        upstreams: d.upstream_list(),
+        tls: d.tls,
+        tls_ca: d.tls_ca.clone(),
     }
 }
 

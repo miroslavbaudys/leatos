@@ -58,6 +58,13 @@ fn paths(e: Error) -> Vec<String> {
     }
 }
 
+/// Issue paths, none if the config is valid.
+fn issues(f: impl FnOnce(&mut Config)) -> Vec<String> {
+    let mut c = Config::default();
+    f(&mut c);
+    parse(&c.to_toml()).err().map(paths).unwrap_or_default()
+}
+
 fn invalid(f: impl FnOnce(&mut Config)) -> Vec<String> {
     let mut c = Config::default();
     f(&mut c);
@@ -93,6 +100,7 @@ fn full_document_parses() {
             rebind_protection: false,
             domain: "home.lan".into(),
             hosts: vec![],
+            ..Dns::default()
         }
     );
     assert_eq!(
@@ -157,6 +165,7 @@ fn defaults_are_valid_and_match_the_kernel() {
             rebind_protection: true,
             domain: "lan".into(),
             hosts: vec![],
+            ..Dns::default()
         }
     );
     assert!(!c.mgmt.on_wan);
@@ -406,6 +415,58 @@ fn shaping_and_dns_checks() {
         (c.shaping.qdisc, c.shaping.isolation),
         (Qdisc::Codel, Isolation::Flows)
     );
+}
+
+#[test]
+fn dns_upstreams_and_tls() {
+    // Cloudflare over TLS, as written by hand.
+    let c = parse(
+        "version = 2\n[dns]\ntls = true\nupstreams = [\"1.1.1.1#cloudflare-dns.com\", \"1.0.0.1:853#Cloudflare-DNS.com\"]\n",
+    )
+    .unwrap();
+    let ups = c.dns.upstream_list();
+    assert_eq!(ups.len(), 2);
+    assert_eq!((ups[0].ip, ups[0].port(true), ups[0].name.as_deref()), (ip(1, 1, 1, 1), 853, Some("cloudflare-dns.com")));
+    assert_eq!((ups[1].port, ups[1].name.as_deref()), (Some(853), Some("cloudflare-dns.com")), "names lowercased");
+    assert_eq!(alloc::format!("{}", ups[1]), "1.0.0.1:853#cloudflare-dns.com");
+    // Version 2 only (an older kernel must not run without its DNS settings).
+    assert!(!c.fits_v1());
+    assert!(c.unsupported().is_empty(), "implemented: {:?}", c.unsupported());
+    assert!(c.to_toml().contains("tls = true"));
+    assert_eq!(parse(&c.to_toml()).unwrap(), c, "round trip");
+    let json = c.to_json();
+    assert_eq!(parse_json(&json).unwrap(), c, "JSON round trip");
+    // Plain upstreams: any port, a name allowed (used once TLS is on).
+    let plain = parse("version = 2\n[dns]\nupstreams = [\"9.9.9.9\", \"192.168.1.53:5353\", \"8.8.8.8#dns.google\"]\n").unwrap();
+    assert_eq!(plain.dns.upstream_list()[1].port(false), 5353);
+    assert_eq!(plain.dns.upstream_list()[0].port(false), 53);
+    // Defaults: the lease's servers, written as nothing.
+    assert!(!Config::default().to_toml().contains("upstreams"));
+    assert!(Config::default().fits_v1());
+
+    let set = |ups: &[&str], tls: bool| {
+        issues(|c| {
+            c.dns.upstreams = ups.iter().map(|s| String::from(*s)).collect();
+            c.dns.tls = tls;
+        })
+    };
+    assert_eq!(set(&["1.1.1.1"], true), ["dns.upstreams[0]"], "TLS needs the certificate name");
+    assert_eq!(set(&[], true), ["dns.upstreams"], "TLS needs servers");
+    assert_eq!(set(&["1.1.1"], false), ["dns.upstreams[0]"]);
+    assert_eq!(set(&["0.0.0.0"], false), ["dns.upstreams[0]"]);
+    assert_eq!(set(&["127.0.0.1"], false), ["dns.upstreams[0]"]);
+    assert_eq!(set(&["1.1.1.1:0"], false), ["dns.upstreams[0]"]);
+    assert_eq!(set(&["1.1.1.1#bad name"], false), ["dns.upstreams[0]"]);
+    assert_eq!(set(&["1.1.1.1#a", "1.1.1.1#b"], true), ["dns.upstreams[1]"], "same server twice");
+    assert_eq!(set(&["1.1.1.1", "1.1.1.1:53"], false), ["dns.upstreams[1]"], "53 is the default");
+    assert_eq!(set(&["1.1.1.1#a", "1.1.1.2#a", "1.1.1.3#a", "1.1.1.4#a", "1.1.1.5#a"], true), ["dns.upstreams"]);
+    assert!(set(&["1.1.1.1#1.1.1.1"], true).is_empty(), "an IP certificate name");
+
+    let ca = |pem: &str| issues(|c| c.dns.tls_ca = Some(String::from(pem)));
+    assert_eq!(ca("not pem"), ["dns.tls_ca"]);
+    assert_eq!(ca("-----BEGIN CERTIFICATE-----\n!!\n-----END CERTIFICATE-----\n"), ["dns.tls_ca"]);
+    assert!(ca("-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n").is_empty());
+    assert!(!parse("version = 2\n[dns]\ntls_ca = \"-----BEGIN CERTIFICATE-----\\nMAA=\\n-----END CERTIFICATE-----\\n\"\n").unwrap().fits_v1());
 }
 
 #[test]
