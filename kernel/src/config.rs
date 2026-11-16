@@ -518,13 +518,16 @@ pub fn networks() -> Vec<Lan> {
 /// replies to the router's own clients (DHCP, DNS upstream, SNTP, ICMP
 /// errors) pass before the policy (`fwd::forwarder` `input`), PPPoE is
 /// not IP, and `[[firewall.rule]]`s from `wan` to `router` can open more.
-/// `reject` drops (no RST / port unreachable yet).
+/// `reject` (zone input, rule action) answers: TCP RST, else ICMP port
+/// unreachable, rate-limited; the WAN zone's input is never answered,
+/// only an explicit `reject` rule from `wan` is.
 pub fn firewall() -> fwd::forwarder::Policy {
     use fwd::forwarder::svc;
     let c = get();
     let names = zone_names(&c);
     let mut forward = Vec::new();
     let mut input = Vec::new();
+    let mut reject_input = Vec::new();
     for (i, name) in names.iter().enumerate() {
         let z = c.zone(name).unwrap_or_else(schema::Zone::builtin_lan);
         forward.push(
@@ -533,6 +536,7 @@ pub fn firewall() -> fwd::forwarder::Policy {
                 .map(|t| 1u32 << zone_index(&names, t))
                 .fold(0, |a, b| a | b),
         );
+        reject_input.push(i != 0 && z.input == schema::Policy::Reject);
         input.push(match z.input {
             _ if i == 0 => Some(if c.mgmt.on_wan { svc::MGMT } else { 0 }),
             schema::Policy::Accept => None,
@@ -551,7 +555,7 @@ pub fn firewall() -> fwd::forwarder::Policy {
             ),
         });
     }
-    use fwd::forwarder::{Rule, RuleTo, proto};
+    use fwd::forwarder::{Action, Rule, RuleTo, proto};
     let net = |n: &Option<schema::Net>| n.map(|n| (n.0.network(), n.0.prefix));
     let rules = c
         .firewall
@@ -575,8 +579,11 @@ pub fn firewall() -> fwd::forwarder::Policy {
             src: net(&r.src),
             dst: net(&r.dst),
             dport: r.dst_port.map(|p| (p.lo, p.hi)),
-            // reject drops for now (no RST / port unreachable yet)
-            accept: r.action == schema::Action::Accept,
+            action: match r.action {
+                schema::Action::Accept => Action::Accept,
+                schema::Action::Drop => Action::Drop,
+                schema::Action::Reject => Action::Reject,
+            },
         })
         .collect();
     let forwards = c
@@ -625,6 +632,7 @@ pub fn firewall() -> fwd::forwarder::Policy {
     fwd::forwarder::Policy {
         forward,
         input,
+        reject_input,
         rules,
         forwards,
         redirects,
@@ -825,6 +833,12 @@ fn arg<'a>(bootargs: &'a str, key: &str) -> Option<&'a str> {
     bootargs
         .split_whitespace()
         .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// `fw_recheck=0`: a new firewall policy leaves tracked connections alone
+/// (`Forwarder::recheck` skipped): the negative control of the lab check.
+pub fn fw_recheck() -> bool {
+    arg_u64(bootargs(), "fw_recheck") != Some(0)
 }
 
 fn arg_u64(bootargs: &str, key: &str) -> Option<u64> {

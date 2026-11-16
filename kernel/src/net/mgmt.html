@@ -285,8 +285,8 @@
       <form class="card cfg" autocomplete="off"><h3>Forwarder</h3>
         <label>Cache entries<input data-path="dns.cache_entries" type="number" min="16" max="65536"></label>
         <label class="check"><input data-path="dns.rebind_protection" type="checkbox">Rebind protection (drop answers pointing into private ranges)</label>
-        <label class="check"><input data-path="dns.prefetch" type="checkbox">Prefetch (renew popular names shortly before they expire)</label>
-        <label>Serve stale for (s, 0 = off)<input data-path="dns.stale_secs" type="number" min="0" max="604800"></label>
+        <label class="check"><input data-path="dns.prefetch" data-default="true" type="checkbox">Prefetch (renew popular names shortly before they expire)</label>
+        <label>Serve stale for (s, 0 = off)<input data-path="dns.stale_secs" data-default="86400" type="number" min="0" max="604800"></label>
       </form>
       <form class="card cfg" autocomplete="off"><h3>Upstream servers</h3>
         <label>Servers (comma-separated; empty = the WAN's)<input id="dnsups" data-x data-path="dns.upstreams" placeholder="1.1.1.1#cloudflare-dns.com, 1.0.0.1#cloudflare-dns.com"></label>
@@ -315,7 +315,7 @@
       <div class="tw"><table id="rules"></table></div>
       <div class="row"><button type="button" id="addrule" class="plain">Add rule</button>
         <span class="hint">Checked from the top for each new connection (and for traffic to the router); the first match decides, otherwise the zones do. Applied at once, to new connections.</span></div>
-      <p class="hint">"To" <b>router</b> means traffic for the router itself (its web interface, DNS, …); <b>any</b> matches forwarded traffic and the router. Replies to the router's own requests (DHCP, DNS upstream, time) always pass. <b>reject</b> drops for now. Rules to the router boot as a trial.</p>
+      <p class="hint">"To" <b>router</b> means traffic for the router itself (its web interface, DNS, …); <b>any</b> matches forwarded traffic and the router. Replies to the router's own requests (DHCP, DNS upstream, time) always pass. <b>drop</b> is silent; <b>reject</b> answers (TCP reset, else ICMP port unreachable), so clients fail at once. A changed rule also ends tracked connections it now refuses. Rules to the router boot as a trial.</p>
     </form>
     <form class="card cfg" autocomplete="off" id="fwdsform"><h3>Port forwards</h3>
       <div class="tw"><table id="fwds"></table></div>
@@ -936,9 +936,11 @@ function fillForm(c) {
   lanName = c.network?.[0]?.name ?? "lan";
   for (const e of document.querySelectorAll("form.cfg [data-net]")) e.dataset.path = lanPath(e.dataset.net);
   for (const e of fields()) {
-    const v = getp(c, e.dataset.path);
+    // Left out of the config = the default: the first option, or
+    // data-default (fields the config omits while they hold their default).
+    const v = getp(c, e.dataset.path) ?? (e.type === "checkbox" && e.dataset.default ? e.dataset.default === "true" : e.dataset.default);
     if (e.type === "checkbox") e.checked = !!v;
-    else if (e.tagName === "SELECT") e.value = v ?? e.options[0].value; // left out = the default (first)
+    else if (e.tagName === "SELECT") e.value = v ?? e.options[0].value;
     else e.value = v ?? "";
   }
   const r = getp(c, lanPath("dhcp.range"));

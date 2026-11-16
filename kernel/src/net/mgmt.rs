@@ -1120,7 +1120,7 @@ fn status_json(
     cpu.push_str("]}");
     let _ = write!(
         s,
-        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"vlan_drops\":{},\"conntrack\":{},\
+        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"vlan_drops\":{},\"conntrack\":{},\"revoked\":{},\"rejected\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
          \"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
@@ -1150,6 +1150,8 @@ fn status_json(
         datapath::DROPPED.load(Ordering::Relaxed),
         datapath::VLAN_DROPS.load(Ordering::Relaxed),
         sh.conntrack(),
+        datapath::REVOKED.load(Ordering::Relaxed),
+        datapath::REJECTED.load(Ordering::Relaxed),
         mgmt.wan_pppoe.as_deref().unwrap_or("null"),
         datapath::PPPOE_DROPS.load(Ordering::Relaxed),
         fwd::forwarder::DropReason::all()

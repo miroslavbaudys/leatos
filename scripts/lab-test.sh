@@ -76,6 +76,14 @@
 #                        WAN); the client checks both through the rules'
 #                        hit counters and the traffic. Negative control:
 #                        LAB_GUEST_RULES=0 (config without them: both fail).
+#                        Reject: the refused HTTP fails at once ("Connection
+#                        refused": the router's RST) and the router's
+#                        "rejected" counter rises; negative control
+#                        LAB_GUEST_REJECT=drop (the rule drops: it times out).
+#                        Recheck: a guest ping to the ISP stops when a live
+#                        config takes the guest zone's internet away
+#                        (tracked connections removed, "revoked" counter);
+#                        negative control LAB_ROUTER_ARGS=fw_recheck=0.
 #                        Port forward (step 5): lab-web, the WAN address
 #                        :8080 -> the client's httpd (reserved at .100),
 #                        with hairpin; the ISP fetches through it and the
@@ -178,6 +186,7 @@ WAN_OPEN="${LAB_WAN_OPEN:-}"
 [[ -n "$WAN_OPEN" ]] && GUEST=1
 GUEST_ZONE="${LAB_GUEST_ZONE:-guest}"
 GUEST_RULES="${LAB_GUEST_RULES:-1}"
+GUEST_REJECT="${LAB_GUEST_REJECT:-reject}"
 FORWARD="${LAB_FORWARD:-1}"
 REDIRECT="${LAB_REDIRECT:-1}"
 GUEST_DOMAIN="${LAB_GUEST_DOMAIN:-1}"
@@ -272,7 +281,7 @@ from = "guest"
 to = ["lan"]
 services = ["_ipp._tcp"]
 CFG
-  [[ "$GUEST_RULES" == 1 ]] && cat >>"$WORK/config.toml" <<'CFG'
+  [[ "$GUEST_RULES" == 1 ]] && cat >>"$WORK/config.toml" <<CFG
 
 [[firewall.rule]]
 name = "guest-ping-nas"
@@ -288,7 +297,7 @@ from = "guest"
 to = "wan"
 proto = "tcp"
 dst_port = 80
-action = "reject"
+action = "$GUEST_REJECT"
 CFG
   [[ -n "$WAN_OPEN" ]] && cat >>"$WORK/config.toml" <<'CFG'
 
@@ -323,7 +332,6 @@ CFG
     awk '/^\[\[network\]\]$/ { n++ } n < 2' "$WORK/config.toml" >"$WORK/boot.toml"
     target/release/rrstore create "$WORK/store.img" --mib 32 >/dev/null
     target/release/rrstore put "$WORK/store.img" config "$WORK/boot.toml" >/dev/null
-    ROUTER_ARGS="$ROUTER_ARGS mgmt_pass=lab-pass"
     # The full config goes into the client's initrd (an extra cpio archive).
     mkdir -p "$WORK/extra"; cp "$WORK/config.toml" "$WORK/extra/guest.toml"
     ( cd "$WORK/extra" && echo guest.toml | cpio -o -H newc 2>/dev/null | gzip -9 ) >"$WORK/extra.cpio.gz"
@@ -331,6 +339,8 @@ CFG
     CLIENT_INITRD="$WORK/client-initrd.img"
   fi
   ROUTER_STORE="$WORK/store.img"
+  # Live config changes (LAB_GUEST_LIVE, the recheck check) need it.
+  ROUTER_ARGS="$ROUTER_ARGS mgmt_pass=lab-pass"
   echo "== router config${GUEST_LIVE:+ (added live by the client)}: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")$([[ "$REDIRECT" == 1 ]] && echo ", NTP redirect")$([[ "$GUEST_DOMAIN" == 1 ]] && echo ", domain guest.lan")$([[ -n "$MDNS" ]] && echo ", mdns reflect (enabled: $MDNS_RULES)")"
 fi
 

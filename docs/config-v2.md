@@ -356,21 +356,39 @@ control `LAB_GUEST_DOMAIN=0`).
     (`Control::policy`).
   - Rules: `Policy::rules` (`fwd::forwarder::Rule`: from zone or any, to
     a zone / the router / any, protocol bits, source and destination
-    prefix, destination port range, accept or drop), compiled from the
+    prefix, destination port range, `Action` accept / drop / reject), compiled from the
     enabled `[[firewall.rule]]`s. On a new flow (conntrack miss) and for
     traffic to the router the first matching rule decides, else the
     zones. Each shard counts packets per rule (`rule_hits`); the datapath
     sums them once a second into `Shared::rule_hits`, shown as `rules[]`
     in `/api/status` and on the Firewall page. A new policy restarts the
-    counters. Tracked connections are not re-checked when rules change
-    (they run until they end).
+    counters. A new policy (or a network moved to another zone) also
+    applies to tracked connections: `Forwarder::recheck` runs the
+    new-flow decision again for each one in every shard and removes those
+    it refuses (zones, rules, a port forward or redirect gone or pointing
+    elsewhere, a redirect that now takes it, a masquerade on a port now
+    forwarded). Their next packet is a new flow: refused (TCP without SYN
+    is invalid, so it ends), or for UDP/ICMP started under the new
+    policy. Connections without a route are left to expire. Counted in
+    `/api/status` `revoked`; boot argument `fw_recheck=0` skips it (the
+    lab's negative control).
+  - `reject` (rule action, zone `input`) answers in place of the packet,
+    back out of its ingress, sharing the ICMP errors' token bucket (50/s,
+    burst 20; beyond it, silent drops): TCP gets a RST from the address
+    and port it went to (RFC 9293: seq = its ACK, or ACK of what it
+    occupies), everything else ICMP port unreachable from the router.
+    Never for RSTs, ICMP errors, fragments, or from or to broadcast and
+    multicast addresses (those, and ones over the rate, are dropped and
+    counted as drops). Answered ones count as `Stats::rejected`, not as
+    drops: `/api/status` `rejected`, not in `drop_reasons`. The WAN zone's input is never rejected,
+    only an explicit `reject` rule from `wan` answers there.
   - Checked only on a conntrack miss, so per-packet cost is unchanged for
     tracked flows.
   - Input policy: packets for the router from a zone with `input = drop`
     are dropped in the forwarder (`drop_reasons.input`) unless they are
     an `allow`ed service (DHCP UDP 67, DNS 53, NTP UDP 123, ping, web TCP
-    80). smoltcp never sees them. `reject` drops for now (no RST / port
-    unreachable yet). Replies to the router's own clients always pass,
+    80). smoltcp never sees them. With `input = reject` they are answered
+    (above). Replies to the router's own clients always pass,
     before rules and zones: TCP/UDP to ports ≥ 60000 (router-local
     sockets), UDP 68 (the DHCP client), ICMP other than echo requests. So
     a rule "from any to router: drop" cannot break its DHCP, DNS
@@ -492,14 +510,22 @@ In rough order of value:
    negative control); isolation: a phone on the iot network (zone with
    `forward_to = []`) gets its lease but no internet, while the router's
    `firewall` drop counter rises (~15/s).
-7. **Firewall polish.**
+7. ✅ (2026-11-16) **Firewall polish.**
    - `reject` sends a TCP RST / ICMP port unreachable (rate-limited)
-     instead of dropping.
+     instead of dropping. Lab: the guest's refused HTTP fails at once
+     ("Connection refused") and `rejected` rises; negative control
+     `LAB_GUEST_REJECT=drop`.
    - When rules or zones change, tracked connections the new policy
-     refuses are removed (today they run until they end).
-   - ICMP errors about forwarded and hairpin connections: `shard_of` has
-     no hint for them yet, so they can miss their connection's shard and
-     be dropped as invalid.
+     refuses are removed (`Forwarder::recheck`). Lab: a guest ping to
+     the ISP stops when a live config takes the guest zone's internet
+     away, `revoked` rises; negative control
+     `LAB_ROUTER_ARGS=fw_recheck=0`.
+   - ICMP errors about forwarded and hairpin connections reach their
+     connection's shard (`shard_of`: the inner packet from a forwarded
+     port of the WAN address, or from a router address to a forward's
+     target), e.g. "fragmentation needed" from the internet about a
+     forwarded server's answers. Host tests with a control (the old
+     mapping misses each kind).
 8. **Small schema items the kernel still refuses:** `[[dns.host]]`
    (local A records), a static WAN (`mode = "static"`, `[wan.static]`).
 9. ✅ (2026-11-15) **Web interface gaps.** Every network's DHCP pool,

@@ -210,6 +210,11 @@ impl Conntrack {
         self.conns.iter().flatten()
     }
 
+    /// Every connection with its id (for [`Conntrack::remove`]).
+    pub fn iter_ids(&self) -> impl Iterator<Item = (ConnId, &Conn)> {
+        self.conns.iter().enumerate().filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
+    }
+
     fn alloc_port(&mut self, proto: u8, preferred: u16) -> Option<u16> {
         let (lo, hi) = NAT_PORTS;
         let span = (hi - lo) as u32 + 1;
@@ -403,7 +408,8 @@ impl Conntrack {
         c.expires = now + t;
     }
 
-    fn remove(&mut self, id: ConnId) {
+    /// Forget a connection (and release its NAT mapping reference).
+    pub fn remove(&mut self, id: ConnId) {
         let Some(c) = self.conns.get_mut(id).and_then(Option::take) else {
             return;
         };

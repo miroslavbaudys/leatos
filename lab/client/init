@@ -414,15 +414,26 @@ if [ -n "$guest" ]; then
     # Guest-sourced HTTP to the ISP: route traffic to the ISP through the
     # VLAN for this check only (all the main-LAN checks are done).
     $bb ip rule add to "$ISP" table 20 pref 100
-    h0=$(hits guest-no-isp-web)
-    if $bb wget -q -T 4 -O /dev/null "http://$ISP/" 2>/dev/null; then web=reached; else web=refused; fi
+    # The rule's action is reject: the router answers the SYN with a RST
+    # (from the ISP's address), so wget fails at once with "Connection
+    # refused" and the router's "rejected" counter rises.
+    # LAB_GUEST_REJECT=drop (scripts/lab-test.sh): the negative control,
+    # wget times out and the counter stays.
+    rejected() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb grep -o '"rejected":[0-9]*' | $bb cut -d: -f2; }
+    h0=$(hits guest-no-isp-web); j0=$(rejected)
+    if werr=$($bb wget -q -T 4 -O /dev/null "http://$ISP/" 2>&1); then web=reached; else web=refused; fi
     $bb sleep 2
-    h1=$(hits guest-no-isp-web)
+    h1=$(hits guest-no-isp-web); j1=$(rejected)
     $bb ip rule del to "$ISP" table 20 pref 100
     if [ "$web" = refused ] && [ -n "$h1" ] && [ "$h1" -gt "${h0:-0}" ]; then
       pass "guest: rule guest-no-isp-web refuses http://$ISP/ from the guest (hits ${h0:-0} -> $h1)"
     else
       fail "guest: rule guest-no-isp-web: http://$ISP/ $web from the guest (hits ${h0:-none} -> ${h1:-none})"
+    fi
+    if echo "$werr" | $bb grep -q "refused" && [ -n "$j1" ] && [ "$j1" -gt "${j0:-0}" ]; then
+      pass "guest: reject answered with a TCP reset (wget: connection refused; router rejected ${j0:-0} -> $j1)"
+    else
+      fail "guest: reject not answered (wget: ${werr:-no error}; router rejected ${j0:-none} -> ${j1:-none})"
     fi
     # Redirect (docs/config-v2.md, scripts/lab-test.sh LAB_REDIRECT): lab-ntp
     # sends NTP to any outside server to 192.168.1.101 (a second address
@@ -484,6 +495,44 @@ if [ -n "$guest" ]; then
         echo "LAB MDNS SENT"
       else
         fail "mdns: not reflected (guest received ${r0:-none} -> ${r1:-none}, lan sent ${s0:-none} -> ${s1:-none}) $($bb cat /tmp/mdns-nc)"
+      fi
+    fi
+    # A new policy also ends tracked connections (Forwarder::recheck): a
+    # ping from the guest to the ISP runs (one ICMP id, one tracked
+    # connection); a live config takes the guest zone's internet away
+    # (forward_to = []), so its replies must stop and the router's
+    # "revoked" counter rise; the original config is restored after.
+    # LAB_ROUTER_ARGS=fw_recheck=0: the negative control, the ping keeps
+    # going. Only with the guest network in its own zone.
+    if [ "$guest" = guest ]; then
+      revoked() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb grep -o '"revoked":[0-9]*' | $bb cut -d: -f2; }
+      post() { $bb wget -q -T 20 -O - --header "Content-Type: application/toml" --post-data="$($bb cat "$1")" \
+        "http://admin:lab-pass@192.168.1.1/api/config" 2>&1; }
+      $bb wget -q -T 5 -O /tmp/cfg-orig.toml "http://admin:lab-pass@192.168.1.1/api/config" 2>/dev/null
+      $bb awk '/^\[/ { s = $0; g = 0 } s == "[[zone]]" && $0 == "name = \"guest\"" { g = 1 } g && /^forward_to = / { $0 = "forward_to = []" } { print }' \
+        /tmp/cfg-orig.toml >/tmp/cfg-cut.toml
+      if $bb cmp -s /tmp/cfg-orig.toml /tmp/cfg-cut.toml; then
+        fail "recheck: guest zone's forward_to not found in /api/config"
+      else
+        v0=$(revoked)
+        $bb ping -c 10 -I "$gip" "$ISP" >/tmp/rping 2>&1 &
+        rping=$!
+        $bb sleep 3
+        r=$(post /tmp/cfg-cut.toml)
+        wait "$rping"
+        v1=$(revoked)
+        r2=$(post /tmp/cfg-orig.toml)
+        n=$($bb grep -c 'seq=' /tmp/rping)
+        last=$($bb sed -n 's/.*seq=\([0-9]*\).*/\1/p' /tmp/rping | $bb tail -1)
+        case "$r$r2" in
+          *'"applied":true'*'"applied":true'*)
+            if [ "$n" -ge 2 ] && [ "${last:-99}" -lt 7 ] && [ -n "$v1" ] && [ "$v1" -gt "${v0:-0}" ]; then
+              pass "recheck: guest ping to the ISP stopped by the new policy ($n of 10 replies, last seq $last; router revoked ${v0:-0} -> $v1)"
+            else
+              fail "recheck: guest ping went on after the policy change ($n of 10 replies, last seq ${last:-none}; router revoked ${v0:-none} -> ${v1:-none})"
+            fi ;;
+          *) fail "recheck: config not applied: $r / $r2" ;;
+        esac
       fi
     fi
   fi

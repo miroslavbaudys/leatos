@@ -75,6 +75,12 @@ pub static DROP_REASONS: [AtomicU64; fwd::forwarder::DROP_REASONS] =
     [const { AtomicU64::new(0) }; fwd::forwarder::DROP_REASONS];
 /// Received frames with the wrong VLAN tag for their port (or none).
 pub static VLAN_DROPS: AtomicU64 = AtomicU64::new(0);
+/// Tracked connections removed because a new firewall policy refused them
+/// (`Forwarder::recheck`).
+pub static REVOKED: AtomicU64 = AtomicU64::new(0);
+/// Refused packets answered with a RST / port unreachable (`reject`),
+/// summed over the shards once a second (not in `DROP_REASONS`).
+pub static REJECTED: AtomicU64 = AtomicU64::new(0);
 /// On a PPPoE port: received frames that are not PPPoE, control frames
 /// that found the client's queue full, and IPv4 to send while there is no
 /// session.
@@ -290,8 +296,9 @@ impl Datapath {
     /// Put networks and the firewall into effect (boot, or a saved config,
     /// live): each network slot gets its VID, address and zone, or is
     /// switched off; a slot that changed forgets its neighbors. Tracked
-    /// connections keep going (they find no route through a slot that
-    /// went away).
+    /// connections the new firewall would not start are removed
+    /// (`Forwarder::recheck`); ones through a slot that went away find no
+    /// route and expire.
     pub fn apply(&self, n: Networks) {
         for (i, link) in self.sh.links.iter().enumerate().skip(1) {
             let want = n.nets.iter().find(|x| x.link == i);
@@ -309,8 +316,17 @@ impl Datapath {
                 *self.neigh[i].lock() = NeighTable::new();
             }
         }
+        let mut revoked = 0;
         for s in &self.shards {
-            s.lock().set_policy(Some(n.policy.clone()));
+            let mut f = s.lock();
+            f.set_policy(Some(n.policy.clone()));
+            if crate::config::fw_recheck() {
+                revoked += f.recheck();
+            }
+        }
+        REVOKED.fetch_add(revoked as u64, Ordering::Relaxed);
+        if revoked > 0 {
+            crate::println!("fwd   : {revoked} tracked connections refused by the new policy, removed");
         }
         let mut port_links = alloc::vec![Vec::new(); self.sh.ports.len()];
         for (i, link) in self.sh.links.iter().enumerate() {
@@ -574,6 +590,7 @@ impl Datapath {
         let mut hits: Vec<u64> = Vec::new();
         let mut fhits: Vec<u64> = Vec::new();
         let mut rhits: Vec<u64> = Vec::new();
+        let mut rejected = 0;
         let add = |into: &mut Vec<u64>, from: &[u64]| {
             into.resize(into.len().max(from.len()), 0);
             for (h, n) in into.iter_mut().zip(from) {
@@ -587,7 +604,9 @@ impl Datapath {
             add(&mut hits, &f.rule_hits);
             add(&mut fhits, &f.forward_hits);
             add(&mut rhits, &f.redirect_hits);
+            rejected += f.stats.rejected;
         }
+        REJECTED.store(rejected, Ordering::Relaxed);
         self.sh.conntrack.store(conns, Ordering::Relaxed);
         *self.sh.rule_hits.lock() = hits;
         *self.sh.forward_hits.lock() = fhits;
