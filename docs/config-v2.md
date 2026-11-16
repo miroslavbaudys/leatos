@@ -481,11 +481,17 @@ pointing at the right row while the user edits.
 ### What is left (as of 2026-11-15)
 In rough order of value:
 
-6. **Hardware check on the apu4.** Before more features, verify on real
-   hardware: a guest VLAN through a managed switch or VLAN-capable AP
-   (lease, internet, isolation from the main LAN), a port forward from
-   outside, and hairpin. Nothing tested on hardware yet beyond one
-   untagged network.
+6. ✅ (2026-11-16) **Hardware check on the apu4.** The apu4 has been the
+   developer's home router since 2026-11-15: three networks on `lan0`
+   (untagged main LAN, VLAN 2 and VLAN 3 through a managed switch) all
+   serve leases and resolve names in their own domains; the port forward
+   (9524 tcp+udp) answers from outside, and it is the only open WAN port
+   (nmap from an outside host); the NTP redirect counts hits; PPPoE on
+   VLAN 848; hairpin: a LAN client reaches the forward through the WAN
+   address (TCP 9524 connects; 9525 and 22 on the WAN address time out:
+   negative control); isolation: a phone on the iot network (zone with
+   `forward_to = []`) gets its lease but no internet, while the router's
+   `firewall` drop counter rises (~15/s).
 7. **Firewall polish.**
    - `reject` sends a TCP RST / ICMP port unreachable (rate-limited)
      instead of dropping.
