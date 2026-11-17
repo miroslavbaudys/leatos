@@ -41,9 +41,9 @@ proto-dot.workspace = true
 cli.workspace = true
 config-store.workspace = true
 linked_list_allocator = "0.10"
-spin = { version = "0.9", default-features = false, features = ["spin_mutex", "once"] }
+spin = { version = "0.12", default-features = false, features = ["spin_mutex", "once"] }
 virtio-drivers = { version = "0.13", default-features = false }
-safe-mmio = "0.3"
+safe-mmio = "0.4"
 smoltcp = { version = "0.14", default-features = false, features = [
     "alloc", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6",
     "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "socket-dns",
@@ -53,7 +53,7 @@ smoltcp = { version = "0.14", default-features = false, features = [
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 fdt = "0.1.5"
-aarch64-cpu = "11"
+aarch64-cpu = "12"
 
 [lints]
 workspace = true

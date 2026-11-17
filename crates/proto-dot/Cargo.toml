@@ -8,7 +8,7 @@ description = "DNS over TLS (RFC 7858) client connections: rustls (no_std, unbuf
 [dependencies]
 rustls = { version = "0.23.46", default-features = false, features = ["tls12"] }
 webpki-roots = "1"
-spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+spin = { version = "0.12", default-features = false, features = ["spin_mutex"] }
 # Crypto provider (src/provider.rs): RustCrypto, pure Rust.
 sha2 = { version = "0.11", default-features = false, features = ["oid"] }
 digest = { version = "0.11", default-features = false }

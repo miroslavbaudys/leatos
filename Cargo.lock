@@ -4,10 +4,11 @@ version = 4
 
 [[package]]
 name = "aarch64-cpu"
-version = "11.2.0"
+version = "12.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44171e22925ec72b63d86747bc3655c7849a5b8d865c980222128839f45ac034"
+checksum = "3d29c35ddc46f9490b91fe6271e848f68ff5b04f9df8e5416457abd05ab2ddf9"
 dependencies = [
+ "arm-targets",
  "tock-registers",
 ]
 
@@ -45,6 +46,12 @@ dependencies = [
  "ctutils",
  "ghash",
 ]
+
+[[package]]
+name = "arm-targets"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0555f30eb9cd1a07d7677d01971da6c74cbbb0f73f0667cbee74e590a68a619"
 
 [[package]]
 name = "asn1-rs"
@@ -1013,7 +1020,7 @@ dependencies = [
  "proto-pppoe",
  "proto-sntp",
  "qdisc",
- "safe-mmio",
+ "safe-mmio 0.4.0",
  "smoltcp",
  "spin",
  "virtio-drivers",
@@ -1106,6 +1113,15 @@ name = "safe-mmio"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e885ed64c91774b671612cb99dda2ede3738b0aa2d39a85a1471b20bf09eabe0"
+dependencies = [
+ "zerocopy",
+]
+
+[[package]]
+name = "safe-mmio"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8227fa63b47c9e32e57da4efeec270bba9a8930387f014f1e4759e46af3bd8c7"
 dependencies = [
  "zerocopy",
 ]
@@ -1241,9 +1257,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.9.9"
+version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
+checksum = "0134f9043ed38b087ac4f7d4af44c79e2c9e5094421fe3164f435ce585953b10"
 
 [[package]]
 name = "spinning_top"
@@ -1361,9 +1377,9 @@ dependencies = [
 
 [[package]]
 name = "tock-registers"
-version = "0.10.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d2d250f87fb3fb6f225c907cf54381509f47b40b74b1d1f12d2dccbc915bdfe"
+checksum = "fc2477fb5e50cca83e3c38fd91757ffd87382baf2a3e032f10e9b29a9a50474b"
 
 [[package]]
 name = "toml"
@@ -1440,7 +1456,7 @@ dependencies = [
  "bitflags 2.13.2",
  "enumn",
  "log",
- "safe-mmio",
+ "safe-mmio 0.3.2",
  "thiserror",
  "zerocopy",
 ]

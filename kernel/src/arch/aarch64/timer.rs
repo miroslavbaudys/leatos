@@ -2,7 +2,7 @@
 
 use aarch64_cpu::asm::barrier;
 use aarch64_cpu::registers::{
-    CNTFRQ_EL0, CNTV_CTL_EL0, CNTV_CVAL_EL0, CNTVCT_EL0, Readable, Writeable,
+    CNTFRQ_EL0, CNTV_CTL_EL0, CNTV_CVAL_EL0, CNTVCT_EL0, Read, Write,
 };
 
 /// Counter frequency in Hz.

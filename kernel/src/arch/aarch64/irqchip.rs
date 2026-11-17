@@ -13,7 +13,7 @@ use crate::irq::Trigger;
 use crate::mmio::Region;
 use crate::platform::{BootInfo, IrqChipInfo};
 use crate::println;
-use aarch64_cpu::registers::{MPIDR_EL1, Readable};
+use aarch64_cpu::registers::{MPIDR_EL1, Read};
 use core::arch::asm;
 use spin::Mutex;
 

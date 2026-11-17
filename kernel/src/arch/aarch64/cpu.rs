@@ -1,6 +1,6 @@
 //! CPU state: exception level, interrupt masking, idle, halt.
 
-use aarch64_cpu::registers::{CurrentEL, Readable};
+use aarch64_cpu::registers::{CurrentEL, Read};
 use core::arch::asm;
 
 /// Current exception level (0–3).
