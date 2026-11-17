@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::marker::PhantomData;
 
-use aes_gcm::aead::{self as aead_api, AeadInPlace, KeyInit};
+use aes_gcm::aead::{self as aead_api, AeadInOut, KeyInit};
 use rustls::crypto::cipher::{
     AeadKey, InboundOpaqueMessage, InboundPlainMessage, Iv, KeyBlockShape, MessageDecrypter, MessageEncrypter,
     NONCE_LEN, Nonce, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload, Tls12AeadAlgorithm,
@@ -113,7 +113,7 @@ static HMAC_SHA384: Hmac<Sha384> = Hmac(PhantomData);
 
 impl<D> hmac::Hmac for Hmac<D>
 where
-    D: Digest + digest::core_api::BlockSizeUser + Clone + Send + Sync + 'static,
+    D: Digest + digest::block_api::BlockSizeUser + Clone + Send + Sync + 'static,
     ::hmac::SimpleHmac<D>: Send + Sync,
 {
     fn with_key(&self, key: &[u8]) -> Box<dyn hmac::Key> {
@@ -125,11 +125,11 @@ where
     }
 }
 
-struct HmacKey<D: Digest + digest::core_api::BlockSizeUser>(::hmac::SimpleHmac<D>);
+struct HmacKey<D: Digest + digest::block_api::BlockSizeUser>(::hmac::SimpleHmac<D>);
 
 impl<D> hmac::Key for HmacKey<D>
 where
-    D: Digest + digest::core_api::BlockSizeUser + Clone + Send + Sync + 'static,
+    D: Digest + digest::block_api::BlockSizeUser + Clone + Send + Sync + 'static,
     ::hmac::SimpleHmac<D>: Send + Sync,
 {
     fn sign_concat(&self, first: &[u8], middle: &[&[u8]], last: &[u8]) -> hmac::Tag {
@@ -158,7 +158,7 @@ type Aes256Gcm = aes_gcm::Aes256Gcm;
 type ChaCha = chacha20poly1305::ChaCha20Poly1305;
 
 /// An AEAD with a 12-byte nonce and a 16-byte tag (all three here).
-trait Aead: AeadInPlace + KeyInit + Send + Sync + 'static {
+trait Aead: AeadInOut + KeyInit + Send + Sync + 'static {
     const KEY_LEN: usize;
     fn secrets(key: AeadKey, iv: Iv) -> ConnectionTrafficSecrets;
 }
@@ -190,9 +190,8 @@ fn new_aead<A: Aead>(key: &AeadKey) -> A {
 }
 
 fn seal<A: Aead>(aead: &A, nonce: &[u8; NONCE_LEN], aad: &[u8], data: &mut [u8]) -> Result<[u8; TAG_LEN], Error> {
-    let tag = aead
-        .encrypt_in_place_detached(aead_api::Nonce::<A>::from_slice(nonce), aad, data)
-        .map_err(|_| Error::EncryptError)?;
+    let nonce = aead_api::Nonce::<A>::try_from(&nonce[..]).map_err(|_| Error::EncryptError)?;
+    let tag = aead.encrypt_inout_detached(&nonce, aad, data.into()).map_err(|_| Error::EncryptError)?;
     let mut t = [0; TAG_LEN];
     t.copy_from_slice(&tag);
     Ok(t)
@@ -200,8 +199,9 @@ fn seal<A: Aead>(aead: &A, nonce: &[u8; NONCE_LEN], aad: &[u8], data: &mut [u8])
 
 fn open<A: Aead>(aead: &A, nonce: &[u8; NONCE_LEN], aad: &[u8], data: &mut [u8], tag: &[u8]) -> Result<(), Error> {
     // All three AEADs: 12-byte nonces, 16-byte tags (callers split them off).
-    aead.decrypt_in_place_detached(aead_api::Nonce::<A>::from_slice(nonce), aad, data, aead_api::Tag::<A>::from_slice(tag))
-        .map_err(|_| Error::DecryptError)
+    let nonce = aead_api::Nonce::<A>::try_from(&nonce[..]).map_err(|_| Error::DecryptError)?;
+    let tag = aead_api::Tag::<A>::try_from(tag).map_err(|_| Error::DecryptError)?;
+    aead.decrypt_inout_detached(&nonce, aad, data.into(), &tag).map_err(|_| Error::DecryptError)
 }
 
 /// TLS 1.3 record protection (RFC 8446 §5.2): the per-record nonce is the
@@ -586,8 +586,8 @@ macro_rules! nist_group {
                         break s;
                     }
                 };
-                use $curve::elliptic_curve::sec1::ToEncodedPoint;
-                let public = secret.public_key().to_encoded_point(false).as_bytes().to_vec();
+                use $curve::elliptic_curve::sec1::ToSec1Point;
+                let public = secret.public_key().to_sec1_point(false).as_bytes().to_vec();
                 Ok(Box::new($kx { secret, public }))
             }
             fn name(&self) -> NamedGroup {
@@ -700,11 +700,11 @@ struct RsaPss(RsaHash);
 
 /// An RSA public key from a certificate (PKCS#1 `RSAPublicKey`), 2048 to
 /// 8192 bits as webpki's other providers accept.
-fn rsa_key(der: &[u8]) -> Result<rsa::RsaPublicKey, InvalidSignature> {
+fn rsa_key(der: &[u8]) -> Result<rsa::PublicKey, InvalidSignature> {
     use rsa::pkcs1::DecodeRsaPublicKey;
     use rsa::traits::PublicKeyParts;
-    let k = rsa::RsaPublicKey::from_pkcs1_der(der).map_err(|_| InvalidSignature)?;
-    if !(2048..=8192).contains(&(k.n().bits())) {
+    let k = rsa::PublicKey::from_pkcs1_der(der).map_err(|_| InvalidSignature)?;
+    if !(2048..=8192).contains(&(k.n().bit_width())) {
         return Err(InvalidSignature);
     }
     Ok(k)

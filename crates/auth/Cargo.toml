@@ -6,9 +6,9 @@ license.workspace = true
 description = "Management authentication: PBKDF2-SHA256 password hashes, an entropy pool, session tokens."
 
 [dependencies]
-sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }  # no SIMD: the kernel targets are soft-float
-hmac = { version = "0.12", default-features = false }
-pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha2 = { version = "0.11", default-features = false }  # x86_64 kernel: software backend via --cfg (.cargo/config.toml)
+hmac = { version = "0.13", default-features = false }
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 
 [lints]
 workspace = true

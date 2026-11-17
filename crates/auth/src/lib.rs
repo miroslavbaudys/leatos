@@ -27,7 +27,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 /// PBKDF2 iterations for new hashes: about 0.1 s on the apu4 (1 GHz

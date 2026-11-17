@@ -6,7 +6,7 @@ license.workspace = true
 description = "PPPoE client: discovery (PADI/PADO/PADR/PADS/PADT), LCP, PAP/CHAP, IPCP, IPv6CP."
 
 [dependencies]
-md-5 = { version = "0.10", default-features = false }
+md-5 = { version = "0.11", default-features = false }
 
 [lints]
 workspace = true

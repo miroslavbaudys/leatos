@@ -10,28 +10,23 @@ rustls = { version = "0.23.46", default-features = false, features = ["tls12"] }
 webpki-roots = "1"
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 # Crypto provider (src/provider.rs): RustCrypto, pure Rust.
-sha2 = { version = "0.10", default-features = false, features = ["oid"] }
-digest = { version = "0.10", default-features = false }
-hmac = { version = "0.12", default-features = false }
-aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
-chacha20poly1305 = { version = "0.10", default-features = false }
-x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
-p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "arithmetic"] }
-p384 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "arithmetic"] }
-ecdsa = { version = "0.16", default-features = false, features = ["verifying", "der"] }
-rsa = { version = "0.9", default-features = false, features = ["sha2"] }
-ed25519-dalek = { version = "2", default-features = false }
-signature = { version = "2", default-features = false }
-
-# x86_64-unknown-none has no SSE: the software SHA-2 (other crates: --cfg
-# flags in .cargo/config.toml).
-[target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
-sha2 = { version = "0.10", default-features = false, features = ["force-soft", "oid"] }
+sha2 = { version = "0.11", default-features = false, features = ["oid"] }
+digest = { version = "0.11", default-features = false }
+hmac = { version = "0.13", default-features = false }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }
+chacha20poly1305 = { version = "0.11", default-features = false }
+x25519-dalek = { version = "3", default-features = false, features = ["static_secrets", "zeroize"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa", "arithmetic"] }
+p384 = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa", "arithmetic"] }
+ecdsa = { version = "0.17", default-features = false, features = ["digest", "der"] }
+rsa = { version = "0.10", default-features = false, features = ["encoding", "pkcs1v15"] }
+ed25519-dalek = { version = "3", default-features = false }
+signature = { version = "3", default-features = false }
 
 [dev-dependencies]
 # A real TLS server for the tests (host only): rustls with ring, rcgen certificates.
 rustls = { version = "0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 time = "0.3"
 
 [lints]

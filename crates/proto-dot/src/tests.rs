@@ -9,7 +9,7 @@ use super::*;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, SignatureAlgorithm};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose, SignatureAlgorithm};
 use rustls::crypto::{CryptoProvider, GetRandomFailed};
 use rustls::pki_types::PrivateKeyDer;
 use rustls::server::ServerConnection;
@@ -51,7 +51,7 @@ const YEAR: u64 = 365 * 86_400;
 
 struct Pki {
     ca: rcgen::Certificate,
-    ca_key: KeyPair,
+    issuer: Issuer<'static, KeyPair>,
 }
 
 fn pki(alg: &'static SignatureAlgorithm) -> Pki {
@@ -67,7 +67,7 @@ fn pki_named(alg: &'static SignatureAlgorithm, cn: &str) -> Pki {
     p.not_before = rcgen::date_time_ymd(2020, 1, 1);
     p.not_after = rcgen::date_time_ymd(2040, 1, 1);
     let ca = p.self_signed(&ca_key).unwrap();
-    Pki { ca, ca_key }
+    Pki { ca, issuer: Issuer::new(p, ca_key) }
 }
 
 fn key(alg: &'static SignatureAlgorithm) -> KeyPair {
@@ -90,7 +90,7 @@ fn leaf(pki: &Pki, alg: &'static SignatureAlgorithm, names: &[&str], from: u64, 
     p.distinguished_name.push(DnType::CommonName, names[0]);
     p.not_before = time::OffsetDateTime::from_unix_timestamp(from as i64).unwrap();
     p.not_after = time::OffsetDateTime::from_unix_timestamp(to as i64).unwrap();
-    let cert = p.signed_by(&k, &pki.ca, &pki.ca_key).unwrap();
+    let cert = p.signed_by(&k, &pki.issuer).unwrap();
     Leaf {
         chain: vec![cert.der().clone()],
         key: PrivateKeyDer::try_from(k.serialize_der()).unwrap(),
@@ -454,14 +454,14 @@ fn before_sntp_the_rtc_dates_the_check_where_it_cannot_lock_dns_out() {
         cp.key_usages = vec![KeyUsagePurpose::KeyCertSign];
         cp.not_before = time::OffsetDateTime::from_unix_timestamp((NOW - YEAR) as i64).unwrap();
         cp.not_after = time::OffsetDateTime::from_unix_timestamp((NOW - 10 * 86_400) as i64).unwrap();
-        let c = cp.signed_by(&k, &p.ca, &p.ca_key).unwrap();
-        (k, c)
+        let c = cp.signed_by(&k, &p.issuer).unwrap();
+        (Issuer::new(cp, k), c)
     };
     let lk = key(&rcgen::PKCS_ECDSA_P256_SHA256);
     let mut lp = CertificateParams::new(vec![String::from("dns.test")]).unwrap();
     lp.not_before = time::OffsetDateTime::from_unix_timestamp((NOW - 30 * 86_400) as i64).unwrap();
     lp.not_after = time::OffsetDateTime::from_unix_timestamp((NOW + 60 * 86_400) as i64).unwrap();
-    let lc = lp.signed_by(&lk, &ic, &ik).unwrap();
+    let lc = lp.signed_by(&lk, &ik).unwrap();
     let l = Leaf { chain: vec![lc.der().clone(), ic.der().clone()], key: PrivateKeyDer::try_from(lk.serialize_der()).unwrap() };
     let (mut c, mut s) = connect(&rtc_config(&p, NOW, NOW - YEAR), "dns.test", server_config(&l, &ANY));
     pump(&mut c, &mut s);
