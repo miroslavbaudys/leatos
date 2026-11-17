@@ -1,12 +1,15 @@
 # Configuration schema v2: networks, zones, firewall
 
-Status (2026-11-15): **the schema is implemented** in `crates/config`
+Status (2026-11-17): **the schema is implemented** in `crates/config`
 (types, validation, migration, the v1-compatible writer, CLI editing by
 name). The kernel implements networks on `lan0` (untagged or VLANs, a
-DHCP server each), zones (forwarding between them, input policy), rules,
-port forwards with hairpin, and the web interface's Networks and
-Firewall pages (§9 steps 1–5). DNS hosts, more ports and a static WAN
-are refused as unsupported (`Config::unsupported`). Schema v1 is
+DHCP server and DNS domain each, changed live), zones (forwarding between
+them, input policy), rules (incl. `reject`), port forwards with hairpin,
+redirects, WAN anti-spoofing, mDNS reflect rules (docs/mdns.md), and the
+web interface's Networks and Firewall pages (§9). All of it runs on the
+apu4 as the developer's home router. DNS hosts, ports other than
+`wan0`/`lan0` and a static WAN are refused as unsupported
+(`Config::unsupported`). Schema v1 is
 in `docs/config-and-storage.md` §5. v2 is the data model the multipage
 web interface is built against (Networks and Firewall pages). It also covers
 the kernel work listed for M10 in `docs/roadmap.md`: one router interface
@@ -103,7 +106,7 @@ name = "router"
 ip = "10.10.0.1"
 
 [shaping]                   # unchanged from v1
-[mgmt]                      # unchanged; later: password_hash (PBKDF2-SHA256)
+[mgmt]                      # on_wan, password_hash (PBKDF2-SHA256, crates/auth)
 [time]                      # unchanged
 ```
 
@@ -207,7 +210,8 @@ ports:
   in one conntrack shard, so the shards share one connection budget
   (`conntrack::Budget`, 16384 in all) instead of a fixed 1/16 each.
 - **Router-local ports (60000–65535):** the router's own client sockets
-  (SNTP 60000–64999, DNS upstream 65000–65535) live here, and forwards
+  (SNTP UDP 60000–64999, DNS upstream UDP 65000–65535, DoT TCP
+  61000–64999) live here, and forwards
   may not use them (validation), so a reply to the router is never taken
   for a forwarded connection. Forwards may use everything below,
   WireGuard's 51820 for example.
@@ -315,7 +319,8 @@ control `LAB_GUEST_DOMAIN=0`).
   unsupported (`Config::unsupported`, separate from validation so the
   crate accepts the whole schema): by a save (web, CLI), by `rrstore
   put`, and a stored config with them is not used (defaults, as for any
-  rejected record). Today that is everything beyond version 1.
+  rejected record). Today that is `[[dns.host]]`, a static WAN, and ports
+  other than `wan0`/`lan0`.
 
 ## 5. Migration and rollback
 - **v1 → v2 on load:**
@@ -349,8 +354,6 @@ control `LAB_GUEST_DOMAIN=0`).
   `network.guest = { ipv4 = "10.20.0.1/24", vlan = 20 }` (new entries go
   last), `config unset network.guest`; `lan.…` is the first network and
   `lan.domain` is `dns.domain`, so version 1 commands keep working.
-- **Boot arguments** keep overriding: `lan=` sets the first network's
-  `ipv4`. `wan_*`/`pppoe_*` are unchanged.
 
 ## 6. Datapath and services mapping (kernel work)
 - **Interfaces** ✅. A *port* is a NIC with its egress qdisc; a *link*
@@ -440,14 +443,16 @@ control `LAB_GUEST_DOMAIN=0`).
   (`dns.domain`), with reverse lookups for every network's subnet. The
   web interface listens on the networks whose zone reaches it.
 - **Status API** ✅. `/api/status` has `networks[]` (name, vlan, ipv4,
-  zone, dhcp, mgmt, bound leases), leases name their network, and
-  `drop_reasons` has `firewall` and `input`. Per-rule hit counters come
-  with rules.
+  zone, dhcp, mgmt, bound leases), leases name their network,
+  `drop_reasons` has `firewall`, `input`, `spoofed` and `clash`, and
+  `rules[]`, `forwards[]`, `redirects[]`, `rejected`, `revoked` count the
+  firewall's decisions.
 
 ## 7. Live apply and trials
 - **Live:** shaping, DNS, DHCP pools and reservations, zone policies
-  (`input`, `allow`, `forward_to`; new flows only), later rules and
-  forwards.
+  (`input`, `allow`, `forward_to`), rules, forwards, redirects (tracked
+  connections the new policy refuses are removed: `Forwarder::recheck`),
+  mDNS rules, the WAN mode and VLAN.
 - **Networks live** ✅ (2026-11-15): the kernel has a link slot per
   possible network from boot (`net::shared::MAX_LINKS`: a forwarder
   interface, ARP table and smoltcp interface each, inactive until used).
@@ -467,19 +472,22 @@ control `LAB_GUEST_DOMAIN=0`).
 - **Trial** (`Config::needs_trial`): any change to the network or zone
   that serves management, i.e. its address, VLAN, ports or zone. Also
   `input`/`allow` of a zone that can reach management, rules with
-  `to = "router"`, and `[mgmt]`. The UI can't always tell which network
+  `to = "router"` or `"any"`, `mgmt.on_wan`, and WAN changes while
+  management is on the WAN. The UI can't always tell which network
   the browser came from, so the kernel decides (it knows the ingress
   interface of the request) and says so in the save response.
 
 ## 8. Web interface mapping
 | Page | Sections |
 |---|---|
-| Networks | `[[network]]` list + editor (VLAN, subnet, DHCP, zone), port membership view |
-| WAN | `[wan]` |
-| Firewall | zone matrix (rows from, columns to), zone input/allow, rules (ordered, enable toggle, hit counters), port forwards, redirects |
-| DHCP & DNS | leases (all networks), reservations, `[[dns.host]]`, `[dns]` |
-| SQM | `[shaping]` |
-| System | `[time]`, `[mgmt]`, backup/restore, upgrade, reboot |
+| Networks | `[[network]]` list + editor (VLAN, subnet, zone, domain), a DHCP panel per network (pool, lease time, reservations) |
+| WAN | `[wan]` (mode, VLAN, PPPoE) |
+| LAN & DHCP | the first network's address and DHCP |
+| Clients | leases of all networks, "Reserve" |
+| DNS | `[dns]` (upstreams, DoT, cache, prefetch, stale), DoT state per server |
+| Firewall | zone matrix (rows from, columns to), zone input/allow, rules (ordered, enable toggle, hit counters), port forwards, redirects, mDNS reflect rules |
+| Traffic shaping | `[shaping]` |
+| System | `[time]`, `[mgmt]` (password), backup/restore, upgrade, reboot |
 
 Lists are edited by key, never by index, so a validation issue keeps
 pointing at the right row while the user edits.
@@ -517,7 +525,7 @@ pointing at the right row while the user edits.
    v1 config from the SD store runs as one network `lan`. VLAN networks,
    zones, rules and forwards are not yet tried on hardware.
 
-### What is left (as of 2026-11-15)
+### What is left (as of 2026-11-17)
 In rough order of value:
 
 6. ✅ (2026-11-16) **Hardware check on the apu4.** The apu4 has been the

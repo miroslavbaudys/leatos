@@ -1,5 +1,9 @@
 # Boot flow, memory, interrupts (QEMU aarch64 `virt`)
 
+This document covers aarch64. The x86_64 side (PVH / Multiboot2 entry,
+ACPI, LAPIC, MSI-X) is in `docs/safety-and-portability.md` §3, secondary
+cores in `docs/smp.md`.
+
 ## Physical memory map (relevant parts)
 
 | Address | What | Mapped as |
@@ -7,7 +11,7 @@
 | `0x0800_0000` | GICv3 distributor (GICD) | Device |
 | `0x080a_0000` | GICv3 redistributors (GICR) | Device |
 | `0x0900_0000` | PL011 UART (console) | Device |
-| `0x0901_0000` | PL031 RTC | Device |
+| `0x0901_0000` | PL031 RTC (not mapped, not used) | — |
 | `0x0a00_0000` | 32 × virtio-mmio slots | Device |
 | `0x1000_0000` | PCIe 32-bit MMIO window (751 MiB), where we assign BARs | Device |
 | `0x3eff_0000` | PCIe PIO window (unused) | Device |
@@ -52,9 +56,15 @@ __kernel_end → heap
    (MMU off → swap → TLB flush → MMU on, which avoids break-before-make
    conflicts). It also sets **SCTLR.WXN**. Permissions: `.text` RX, `.rodata` and
    DTB RO, everything writable is XN, guard pages unmapped, MMIO Device+XN.
-10. `gic::init`, `timer::init_irq`, unmask IRQs.
-11. `pci::enumerate`: scan ECAM and assign memory BARs from the 32-bit window.
-12. Self-tests, then `executor::run()`.
+10. `arch::irqchip::init` (GICv3), `timer::init_irq`, hybrid-idle spin
+    window, unmask IRQs, console RX interrupt.
+11. `smp::start`: secondary cores (docs/smp.md).
+12. Packet pool, `pci::init`: scan ECAM and assign memory BARs from the
+    32-bit window.
+13. Store (`store::open`), hardware watchdog probe + early arm,
+    `upgrade::boot` (x86_64 loader, docs/upgrades.md), `config::load`.
+14. `net::stack::bring_up` (NICs, datapath and `svc` tasks), self-tests,
+    `watchdog::start`, then `executor::run()`.
 
 ## Exceptions and interrupts
 - **Vector table** (`boot.S`): entry 1 (IRQ, current EL, SP0) is the normal
@@ -69,8 +79,10 @@ __kernel_end → heap
 - **Handler rules:** acknowledge the device and set an atomic flag. No
   allocation, no printing, no locks shared with thread context.
 - **GICv3:** all interrupts are Group 1 NS at priority `0xa0`, PMR `0xff`,
-  affinity routing, and SPIs routed to core 0. The redistributor is found by
-  walking GICR frames and matching affinity.
+  affinity routing; each SPI is routed to the core that unmasks it
+  (`GICD_IROUTER`, so a NIC's interrupt lands on its RX core). The
+  redistributor is found by walking GICR frames and matching affinity
+  (one 64-bit `GICR_TYPER` read, see docs/smp.md "HVF note").
 
 ## Timers
 The EL1 **virtual** timer (INTID 27, read from the DTB) runs **tickless**:
@@ -88,10 +100,9 @@ it so automated runs exit.
 ## Known limits
 - RAM above 4 GiB and the 64-bit PCIe window are outside the 39-bit VA. Keep
   `-m` ≤ 3G. Moving to a 48-bit VA (start at L0) is a small change once it's needed.
-- Single core only. SMP needs PSCI `CPU_ON`, per-core stacks and redistributors, and an SMP-safe executor.
 - PCI: bus 0 only in practice (bridges are listed but not configured), no
   I/O BARs. Device interrupts use legacy INTx routed through the DTB
-  `interrupt-map` (virtio-net: INTID 36/37). MSI-X arrives with the x86 port
-  or the GIC ITS.
+  `interrupt-map` (virtio-net: INTID 36/37). MSI-X is used on x86_64 only;
+  on aarch64 it would need the GIC ITS.
 - The stack was 64 KiB until M2: NIC bring-up in debug builds overflowed it.
   The guard page caught this cleanly.

@@ -192,20 +192,11 @@ defaults, so a config that doesn't use it stays readable by older kernels
 back. The same holds inside `[wan]`: `mode` is written only when it is
 not `dhcp` and `[wan.pppoe]` only when it differs from the defaults, so a
 config with just a VLAN stays readable by the kernel that introduced
-`[wan]`. Later versions add `[firewall]`
-(designed in `docs/config-v2.md`)
-(rules, `[[firewall.forward]]`), LAN VLANs and the management password
-hash, as the kernel implements them:
-
-```toml
-[[firewall.forward]]     # later
-name = "nas-https"
-proto = "tcp"
-wan_port = 8443
-to = "10.10.0.10:443"
-```
-
-The full target schema is in `docs/soho-features.md`. List entries
+`[wan]`. Version 2 (`docs/config-v2.md`) adds networks and VLANs, zones,
+`[[firewall.rule]]`, `[[firewall.forward]]`, `[[firewall.redirect]]`,
+`[[mdns.reflect]]`, per-network DNS domains, `dns.upstreams`/`tls`, and
+`[mgmt] password_hash` (also written in v1 form while the rest fits it).
+List entries
 (reservations, rules, forwards) carry a stable key (`name`, `mac`) so the
 web interface can edit or delete one entry. The bounds the validation
 enforces (version 1): prefix 8–29, lease 60 s–30 days, ≤ 1024
@@ -229,7 +220,7 @@ saving it ("Use values in effect" on the page) and then removing the
 arguments leaves the router with the same settings from the store. For a
 new SD image: `scripts/apu-image.sh --mgmt-pass --config FILE` writes
 FILE (validated) into the store, and the command line keeps only
-`mgmt_pass=` (no password field in the schema yet). Lab fixtures (the
+`mgmt_pass=` (or nothing, once the config has `mgmt.password_hash`). Lab fixtures (the
 `nas` reservation) are added to the defaults on virtual machines only,
 so they never end up in a hardware config.
 
@@ -237,7 +228,9 @@ so they never end up in a hardware config.
 `crates/config` checks across sections before anything is saved: the
 DHCP pool and reservations lie inside the LAN subnet, no two reservations
 share an address or MAC, forward targets are on a LAN, names are unique.
-Settings the kernel does not implement yet are rejected as unsupported.
+Settings the kernel does not implement yet are rejected as unsupported
+(`Config::unsupported`: today `[[dns.host]]`, a static WAN, ports other
+than `wan0`/`lan0`).
 
 ### Schema versions
 `version` in the document. A newer kernel migrates older documents on
@@ -288,9 +281,11 @@ is UI-managed, with import/export.
 The web interface (`kernel/src/net/mgmt.html`, one compiled-in file) is
 hash-routed into pages: Overview (WAN state, throughput from the byte
 counters, CPU per core), Interfaces, Clients (leases; "Reserve" adds a
-reservation), WAN, LAN & DHCP, DNS, Firewall (the fixed v1 policy and
-drops by reason), Traffic shaping, System (time, management, backup and
-restore, firmware, reboot) and Logs (`GET /api/log`). All pages' forms
+reservation), WAN, Networks (networks, VLANs, zone, DHCP per network),
+LAN & DHCP, DNS (upstreams, DoT state), Firewall (zones, rules, port
+forwards, redirects, mDNS reflect rules, hit counters, drops by reason),
+Traffic shaping, System (time, management password, backup and restore,
+firmware, reboot) and Logs (`GET /api/log`). All pages' forms
 edit one working copy of the config. A bar at the bottom counts the
 changes; Review shows the diff (setting, saved, new) and, after a refused
 save, the validation issues with links to their pages; Save posts the
@@ -306,13 +301,13 @@ after the login. Without a password the page is read-only, its reads
 public. The page's requests carry `X-Rrouter-UI: 1`, so a 401 has no
 `WWW-Authenticate` and the browser shows no password dialog of its own.
 Scripts use Basic auth on every request (checked once, then cached).
-Networks, zones, rules and port forwards are designed in
+Networks, zones, rules and port forwards are described in
 `docs/config-v2.md`.
 
 - `GET /api/config` (auth once a password exists): current config as TOML (secrets omitted), without
   boot-argument overrides (what a save starts from). `GET
   /api/config.json`: the same as JSON (the form).
-- `POST /api/config` (Basic auth): TOML, or JSON with `Content-Type:
+- `POST /api/config` (auth: Bearer token or Basic): TOML, or JSON with `Content-Type:
   application/json` (the form). Validate, save, apply live (a trial:
   reboot). Errors: 422 with
   the parser or validation message (line and column) and, for
@@ -320,7 +315,7 @@ Networks, zones, rules and port forwards are designed in
   501 without a store. The kernel stores the canonical TOML of the parsed
   structs. The save runs in the services task and yields while the disk
   works.
-- `POST /api/config/confirm`, `POST /api/config/revert` (Basic auth; 409
+- `POST /api/config/confirm`, `POST /api/config/revert` (auth; 409
   without a pending trial). `/api/status` has `config` (where it came
   from), `store` and `trial` (`{seq, remaining_s}` or `null`).
 - **Applied live:** a save without a trial takes effect at once, no
@@ -334,14 +329,19 @@ Networks, zones, rules and port forwards are designed in
     client keeps using its address, even if a new reservation gave it to
     someone else;
   - DNS: the zone is rebuilt from the reservations and bound leases; the
-    cache keeps what fits the new size.
+    cache keeps what fits the new size;
+  - networks, zones, rules, forwards, redirects, mDNS rules, WAN mode and
+    VLAN (docs/config-v2.md §7).
 
-  Boot arguments still override (`overrides`). Trial changes (LAN
-  address, management) reboot, because a trial must boot to be confirmed.
+  Boot arguments still override (`overrides`). Trial changes (the
+  management network's address, VLAN or zone, its zone's input policy,
+  rules to the router, `mgmt.on_wan`) reboot, because a trial must boot to be
+  confirmed.
 
 ### Confirm or revert
-A save that changes the LAN address or the management settings
-(`Config::needs_trial`) could cut the user off, so it is written as a
+A save that changes how management is reached (`Config::needs_trial`,
+docs/config-v2.md §7: the management network's address, VLAN, ports or
+zone, rules to the router, `mgmt.on_wan`) could cut the user off, so it is written as a
 **trial** (record flag bit 0):
 
 1. Boot finds a trial without the booted bit: rewrites its header with
@@ -364,6 +364,8 @@ record, a revert lands on the defaults.
 For when the network is not an option: the console prompt `rrouter> `.
 - Commands:
   - `status`, `leases`, `help`, `reboot`
+  - `log [N|all|clear]` (the RAM log: after boot, log messages go there
+    instead of the UART unless `log=console`)
   - `config show [running|stored|pending]`
   - `config set <setting> = <value>` (a TOML assignment, `Config::with_assignment`), `config unset <setting>` (back to the default)
   - `config diff` (pending vs stored), `config save`, `config discard`
@@ -374,8 +376,12 @@ For when the network is not an option: the console prompt `rrouter> `.
   interface would boot as a trial (LAN address, management) is saved for
   good and reboots: on the console nobody can lock themselves out.
 - No authentication: the serial port is physical access.
-- Input is polled from the services task: every 50 ms, every 2 ms for 2 s
-  after a byte (on x86_64 the UART interrupt would need IOAPIC routing).
+- Input arrives by the UART RX interrupt (PL011; on x86_64 COM1's ISA IRQ
+  4 through one IOAPIC entry from the MADT) into a lock-free ring, so
+  pastes survive the 16-byte FIFO; the line is redrawn after other
+  output. The services task also polls the FIFO (every 50 ms, every 2 ms
+  for 2 s after input) as a fallback without the interrupt (`status`
+  shows `interrupt` or `polled`).
 - The line editor handles Backspace, Ctrl-U, Ctrl-C and Up/Down history,
   on any VT100 terminal (`screen`, QEMU's stdio).
 
@@ -387,7 +393,7 @@ For when the network is not an option: the console prompt `rrouter> `.
   Requests are at most 64 KiB (`crate::store` splits). Known limit:
   `virtio-drivers` has only a blocking flush, so each flush (two per
   record) spins until QEMU answers.
-- Host tool `tools/rrstore` (`cargo run -p rrstore -- create|format|show|put|get|corrupt`):
+- Host tool `tools/rrstore` (`cargo run -p rrstore -- create|format|show|put|get|corrupt|hash`):
   creates and formats store images, writes and reads records through the
   same `config-store` code, and flips payload bytes for negative controls.
   `QEMU_STORE=img scripts/qemu-run.sh` attaches an image as virtio-blk.

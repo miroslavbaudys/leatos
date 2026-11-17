@@ -1,9 +1,10 @@
 # rrouter architecture
 
 rrouter is a SOHO router OS written in Rust, running **bare metal** as a
-**single-address-space unikernel** on aarch64. The development target is
-QEMU's `virt` machine (HVF-accelerated on Apple Silicon); real hardware comes
-later.
+**single-address-space unikernel** on aarch64 and x86_64. Development
+runs on QEMU (`virt` with HVF on Apple Silicon; q35 under TCG for x86_64);
+the hardware target is a PC Engines apu4 (x86_64, 4× Intel i211), which has
+been the developer's home router since 2026-11-15.
 
 Required features: PPPoE (WAN), DHCP (WAN client, LAN server, DHCPv6-PD,
 RA), DNS (forwarder, cache, local zone), NAT and a firewall, IPv4 and IPv6,
@@ -23,43 +24,49 @@ watchdog backed by a hardware timer resets a stuck one (M8,
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│ Services (async tasks, no_std + alloc)                         │
-│  pppoe-client · dhcpv4 srv/cli · dhcpv6-pd · RA · dns · ntp    │
-│  config · serial CLI · (later: SSH via `sunset`, HTTP via      │
-│  `picoserve`)                                                  │
+│ Services (`svc` task, no_std + alloc)                          │
+│  pppoe client · dhcpv4 server (+ smoltcp's client on the WAN)  │
+│  dns forwarder + DoT · sntp · mdns reflector · web UI (own     │
+│  HTTP, proto-http) · config + store · serial CLI               │
+│  (planned: dhcpv6-pd · RA, M7)                                 │
 ├───────────────────────────────────────────────────────────────┤
 │ Local stack: smoltcp  ← packets addressed TO the router        │
 ├───────────────────────────────────────────────────────────────┤
 │ Forwarding plane (crates/fwd) ← packets going THROUGH          │
-│  L2: eth / VLAN / bridge+MAC learning / PPPoE encap            │
-│  L3: LPM route table · ARP/NDP neighbor cache · TTL · ICMP err │
-│  conntrack · NAPT · firewall rules · MSS clamp                 │
-│ Queue management (crates/qdisc): CAKE egress (WAN) + ingress   │
-│  shaper · FQ · COBALT · host isolation · tins · ACK filter     │
+│  L2: eth / VLAN / PPPoE encap (kernel datapath)                │
+│  L3: LPM route table · ARP neighbor cache · TTL · ICMP errors  │
+│  conntrack · NAPT · DNAT · zone firewall + rules · MSS clamp   │
+│ Queue management (crates/qdisc): CAKE egress on both ports     │
+│  shaper · FQ · COBALT · host isolation (later: tins, ACK       │
+│  filter, ingress mode)                                         │
 ├───────────────────────────────────────────────────────────────┤
-│ Drivers: virtio-net ×2 (WAN, LAN) · virtio-blk · PL011 · PL031 │
+│ Drivers: virtio-net · igb (i211/82576) · virtio-blk · SDHCI ·  │
+│ i6300esb / AMD FCH watchdog · PL011 / 16550                    │
 ├───────────────────────────────────────────────────────────────┤
-│ Kernel core (kernel/): boot · MMU · heap · exceptions · GIC ·  │
-│ generic timer · PCIe · async executor (IRQ → waker)            │
+│ Kernel core (kernel/): boot · MMU · heap · exceptions ·        │
+│ GICv3 / LAPIC + MSI-X · tickless timer · PCIe · SMP ·          │
+│ priority async executor (IRQ → waker)                          │
 └───────────────────────────────────────────────────────────────┘
 ```
 
-### Packet path (implemented in M4: `kernel/src/net/datapath.rs` + `crates/fwd`)
-1. A NIC RX interrupt wakes the datapath task (`net`), which drains the RX queue in batches.
+### Packet path (`kernel/src/net/datapath.rs` + `crates/fwd`)
+1. A NIC RX interrupt wakes that port's datapath direction task (`dp_down`
+   for the WAN, `dp_up` for the LAN), which drains the RX queue in batches.
 2. Classification: if the packet is addressed to the router (one of its IPs,
    ARP/NDP for its IPs, PPPoE discovery or control frames), hand it to the local
    path (smoltcp or a protocol state machine). Otherwise it goes to the forwarding plane.
 3. Forwarding: decapsulate (VLAN or PPPoE), conntrack lookup or create,
    firewall verdict, NAT rewrite, **classify** (fill `PacketMeta`: pre-NAT
-   flow and host hashes, tin, wire length), WAN-ingress CAKE (download
-   shaping), route lookup (LPM), neighbor resolution (queue the packet if the
-   neighbor is unresolved), TTL decrement and incremental checksum update.
-   Packets *for* the router go into a small bounded per-port queue
-   (`local_rx`) and from there into smoltcp, which runs in the services
-   task. The router's own transmissions go straight into the port's qdisc,
+   flow and host hashes, wire length), route lookup (LPM), neighbor
+   resolution (at most 3 packets held per unresolved next hop), TTL
+   decrement and incremental checksum update. Download shaping happens on
+   LAN egress (a WAN-ingress CAKE stage is planned for the multi-port LAN).
+   Packets *for* the router go into a small bounded per-link queue
+   (`local_rx`, 64 packets) and from there into smoltcp, which runs in the
+   services task. The router's own transmissions go straight into the port's qdisc,
    so the qdisc sees all egress traffic.
-4. Egress: enqueue into the egress interface's qdisc (CAKE on the WAN; a bounded FIFO until M6). A TX
-   task **pulls** from the qdisc when the driver has ring space and the
+4. Egress: enqueue into the egress port's qdisc (CAKE by default on both
+   ports, wrapped in the shaper). The transmitting task **pulls** from the qdisc when the driver has ring space and the
    shaper allows it, then encapsulates and transmits. The qdisc is the only
    place packets wait (no hidden queues).
 
@@ -75,8 +82,10 @@ forwarded frames, ARP requests and smoltcp's frames. The forwarder, ARP
 snooping, neighbor tables, smoltcp and the qdiscs therefore only see
 untagged frames, and `crates/fwd` stays tag-free. Because the qdisc counts
 untagged lengths, the WAN shaper adds the tag's 4 bytes to its overhead
-(`config::Qos::port_rate`). LAN VLANs (M10) will reuse the same two
-hooks, with one interface per (port, VID).
+(`config::Qos::port_rate`). LAN VLANs use the RX hook the same way (the
+VID selects the link, one router interface per network on `lan0`), but a
+frame for a VLAN network gets its tag when it is queued, so the LAN qdisc
+holds tagged frames and shapes the 4 bytes too (docs/config-v2.md §6).
 
 **PPPoE (implemented for the WAN, `wan.mode = "pppoe"`):** the same two
 hooks, inside the VLAN tag. On a PPPoE port (`PortShared::pppoe_mode`)
@@ -110,22 +119,26 @@ the project (it effectively replaces netfilter), and it must be fuzzed.
 
 ## Latency rules (from the CAKE requirements)
 - Timers are **tickless** and high-resolution: program the next deadline in
-  `CNTV_CVAL`. There is no periodic tick.
+  `CNTV_CVAL` (aarch64) or the LAPIC one-shot counter (x86_64). There is no
+  periodic tick.
 - The executor has **priority classes**. Datapath work (RX → forward → qdisc → TX) runs before service tasks.
 
-### Tasks (M11 step 1)
-| Task | Priority | Owns | Does |
-|---|---|---|---|
-| `dp_down` / `dp_up` (`net::stack::run_dir`) | Datapath | one direction each: RX on one port, TX on the other; share the locked NICs and `Datapath` (forwarder, neighbor table) | RX → forward → qdisc → TX, NAPI; `dp_down` also housekeeping and control |
-| `svc` (`net::svc::run`) | Service | smoltcp interfaces and sockets (`HostIf`), DHCP client, LAN DHCP server, DNS, mgmt | the router's own traffic |
+### Tasks (M11, docs/smp.md)
+| Task | Priority | Core (≥ 3 online) | Owns | Does |
+|---|---|---|---|---|
+| `dp_down` / `dp_up` (`net::stack::run_dir`) | Datapath | 0 / 1 | one direction each: RX on one port, TX on the other; share the locked NICs and `Datapath` (16 forwarder shards, neighbor tables) | RX → forward → qdisc → TX, NAPI; `dp_down` also housekeeping and control |
+| `svc` (`net::svc::run`) | Service | 2 | smoltcp interfaces and sockets (`HostIf`, one per link), WAN DHCP client or PPPoE, LAN DHCP servers, DNS + DoT, SNTP, mDNS, mgmt, CLI, store writes | the router's own traffic |
+| `watchdog` (one per core) | Datapath | each | `LAST_SEEN` stamps | cross-core check, hardware watchdog (docs/watchdog-and-time.md) |
 
-They share only `net::shared`: per port a locked qdisc and `local_rx`
-queue, a stats snapshot for the status page, `Control` messages (WAN
-lease → forwarder, reboot/upgrade → the datapath quiesces the NICs) and two
-events (`dp_kick`, `svc_kick`). A service poll therefore delays forwarding
-by at most one poll, and the CPU accounting separates the two (`/api/status`
-`cpu`, the console's per-task `cpu` line). Next: the services and each
-direction of the datapath on their own cores (roadmap M11).
+With one core everything runs on core 0 (a single `dp` task); with two the
+datapath is on core 0 and `svc` on core 1. They share only `net::shared`:
+per port a locked qdisc (plus the PPPoE `ctrl_rx` queue and session), per
+link a `local_rx` queue, a stats snapshot for the status page, `Control`
+messages (WAN lease, zone policy and networks → forwarder, reboot/upgrade →
+the datapath quiesces the NICs) and two events (`dp_kick`, `svc_kick`). A
+service poll therefore never delays forwarding on another core, and the
+CPU accounting separates them (`/api/status` `cpu`, the console's per-task
+`cpu` line).
 - Interrupt handlers only acknowledge hardware and set flags or wake
   state. No allocation, no locks shared with thread context, no printing.
 - TX is pull-based with byte-limited driver rings (BQL-style).
@@ -135,15 +148,17 @@ Services react to events instead of polling each other:
 
 ```
 pppoe: PADI→PADO→PADR→PADS → LCP → PAP/CHAP → IPCP
-        └─► WanUp{ip, peer, dns[]}
-              ├─ fwd:     address + default route on ppp0, masquerade, MSS clamp
-              ├─ dns:     upstreams = dns[] (unless overridden)
-              └─ dhcp6pd: solicit over PPPoE → PrefixDelegated{/56}
+        └─► Session + LeaseChange{ip, peer, dns[]}
+              ├─ fwd:     WAN address + default route (Control), masquerade, MSS clamp
+              ├─ dns:     upstreams = dns[] (unless dns.upstreams is set)
+              └─ (M7) dhcp6pd: solicit over PPPoE → PrefixDelegated{/56}
                                 └─ LAN /64 + RA with RDNSS
-LeaseAdded{mac, ip, hostname} ─► dns local zone (`host.lan`)
-WanDown (PADT / LCP echo timeout) ─► routes withdrawn, reconnect with backoff
-ConfigChanged ─► only the affected services re-apply
+DHCP Bound/Released{mac, ip, hostname} ─► dns local zone (`host.<domain>`)
+WAN down (PADT / LCP echo timeout / lease lost) ─► address withdrawn, reconnect with backoff
+config save ─► config::apply: shaping, networks, firewall policy, LAN services re-apply live
 ```
+(Events are plain values returned by the sans-IO crates and handled in
+`svc`; there is no separate bus.)
 
 ## Code-sharing strategy: sans-IO, no_std crates
 Every protocol lives in a `#![no_std]` + `alloc` crate with **no I/O**: pure
@@ -151,17 +166,26 @@ state machines that take bytes and the current time as input, and return
 bytes to send plus events.
 
 ```
-crates/proto-pppoe   PPPoE discovery, LCP, PAP/CHAP, IPCP, IPv6CP
-crates/proto-dhcp    DHCPv4 server/client, DHCPv6-PD, RA
-crates/proto-dns     forwarder, cache, local zone
-crates/fwd           LPM, neighbor cache, conntrack, NAT, firewall
-crates/qdisc         CoDel, FQ-CoDel, CAKE (simulation-tested with fake time)
+crates/proto-pppoe   PPPoE discovery, LCP, PAP/CHAP, IPCP (IPv6CP: M7)
+crates/proto-dhcp    DHCPv4 server + lease snapshots (DHCPv6-PD, RA: M7)
+crates/proto-dns     forwarder, cache, local zones
+crates/proto-dot     DNS over TLS client (rustls, unbuffered)
+crates/proto-sntp    SNTP client
+crates/proto-mdns    mDNS reflector across networks
+crates/proto-http    incremental HTTP/1.1 parser
+crates/fwd           LPM, neighbor cache, conntrack, NAT, zone firewall
+crates/qdisc         CoDel, FQ-CoDel, CAKE, shaper (simulation-tested with fake time)
+crates/config        config.toml schema, validation, migration
+crates/config-store  power-fail-safe store partition format
+crates/auth          password hashes, sessions, entropy pool
+crates/boot-image    ELF / Multiboot2 checks for upgrades
+crates/cli           serial line editor + command parser
 kernel/              bare-metal platform that drives the crates
-  arch/<target>/     all CPU-specific code (aarch64 today, x86_64 skeleton)
-  platform/          neutral BootInfo + firmware backends (DTB; ACPI later)
-  mm/ mmio.rs        memory, page tables, DMA; the safe MMIO abstraction
-  drivers/ net/      virtio-net, packet pool, smoltcp glue, network task
-(platform-host)      planned: TAP/pcap harness to run the crates on a dev machine
+  arch/<target>/     all CPU-specific code (aarch64, x86_64)
+  platform/          neutral BootInfo + firmware backends (DTB; PVH/Multiboot2 + ACPI)
+  mm/ mmio.rs        memory, page tables, DMA, stacks; the safe MMIO abstraction
+  drivers/ net/      NICs, block devices, watchdogs; packet pool, datapath, services
+tools/rrstore        host tool for store images (std)
 ```
 
 The benefits: fast iteration and unit tests on the host, fuzzing with
@@ -183,5 +207,8 @@ and dhcproto are out).
 | MMIO | `safe-mmio` (via `mmio::Region`) |
 | aarch64 system registers | `aarch64-cpu` (arch backend only) |
 | TCP/IP for the router's own services | `smoltcp` |
-| DNS wire format | `simple-dns` or `domain` (check no_std support), or our own |
-| SSH / HTTP (later) | `sunset` / `picoserve` |
+| DNS wire format | our own (`crates/proto-dns`, `crates/proto-mdns`) |
+| HTTP server | our own (`crates/proto-http`) over smoltcp TCP |
+| TLS (DoT) | `rustls` 0.23 (no std, unbuffered API) + RustCrypto provider |
+| Config | `toml` + `serde`, `serde_json` |
+| SSH (later) | `sunset` |

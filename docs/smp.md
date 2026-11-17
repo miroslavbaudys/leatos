@@ -19,8 +19,8 @@ The boot argument `cores=N` caps the cores used, for A/B measurements
 (`cores=1` = the single-core layout).
 
 ## Step 1: services split ✅
-The datapath task `net` (`Priority::Datapath`) owns the NICs and the
-forwarder. The services task `svc` (`Priority::Service`) owns smoltcp
+The datapath task (`net` at the time, now `dp_down`/`dp_up`, step 3;
+`Priority::Datapath`) owns the NICs and the forwarder. The services task `svc` (`Priority::Service`) owns smoltcp
 and everything on it (WAN DHCP client, LAN DHCP server, DNS, web
 interface). They share only `net::shared` (see `docs/architecture.md`
 "Tasks"). Forwarded packets never leave the datapath, and router-local
@@ -69,8 +69,8 @@ TX goes straight into the qdisc, so no queue was added.
   in `wfi` sees it.
   - No wakeup is lost: the idle path masks IRQs, re-checks for work and
     only then runs `wfi`, and a pending IPI ends `wfi` even while masked.
-- **Device interrupts** still go to core 0 (the core that enables them).
-  Step 3 routes each NIC to its RX core.
+- **Device interrupts** went to core 0 in this step; step 3 routes each
+  NIC to its RX core.
 - **Stopping:** on a panic (any core) and before replacing the kernel in
   RAM, `smp::stop_others` halts the other cores (stop flag + IPI).
 
@@ -87,8 +87,8 @@ does one 64-bit access. TCG answered either way.
   sleep on core 1 (+2 µs).
   - Negative control: `QEMU_SMP=4 QEMU_APPEND=cores=1` fails the boot
     case.
-- `QEMU_SMP=4 scripts/lab-test.sh`: the full lab, with `svc` on core 1
-  (the per-task CPU line shows `svc@1`).
+- `QEMU_SMP=4 scripts/lab-test.sh`: the full lab, with `svc` on core 2
+  after step 3 (the per-task CPU line shows `svc@2`; `svc@1` with 2 cores).
 
 ## Step 3: one datapath core per direction ✅
 - **Tasks:** `dp_down` (WAN RX → forwarder → LAN qdisc → LAN TX) and

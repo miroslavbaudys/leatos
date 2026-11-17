@@ -16,7 +16,9 @@ the IoT network. Forwarding the packets cannot fix that; the router must
 receive them on one link and **send them again from its own address** on
 another.
 
-## 1. Today (verified in the code)
+## 1. Before the reflector (verified in the code, 2026-11-15)
+The starting point; §3–§5 describe what changed (smoltcp `multicast`,
+`svc::MDNS`, the reflector).
 - `crates/fwd` `Forwarder::process`: a multicast destination counts as "to
   us" and goes to `input()`; multicast is never forwarded. Stays so.
 - `input()` service mask: UDP 5353 maps to no service, so a zone with

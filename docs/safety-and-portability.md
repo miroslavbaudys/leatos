@@ -26,11 +26,19 @@ page-table *construction*, PCI enumeration logic, driver state machines) can be 
   - `mm::dma`: the `virtio_drivers::Hal` implementation; `DmaRegion`
     (descriptor rings: volatile access, and `unsafe fn write_buffer_addr`,
     the hand-off)
+  - `mm::mmu`: one call, activating the finished page tables
+  - `mm::sym`: `unsafe extern` declarations of linker symbols (addresses only)
   - `mmio`: one constructor that turns an address into an MMIO region, plus `Region::read64` (one 64-bit access inside a region it owns; GICv3 `GICR_TYPER` under HVF)
-  - `platform::dtb`: DTB blob pointer
+  - `pci`: the ECAM handle
+  - `platform::dtb`: DTB blob pointer; `platform::phys` (x86_64): the one
+    constructor that views firmware memory as bytes
   - `drivers::virtio_net`: the DMA buffer hand-off (begin/complete pairs)
+  - `drivers::virtio_blk`: the DMA buffer hand-off (submit/complete pairs,
+    driver-owned buffers)
   - `drivers::igb`: the register window (`Region::new` over BAR0) and the
     two hand-offs (RX refill, TX post)
+  - `drivers::sdhci`, `drivers::i6300esb`: the register window's
+    constructor (PIO, no DMA)
   - `selftest`: deliberate faults, feature-gated
   - `arch::x86_64::kexec` (inside the arch backend): the in-RAM upgrade's CR3 switch + jump into the trampoline (`kexec.S`), and the view of the trampoline bytes
 - `crates/*`: `#![forbid(unsafe_code)]` (cannot be overridden).
@@ -63,19 +71,19 @@ Every dependency is reviewed for `no_std` support and its own unsafe surface bef
 
 ## 3. x86_64 portability
 
-**Status (M9b, 2026-11-09): x86_64 runs.** On QEMU q35 (TCG on Apple
-Silicon), the x86_64 kernel passes the same smoke tests (boot with DHCP and
-ping, fault-wx, fault-stack) and the full lab (`RROUTER_ARCH=x86_64
-scripts/lab-test.sh`: DHCP, DNS, NAT, firewall, shaping, CAKE, ECN). The
-next target is the PC Engines apu4 (M10).
+**Status: x86_64 runs on QEMU and on hardware.** On QEMU q35 (TCG on
+Apple Silicon), the x86_64 kernel passes the same smoke tests and the full
+lab (`RROUTER_ARCH=x86_64 scripts/lab-test.sh`) since M9b (2026-11-09).
+Since M10 it runs on the PC Engines apu4 (booted by Limine through
+Multiboot2), the developer's home router since 2026-11-15.
 
 ### 3.1 What's the same, and what differs
 | Area | aarch64 | x86_64 | Portable? |
 |---|---|---|---|
-| Boot | QEMU `-kernel` ELF, DTB at RAM start | **PVH** (`XEN_ELFNOTE_PHYS32_ENTRY`): QEMU `-kernel`, 32-bit entry stub in `boot.S` → long mode; multiboot2 header for GRUB/Limine on hardware in M10 | arch + platform backend |
+| Boot | QEMU `-kernel` ELF, DTB at RAM start | **PVH** (`XEN_ELFNOTE_PHYS32_ENTRY`): QEMU `-kernel`, 32-bit entry stub in `boot.S` → long mode; **Multiboot2** for Limine on the apu4 (`platform::multiboot2`) | arch + platform backend |
 | HW discovery | DTB | PVH start info (memory map, command line) + ACPI: MADT (LAPIC/IOAPIC), MCFG (ECAM), FADT + DSDT `\_S5` | neutral `BootInfo`, two backends |
 | Console | PL011 MMIO | 16550 UART (port I/O `0x3f8`) | `arch::console` |
-| Interrupt controller | GICv3, INTx from the DTB `interrupt-map` | local APIC, 8259 PICs masked; devices via **MSI-X** | `arch::irqchip` API |
+| Interrupt controller | GICv3, INTx from the DTB `interrupt-map` | local APIC, 8259 PICs remapped (224–239) and masked; devices via **MSI-X**; one IOAPIC entry for COM1's ISA IRQ 4 (from the MADT, no AML) | `arch::irqchip` API |
 | Timer (tickless) | generic timer, CNTV_CVAL | TSC clock (calibrated on the 8254 PIT), **LAPIC one-shot** deadlines. TSC-deadline mode isn't used: the apu4's AMD GX-412TC lacks it | `arch::timer` API |
 | Page tables | 4 KiB granule, 512-entry levels | 4-level, 4 KiB × 512; NX via EFER.NXE, W^X enforced for ring 0 by CR0.WP | **neutral builder** + per-arch descriptor bits |
 | Exceptions | vector table, ESR decode | IDT, TSS with IST1 (exception stack) for #PF/#DF/NMI/#MC, error codes, CR2 | arch |
@@ -83,21 +91,27 @@ next target is the PC Engines apu4 (M10).
 | Memory ordering for DMA | weak (`dmb`/`dsb`) | strong (TSO) | handled inside virtio-drivers / fences |
 | PCIe | ECAM, we assign BARs | ECAM via MCFG; firmware assigned the BARs; every BAR is mapped at runtime (`mm::mmu::map_device`) | **neutral** |
 | virtio-net (PCI) | ✔ | ✔ | **neutral**. This is why we use virtio-**pci**, not virtio-mmio |
-| Real NICs | — | Intel i211 (igb), apu4 (M10) | neutral driver over `mmio` + `dma` |
+| Real NICs | (igb on QEMU's 82576, INTx) | Intel i211 (igb) on the apu4 | neutral driver over `mmio` + `dma` |
+| SMP | PSCI `CPU_ON` | INIT-SIPI-SIPI, trampoline at 0x8000 | `arch::smp` (docs/smp.md) |
+| Watchdog, RTC, kexec | none (stubs; i6300esb over PCI in QEMU) | AMD FCH watchdog, CMOS RTC, in-RAM kernel replacement | `arch::watchdog`, `arch::rtc`, `arch::kexec` |
 
 ### 3.2 Code layout that keeps the port cheap
 ```
 kernel/src/
   main.rs            arch-neutral boot order
   arch/mod.rs        selects the backend; documents the arch API contract
-  arch/aarch64/      boot.S, cpu, exceptions, gic (irqchip), timer, mmu bits, psci, pl011
-  arch/x86_64/       boot.S (PVH entry), isr.S, cpu, exceptions (IDT/TSS), irqchip (LAPIC,
-                     MSI-X), timer (TSC + LAPIC), mmu bits, power (ACPI S5), console, port
-  platform/          neutral BootInfo; dtb (aarch64); pvh + acpi + phys (x86_64)
-  mm/                heap, page-table builder, dma
-  irq.rs timer.rs executor.rs console.rs pci.rs mmio.rs   (neutral)
-  drivers/           Nic (one interface), virtio_net, igb (neutral)
-  net/               packet buffers, netdev, smoltcp glue (neutral)
+  arch/aarch64/      boot.S, cpu, exceptions, irqchip (GICv3), timer, mmu bits, power (PSCI),
+                     console (PL011), smp; stubs: kexec, rtc, watchdog
+  arch/x86_64/       boot.S (PVH + Multiboot2 entry, AP trampoline), isr.S, cpu, exceptions
+                     (IDT/TSS), irqchip (LAPIC, MSI-X, COM1's IOAPIC entry), timer (TSC + LAPIC),
+                     mmu bits, power (ACPI S5), console (16550), port, smp, kexec (+ kexec.S),
+                     rtc (CMOS), watchdog (AMD FCH)
+  platform/          neutral BootInfo; dtb (aarch64); pvh + multiboot2 + acpi + phys (x86_64)
+  mm/                heap, page-table builder, dma, stacks, sym
+  irq.rs timer.rs executor.rs smp.rs console.rs pci.rs mmio.rs ...   (neutral)
+  drivers/           Nic and Disk (one interface each), virtio_net, igb, virtio_blk, sdhci,
+                     i6300esb, watchdog (neutral)
+  net/               packet buffers, datapath, smoltcp glue, services (neutral)
 ```
 **Rule:** nothing outside `arch/` may use `core::arch`, `asm!` or arch-specific
 crates. Neutral code calls only the `arch::` API.

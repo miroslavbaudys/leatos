@@ -52,8 +52,9 @@ CAKE.
 - **Drain RX promptly** so the RX ring doesn't become the hidden queue for ingress shaping.
 - **Status (M2):** implemented in `drivers/virtio_net.rs` + `net/device.rs`:
   `can_transmit()` = free descriptor **and** in-flight bytes below
-  `tx_byte_limit` (fixed, 8 × 1514 B). smoltcp only gets a TX token when
-  there is room. Adaptive (BQL) limits follow in M6. The bounded packet pool
+  `tx_byte_limit` (fixed, 8 × 1514 B; the igb driver uses the same limit).
+  smoltcp only gets a TX token when there is room. Adaptive (BQL) limits
+  are still open (fixed limits so far, also on the apu4). The bounded packet pool
   (`net/packet.rs`, 1024 × 2 KiB) carries `PacketMeta` and has 128 B of
   headroom on every received packet, for re-encapsulation without a copy.
 
@@ -68,9 +69,10 @@ CAKE.
 - **Hybrid idle (implemented, M6 step 1):** `timer::set_spin_window(w)`. The
   comparator is armed `w` early; when the next deadline is within `w`, the
   executor spins with IRQs enabled instead of `wfi`, and the exact-deadline
-  interrupt arrives in microseconds. `w` = 4 ms on QEMU `virt` (detected from
-  the DTB root `linux,dummy-virt`) and 0 on physical machines
-  (`config::idle_spin_window`). `timer::pending()` also checks the deadline
+  interrupt arrives in microseconds. `w` = 4 ms on virtual machines
+  (aarch64: the DTB root `linux,dummy-virt`; x86_64: the CPUID hypervisor
+  bit) and 0 on physical machines (`config::idle_spin_window`; boot
+  argument `idle_spin_us=`). `timer::pending()` also checks the deadline
   directly, so a late or lost interrupt cannot stall timers. Measured (HVF):
 
   | sleep | wfi only (M1) | hybrid idle | idle-poll |
@@ -410,6 +412,21 @@ to ECN on ingress, off on egress):
   runs, and a variable-rate line ultimately needs autorate.
 
 ## 5. Configuration UX
+**Implemented** (`[shaping]`, docs/config-and-storage.md §5; boot
+arguments `shape_up=`, `shape_down=`, `shape_overhead=`, `qdisc=`,
+`isolation=`, `ecn_up=`, `ecn_down=`):
+```toml
+[shaping]
+up_kbit = 18000              # unset = not shaped
+down_kbit = 90000
+overhead = 20                # bytes per packet; the WAN VLAN (+4) and PPPoE (+8) are added automatically
+ecn_up = false
+ecn_down = true
+qdisc = "cake"               # cake | fq_codel | codel
+isolation = "triple-isolate" # dual-srchost | dual-dsthost | flows
+```
+**Target** (not implemented: framing/MPU, DiffServ, ACK filter, a true
+ingress stage):
 ```toml
 [qos]
 enabled = true

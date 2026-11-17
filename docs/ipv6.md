@@ -1,7 +1,8 @@
 # IPv6 (M7, plan)
 
-Status (2026-11-15): not started. This is the plan; the analysis in §1 was
-checked against the code at 2712911.
+Status (2026-11-17): not started. This is the plan; the analysis in §1 was
+checked against the code at 2712911 (line numbers dropped since: search
+for the names).
 
 Goal (roadmap M7): a LAN client gets a global IPv6 address (SLAAC from the
 delegated prefix) and reaches the ISP over IPv6, through DHCP or PPPoE on
@@ -10,8 +11,8 @@ CAKE handling IPv6 like IPv4.
 
 ## 1. Today (verified in the code)
 - `crates/fwd` `Forwarder::process`: anything that is not IPv4 goes to
-  `local()` ("ARP, IPv6 (until M7)", `forwarder.rs:744`); `shard_of` puts
-  every non-IPv4 frame in shard 0 (`forwarder.rs:484`). IPv6 is never
+  `local()` ("ARP, IPv6 (until M7)"); `shard_of` puts every non-IPv4
+  frame in shard 0. IPv6 is never
   forwarded, so nothing bypasses the firewall.
 - smoltcp 0.14 is built with `proto-ipv6` and `multicast`, but no IPv6
   address is ever configured (not even link-local): `net/stack.rs`,
@@ -20,7 +21,7 @@ CAKE handling IPv6 like IPv4.
 - Side effect: LAN clients' ND, MLD and mDNS multicast all go through each
   link's `local_rx` into `svc` and are discarded there; they compete with
   ARP for `local_rx` space (`local_rx_drops`).
-- PPPoE: IPv6CP gets an LCP Protocol-Reject (`proto-pppoe/src/lib.rs:828`);
+- PPPoE: IPv6CP gets an LCP Protocol-Reject (`proto-pppoe` `protocol_reject`);
   `classify_session` / `decap_ipv4` / `encap_ipv4` handle PPP protocol
   0x0021 only; `datapath.rs` `pppoe_rx`/`pppoe_tx` drop anything else. The
   lab ISP offers `+ipv6` to exercise the reject.
@@ -29,17 +30,17 @@ CAKE handling IPv6 like IPv4.
 - All `crates/fwd` types are IPv4-only: `conntrack::Tuple` (`src`/`dst:
   Ipv4Addr`), mappings, `host_hash`, `neigh::NeighTable` keyed by
   `(IfIndex, Ipv4Addr)`, `route` (IPv4 LPM), `wire` (no IPv6 view).
-- `PacketBuf::mark_ce` is IPv4-only (`net/packet.rs:221`).
+- `PacketBuf::mark_ce` is IPv4-only (`net/packet.rs`).
 - Already usable: `PPP_IPV6`/`PPP_IPV6CP` constants
-  (`proto-pppoe/src/wire.rs:51`); igb accepts all multicast, virtio-net
+  (`proto-pppoe/src/wire.rs`); igb accepts all multicast, virtio-net
   delivers everything; the qdiscs only see `flow_hash` / `host_hashes`
   (`qdisc/src/lib.rs`), so CAKE needs nothing version-specific.
-- `crates/proto-dhcp` is a placeholder for the DHCPv4 client, DHCPv6-PD
-  and RA (its `lib.rs` is 17 lines).
+- `crates/proto-dhcp` has only the DHCPv4 server (`v4`) so far; the WAN
+  DHCPv4 client is smoltcp's. DHCPv6-PD and RA are new code.
 - Requirements already written down: `docs/soho-features.md` (DHCPv6-PD
   with a /56 hint, prefix changes with deprecating RAs, a /64 per network,
   RA + RDNSS + M/O flags, SLAAC mandatory: Android has no DHCPv6),
-  `docs/config-v2.md` §12 (`[wan.ipv6]`, inbound blocked by default),
+  `docs/config-v2.md` §9 item 12 (`[wan.ipv6]`, inbound blocked by default),
   `docs/mdns.md` (`ff02::fb` waits for M7).
 
 ## 2. Design decisions

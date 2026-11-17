@@ -20,9 +20,10 @@ Kernel: `net::pppoe` (svc) + the datapath hooks (architecture.md). MSS
 clamping and ICMP "fragmentation needed" in `crates/fwd`. Lab:
 `LAB_PPPOE=pap|chap scripts/lab-test.sh` (rp-pppoe's `pppoe-server` in the
 ISP VM, also with `LAB_VLAN=848`), `scripts/pppoe-test.sh` (live switch
-between DHCP and PPPoE). Open: IPv6CP + DHCPv6-PD over the session (M7),
-RFC 4638, IPv4 fragmentation of non-DF packets above the MTU (dropped
-today), PPPoE on real hardware.
+between DHCP and PPPoE). PPPoE runs on the apu4 against the developer's ISP (VLAN 848, no
+authentication, since 2026-11-15). Open: IPv6CP + DHCPv6-PD over the
+session (M7), RFC 4638, IPv4 fragmentation of non-DF packets above the MTU
+(dropped today), long-run stability (forced daily disconnects).
 
 | Stage | Details |
 |---|---|
@@ -44,10 +45,13 @@ Pitfalls:
 - Reconnect with exponential backoff. Send PADT on shutdown so the ISP
   doesn't keep a stale session. Handle forced daily disconnects.
 - On multi-core hardware, NIC RSS can't hash inside PPPoE, so all traffic
-  lands on one core. This doesn't matter for single-core QEMU.
+  lands on one core. rrouter doesn't use RSS: it splits by direction
+  (docs/smp.md), which PPPoE doesn't affect.
 
 ## DHCP
-Crate: `crates/proto-dhcp`. Status: v4 server done (M3); clients and v6 pending.
+Crate: `crates/proto-dhcp`. Status: v4 server done (M3), lease
+persistence done (M8); the WAN DHCPv4 client is smoltcp's; v6 pending (M7,
+docs/ipv6.md).
 
 ### DHCPv4 server (LAN), required
 **Status (M3): implemented** in `crates/proto-dhcp/src/v4/` (17 tests,
@@ -55,23 +59,27 @@ including fuzzing) and wired up in `kernel/src/net/services.rs`. Done:
 DORA, static reservations, offer hold, returning client gets the same IP,
 renew/rebind, INIT-REBOOT, NAK, RELEASE, DECLINE (10 min hold), INFORM,
 expiry, hostname sanitising, and `Bound`/`Released` events to DNS. Replies
-are always broadcast. Open: lease persistence (M8), conflict probe, option
-121, multiple pools/VLANs, relay.
+are always broadcast. One server per network (`[[network]]`, VLANs,
+docs/config-v2.md) with its own domain (option 15). Leases persist in the
+store (`persist`, `Server::restore`; docs/config-and-storage.md §4).
+Open: conflict probe, option 121, option 42 (no NTP server), relay.
 
 - Pools, static reservations by MAC, lease time, T1/T2, DECLINE, RELEASE, INFORM.
 - Options: 1 subnet mask, 3 router, 6 DNS (= router IP), 15/119 domain, 42 NTP,
   12 hostname (from the client), optionally 121 classless routes.
 - Lease persistence: in memory, flushed periodically and on shutdown. Batch
-  writes to limit flash wear.
+  writes to limit flash wear. ✅
 - Optional ARP or ICMP probe before handing out an address.
 - Emit `LeaseAdded{mac, ip, hostname}` so the DNS zone resolves `host.lan`.
-- One pool per LAN or VLAN (guest network later).
+- One pool per LAN or VLAN. ✅
 
 ### DHCPv4 client (WAN, non-PPPoE ISPs)
+**Status: implemented** with smoltcp's `dhcpv4` socket (`net/svc.rs`),
+since M2; the lease feeds the forwarder (WAN address, route) and the DNS
+upstreams.
 - DISCOVER, OFFER, REQUEST, ACK, then renew, rebind and expire. Must work
   before the interface has an IP address (raw L2 frames).
-- Some ISPs need option 60/61 or MAC cloning.
-- smoltcp has a DHCPv4 client socket that may cover this.
+- Open: some ISPs need option 60/61 or MAC cloning.
 
 ### DHCPv6-PD client (WAN), required
 - SOLICIT, ADVERTISE, REQUEST, REPLY with an IA_PD prefix-size hint (/56).
@@ -129,7 +137,8 @@ moves (OPT last, or a new OPT); lab check: the stale answer to a crafted
 EDNS query carries EDE 3.
 **Open:** TCP port 53 from clients, randomised upstream source port
 per query (Kaminsky hardening; one fixed random port today), DoH,
-blocklists, DNSSEC.
+blocklists, DNSSEC validation, static local records (`[[dns.host]]`:
+in the schema, refused by the kernel so far).
 
 | Function | Priority |
 |---|---|
@@ -143,8 +152,9 @@ blocklists, DNSSEC.
 | Blocklists (Pi-hole style) | later |
 | DNSSEC validation (needs correct time, so NTP) | optional |
 
-Resolution order in the request handler: local zone → blocklist → cache →
-forward to the current upstream (the upstream list is swapped atomically on `WanUp`).
+Resolution order in the request handler: local zone → (later: blocklist) →
+cache → forward to the current upstream (the list is replaced when the WAN
+lease changes, unless `dns.upstreams` is set).
 
 ## NAT and firewall
 **Status (M4): implemented** in `crates/fwd` (27 tests, including fuzzing) and
@@ -153,20 +163,27 @@ forward to the current upstream (the upstream list is swapped atomically on `Wan
   (RFC 4787) and endpoint-dependent filtering. NAT ports 10000–39999
   (router-local sockets use ≥ 60000; forwarded ports are skipped). Port preservation when free.
 - Conntrack: TCP state (SYN → established → closing/closed) with
-  timeouts, UDP unreplied/assured, ICMP echo; bounded at 16384 entries;
-  all NAT state flushed when the WAN address changes.
+  timeouts, UDP unreplied/assured, ICMP echo; 16 shards sharing one
+  budget of 16384 entries (`conntrack::Budget`); all NAT state flushed when
+  the WAN address changes.
 - ICMP errors: TTL-exceeded generated (rate-limited, 50/s), and errors
   about NATed flows translated, including the embedded header.
-- Firewall: new flows only LAN→WAN; TCP must start with SYN; WAN→LAN only
-  for tracked connections; hairpin, fragments and unknown protocols dropped.
+- Firewall: since config v2 (2026-11-15) a zone firewall with ordered
+  rules, `reject`, live recheck of tracked connections and WAN
+  anti-spoofing (docs/config-v2.md). The default is still M4's policy:
+  new flows only LAN→WAN; TCP must start with SYN; WAN→LAN only for
+  tracked connections (or port forwards); fragments and unknown protocols
+  dropped.
 - Port forwarding (DNAT) and hairpin NAT ✅ (2026-11-15, docs/config-v2.md).
 - Redirects ✅ (2026-11-16, `[[firewall.redirect]]`, docs/config-v2.md): the
   networks' connections to an outside server on given ports go to a device
   inside (NTP to the LAN's time server, as UniFi's NTP redirect).
-- Open: IP fragment reassembly
-  (fragments are dropped today), ICMP unreachable for no-route, MSS
-  clamping + PMTU (M5, with PPPoE), UPnP/NAT-PMP, faster conntrack
-  structures (hash table + timer wheel instead of BTreeMap + O(n) expiry).
+- MSS clamping and ICMP "fragmentation needed" for DF packets above the
+  egress MTU ✅ (M5, with PPPoE).
+- Open: IP fragment reassembly (fragments are dropped today), ICMP
+  unreachable for no-route (dropped as `no-route`), UPnP/NAT-PMP, faster
+  conntrack structures (hash table + timer wheel instead of BTreeMap +
+  O(n) expiry).
 
 ## Supporting pieces needed by all of the above
 - NAT (masquerade on the WAN) and a stateful firewall: LAN→WAN allowed,
@@ -178,7 +195,11 @@ forward to the current upstream (the upstream list is swapped atomically on `Wan
   trusted as the time (only a hint for DoT certificate dates). Open: serving NTP to the LAN.
 - Persistent config storage: raw store partition with A/B record slots (`docs/config-and-storage.md`); virtio-blk in QEMU, SD on the apu4.
 
-## Target configuration UX
+## Target configuration UX (early sketch)
+The implemented schema differs: see `docs/config-and-storage.md` §5
+(version 1) and `docs/config-v2.md` (version 2: `[[network]]` instead of
+`[lan]`, `lease_secs`, `[[network.dhcp.static]]`, `[dns] upstreams`,
+`cache_entries`). `[wan.ipv6]` is still to come (M7).
 ```toml
 [wan]
 interface = "wan0"
