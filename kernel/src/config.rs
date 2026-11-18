@@ -982,6 +982,13 @@ pub fn fw_fragments() -> bool {
     arg_u64(bootargs(), "fw_frag") != Some(0)
 }
 
+/// Split packets without DF that exceed the egress MTU (RFC 791); boot
+/// argument `fw_split=0` drops them as `too-big` (the lab's negative
+/// control).
+pub fn fw_split() -> bool {
+    arg_u64(bootargs(), "fw_split") != Some(0)
+}
+
 fn arg_u64(bootargs: &str, key: &str) -> Option<u64> {
     arg(bootargs, key).and_then(|v| v.parse().ok())
 }

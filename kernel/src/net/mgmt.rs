@@ -1153,7 +1153,7 @@ fn status_json(
         "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"vlan_drops\":{},\"conntrack\":{},\"revoked\":{},\"rejected\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"temp\":{temp},\"memory\":{memory},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
-         \"fragments\":{{\"forwarded\":{},\"parked\":{},\"park_drops\":{}}},\"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
+         \"fragments\":{{\"forwarded\":{},\"parked\":{},\"park_drops\":{},\"split\":{},\"split_drops\":{}}},\"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
         json_str(env!("CARGO_PKG_VERSION")),
         json_str(env!("RROUTER_BUILD")),
         json_str(if cfg!(target_arch = "x86_64") {
@@ -1187,6 +1187,8 @@ fn status_json(
         datapath::FRAGS_FORWARDED.load(Ordering::Relaxed),
         datapath::FRAGS_PARKED.load(Ordering::Relaxed),
         datapath::FRAGS_PARK_DROPS.load(Ordering::Relaxed),
+        datapath::SPLIT.load(Ordering::Relaxed),
+        datapath::SPLIT_DROPS.load(Ordering::Relaxed),
         fwd::forwarder::DropReason::all()
             .iter()
             .map(|r| format!(

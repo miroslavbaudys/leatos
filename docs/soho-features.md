@@ -22,8 +22,9 @@ clamping and ICMP "fragmentation needed" in `crates/fwd`. Lab:
 ISP VM, also with `LAB_VLAN=848`), `scripts/pppoe-test.sh` (live switch
 between DHCP and PPPoE). PPPoE runs on the apu4 against the developer's ISP (VLAN 848, no
 authentication, since 2026-11-15). Open: IPv6CP + DHCPv6-PD over the
-session (M7), RFC 4638 on hardware (implemented, see below), IPv4 fragmentation of non-DF packets above the MTU
-(dropped today), long-run stability (forced daily disconnects).
+session (M7), RFC 4638 on hardware (implemented, see below; not usable on
+the developer's line), long-run stability (forced daily disconnects).
+Non-DF packets above the session's MTU are split (2026-11-18).
 
 | Stage | Details |
 |---|---|
@@ -210,9 +211,12 @@ lease changes, unless `dns.upstreams` is set).
   egress MTU ✅ (M5, with PPPoE).
 - IP fragments through NAT and the firewall ✅ (2026-11-18, `fwd::frag`,
   docs/architecture.md): forwarded as they come, with the first
-  fragment's decision; no reassembly, no splitting.
-- Open: splitting packets larger than the egress MTU (non-DF, and
-  fragments: 1500 B fragments into a PPPoE session), ICMP
+  fragment's decision; no reassembly.
+- Splitting packets larger than the egress MTU ✅ (2026-11-18,
+  `wire::SplitPlan`): non-DF packets and fragments (1500 B into a PPPoE
+  session's 1492) are cut into fragments (RFC 791); DF ones still get
+  "fragmentation needed".
+- Open: ICMP
   unreachable for no-route (dropped as `no-route`), UPnP/NAT-PMP, faster
   conntrack structures (hash table + timer wheel instead of BTreeMap +
   O(n) expiry).

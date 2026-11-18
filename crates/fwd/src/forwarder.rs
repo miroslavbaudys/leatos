@@ -345,7 +345,8 @@ pub enum DropReason {
     Hairpin,
     IcmpRateLimit,
     Unsupported,
-    /// Larger than the egress MTU without DF (fragmentation is not done).
+    /// Larger than the egress MTU and not split: IP options, or splitting
+    /// off (`split`); with DF the sender gets "fragmentation needed".
     TooBig,
     /// To the router itself, from a zone whose input policy refuses it.
     Input,
@@ -412,6 +413,11 @@ pub enum Verdict {
         next_hop: Ipv4Addr,
         len: usize,
         class: Classification,
+        /// 0: as it is. Else the egress MTU: the packet (no DF) is larger
+        /// and must be split into fragments of at most this many bytes
+        /// first ([`wire::SplitPlan`], done by the caller: it owns the
+        /// buffers).
+        split: u16,
     },
     Drop(DropReason),
 }
@@ -479,6 +485,10 @@ pub struct Forwarder {
     /// Forward IP fragments ([`crate::frag`]); off: dropped, as before
     /// (the lab's negative control).
     pub fragments: bool,
+    /// Split packets without DF that are larger than the egress MTU
+    /// ([`Verdict::Forward`] `split`); off: dropped as `too-big`, as before
+    /// (the lab's negative control).
+    pub split: bool,
     /// The last [`Self::process`]'s first fragment, forwarded: what its
     /// datagram's later fragments need ([`Self::take_fragment`]).
     frag: Option<frag::Decision>,
@@ -751,6 +761,7 @@ impl Forwarder {
             redirect_hits: Vec::new(),
             wan_antispoof: true,
             fragments: true,
+            split: true,
             frag: None,
         }
     }
@@ -1182,6 +1193,7 @@ impl Forwarder {
             next_hop: back.gateway.unwrap_or(src),
             len: new_len,
             class: Classification::default(),
+            split: 0,
         }
     }
 
@@ -1402,16 +1414,25 @@ impl Forwarder {
             return self.icmp_error(ingress, my_ip, buf, len, &v, ICMP_TIME_EXCEEDED, 0, 0);
         }
 
-        // MTU (RFC 1191): no fragmentation, so DF or not, it cannot go as is.
+        // MTU: with DF, "fragmentation needed" back (RFC 1191); without,
+        // split into fragments after the rewrite (RFC 791), unless it has
+        // IP options (not split) or splitting is off.
         let mtu = self.mtus[route.egress as usize];
+        let mut split = 0;
         if v.total_len > mtu as usize {
-            if !v.dont_fragment(f) || matches!(key, Key::Related { .. }) {
+            if !v.dont_fragment(f) {
+                if !self.split || v.ihl != 20 {
+                    return self.drop(DropReason::TooBig);
+                }
+                split = mtu;
+            } else if matches!(key, Key::Related { .. }) {
                 return self.drop(DropReason::TooBig);
+            } else {
+                if !self.take_icmp_token(now) {
+                    return self.drop(DropReason::IcmpRateLimit);
+                }
+                return self.icmp_error(ingress, my_ip, buf, len, &v, ICMP_DEST_UNREACH, 4, mtu);
             }
-            if !self.take_icmp_token(now) {
-                return self.drop(DropReason::IcmpRateLimit);
-            }
-            return self.icmp_error(ingress, my_ip, buf, len, &v, ICMP_DEST_UNREACH, 4, mtu);
         }
 
         let tcp_flags = if let Key::Flow(_, fl) = key { fl } else { 0 };
@@ -1496,6 +1517,7 @@ impl Forwarder {
             next_hop,
             len,
             class,
+            split,
         }
     }
 
@@ -1535,9 +1557,14 @@ impl Forwarder {
         if v.ttl(f) <= 1 {
             return self.drop(DropReason::Fragment);
         }
-        if v.total_len > self.mtus[d.egress as usize] as usize {
+        let mtu = self.mtus[d.egress as usize];
+        let split = if v.total_len <= mtu as usize {
+            0
+        } else if self.split && !v.dont_fragment(f) && v.ihl == 20 {
+            mtu
+        } else {
             return self.drop(DropReason::TooBig);
-        }
+        };
         v.dec_ttl(buf);
         v.set_ip_addr(buf, true, d.src);
         v.set_ip_addr(buf, false, d.dst);
@@ -1548,6 +1575,7 @@ impl Forwarder {
             next_hop: d.next_hop,
             len,
             class: d.class,
+            split,
         }
     }
 
@@ -1607,6 +1635,7 @@ impl Forwarder {
                 dscp: 0x30,
                 ..Default::default()
             },
+            split: 0,
         }
     }
 }
@@ -1740,6 +1769,7 @@ mod tests {
             next_hop,
             len,
             class,
+            ..
         } = run(&mut fw, 1, WAN, &mut f)
         else {
             panic!()
@@ -2352,9 +2382,22 @@ mod tests {
         assert_eq!(wire::checksum(&f[v.l4..v.l4 + v.l4_len]), 0);
         // The quoted header is the host's original one.
         assert_eq!(wire::get_ip(f, v.l4 + 8 + 12), HOST);
-        // Without DF: dropped (no fragmentation).
+        // Without DF: forwarded (NAT applied), to be split to 1492.
         let mut f = udp_out(1493, false);
-        assert_eq!(run(&mut fw, 2, LAN, &mut f), Verdict::Drop(DropReason::TooBig));
+        let Verdict::Forward { egress, len, split, .. } = run(&mut fw, 2, LAN, &mut f) else {
+            panic!("not forwarded")
+        };
+        assert_eq!((egress, split), (WAN, 1492));
+        let plan = wire::SplitPlan::new(&f[..len], split).expect("splittable");
+        assert_eq!(plan.pieces(), 2);
+        assert_eq!(view(&f[..len]).src(&f[..len]), ROUTER_WAN, "translated before splitting");
+        // A packet that fits is not split.
+        let mut f = udp_out(1492, false);
+        assert!(matches!(run(&mut fw, 3, LAN, &mut f), Verdict::Forward { split: 0, .. }));
+        // Splitting off (negative control): dropped as before.
+        fw.split = false;
+        let mut f = udp_out(1493, false);
+        assert_eq!(run(&mut fw, 4, LAN, &mut f), Verdict::Drop(DropReason::TooBig));
         assert_eq!(fw.stats.drops[DropReason::TooBig.index()], 1);
     }
 
@@ -3616,9 +3659,14 @@ mod tests {
         wire::put16(&mut f, ETH_HDR + 10, c);
         let len = f.len() - 64;
         assert_eq!(fw.forward_fragment(0, LAN, &mut f, len, &d), Verdict::Drop(DropReason::Fragment));
+        // Larger than the egress: split (a fragment is split again).
         fw.set_mtu(WAN, 1000);
         let mut f = frames[1].clone();
+        assert!(matches!(fw.forward_fragment(0, LAN, &mut f, len, &d), Verdict::Forward { split: 1000, .. }));
+        fw.split = false;
+        let mut f = frames[1].clone();
         assert_eq!(fw.forward_fragment(0, LAN, &mut f, len, &d), Verdict::Drop(DropReason::TooBig));
+        fw.split = true;
         fw.set_mtu(WAN, 1500);
         // The connection gone: its fragments go nowhere.
         fw.ct.remove(d.conn);

@@ -829,7 +829,7 @@ const DROP_TEXT = {
   "hairpin": "would leave through the port it came in on (no hairpin NAT yet)",
   "icmp-ratelimit": "ICMP error not sent: rate limit (50/s)",
   "unsupported": "new flow with a protocol other than TCP, UDP or ICMP",
-  "too-big": "larger than the outgoing MTU without DF (no fragmentation)",
+  "too-big": "larger than the outgoing MTU and not split (IP options, or splitting off with fw_split=0)",
   "input": "to the router, refused by the zone's input policy",
   "spoofed": "from the WAN with a source in one of our networks or loopback (forged)",
   "clash": "new connection whose addresses and ports a tracked one already uses (or a fragmented datagram whose IP ID another one already uses through NAT)",
@@ -915,7 +915,7 @@ async function refresh() {
     drs.map(([k, v]) => `<tr><td>${esc(k)}</td><td class=num>${n(v)}</td><td class="muted">${esc(DROP_TEXT[k] ?? "")}</td></tr>`).join("") +
     `<tr><td>other</td><td class=num>${n(Math.max(0, st.dropped - drs.reduce((a, [, v]) => a + v, 0)))}</td><td class="muted">queue full, no packet buffer</td></tr>`;
   const fr = st.fragments;
-  $("fragst").textContent = fr ? `IP fragments: ${n(fr.forwarded)} forwarded after their first one · ${n(fr.parked)} arrived before it (held) · ${n(fr.park_drops)} held and dropped` : "";
+  $("fragst").textContent = fr ? `IP fragments: ${n(fr.forwarded)} forwarded after their first one · ${n(fr.parked)} arrived before it (held) · ${n(fr.park_drops)} held and dropped · ${n(fr.split ?? 0)} packets split for a smaller MTU` + (fr.split_drops ? ` (${n(fr.split_drops)} lost: no buffer)` : "") : "";
 
   // System
   $("sys").innerHTML = rows([

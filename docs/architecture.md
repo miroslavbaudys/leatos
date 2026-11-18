@@ -102,8 +102,8 @@ packets to the WAN skip ARP (the AC is the only neighbor), the router
 stack's WAN interface is IP-only (`Medium::Ip`, rebuilt when the mode
 changes), and the WAN shaper adds 8 bytes of overhead. The forwarder
 knows the WAN's MTU (1492): larger packets get ICMP "fragmentation needed"
-(DF) or are dropped (no fragmentation), and TCP SYNs in both directions
-have their MSS clamped to the smaller MTU (`wire::clamp_mss`).
+(DF) or are split into fragments (no DF, see below), and TCP SYNs in both
+directions have their MSS clamped to the smaller MTU (`wire::clamp_mss`).
 
 IP fragments (`fwd::frag`, 2026-11-18) are forwarded without reassembly:
 the first fragment (offset 0, holding the ports) goes through conntrack,
@@ -117,8 +117,19 @@ fragment that arrives before its first one is held (at most 16 per port,
 250 ms), the only wait outside the qdisc besides ARP resolution. Refused:
 first fragments without their whole L4 header, TCP fragments at offset 8
 bytes (RFC 1858/3128), a datagram whose translated IP ID another one
-already uses (`clash`). Fragments are never split: one larger than the
-egress MTU (a 1500 B fragment into PPPoE's 1492) is dropped (`too-big`).
+already uses (`clash`).
+
+Splitting (RFC 791, `wire::SplitPlan`, 2026-11-18): a packet without DF
+that is larger than the egress MTU (a 1500 B packet or fragment into
+PPPoE's 1492) is forwarded with `Verdict::Forward` `split` = the MTU, after
+NAT, and the datapath cuts it: pieces of a multiple of 8 data bytes, each
+with a copy of the header, its offset and MF (a fragment's pieces keep its
+place; only the last keeps its MF), checksums recomputed. The first piece
+stays in the packet's buffer, the others come from the pool (at most 4;
+all or none, `split_drops`), and they enter the qdisc back to back in one
+CAKE flow. Not split: packets with IP options (`too-big`). Counters in
+`/api/status` `fragments` (`split`, `split_drops`); boot argument
+`fw_split=0` drops them as `too-big` again (negative control).
 Fragments to the router itself still go to smoltcp, which does not
 reassemble. Boot argument `fw_frag=0` drops all fragments (negative
 control).

@@ -446,6 +446,89 @@ pub fn build_arp_request(
     len
 }
 
+/// IPv4 fragmentation (RFC 791 §2.3): how a packet too large for the
+/// next link is cut. Data goes in pieces of a multiple of 8 bytes; each
+/// piece gets a copy of the header with its own offset and length. A
+/// fragment is split the same way: the pieces keep its place in the
+/// datagram, and only the last one keeps its "more fragments" flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SplitPlan {
+    ihl: usize,
+    total_len: usize,
+    /// Data bytes per piece (a multiple of 8; the last may be shorter).
+    chunk: usize,
+    /// The packet's own offset (8-byte units) and MF flag.
+    offset: u16,
+    more: bool,
+}
+
+impl SplitPlan {
+    /// The plan for the IPv4 packet at [`ETH_HDR`] of `frame` and pieces
+    /// of at most `mtu` bytes of IP. `None` if it must not or cannot be
+    /// split: DF set, IP options (they would need per-option copying),
+    /// already small enough, or `mtu` too small for 8 bytes of data.
+    pub fn new(frame: &[u8], mtu: u16) -> Option<Self> {
+        let v = Ipv4View::parse(frame, ETH_HDR)?;
+        let mtu = usize::from(mtu);
+        if v.dont_fragment(frame) || v.ihl != 20 || v.total_len <= mtu || mtu < v.ihl + 8 {
+            return None;
+        }
+        let flags = get16(frame, v.ip + 6);
+        Some(SplitPlan {
+            ihl: v.ihl,
+            total_len: v.total_len,
+            chunk: (mtu - v.ihl) / 8 * 8,
+            offset: v.frag_offset,
+            more: flags & 0x2000 != 0,
+        })
+    }
+
+    /// How many pieces.
+    pub fn pieces(&self) -> usize {
+        (self.total_len - self.ihl).div_ceil(self.chunk)
+    }
+
+    /// Frame length (Ethernet + IP) of piece `i`.
+    pub fn piece_len(&self, i: usize) -> usize {
+        let data = self.total_len - self.ihl;
+        let len = self.chunk.min(data - i * self.chunk);
+        ETH_HDR + self.ihl + len
+    }
+
+    /// Write piece `i` (1.., not the first) of `src`'s packet into `out`
+    /// (at least [`Self::piece_len`] bytes): Ethernet and IP header copied,
+    /// then its data. Returns the frame length.
+    pub fn write_piece(&self, src: &[u8], i: usize, out: &mut [u8]) -> usize {
+        let len = self.piece_len(i);
+        let hdr = ETH_HDR + self.ihl;
+        let data = hdr + i * self.chunk;
+        out[..hdr].copy_from_slice(&src[..hdr]);
+        out[hdr..len].copy_from_slice(&src[data..data + (len - hdr)]);
+        self.fix_header(out, i, len);
+        len
+    }
+
+    /// Cut `f` down to piece 0 in place (after the others were written).
+    /// Returns its frame length.
+    pub fn truncate_first(&self, f: &mut [u8]) -> usize {
+        let len = self.piece_len(0);
+        self.fix_header(f, 0, len);
+        len
+    }
+
+    fn fix_header(&self, f: &mut [u8], i: usize, len: usize) {
+        let ip = ETH_HDR;
+        let last = i + 1 == self.pieces();
+        let more = !last || self.more;
+        let off = self.offset + (i * self.chunk / 8) as u16;
+        put16(f, ip + 2, (len - ETH_HDR) as u16);
+        put16(f, ip + 6, off | if more { 0x2000 } else { 0 });
+        put16(f, ip + 10, 0);
+        let c = checksum(&f[ip..ip + self.ihl]);
+        put16(f, ip + 10, c);
+    }
+}
+
 #[cfg(test)]
 pub mod test_util {
     //! Builders for test frames.
@@ -633,5 +716,113 @@ mod tests {
         assert_eq!(buf, tagged(&plain, ETHERTYPE_VLAN, tci));
         vlan_remove(&mut buf);
         assert_eq!(&buf[VLAN_HDR..], &plain[..]);
+    }
+
+    // ---- SplitPlan (RFC 791 fragmentation) -------------------------------
+
+    /// Split `f` with `plan` the way the datapath does: pieces 1.. into new
+    /// buffers, then piece 0 in place.
+    fn split(mut f: Vec<u8>, plan: &SplitPlan) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for i in 1..plan.pieces() {
+            let mut b = alloc::vec![0u8; plan.piece_len(i)];
+            let n = plan.write_piece(&f, i, &mut b);
+            b.truncate(n);
+            out.push(b);
+        }
+        let n = plan.truncate_first(&mut f);
+        f.truncate(n);
+        out.insert(0, f);
+        out
+    }
+
+    fn reassemble(pieces: &[Vec<u8>]) -> (Vec<u8>, bool) {
+        let mut data = Vec::new();
+        let mut more = false;
+        for p in pieces {
+            let v = Ipv4View::parse(p, ETH_HDR).expect("valid header and checksum");
+            assert_eq!(v.frag_offset as usize * 8, data.len(), "contiguous");
+            data.extend_from_slice(&p[v.l4..v.l4 + v.l4_len]);
+            more = get16(p, ETH_HDR + 6) & 0x2000 != 0;
+        }
+        (data, more)
+    }
+
+    fn no_df(mut f: Vec<u8>) -> Vec<u8> {
+        put16(&mut f, ETH_HDR + 6, 0);
+        put16(&mut f, ETH_HDR + 10, 0);
+        let c = checksum(&f[ETH_HDR..ETH_HDR + 20]);
+        put16(&mut f, ETH_HDR + 10, c);
+        f
+    }
+
+    #[test]
+    fn split_a_1500_packet_for_pppoe() {
+        let b = Ipv4Addr::new(203, 0, 113, 1);
+        let payload: Vec<u8> = (0..1472u32).map(|i| i as u8).collect();
+        let udp = udp_datagram(A, b, 5000, 53, &payload);
+        let f = no_df(ipv4_frame(A, b, PROTO_UDP, 64, &udp));
+        let plan = SplitPlan::new(&f, 1492).unwrap();
+        assert_eq!(plan.pieces(), 2);
+        let pieces = split(f.clone(), &plan);
+        assert_eq!(pieces[0].len(), ETH_HDR + 20 + 1472, "1492 B of IP, 8-byte aligned data");
+        assert!(pieces.iter().all(|p| p.len() - ETH_HDR <= 1492));
+        let (data, more) = reassemble(&pieces);
+        assert_eq!(data, udp, "the UDP datagram, whole again");
+        assert!(!more, "the last piece ends the datagram");
+        assert_eq!(get16(&pieces[0], ETH_HDR + 6), 0x2000, "first: MF, offset 0");
+        // Ethernet header, version/TOS, ID, TTL/protocol and addresses are
+        // the original's in every piece.
+        let same = |p: &[u8], r: core::ops::Range<usize>| assert_eq!(p[r.clone()], f[r]);
+        for p in &pieces {
+            same(p, 0..ETH_HDR + 2);
+            same(p, ETH_HDR + 4..ETH_HDR + 6);
+            same(p, ETH_HDR + 8..ETH_HDR + 10);
+            same(p, ETH_HDR + 12..ETH_HDR + 20);
+        }
+    }
+
+    #[test]
+    fn split_a_fragment_keeps_its_place() {
+        let b = Ipv4Addr::new(203, 0, 113, 1);
+        // A middle fragment: offset 1480 B, MF set, 1480 B of data.
+        let data: Vec<u8> = (0..1480u32).map(|i| (i * 3) as u8).collect();
+        let mut f = ipv4_frame(A, b, PROTO_UDP, 64, &data);
+        put16(&mut f, ETH_HDR + 6, 0x2000 | 185);
+        put16(&mut f, ETH_HDR + 10, 0);
+        let c = checksum(&f[ETH_HDR..ETH_HDR + 20]);
+        put16(&mut f, ETH_HDR + 10, c);
+        let plan = SplitPlan::new(&f, 1492).unwrap();
+        let pieces = split(f, &plan);
+        assert_eq!(pieces.len(), 2);
+        let v0 = Ipv4View::parse(&pieces[0], ETH_HDR).unwrap();
+        let v1 = Ipv4View::parse(&pieces[1], ETH_HDR).unwrap();
+        assert_eq!((v0.frag_offset, v1.frag_offset), (185, 185 + 1472 / 8));
+        assert!(get16(&pieces[1], ETH_HDR + 6) & 0x2000 != 0, "MF kept: more of the datagram follows");
+        let mut got = pieces[0][v0.l4..v0.l4 + v0.l4_len].to_vec();
+        got.extend_from_slice(&pieces[1][v1.l4..v1.l4 + v1.l4_len]);
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn split_refusals_and_small_mtus() {
+        let b = Ipv4Addr::new(203, 0, 113, 1);
+        let udp = udp_datagram(A, b, 1, 2, &[7u8; 1472]);
+        let df = ipv4_frame(A, b, PROTO_UDP, 64, &udp); // DF set
+        assert_eq!(SplitPlan::new(&df, 1492), None, "DF");
+        let f = no_df(df);
+        assert_eq!(SplitPlan::new(&f, 1500), None, "fits");
+        assert_eq!(SplitPlan::new(&f, 27), None, "no room for 8 bytes");
+        // Small MTU: many pieces, all within it, data intact.
+        for mtu in [28u16, 576, 1280, 1499] {
+            let plan = SplitPlan::new(&f, mtu).unwrap();
+            let pieces = split(f.clone(), &plan);
+            assert!(pieces.iter().all(|p| p.len() - ETH_HDR <= usize::from(mtu)), "mtu {mtu}");
+            assert_eq!(reassemble(&pieces).0, udp, "mtu {mtu}");
+        }
+        // IP options: not split.
+        let mut opt = f.clone();
+        opt[ETH_HDR] = 0x46;
+        assert_eq!(SplitPlan::new(&opt, 1492), None);
     }
 }

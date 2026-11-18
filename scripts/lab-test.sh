@@ -44,9 +44,14 @@
 #                        (1473 = fragmented: passes since fragments are
 #                        forwarded; with LAB_ROUTER_ARGS=fw_frag=0 it is the
 #                        negative control). The fragmented ping (-s 3000,
-#                        fwd::frag) has fw_frag=0 as its negative control.
+#                        fwd::frag) has fw_frag=0 as its negative control;
+#                        over PPPoE the router splits its 1500 B fragments
+#                        (fw_split=0: the negative control).
 #                        With PPPoE the default is 1464 (MTU 1492; 1465 =
-#                        negative control: too big for the session, dropped).
+#                        too big for the session: the client's ping has DF,
+#                        gets "fragmentation needed" and passes as fragments
+#                        it cuts itself; LAB_ROUTER_ARGS=fw_frag=0 is then
+#                        its negative control).
 #   LAB_PPPOE=pap|chap|none  the ISP is a PPPoE access concentrator only (no
 #                        DHCP; pppoe-server from the pinned packages, needs
 #                        modloop) requiring PAP or CHAP; the router gets

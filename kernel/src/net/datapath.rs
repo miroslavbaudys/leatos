@@ -92,6 +92,12 @@ pub static REJECTED: AtomicU64 = AtomicU64::new(0);
 pub static FRAGS_FORWARDED: AtomicU64 = AtomicU64::new(0);
 pub static FRAGS_PARKED: AtomicU64 = AtomicU64::new(0);
 pub static FRAGS_PARK_DROPS: AtomicU64 = AtomicU64::new(0);
+/// Packets split for a smaller egress MTU (`wire::SplitPlan`), and ones
+/// dropped because the pool had no buffer for every piece.
+pub static SPLIT: AtomicU64 = AtomicU64::new(0);
+pub static SPLIT_DROPS: AtomicU64 = AtomicU64::new(0);
+/// A frame (≤ 2048 B) splits into at most this many pieces at MTU ≥ 576.
+const MAX_PIECES: usize = 4;
 pub static PPPOE_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// What a PPPoE port does with a received frame.
@@ -281,6 +287,7 @@ impl Datapath {
                 }
                 f.wan_antispoof = crate::config::wan_antispoof();
                 f.fragments = crate::config::fw_fragments();
+                f.split = crate::config::fw_split();
                 Mutex::new(f)
             })
             .collect();
@@ -676,38 +683,83 @@ impl Datapath {
                 next_hop,
                 len,
                 class,
+                split,
             } => {
                 pkt.set_len(len);
                 self.observe_ecn(port_ix, pkt.data());
-                pkt.meta = meta_from(&class, ifx, len, now_ns());
                 FORWARDED.fetch_add(1, Ordering::Relaxed);
-                let out = &self.sh.ports[self.sh.links[egress as usize].port];
-                if out.is_pppoe() {
-                    // Point to point: the access concentrator is the
-                    // only neighbor.
-                    match out.pppoe_session() {
-                        Some(s) => self.send_resolved(egress, s.peer, pkt, touched),
-                        None => {
-                            PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                if split == 0 {
+                    self.send_out(egress, next_hop, &class, ifx, pkt, now, touched);
                     return;
                 }
-                let r = self.neigh[egress as usize]
-                    .lock()
-                    .resolve(egress, next_hop, pkt, now);
-                match r {
-                    Resolve::Ready(mac, pkt) => self.send_resolved(egress, mac, pkt, touched),
-                    Resolve::Queued { send_arp: true } => {
-                        self.send_arp_request(egress, next_hop, touched)
-                    }
-                    Resolve::Queued { send_arp: false } => {}
+                // Larger than the egress MTU, no DF: split (RFC 791).
+                let Some(plan) = wire::SplitPlan::new(pkt.data(), split).filter(|p| p.pieces() <= MAX_PIECES)
+                else {
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                    DROP_REASONS[DropReason::TooBig.index()].fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
+                // Every piece or none: a datagram missing one is useless.
+                let mut rest: [Option<PacketBuf>; MAX_PIECES - 1] = [const { None }; MAX_PIECES - 1];
+                for i in 1..plan.pieces() {
+                    let Some(mut p) = PacketBuf::alloc() else {
+                        DROPPED.fetch_add(1, Ordering::Relaxed);
+                        SPLIT_DROPS.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    };
+                    p.set_len(plan.piece_len(i));
+                    let n = plan.write_piece(pkt.data(), i, p.data_mut());
+                    p.set_len(n);
+                    rest[i - 1] = Some(p);
+                }
+                let n = plan.truncate_first(pkt.data_mut());
+                pkt.set_len(n);
+                SPLIT.fetch_add(1, Ordering::Relaxed);
+                // In order, one after the other, into the same CAKE flow.
+                self.send_out(egress, next_hop, &class, ifx, pkt, now, touched);
+                for p in rest.into_iter().flatten() {
+                    self.send_out(egress, next_hop, &class, ifx, p, now, touched);
                 }
             }
             Verdict::Drop(r) => {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
                 DROP_REASONS[r.index()].fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// A forwarded frame (or piece of one) to its next hop: the PPPoE AC,
+    /// or through the neighbor table, into the egress qdisc.
+    #[allow(clippy::too_many_arguments)]
+    fn send_out(
+        &self,
+        egress: IfIndex,
+        next_hop: Ipv4Addr,
+        class: &Classification,
+        ifx: IfIndex,
+        mut pkt: PacketBuf,
+        now: u64,
+        touched: &mut [bool; 2],
+    ) {
+        pkt.meta = meta_from(class, ifx, pkt.len(), now_ns());
+        let out = &self.sh.ports[self.sh.links[egress as usize].port];
+        if out.is_pppoe() {
+            // Point to point: the access concentrator is the only neighbor.
+            match out.pppoe_session() {
+                Some(s) => self.send_resolved(egress, s.peer, pkt, touched),
+                None => {
+                    PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+        let r = self.neigh[egress as usize]
+            .lock()
+            .resolve(egress, next_hop, pkt, now);
+        match r {
+            Resolve::Ready(mac, pkt) => self.send_resolved(egress, mac, pkt, touched),
+            Resolve::Queued { send_arp: true } => self.send_arp_request(egress, next_hop, touched),
+            Resolve::Queued { send_arp: false } => {}
         }
     }
 
