@@ -25,7 +25,7 @@ Goals: PPPoE, DHCP (v4 server/client, DHCPv6-PD, RA), a DNS forwarder, NAT, a fi
 - `tools/rrstore`: host tool (std) for store images: `create`, `format`, `show`, `put` (refuses a clear `mgmt.password`), `get`, `corrupt`, `hash <password>` (a `mgmt.password_hash` value)
 - `lab/client/`, `lab/isp/`: overlays for the Alpine lab VMs (`/init`, configs, web/CGI); `lab/cache/` (gitignored) holds downloads
 - `scripts/qemu-run.sh` (cargo runner), feature tests (`store-test.sh`, `lease-test.sh`, `cli-test.sh`, `pppoe-test.sh`, `vlan-test.sh`, `upgrade-test.sh`, `persist-test.sh`; see Commands), `scripts/apu-upload.sh`, `scripts/apu-image.sh` (apu4 SD image: MBR + FAT32 + Limine BIOS → Multiboot2, plus the 16 MiB store partition p2), `scripts/smoke-test.sh`, `scripts/lab-test.sh`, `scripts/mac-lab.sh` (+ `scripts/lab/`: fetch, initrd build, `common.sh`), `scripts/unsafe-report.sh`
-- `docs/`: dns-over-tls, architecture, boot-and-memory, qemu, soho-features, bufferbloat-cake, safety-and-portability, smp, config-and-storage, config-v2 (design: networks/VLANs, zones, rules, port forwards), upgrades, watchdog-and-time, mdns (design: reflector across networks), dns-views (design: split-horizon local DNS), ipv6 (M7 plan), roadmap
+- `docs/`: dns-over-tls, architecture, boot-and-memory, qemu, soho-features, bufferbloat-cake, safety-and-portability, smp, config-and-storage, config-v2 (design: networks/VLANs, zones, rules, port forwards), upgrades, watchdog-and-time, mdns (design: reflector across networks), dns-views (design: split-horizon local DNS), wireguard (design: server, M12), ipv6 (M7 plan), roadmap
 
 ## Commands
 - `cargo kbuild [--release]`: build the kernel. `cargo krun` boots it (`Ctrl-A X` quits; `QEMU_NET=user` adds 2 NICs)
