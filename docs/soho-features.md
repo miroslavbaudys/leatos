@@ -175,15 +175,18 @@ lease changes, unless `dns.upstreams` is set).
   rules, `reject`, live recheck of tracked connections and WAN
   anti-spoofing (docs/config-v2.md). The default is still M4's policy:
   new flows only LAN→WAN; TCP must start with SYN; WAN→LAN only for
-  tracked connections (or port forwards); fragments and unknown protocols
-  dropped.
+  tracked connections (or port forwards); unknown protocols dropped.
 - Port forwarding (DNAT) and hairpin NAT ✅ (2026-11-15, docs/config-v2.md).
 - Redirects ✅ (2026-11-16, `[[firewall.redirect]]`, docs/config-v2.md): the
   networks' connections to an outside server on given ports go to a device
   inside (NTP to the LAN's time server, as UniFi's NTP redirect).
 - MSS clamping and ICMP "fragmentation needed" for DF packets above the
   egress MTU ✅ (M5, with PPPoE).
-- Open: IP fragment reassembly (fragments are dropped today), ICMP
+- IP fragments through NAT and the firewall ✅ (2026-11-18, `fwd::frag`,
+  docs/architecture.md): forwarded as they come, with the first
+  fragment's decision; no reassembly, no splitting.
+- Open: splitting packets larger than the egress MTU (non-DF, and
+  fragments: 1500 B fragments into a PPPoE session), ICMP
   unreachable for no-route (dropped as `no-route`), UPnP/NAT-PMP, faster
   conntrack structures (hash table + timer wheel instead of BTreeMap +
   O(n) expiry).

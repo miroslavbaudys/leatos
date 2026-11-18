@@ -25,6 +25,7 @@
 
 use crate::IfIndex;
 use crate::conntrack::{Conn, Conntrack, Dir, Tuple};
+use crate::frag;
 use crate::route::{Route, RouteKind, RouteTable};
 use crate::wire::{
     self, ETH_HDR, ETHERTYPE_ARP, ETHERTYPE_IPV4, ICMP_DEST_UNREACH, ICMP_TIME_EXCEEDED, Ipv4View,
@@ -475,6 +476,12 @@ pub struct Forwarder {
     /// Drop WAN packets with a spoofed source ([`DropReason::Spoofed`]);
     /// off only for the lab's negative control.
     pub wan_antispoof: bool,
+    /// Forward IP fragments ([`crate::frag`]); off: dropped, as before
+    /// (the lab's negative control).
+    pub fragments: bool,
+    /// The last [`Self::process`]'s first fragment, forwarded: what its
+    /// datagram's later fragments need ([`Self::take_fragment`]).
+    frag: Option<frag::Decision>,
 }
 
 fn broadcast_of(addr: Ipv4Addr, len: u8) -> Ipv4Addr {
@@ -617,7 +624,7 @@ pub fn endpoint_shard(proto: u8, ip: Ipv4Addr, port: u16, shards: usize, hash_ke
 ///   target endpoint. ICMP errors from inside go where the connection
 ///   they are about, seen from the sender, does.
 ///
-/// Everything else (ARP, non-IPv4, fragments, untracked protocols) → 0;
+/// Everything else (ARP, non-IPv4, later fragments, untracked protocols) → 0;
 /// those frames are local, dropped, or never tracked.
 pub fn shard_of(role: Role, frame: &[u8], shards: usize, hash_key: u64, hints: &ShardHints) -> usize {
     let internal = hints.internal;
@@ -627,7 +634,9 @@ pub fn shard_of(role: Role, frame: &[u8], shards: usize, hash_key: u64, hints: &
     let Some(v) = Ipv4View::parse(frame, ETH_HDR) else {
         return 0;
     };
-    if v.is_fragment {
+    // A later fragment has no ports: the datapath sends it to its first
+    // fragment's shard ([`crate::frag`]). A first fragment has them.
+    if v.frag_offset != 0 {
         return 0;
     }
     let inside = |ip: Ipv4Addr| {
@@ -741,6 +750,8 @@ impl Forwarder {
             forward_hits: Vec::new(),
             redirect_hits: Vec::new(),
             wan_antispoof: true,
+            fragments: true,
+            frag: None,
         }
     }
 
@@ -1205,6 +1216,7 @@ impl Forwarder {
     /// Process one received frame in `buf[..len]`. `buf` may be longer than
     /// `len` (tailroom), which ICMP error generation can use.
     pub fn process(&mut self, now: u64, ingress: IfIndex, buf: &mut [u8], len: usize) -> Verdict {
+        self.frag = None;
         let iface = self.ifs[ingress as usize];
         let f = &buf[..len];
         let Some(et) = wire::ethertype(f) else {
@@ -1236,7 +1248,13 @@ impl Forwarder {
                 .iter()
                 .any(|i| i.addr.is_some_and(|(a, _)| a == dst));
 
-        if v.is_fragment {
+        // A later fragment reaching here has no recorded first one (the
+        // datapath forwards the others: [`Self::forward_fragment`]); a
+        // first fragment goes on like a whole packet if it holds its L4
+        // header (RFC 1858).
+        if v.is_fragment
+            && (!self.fragments || v.frag_offset != 0 || !matches!(frag::classify(f), frag::Kind::First(_)))
+        {
             return if to_us {
                 self.input(now, ingress, buf, len, &v)
             } else {
@@ -1452,18 +1470,84 @@ impl Forwarder {
             && tcp_flags & !(wire::TCP_PSH) == wire::TCP_ACK
             && v.l4_len == ((f[v.l4 + 12] >> 4) as usize) * 4;
         self.stats.forwarded += 1;
+        let class = Classification {
+            flow_hash: conn.flow_hash,
+            src_host_hash: src_h,
+            dst_host_hash: dst_h,
+            dscp: tos >> 2,
+            ecn_capable: tos & 3 != 0,
+            is_pure_ack,
+        };
+        let next_hop = route.gateway.unwrap_or(out_dst);
+        if v.is_fragment {
+            self.frag = Some(frag::Decision {
+                conn: id,
+                dir,
+                orig: conn.orig,
+                egress: route.egress,
+                next_hop,
+                src: v.src(f),
+                dst: v.dst(f),
+                class: Classification { is_pure_ack: false, ..class },
+            });
+        }
         Verdict::Forward {
             egress: route.egress,
-            next_hop: route.gateway.unwrap_or(out_dst),
+            next_hop,
             len,
-            class: Classification {
-                flow_hash: conn.flow_hash,
-                src_host_hash: src_h,
-                dst_host_hash: dst_h,
-                dscp: tos >> 2,
-                ecn_capable: tos & 3 != 0,
-                is_pure_ack,
-            },
+            class,
+        }
+    }
+
+    /// After [`Self::process`] forwarded a first fragment: the decision its
+    /// datagram's later fragments take ([`frag::Table::record_forward`]).
+    pub fn take_fragment(&mut self) -> Option<frag::Decision> {
+        self.frag.take()
+    }
+
+    /// A later fragment of a datagram whose first fragment this shard
+    /// forwarded with `d`: the same egress and address rewrite, if its
+    /// connection still exists. No ICMP errors (only about first
+    /// fragments, RFC 792); too large for the egress: dropped (fragments
+    /// are not split).
+    pub fn forward_fragment(&mut self, now: u64, ingress: IfIndex, buf: &mut [u8], len: usize, d: &frag::Decision) -> Verdict {
+        let iface = self.ifs[ingress as usize];
+        let f = &buf[..len];
+        if wire::ethertype(f) != Some(ETHERTYPE_IPV4) {
+            return self.drop(DropReason::Malformed);
+        }
+        let dmac = wire::dst_mac(f);
+        if dmac != iface.mac && !wire::is_multicast_mac(&dmac) {
+            return self.drop(DropReason::NotForUs);
+        }
+        let Some(v) = Ipv4View::parse(f, ETH_HDR) else {
+            return self.drop(DropReason::Malformed);
+        };
+        if iface.role == Role::Wan && self.wan_antispoof && self.spoofed_from_wan(&iface, v.src(f)) {
+            return self.drop(DropReason::Spoofed);
+        }
+        if !self.fragments || v.frag_offset == 0 || (v.proto == PROTO_TCP && v.frag_offset == 1) {
+            return self.drop(DropReason::Fragment);
+        }
+        if self.ct.get(d.conn).is_none_or(|c| c.orig != d.orig) {
+            return self.drop(DropReason::Fragment);
+        }
+        if v.ttl(f) <= 1 {
+            return self.drop(DropReason::Fragment);
+        }
+        if v.total_len > self.mtus[d.egress as usize] as usize {
+            return self.drop(DropReason::TooBig);
+        }
+        v.dec_ttl(buf);
+        v.set_ip_addr(buf, true, d.src);
+        v.set_ip_addr(buf, false, d.dst);
+        self.ct.update(now, d.conn, d.dir, 0, v.total_len);
+        self.stats.forwarded += 1;
+        Verdict::Forward {
+            egress: d.egress,
+            next_hop: d.next_hop,
+            len,
+            class: d.class,
         }
     }
 
@@ -1895,7 +1979,9 @@ mod tests {
             Verdict::Drop(DropReason::NoRoute)
         );
         let mut f = to(LAN_MAC, ipv4_frame(HOST, SERVER, PROTO_UDP, 64, &seg));
-        f[ETH_HDR + 6] = 0x20; // MF: fragment
+        // MF, offset 128 B: a later fragment whose first one was not seen.
+        f[ETH_HDR + 6] = 0x20;
+        f[ETH_HDR + 7] = 16;
         let c = {
             f[ETH_HDR + 10] = 0;
             f[ETH_HDR + 11] = 0;
@@ -1961,6 +2047,24 @@ mod tests {
             let len = (seed as usize >> 4) % (f.len() - 64 + 1);
             let ifx = (i % 2) as IfIndex;
             let _ = fw.process(i, ifx, &mut f, len);
+        }
+        // Later fragments with a recorded decision, mutated the same way.
+        let dgram = udp_datagram(HOST, SERVER, 5000, 4500, &[3u8; 3000]);
+        let frames = fragments(LAN_MAC, HOST, SERVER, PROTO_UDP, 5, &dgram, 1480);
+        let mut f = frames[0].clone();
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward { .. }));
+        let d = fw.take_fragment().unwrap();
+        for i in 0..30_000 {
+            let mut f = frames[1 + i % 2].clone();
+            for _ in 0..6 {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                let j = seed as usize % (f.len() - 64);
+                f[j] = (seed >> 8) as u8;
+            }
+            let len = (seed as usize >> 4) % (f.len() - 64 + 1);
+            let _ = fw.forward_fragment(i as u64, (i % 2) as IfIndex, &mut f, len, &d);
         }
     }
 
@@ -3379,5 +3483,167 @@ mod tests {
                 assert!(matches!(fws[k].process(5, GUEST, &mut r, len), Verdict::Forward { egress: GUEST, .. }));
             }
         }
+    }
+
+    // ---- fragments (crate::frag) ----------------------------------------
+
+    /// `l4` as IPv4 fragments of at most `chunk` L4 bytes (a multiple of
+    /// 8), IP ID `id`, as frames to `mac`.
+    fn fragments(mac: Mac, src: Ipv4Addr, dst: Ipv4Addr, proto: u8, id: u16, l4: &[u8], chunk: usize) -> Vec<Vec<u8>> {
+        l4.chunks(chunk)
+            .enumerate()
+            .map(|(i, c)| {
+                let mut f = ipv4_frame(src, dst, proto, 64, c);
+                let more = (i + 1) * chunk < l4.len();
+                wire::put16(&mut f, ETH_HDR + 4, id);
+                wire::put16(&mut f, ETH_HDR + 6, (i * chunk / 8) as u16 | if more { 0x2000 } else { 0 });
+                wire::put16(&mut f, ETH_HDR + 10, 0);
+                let c = wire::checksum(&f[ETH_HDR..ETH_HDR + 20]);
+                wire::put16(&mut f, ETH_HDR + 10, c);
+                to(mac, f)
+            })
+            .collect()
+    }
+
+    /// The datagram the forwarded fragments make up again: (source,
+    /// destination, L4 bytes), checking each IP header.
+    fn reassemble(out: &[(Vec<u8>, usize)]) -> (Ipv4Addr, Ipv4Addr, Vec<u8>) {
+        let mut l4 = Vec::new();
+        let (f0, l0) = &out[0];
+        let first = view(&f0[..*l0]);
+        for (f, len) in out {
+            let f = &f[..*len];
+            let v = view(f);
+            assert_eq!(wire::checksum(&f[ETH_HDR..ETH_HDR + 20]), 0, "IP header checksum");
+            assert_eq!((v.src(f), v.dst(f), v.id(f)), (first.src(&f0[..*l0]), first.dst(&f0[..*l0]), first.id(&f0[..*l0])));
+            assert_eq!(v.frag_offset as usize * 8, l4.len(), "in order, no gaps");
+            assert_eq!(v.ttl(f), 63);
+            l4.extend_from_slice(&f[v.l4..v.l4 + v.l4_len]);
+        }
+        (first.src(&f0[..*l0]), first.dst(&f0[..*l0]), l4)
+    }
+
+    /// Forward a datagram's fragments in the given order the way the
+    /// datapath does: the first through `process`, the others with its
+    /// decision (held until it is known).
+    fn forward_frags(fw: &mut Forwarder, ifx: IfIndex, frames: Vec<Vec<u8>>, order: &[usize]) -> Vec<(Vec<u8>, usize)> {
+        let mut decision = None;
+        let mut held = Vec::new();
+        let mut out = Vec::new();
+        for &i in order {
+            let mut f = frames[i].clone();
+            let len = f.len() - 64;
+            if i == 0 {
+                let Verdict::Forward { len, .. } = fw.process(0, ifx, &mut f, len) else { panic!("first fragment not forwarded") };
+                decision = fw.take_fragment();
+                assert!(decision.is_some());
+                out.push((i, f, len));
+                for (j, mut h) in core::mem::take(&mut held) {
+                    let hl = Vec::len(&h) - 64;
+                    let Verdict::Forward { len, .. } = fw.forward_fragment(0, ifx, &mut h, hl, decision.as_ref().unwrap()) else { panic!() };
+                    out.push((j, h, len));
+                }
+            } else if let Some(d) = &decision {
+                let Verdict::Forward { len, egress, .. } = fw.forward_fragment(0, ifx, &mut f, len, d) else { panic!() };
+                assert_eq!(egress, d.egress);
+                out.push((i, f, len));
+            } else {
+                held.push((i, f));
+            }
+        }
+        out.sort_by_key(|(i, _, _)| *i);
+        out.into_iter().map(|(_, f, l)| (f, l)).collect()
+    }
+
+    #[test]
+    fn fragmented_udp_through_nat_both_ways() {
+        let mut fw = router();
+        let payload: Vec<u8> = (0..3000u32).map(|i| (i * 7) as u8).collect();
+        let dgram = udp_datagram(HOST, SERVER, 5000, 4500, &payload);
+        let frames = fragments(LAN_MAC, HOST, SERVER, PROTO_UDP, 0x4242, &dgram, 1480);
+        assert_eq!(frames.len(), 3);
+        let out = forward_frags(&mut fw, LAN, frames, &[0, 1, 2]);
+        let (src, dst, l4) = reassemble(&out);
+        assert_eq!((src, dst), (ROUTER_WAN, SERVER));
+        assert_eq!(wire::l4_checksum(src, dst, PROTO_UDP, &l4), 0, "UDP checksum of the whole datagram");
+        assert_eq!(&l4[8..], &payload[..]);
+        let nat_port = wire::get16(&l4, 0);
+        assert_eq!(wire::get16(&l4, 2), 4500);
+        // The answer, fragmented, back to the NAT port; the second fragment
+        // first (held until the first arrives).
+        let reply = udp_datagram(SERVER, ROUTER_WAN, 4500, nat_port, &payload);
+        let frames = fragments(WAN_MAC, SERVER, ROUTER_WAN, PROTO_UDP, 0x0777, &reply, 1480);
+        let out = forward_frags(&mut fw, WAN, frames, &[1, 0, 2]);
+        let (src, dst, l4) = reassemble(&out);
+        assert_eq!((src, dst), (SERVER, HOST));
+        assert_eq!(wire::get16(&l4, 2), 5000, "back to the host's port");
+        assert_eq!(wire::l4_checksum(src, dst, PROTO_UDP, &l4), 0);
+        assert_eq!(&l4[8..], &payload[..]);
+    }
+
+    #[test]
+    fn fragmented_ping_through_nat() {
+        let mut fw = router();
+        let mut echo = icmp_echo(ICMP_ECHO_REQUEST, 0x77, 1);
+        echo.extend((0..2000u32).map(|i| i as u8));
+        wire::put16(&mut echo, 2, 0);
+        let c = wire::checksum(&echo);
+        wire::put16(&mut echo, 2, c);
+        let frames = fragments(LAN_MAC, HOST, SERVER, PROTO_ICMP, 9, &echo, 1480);
+        let out = forward_frags(&mut fw, LAN, frames, &[0, 1]);
+        let (src, _, l4) = reassemble(&out);
+        assert_eq!(src, ROUTER_WAN);
+        assert_eq!(wire::checksum(&l4), 0, "ICMP checksum after the identifier rewrite");
+    }
+
+    #[test]
+    fn fragment_refusals() {
+        let mut fw = router();
+        let dgram = udp_datagram(HOST, SERVER, 5000, 4500, &[1u8; 3000]);
+        let frames = fragments(LAN_MAC, HOST, SERVER, PROTO_UDP, 1, &dgram, 1480);
+        // A later fragment without its first one.
+        let mut f = frames[1].clone();
+        assert_eq!(run(&mut fw, 0, LAN, &mut f), Verdict::Drop(DropReason::Fragment));
+        let mut f = frames[0].clone();
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward { .. }));
+        let d = fw.take_fragment().unwrap();
+        assert_eq!(fw.take_fragment(), None, "taken once");
+        // TTL 1, too large for the egress: dropped, no ICMP error.
+        let mut f = frames[1].clone();
+        f[ETH_HDR + 8] = 1;
+        wire::put16(&mut f, ETH_HDR + 10, 0);
+        let c = wire::checksum(&f[ETH_HDR..ETH_HDR + 20]);
+        wire::put16(&mut f, ETH_HDR + 10, c);
+        let len = f.len() - 64;
+        assert_eq!(fw.forward_fragment(0, LAN, &mut f, len, &d), Verdict::Drop(DropReason::Fragment));
+        fw.set_mtu(WAN, 1000);
+        let mut f = frames[1].clone();
+        assert_eq!(fw.forward_fragment(0, LAN, &mut f, len, &d), Verdict::Drop(DropReason::TooBig));
+        fw.set_mtu(WAN, 1500);
+        // The connection gone: its fragments go nowhere.
+        fw.ct.remove(d.conn);
+        let mut f = frames[1].clone();
+        assert_eq!(fw.forward_fragment(0, LAN, &mut f, len, &d), Verdict::Drop(DropReason::Fragment));
+        // Tiny first fragment (no room for the ports): refused.
+        let tiny = fragments(LAN_MAC, HOST, SERVER, PROTO_UDP, 2, &dgram, 8);
+        let mut f = tiny[0].clone();
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward { .. }), "8 bytes hold the UDP header");
+        let tcp = tcp_segment(HOST, SERVER, 40001, 80, TCP_SYN, &[0u8; 64]);
+        let tiny = fragments(LAN_MAC, HOST, SERVER, PROTO_TCP, 3, &tcp, 16);
+        let mut f = tiny[0].clone();
+        assert_eq!(run(&mut fw, 0, LAN, &mut f), Verdict::Drop(DropReason::Fragment), "no room for the TCP flags");
+        assert_eq!(fw.take_fragment(), None);
+        // Tracking off (negative control): first fragments dropped too.
+        fw.fragments = false;
+        let mut f = frames[0].clone();
+        assert_eq!(run(&mut fw, 0, LAN, &mut f), Verdict::Drop(DropReason::Fragment));
+        assert_eq!(fw.take_fragment(), None);
+        // A first fragment refused by the firewall leaves no decision.
+        fw.fragments = true;
+        let inbound = udp_datagram(SERVER, HOST, 4500, 5000, &[1u8; 3000]);
+        let frames = fragments(WAN_MAC, SERVER, HOST, PROTO_UDP, 4, &inbound, 1480);
+        let mut f = frames[0].clone();
+        assert!(matches!(run(&mut fw, 0, WAN, &mut f), Verdict::Drop(_)));
+        assert_eq!(fw.take_fragment(), None);
     }
 }

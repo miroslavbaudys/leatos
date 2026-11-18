@@ -41,7 +41,10 @@
 #                        Negative controls: LAB_ROUTER_ARGS=wan_vlan=0
 #                        (untagged) or another VLAN must fail (no WAN lease).
 #   LAB_BIG_PING=1472    ICMP data size of the client's full-size ping
-#                        (1473 = negative control: fragmented, dropped).
+#                        (1473 = fragmented: passes since fragments are
+#                        forwarded; with LAB_ROUTER_ARGS=fw_frag=0 it is the
+#                        negative control). The fragmented ping (-s 3000,
+#                        fwd::frag) has fw_frag=0 as its negative control.
 #                        With PPPoE the default is 1464 (MTU 1492; 1465 =
 #                        negative control: too big for the session, dropped).
 #   LAB_PPPOE=pap|chap|none  the ISP is a PPPoE access concentrator only (no

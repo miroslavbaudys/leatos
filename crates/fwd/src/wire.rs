@@ -203,6 +203,9 @@ pub struct Ipv4View {
     /// Bytes of L4 header + payload present (total_len - ihl).
     pub l4_len: usize,
     pub is_fragment: bool,
+    /// Fragment offset in 8-byte units (0: whole datagram or its first
+    /// fragment).
+    pub frag_offset: u16,
 }
 
 impl Ipv4View {
@@ -230,6 +233,7 @@ impl Ipv4View {
             l4: ip + ihl,
             l4_len: total_len - ihl,
             is_fragment: frag & 0x2000 != 0 || frag & 0x1fff != 0,
+            frag_offset: frag & 0x1fff,
         })
     }
 
@@ -292,6 +296,25 @@ impl Ipv4View {
                 put16(f, co, c);
             }
         }
+    }
+
+    /// Rewrite the source or destination address in the IP header only:
+    /// a fragment after the first carries no L4 header (its checksum,
+    /// in the first fragment, already covers the new address).
+    pub fn set_ip_addr(&self, f: &mut [u8], is_src: bool, new: Ipv4Addr) {
+        let off = self.ip + if is_src { 12 } else { 16 };
+        let old = get_ip(f, off);
+        if old == new {
+            return;
+        }
+        put_ip(f, off, new);
+        let c = csum_update_ip(self.ip_csum(f), old, new);
+        put16(f, self.ip + 10, c);
+    }
+
+    /// The IP identification field (fragments of one datagram share it).
+    pub fn id(&self, f: &[u8]) -> u16 {
+        get16(f, self.ip + 4)
     }
 
     /// Rewrite the source or destination port (TCP/UDP) or the echo

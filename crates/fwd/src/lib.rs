@@ -7,6 +7,7 @@
 //! - [`neigh`]: ARP cache with a tiny bounded pending queue
 //! - [`conntrack`]: connections, NAPT with endpoint-independent mapping
 //! - [`forwarder`]: the per-packet pipeline → [`forwarder::Verdict`]
+//! - [`frag`]: IP fragments forwarded through NAT without reassembly
 //!
 //! Design rules (see `docs/architecture.md`): `#![no_std]` + `alloc`,
 //! sans-IO (frames and `now_ms` in, verdicts out), no allocation per
@@ -19,6 +20,7 @@ extern crate alloc;
 
 pub mod conntrack;
 pub mod forwarder;
+pub mod frag;
 pub mod neigh;
 pub mod route;
 pub mod wire;

@@ -49,8 +49,10 @@ use alloc::vec::Vec;
 use core::net::Ipv4Addr;
 use core::sync::atomic::{AtomicU64, Ordering};
 use fwd::forwarder::{
-    Classification, Forwarder, Interface, PortForward, Redirect, Role, ShardHints, Verdict, shard_of,
+    Classification, DropReason, Forwarder, Interface, PortForward, Redirect, Role, ShardHints, Verdict,
+    shard_of,
 };
+use fwd::frag::{self, Kind as FragKind, Lookup as FragLookup, Table as FragTable};
 use fwd::neigh::{NeighTable, Resolve};
 use fwd::{IfIndex, wire};
 use qdisc::{Dequeue, Qdisc};
@@ -85,6 +87,11 @@ pub static REJECTED: AtomicU64 = AtomicU64::new(0);
 /// On a PPPoE port: received frames that are not PPPoE, control frames
 /// that found the client's queue full, and IPv4 to send while there is no
 /// session.
+/// IP fragments ([`fwd::frag`]): later fragments forwarded with their
+/// first one's decision, held for it, and held ones dropped.
+pub static FRAGS_FORWARDED: AtomicU64 = AtomicU64::new(0);
+pub static FRAGS_PARKED: AtomicU64 = AtomicU64::new(0);
+pub static FRAGS_PARK_DROPS: AtomicU64 = AtomicU64::new(0);
 pub static PPPOE_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// What a PPPoE port does with a received frame.
@@ -191,6 +198,12 @@ pub struct Datapath {
     /// whole by [`Self::apply`], read once per batch.
     topo: Mutex<alloc::sync::Arc<Topo>>,
     hk: Mutex<Hk>,
+    /// Per ingress port: datagrams whose first fragment came through
+    /// ([`fwd::frag`]); each port's RX runs in one direction task, so the
+    /// lock is never contended.
+    frags: [Mutex<FragTable<PacketBuf>>; 2],
+    /// Forward IP fragments (boot argument `fw_frag=0`: dropped).
+    fragments: bool,
     local_rx_drops: AtomicU64,
     /// Per ingress port: forwarded IPv4 packets by ECN codepoint
     /// [Not-ECT, ECT(1), ECT(0), CE], and TCP packets with ECE / CWR set.
@@ -267,6 +280,7 @@ impl Datapath {
                     f.add_interface(*iface);
                 }
                 f.wan_antispoof = crate::config::wan_antispoof();
+                f.fragments = crate::config::fw_fragments();
                 Mutex::new(f)
             })
             .collect();
@@ -287,6 +301,8 @@ impl Datapath {
                 ecn_reported: [0; 2],
                 vlan_reported: 0,
             }),
+            frags: [Mutex::new(FragTable::new()), Mutex::new(FragTable::new())],
+            fragments: crate::config::fw_fragments(),
             local_rx_drops: AtomicU64::new(0),
             ecn_seen: [const { [const { AtomicU64::new(0) }; 4] }; 2],
             tcp_ece: [const { AtomicU64::new(0) }; 2],
@@ -506,6 +522,10 @@ impl Datapath {
             forwards: &topo.forwards,
             redirects: &topo.redirects,
         };
+        // Fragments held for a first fragment that just came (rare: the
+        // Vec stays empty and unallocated otherwise).
+        let mut released: Vec<PacketBuf> = Vec::new();
+        let mut released_key = None;
         for mut pkt in batch.drain(..) {
             let Some((ifx, want_vid)) = self.link_of(&topo, port_ix, pkt.data()) else {
                 VLAN_DROPS.fetch_add(1, Ordering::Relaxed);
@@ -543,62 +563,151 @@ impl Datapath {
                 self.snoop_arp(ifx, pkt.data(), now, touched);
             }
             let len = pkt.len();
-            let k = shard_of(role, pkt.data(), SHARDS, self.hash_key, &hints);
-            let verdict =
-                self.shards[k]
-                    .lock()
-                    .process(now, ifx, pkt.data_with_tailroom_mut(), len);
-            match verdict {
-                Verdict::Local => {
-                    let mut q = self.sh.links[ifx as usize].local_rx.lock();
-                    if q.len() < LOCAL_RX_MAX {
-                        q.push_back(pkt);
-                        local = true;
-                    } else {
-                        self.local_rx_drops.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                Verdict::Forward {
-                    egress,
-                    next_hop,
-                    len,
-                    class,
-                } => {
-                    pkt.set_len(len);
-                    self.observe_ecn(port_ix, pkt.data());
-                    pkt.meta = meta_from(&class, ifx, len, now_ns());
-                    FORWARDED.fetch_add(1, Ordering::Relaxed);
-                    let out = &self.sh.ports[self.sh.links[egress as usize].port];
-                    if out.is_pppoe() {
-                        // Point to point: the access concentrator is the
-                        // only neighbor.
-                        match out.pppoe_session() {
-                            Some(s) => self.send_resolved(egress, s.peer, pkt, touched),
-                            None => {
-                                PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
+            let kind = if self.fragments && port_ix < 2 {
+                frag::classify(pkt.data())
+            } else {
+                FragKind::Whole
+            };
+            let verdict = match kind {
+                // A later fragment: its first one's decision, or held for it.
+                FragKind::Later(key) => {
+                    let hit = self.frags[port_ix].lock().lookup(&key, now);
+                    match hit {
+                        Some(FragLookup::Forward { shard, decision }) => {
+                            let v = self.shards[shard].lock().forward_fragment(
+                                now,
+                                ifx,
+                                pkt.data_with_tailroom_mut(),
+                                len,
+                                &decision,
+                            );
+                            if matches!(v, Verdict::Forward { .. }) {
+                                FRAGS_FORWARDED.fetch_add(1, Ordering::Relaxed);
                             }
+                            v
                         }
-                        continue;
-                    }
-                    let r = self.neigh[egress as usize]
-                        .lock()
-                        .resolve(egress, next_hop, pkt, now);
-                    match r {
-                        Resolve::Ready(mac, pkt) => self.send_resolved(egress, mac, pkt, touched),
-                        Resolve::Queued { send_arp: true } => {
-                            self.send_arp_request(egress, next_hop, touched)
-                        }
-                        Resolve::Queued { send_arp: false } => {}
+                        Some(FragLookup::Drop) => Verdict::Drop(DropReason::Fragment),
+                        None => match self.frags[port_ix].lock().park(key, pkt, now) {
+                            Ok(()) => {
+                                FRAGS_PARKED.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            Err(p) => {
+                                pkt = p;
+                                FRAGS_PARK_DROPS.fetch_add(1, Ordering::Relaxed);
+                                Verdict::Drop(DropReason::Fragment)
+                            }
+                        },
                     }
                 }
-                Verdict::Drop(r) => {
-                    DROPPED.fetch_add(1, Ordering::Relaxed);
-                    DROP_REASONS[r.index()].fetch_add(1, Ordering::Relaxed);
+                FragKind::Bad => Verdict::Drop(DropReason::Fragment),
+                FragKind::Whole | FragKind::First(_) => {
+                    let k = shard_of(role, pkt.data(), SHARDS, self.hash_key, &hints);
+                    let mut shard = self.shards[k].lock();
+                    let mut v = shard.process(now, ifx, pkt.data_with_tailroom_mut(), len);
+                    if let FragKind::First(key) = kind {
+                        let decision = shard.take_fragment();
+                        drop(shard);
+                        let mut t = self.frags[port_ix].lock();
+                        match decision {
+                            Some(d) if matches!(v, Verdict::Forward { .. }) => {
+                                if t.record_forward(key, k, d, now).is_err() {
+                                    t.record_drop(key, now);
+                                    v = Verdict::Drop(DropReason::Clash);
+                                }
+                            }
+                            _ => t.record_drop(key, now),
+                        }
+                        // Fragments that came before it go right after it.
+                        t.take_parked(&key, &mut released);
+                        released_key = Some(key);
+                    }
+                    v
+                }
+            };
+            self.deliver(verdict, pkt, ifx, port_ix, now, touched, &mut local);
+            if let Some(key) = released_key.take() {
+                let hit = self.frags[port_ix].lock().lookup(&key, now);
+                for mut p in released.drain(..) {
+                    let len = p.len();
+                    let v = match hit {
+                        Some(FragLookup::Forward { shard, decision }) => self.shards[shard]
+                            .lock()
+                            .forward_fragment(now, ifx, p.data_with_tailroom_mut(), len, &decision),
+                        _ => Verdict::Drop(DropReason::Fragment),
+                    };
+                    if matches!(v, Verdict::Forward { .. }) {
+                        FRAGS_FORWARDED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.deliver(v, p, ifx, port_ix, now, touched, &mut local);
                 }
             }
         }
         if local {
             self.sh.svc_kick.signal();
+        }
+    }
+
+    /// Act on the forwarder's verdict for a received frame: to the router
+    /// stack, out through the neighbor table into the qdisc, or dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver(
+        &self,
+        verdict: Verdict,
+        mut pkt: PacketBuf,
+        ifx: IfIndex,
+        port_ix: usize,
+        now: u64,
+        touched: &mut [bool; 2],
+        local: &mut bool,
+    ) {
+        match verdict {
+            Verdict::Local => {
+                let mut q = self.sh.links[ifx as usize].local_rx.lock();
+                if q.len() < LOCAL_RX_MAX {
+                    q.push_back(pkt);
+                    *local = true;
+                } else {
+                    self.local_rx_drops.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Verdict::Forward {
+                egress,
+                next_hop,
+                len,
+                class,
+            } => {
+                pkt.set_len(len);
+                self.observe_ecn(port_ix, pkt.data());
+                pkt.meta = meta_from(&class, ifx, len, now_ns());
+                FORWARDED.fetch_add(1, Ordering::Relaxed);
+                let out = &self.sh.ports[self.sh.links[egress as usize].port];
+                if out.is_pppoe() {
+                    // Point to point: the access concentrator is the
+                    // only neighbor.
+                    match out.pppoe_session() {
+                        Some(s) => self.send_resolved(egress, s.peer, pkt, touched),
+                        None => {
+                            PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    return;
+                }
+                let r = self.neigh[egress as usize]
+                    .lock()
+                    .resolve(egress, next_hop, pkt, now);
+                match r {
+                    Resolve::Ready(mac, pkt) => self.send_resolved(egress, mac, pkt, touched),
+                    Resolve::Queued { send_arp: true } => {
+                        self.send_arp_request(egress, next_hop, touched)
+                    }
+                    Resolve::Queued { send_arp: false } => {}
+                }
+            }
+            Verdict::Drop(r) => {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                DROP_REASONS[r.index()].fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -643,6 +752,16 @@ impl Datapath {
         *self.sh.rule_hits.lock() = hits;
         *self.sh.forward_hits.lock() = fhits;
         *self.sh.redirect_hits.lock() = rhits;
+        // Fragments held too long for a first fragment that never came.
+        let mut stale = Vec::new();
+        for t in &self.frags {
+            t.lock().expire(now, &mut stale);
+        }
+        for _ in stale.drain(..) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            DROP_REASONS[DropReason::Fragment.index()].fetch_add(1, Ordering::Relaxed);
+            FRAGS_PARK_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
         for (i, n) in self.neigh.iter().enumerate() {
             let retries = n.lock().poll(now);
             for (ifx, ip) in retries {

@@ -975,6 +975,13 @@ pub fn wan_antispoof() -> bool {
     arg_u64(bootargs(), "wan_antispoof") != Some(0)
 }
 
+/// Forward IP fragments through NAT and the firewall (`fwd::frag`);
+/// boot argument `fw_frag=0` drops them as before (the lab's negative
+/// control).
+pub fn fw_fragments() -> bool {
+    arg_u64(bootargs(), "fw_frag") != Some(0)
+}
+
 fn arg_u64(bootargs: &str, key: &str) -> Option<u64> {
     arg(bootargs, key).and_then(|v| v.parse().ok())
 }

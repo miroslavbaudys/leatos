@@ -379,7 +379,8 @@
       <div class="tw"><table id="mdnsstats"></table></div>
     </form>
     <div class="card"><h3>Dropped packets by reason</h3><div class="tw"><table id="drops"></table></div>
-      <p class="hint">Counted since boot by the forwarding plane (packets the router forwards, not its own).</p></div>
+      <p class="hint">Counted since boot by the forwarding plane (packets the router forwards, not its own).</p>
+      <p class="hint" id="fragst"></p></div>
   </section>
 
   <!-- ================= Shaping ================= -->
@@ -822,7 +823,7 @@ const DROP_TEXT = {
   "invalid": "new TCP connection without SYN, or an ICMP error for no connection",
   "not-for-us": "addressed to another MAC address",
   "malformed": "broken Ethernet or IPv4 header",
-  "fragment": "IP fragment to forward (not reassembled yet)",
+  "fragment": "IP fragment whose first fragment was not seen in time, was refused, or too short (or overlapping TCP flags)",
   "no-route": "no route to the destination",
   "table-full": "connection table full",
   "hairpin": "would leave through the port it came in on (no hairpin NAT yet)",
@@ -831,7 +832,7 @@ const DROP_TEXT = {
   "too-big": "larger than the outgoing MTU without DF (no fragmentation)",
   "input": "to the router, refused by the zone's input policy",
   "spoofed": "from the WAN with a source in one of our networks or loopback (forged)",
-  "clash": "new connection whose addresses and ports a tracked one already uses",
+  "clash": "new connection whose addresses and ports a tracked one already uses (or a fragmented datagram whose IP ID another one already uses through NAT)",
 };
 let savedReboot = false;
 let st = null, lastUptime = null, failures = 0;
@@ -913,6 +914,8 @@ async function refresh() {
   $("drops").innerHTML = "<tr><th>Reason</th><th class=num>Packets</th><th>Meaning</th></tr>" +
     drs.map(([k, v]) => `<tr><td>${esc(k)}</td><td class=num>${n(v)}</td><td class="muted">${esc(DROP_TEXT[k] ?? "")}</td></tr>`).join("") +
     `<tr><td>other</td><td class=num>${n(Math.max(0, st.dropped - drs.reduce((a, [, v]) => a + v, 0)))}</td><td class="muted">queue full, no packet buffer</td></tr>`;
+  const fr = st.fragments;
+  $("fragst").textContent = fr ? `IP fragments: ${n(fr.forwarded)} forwarded after their first one · ${n(fr.parked)} arrived before it (held) · ${n(fr.park_drops)} held and dropped` : "";
 
   // System
   $("sys").innerHTML = rows([

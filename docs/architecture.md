@@ -105,6 +105,24 @@ knows the WAN's MTU (1492): larger packets get ICMP "fragmentation needed"
 (DF) or are dropped (no fragmentation), and TCP SYNs in both directions
 have their MSS clamped to the smaller MTU (`wire::clamp_mss`).
 
+IP fragments (`fwd::frag`, 2026-11-18) are forwarded without reassembly:
+the first fragment (offset 0, holding the ports) goes through conntrack,
+NAT and the firewall like any packet, and its decision is recorded per
+datagram (source, destination, protocol, IP ID) in a table per ingress
+port (so per direction task, never shared). Later fragments take the same
+egress, next hop and address rewrite (`Forwarder::forward_fragment`: IP
+header only; the L4 checksum in the first fragment already covers the new
+addresses) and enter the qdisc in the first fragment's flow. A later
+fragment that arrives before its first one is held (at most 16 per port,
+250 ms), the only wait outside the qdisc besides ARP resolution. Refused:
+first fragments without their whole L4 header, TCP fragments at offset 8
+bytes (RFC 1858/3128), a datagram whose translated IP ID another one
+already uses (`clash`). Fragments are never split: one larger than the
+egress MTU (a 1500 B fragment into PPPoE's 1492) is dropped (`too-big`).
+Fragments to the router itself still go to smoltcp, which does not
+reassemble. Boot argument `fw_frag=0` drops all fragments (negative
+control).
+
 ```text
  svc: proto_pppoe::Client ◄── ctrl_rx ──┐            ┌── qdisc ◄── Client frames
       Event::Session ─► pppoe_session ──┼────────────┤

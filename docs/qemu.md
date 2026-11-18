@@ -205,7 +205,7 @@ scripts/mac-internet.sh --restore        # undo a previous run (after a crash, k
   `router.lan`; HTTPS to example.com; ping 1.1.1.1.
 - **Known limits:**
   - IPv6 traffic bypasses rrouter unless you use `--ipv4-only`;
-  - IP fragments are dropped;
+  - IP fragments larger than the WAN's MTU are dropped (no splitting);
   - DNS rebind protection refuses home-LAN names that resolve to private addresses;
   - QEMU-on-macOS timer slack (see above) adds latency jitter.
 
