@@ -4,12 +4,10 @@
 //!
 //! - [`parse`]: text → checked [`Config`] (size limit, schema version,
 //!   TOML, unknown fields, [`Config::validate`]). Version 1 documents
-//!   (`[lan]`) are migrated on load ([`v1`]).
-//! - [`Config::to_toml`]: the canonical text (what the store holds). It is
-//!   written as version 1 while the config fits it, so a kernel that only
-//!   reads version 1 (after a rollback) still finds its LAN.
-//! - [`parse_json`], [`Config::to_json`]: the same schema as JSON (always
-//!   version 2), for the web interface
+//!   (`[lan]`) are no longer read: they are refused with a hint.
+//! - [`Config::to_toml`]: the canonical text (what the store holds)
+//! - [`parse_json`], [`Config::to_json`]: the same schema as JSON, for the
+//!   web interface
 //! - [`Config::needs_trial`]: does a change need confirm-or-revert?
 //! - [`Config::unsupported`]: settings the kernel does not implement yet
 //! - [`Config::with_assignment`], [`Config::without`], [`diff_lines`]: one
@@ -31,7 +29,6 @@ extern crate alloc;
 mod edit;
 mod names;
 mod types;
-pub mod v1;
 mod validate;
 
 pub use edit::{diff_lines, flat_lines};
@@ -61,11 +58,11 @@ pub const PORT_WAN: &str = "wan0";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Always [`VERSION`] in memory; [`Self::to_toml`] picks what it writes.
+    /// Always [`VERSION`].
     pub version: u32,
     #[serde(skip_serializing_if = "Wan::is_default")]
     pub wan: Wan,
-    /// The router's networks; the first is "the LAN" of version 1.
+    /// The router's networks; the first is "the LAN" ([`Self::lan`]).
     #[serde(rename = "network")]
     pub networks: Vec<Network>,
     /// Firewall zones beyond the built-in `lan` and `wan`.
@@ -854,6 +851,8 @@ pub enum Error {
     Syntax(String),
     /// Written by a newer rrouter.
     NewerVersion(u32),
+    /// An older schema this rrouter no longer reads (version 1: `[lan]`).
+    OldVersion(u32),
     /// Parsed, but the settings are inconsistent (or, from
     /// [`Config::unsupported`], not implemented yet).
     Invalid(Vec<Issue>),
@@ -872,6 +871,14 @@ impl fmt::Display for Error {
                     "config version {v} is newer than this rrouter supports ({VERSION})"
                 )
             }
+            Error::OldVersion(v) => {
+                write!(
+                    f,
+                    "config version {v} is no longer supported (version {VERSION} needed): \
+                     write [lan] as [[network]] with name = \"lan\", lan.domain as dns.domain \
+                     (docs/config-v2.md)"
+                )
+            }
             Error::Invalid(issues) => {
                 for (i, x) in issues.iter().enumerate() {
                     if i > 0 {
@@ -886,9 +893,8 @@ impl fmt::Display for Error {
 }
 
 /// The `version` field and whether there is a `[lan]`, ignoring
-/// everything else: a document without a version is version 1 if it has
-/// `[lan]` (hand-written files from before version 2), else the current
-/// one.
+/// everything else: a document without a version is the current one,
+/// unless it has version 1's `[lan]`.
 #[derive(Deserialize)]
 struct VersionOnly {
     version: Option<u32>,
@@ -896,170 +902,56 @@ struct VersionOnly {
 }
 
 impl VersionOnly {
-    fn get(&self) -> u32 {
-        self.version
-            .unwrap_or(if self.lan.is_some() { 1 } else { VERSION })
+    fn check(&self) -> Result<(), Error> {
+        match self.version {
+            None if self.lan.is_some() => Err(Error::OldVersion(1)),
+            None | Some(VERSION) => Ok(()),
+            Some(v) if v > VERSION => Err(Error::NewerVersion(v)),
+            Some(v) if v >= 1 => Err(Error::OldVersion(v)),
+            Some(_) => Err(Error::Invalid(vec![Issue {
+                path: "version".into(),
+                msg: alloc::format!("must be {VERSION}"),
+            }])),
+        }
     }
 }
 
-fn check_version(v: u32) -> Result<(), Error> {
-    match v {
-        1..=VERSION => Ok(()),
-        v if v > VERSION => Err(Error::NewerVersion(v)),
-        _ => Err(Error::Invalid(vec![Issue {
-            path: "version".into(),
-            msg: alloc::format!("must be 1–{VERSION}"),
-        }])),
-    }
-}
-
-/// The schema version a `config.toml` is written in (not validated
-/// otherwise): for a store record's header when the text is stored as is.
-pub fn document_version(text: &str) -> Result<u32, Error> {
-    let v = toml::from_str::<VersionOnly>(text)
-        .map_err(|e| Error::Syntax(e.to_string()))?
-        .get();
-    check_version(v)?;
-    Ok(v)
-}
-
-/// `config.toml` (version 1 or 2) → a checked [`Config`].
+/// `config.toml` → a checked [`Config`].
 pub fn parse(text: &str) -> Result<Config, Error> {
     if text.len() > MAX_LEN {
         return Err(Error::TooLarge { len: text.len() });
     }
     let syntax = |e: toml::de::Error| Error::Syntax(e.to_string());
-    let v = toml::from_str::<VersionOnly>(text).map_err(syntax)?.get();
-    check_version(v)?;
-    let c = if v == 1 {
-        toml::from_str::<v1::Config>(text).map_err(syntax)?.into()
-    } else {
-        toml::from_str::<Config>(text).map_err(syntax)?
-    };
+    toml::from_str::<VersionOnly>(text).map_err(syntax)?.check()?;
+    let c = toml::from_str::<Config>(text).map_err(syntax)?;
     c.validate().map_err(Error::Invalid)?;
     Ok(c)
 }
 
 /// JSON (the web interface's form) → a checked [`Config`]: the same
-/// schemas, defaults and checks as [`parse`].
+/// schema, defaults and checks as [`parse`].
 pub fn parse_json(text: &str) -> Result<Config, Error> {
     if text.len() > MAX_LEN {
         return Err(Error::TooLarge { len: text.len() });
     }
     let syntax = |e: serde_json::Error| Error::Syntax(e.to_string());
-    let v = serde_json::from_str::<VersionOnly>(text).map_err(syntax)?.get();
-    check_version(v)?;
-    let c = if v == 1 {
-        serde_json::from_str::<v1::Config>(text).map_err(syntax)?.into()
-    } else {
-        serde_json::from_str::<Config>(text).map_err(syntax)?
-    };
+    serde_json::from_str::<VersionOnly>(text).map_err(syntax)?.check()?;
+    let c = serde_json::from_str::<Config>(text).map_err(syntax)?;
     c.validate().map_err(Error::Invalid)?;
     Ok(c)
 }
 
 impl Config {
-    /// The canonical `config.toml`: version 1 while the config fits it
-    /// ([`Self::fits_v1`]), else version 2.
+    /// The canonical `config.toml`.
     pub fn to_toml(&self) -> String {
         // Serialisation fails only for types TOML cannot express; the
         // schema has none (tested).
-        match v1::Config::try_from(self) {
-            Ok(old) => toml::to_string(&old),
-            Err(_) => toml::to_string(self),
-        }
-        .unwrap_or_default()
+        toml::to_string(self).unwrap_or_default()
     }
 
-    /// The config as JSON, always version 2 (the web interface's shape).
+    /// The config as JSON (the web interface's shape).
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
-    }
-
-    /// The schema version [`Self::to_toml`] writes: the version for the
-    /// store's record header, so a kernel that reads only version 1 skips
-    /// a version 2 record and keeps the one before it.
-    pub fn doc_version(&self) -> u32 {
-        if self.fits_v1() { 1 } else { VERSION }
-    }
-
-    /// Expressible as a version 1 document (docs/config-v2.md §5).
-    pub fn fits_v1(&self) -> bool {
-        self.beyond_v1().is_empty()
-    }
-
-    pub(crate) fn beyond_v1_paths(&self) -> Vec<String> {
-        self.beyond_v1().into_iter().map(|(p, _)| p).collect()
-    }
-
-    /// The settings that need version 2, with their paths.
-    fn beyond_v1(&self) -> Vec<(String, &'static str)> {
-        let mut out = Vec::new();
-        let mut add = |p: String, why: &'static str| out.push((p, why));
-        if self.networks.len() != 1 {
-            add("network".into(), "more than one network");
-        }
-        for n in self.networks.iter().take(1) {
-            let p = |f: &str| alloc::format!("network.{}.{f}", n.name);
-            if n.name != "lan" {
-                add(p("name"), "a network not named \"lan\"");
-            }
-            if n.ports.len() != 1 || n.ports[0] != PORT_LAN {
-                add(p("ports"), "ports other than lan0");
-            }
-            if n.vlan != 0 {
-                add(p("vlan"), "a tagged network");
-            }
-            if n.zone != ZONE_LAN {
-                add(p("zone"), "a network outside the lan zone");
-            }
-            if !n.dhcp.enabled {
-                add(p("dhcp.enabled"), "DHCP switched off");
-            }
-            if n.domain.is_some() {
-                add(p("domain"), "a network's own DNS domain");
-            }
-        }
-        if !self.zones.is_empty() {
-            add("zone".into(), "firewall zones");
-        }
-        if !self.firewall.is_empty() {
-            add("firewall".into(), "firewall rules, port forwards or redirects");
-        }
-        if !self.dns.hosts.is_empty() {
-            add("dns.host".into(), "local DNS records");
-        }
-        if !self.dns.views.is_all() {
-            add("dns.views".into(), "DNS views");
-        }
-        if !self.dns.upstreams.is_empty() {
-            add("dns.upstreams".into(), "DNS servers of its own");
-        }
-        if !self.dns.prefetch {
-            add("dns.prefetch".into(), "DNS prefetch switched off");
-        }
-        if self.dns.stale_secs != DEFAULT_STALE_SECS {
-            add("dns.stale_secs".into(), "a serve-stale window of its own");
-        }
-        if self.dns.tls {
-            add("dns.tls".into(), "DNS over TLS");
-        }
-        if self.dns.tls_ca.is_some() {
-            add("dns.tls_ca".into(), "DNS-over-TLS trust anchors");
-        }
-        if !self.mdns.is_empty() {
-            add("mdns.reflect".into(), "mDNS reflection");
-        }
-        if self.wan.port != PORT_WAN {
-            add("wan.port".into(), "a WAN port other than wan0");
-        }
-        if self.wan.mode == WanMode::Static || self.wan.static_ip.is_some() {
-            add("wan.static".into(), "a static WAN address");
-        }
-        if self.mgmt.password_hash.is_some() || self.mgmt.password.is_some() {
-            add("mgmt.password_hash".into(), "a management password in the config");
-        }
-        out
     }
 
     /// Settings this kernel does not implement yet (docs/config-v2.md §9):
@@ -1106,7 +998,7 @@ impl Config {
         a != b
     }
 
-    /// The first network: version 1's `[lan]`, where boot argument `lan=`
+    /// The first network ("the LAN"), where boot argument `lan=`
     /// applies. `None` only for an unchecked config without networks.
     pub fn lan(&self) -> Option<&Network> {
         self.networks.first()

@@ -112,8 +112,7 @@ networks = ["lan"]          # required for overrides; other networks: forwarded 
     no names under `.arpa` (reverse names come from the records).
   - A name that is a local domain itself is refused. No trailing dot.
   - ≤ 256 records (as today). Paths `dns.host[i].networks[j]`.
-- `views` and `networks` are version 2 only (`unsupported_v1`); `dns.host`
-  leaves `unsupported()`.
+- `dns.host` leaves `unsupported()`.
 - CLI: list editing in `edit.rs` (`dns.host`, `dns.host[i].networks`).
 - The view computation (`dns_views`: per network the mask of networks it
   sees, from zones, `forward_to`, rules and subnets) is a pure function in

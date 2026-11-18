@@ -426,7 +426,7 @@ impl core::fmt::Display for Redacted<'_> {
 }
 
 /// One network as the datapath and the services use it
-/// (docs/config-v2.md): the first is version 1's LAN.
+/// (docs/config-v2.md): the first is the LAN (`lan=` applies to it).
 #[derive(Clone)]
 pub struct Lan {
     pub name: String,
@@ -479,7 +479,7 @@ fn zone_index(names: &[String], name: &str) -> u8 {
     names.iter().position(|n| n == name).unwrap_or(1) as u8
 }
 
-/// The networks, in config order (the first is the LAN of version 1).
+/// The networks, in config order (the first is the LAN).
 pub fn networks() -> Vec<Lan> {
     let c = get();
     let names = zone_names(&c);

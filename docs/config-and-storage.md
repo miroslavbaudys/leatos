@@ -135,7 +135,7 @@ ignored. Nesting depth is bounded by the parser; size is bounded (64 KiB)
 before parsing.
 
 ```toml
-version = 1
+version = 2
 
 [wan]                    # optional; written only when set
 vlan = 848               # 802.1Q VLAN ID 1–4094; unset = untagged
@@ -151,20 +151,21 @@ mtu = 1492               # 1280–1492
 lcp_echo_interval = 10   # seconds, 0 = no keepalive
 lcp_echo_failure = 5     # unanswered echoes before reconnecting
 
-[lan]
+[[network]]              # more networks, VLANs, zones: docs/config-v2.md
+name = "lan"
 ipv4 = "10.10.0.1/24"
-domain = "lan"
 
-[lan.dhcp]
+[network.dhcp]
 range = ["10.10.0.100", "10.10.0.199"]   # optional: default .100–.199
 lease_secs = 43200
 
-[[lan.dhcp.static]]
+[[network.dhcp.static]]
 mac = "52:54:00:00:00:05"
 ip = "10.10.0.10"
 hostname = "nas"
 
 [dns]
+domain = "lan"
 cache_entries = 4096
 rebind_protection = true
 
@@ -182,9 +183,9 @@ on_wan = false
 ```
 
 Schema version 2 (`crates/config`, `docs/config-v2.md`) replaces `[lan]`
-with `[[network]]` entries (and moves `lan.domain` to `dns.domain`); it
-reads version 1 and writes version 1 while the config fits it. Schema
-version 1 has the sections above. Every field
+with `[[network]]` entries (and moves `lan.domain` to `dns.domain`);
+version 1 is no longer read (refused with a hint, `docs/config-v2.md` §5).
+Every field
 has a default, so a file may set only what it changes. `[wan]` was added
 within version 1: it is left out of the canonical form while it holds only
 defaults, so a config that doesn't use it stays readable by older kernels
@@ -195,14 +196,14 @@ config with just a VLAN stays readable by the kernel that introduced
 `[wan]`. Version 2 (`docs/config-v2.md`) adds networks and VLANs, zones,
 `[[firewall.rule]]`, `[[firewall.forward]]`, `[[firewall.redirect]]`,
 `[[mdns.reflect]]`, per-network DNS domains, `dns.upstreams`/`tls`, and
-`[mgmt] password_hash` (also written in v1 form while the rest fits it).
+`[mgmt] password_hash`.
 List entries
 (reservations, rules, forwards) carry a stable key (`name`, `mac`) so the
 web interface can edit or delete one entry. The bounds the validation
-enforces (version 1): prefix 8–29, lease 60 s–30 days, ≤ 1024
+enforces: prefix 8–29, lease 60 s–30 days, ≤ 1024
 reservations, DNS cache 16–65536 entries, rates 64 kbit/s–10 Gbit/s,
 overhead ≤ 256 bytes. Validation problems carry a path
-(`lan.dhcp.static[2].ip`, indices from 0) for the web interface.
+(`network.lan.dhcp.static[2].ip`, indices from 0) for the web interface.
 
 ### Layering
 ```
@@ -448,7 +449,7 @@ For when the network is not an option: the console prompt `rrouter> `.
 | Step | Status |
 |---|---|
 | `crates/config-store`: layout, records, MBR lookup, write plans | ✅ host-tested |
-| `crates/config`: schema v1 (LAN, DHCP + reservations, DNS, shaping, mgmt), defaults, validation, TOML; schema v2 (networks, zones, rules, forwards; `docs/config-v2.md`) with v1 migration and v1-compatible writer | ✅ host-tested |
+| `crates/config`: schema v1 (LAN, DHCP + reservations, DNS, shaping, mgmt), defaults, validation, TOML; schema v2 (networks, zones, rules, forwards; `docs/config-v2.md`) (version 1 no longer read since 2026-11-18) | ✅ host-tested |
 | Kernel: one `Config` loaded at boot (refactor, no behaviour change) | ✅ `config::load()`; boot arguments overlay it |
 | virtio-blk + store partition in QEMU, lab check | ✅ `drivers::virtio_blk`, `store`, `tools/rrstore`, `GET`/`POST /api/config`, `scripts/store-test.sh` (aarch64 + x86_64) |
 | DHCP leases in the `leases` area | ✅ (2026-11-15) `proto_dhcp::v4::persist` + `Server::restore` (host-tested), `net/svc.rs` `LeaseStore`, `scripts/lease-test.sh` (both arches, virtio + SD) |

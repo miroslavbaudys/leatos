@@ -90,7 +90,7 @@ echo "== boot-time reads ($ARCH, ${QEMU_STORE_BUS:-virtio}, $STORE_MIB MiB)"
 r="$(boot_config empty "")"
 check "empty store -> defaults" "defaults (store has no valid config)" "${r%%,*}"
 
-printf 'version = 1\n\n[lan]\nipv4 = "10.20.0.1/24"\n' >"$WORK/a.toml"
+printf 'version = 2\n\n[[network]]\nname = "lan"\nipv4 = "10.20.0.1/24"\n' >"$WORK/a.toml"
 "$RRSTORE" put "$IMG" config "$WORK/a.toml" >/dev/null
 r="$(boot_config stored "")"
 check "stored config used" "stored (slot A, seq 1), lan 10.20.0.1/24" "${r%%, dhcp*}"
@@ -98,10 +98,17 @@ r="$(boot_config ignored "config=defaults")"
 check "config=defaults ignores the store" "defaults (config=defaults: store ignored)" "${r%%,*}"
 
 "$RRSTORE" create "$IMG" --mib "$STORE_MIB" >/dev/null
-printf 'version = 1\nbogus = 1\n' >"$WORK/bad.toml"
+printf 'version = 2\nbogus = 1\n' >"$WORK/bad.toml"
 "$RRSTORE" put "$IMG" config "$WORK/bad.toml" --raw >/dev/null
 r="$(boot_config rejected "")"
 check "stored config that does not validate -> defaults" "defaults (stored config slot A rejected" "${r%%:*}"
+
+# Schema version 1 ([lan]) is no longer read: such a record is rejected.
+"$RRSTORE" create "$IMG" --mib "$STORE_MIB" >/dev/null
+printf 'version = 1\n\n[lan]\nipv4 = "10.20.0.1/24"\n' >"$WORK/v1.toml"
+"$RRSTORE" put "$IMG" config "$WORK/v1.toml" --raw --version 1 >/dev/null
+r="$(boot_config v1 "")"
+check "stored version 1 config -> defaults" "defaults (stored config slot A rejected" "${r%%:*}"
 
 echo "== save through the management interface"
 "$RRSTORE" create "$IMG" --mib "$STORE_MIB" >/dev/null
@@ -122,7 +129,7 @@ AUTH=admin:test # reads need the password too (the one of the running boot)
 status() { curl -s -m 10 -u "$AUTH" -o "$WORK/status" "$URL/api/status" || true; json "$WORK/status" "$1"; }
 slot() { "$RRSTORE" get "$IMG" config 2>&1 >/dev/null | sed -n 's/.*slot \([AB]\), seq \([0-9]*\), version [0-9]*, flags \([0-9]*\).*/\1 \2 \3/p'; }
 save_toml() { code -u admin:test -X POST -H 'Content-Type: application/toml' --data-binary @"$1" "$URL/api/config"; }
-lan_toml() { printf 'version = 1\n\n[lan]\nipv4 = "%s"\n\n[[lan.dhcp.static]]\nmac = "52:54:00:00:00:07"\nip = "%s"\nhostname = "printer"\n' "$1/24" "${1%.1}.7" >"$WORK/lan.toml"; }
+lan_toml() { printf 'version = 2\n\n[[network]]\nname = "lan"\nipv4 = "%s"\n\n[[network.dhcp.static]]\nmac = "52:54:00:00:00:07"\nip = "%s"\nhostname = "printer"\n' "$1/24" "${1%.1}.7" >"$WORK/lan.toml"; }
 
 check "GET /api/info is public: a password exists" '{"auth":true}' "$(curl -s -m 10 "$URL/api/info" || true)"
 check "reads without password -> 401 (status, config, config.json, effective.json)" "401 401 401 401" \
@@ -140,7 +147,7 @@ check "effective config = stored + boot arguments (on_wan from mgmt=wan)" "10.20
 lan_toml 10.30.0.1
 check "save without password -> 401" 401 "$(code -X POST --data-binary @"$WORK/lan.toml" "$URL/api/config")"
 check "invalid TOML -> 422" 422 "$(save_toml "$WORK/bad.toml")"
-printf 'version = 1\n\n[lan]\nipv4 = "10.30.0.1/24"\n\n[lan.dhcp]\nrange = ["10.40.0.100", "10.40.0.199"]\n' >"$WORK/incons.toml"
+printf 'version = 2\n\n[[network]]\nname = "lan"\nipv4 = "10.30.0.1/24"\n\n[network.dhcp]\nrange = ["10.40.0.100", "10.40.0.199"]\n' >"$WORK/incons.toml"
 check "inconsistent config -> 422" 422 "$(save_toml "$WORK/incons.toml")"
 check "422 names the field" "network.lan.dhcp.range" "$(json "$WORK/resp" issues.0.path | cut -d'[' -f1)"
 # Valid, but beyond what this kernel implements (a static WAN): refused.
@@ -175,9 +182,8 @@ curl -s -m 10 -u "$AUTH" -o "$WORK/cfg.json" "$URL/api/config.json" || true
 check "saved values read back" "1000 tv" "$(json "$WORK/cfg.json" dns.cache_entries) $(json "$WORK/cfg.json" network.0.dhcp.static.0.hostname)"
 check "no trial after a harmless save" "0 null" "$(count 'config          : trial (') $(status trial)"
 check "kernel stored canonical TOML (defaults written out)" 1 "$("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c '^cache_entries = 1000' || true)"
-# A config that fits schema v1 is stored as v1, header and text: kernels
-# that read only v1 still use it after a rollback (docs/config-v2.md §5).
-check "  ... as version 1 (header and text)" "1 1 1" "$("$RRSTORE" show "$IMG" 2>/dev/null | grep -c 'seq 2 version 1 ' || true) $("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c -e '^version = 1$' || true) $("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c '^\[lan\]$' || true)"
+# Always schema version 2, header and text (docs/config-v2.md §5).
+check "  ... as version 2 (header and text)" "1 1 1" "$("$RRSTORE" show "$IMG" 2>/dev/null | grep -c 'seq 2 version 2 ' || true) $("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c -e '^version = 2$' || true) $("$RRSTORE" get "$IMG" config 2>/dev/null | grep -c '^\[\[network\]\]$' || true)"
 # Rate only: the queue is kept.
 python3 -I -c 'import json,sys
 c=json.load(open(sys.argv[1])); c["shaping"]["down_kbit"]=60000

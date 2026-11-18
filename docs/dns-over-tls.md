@@ -38,8 +38,6 @@ and `dns_tls=1|0`.
   out, and with none left every query gets SERVFAIL.
 - `dns.tls_ca`: up to 8 PEM certificates, 16 KiB, added to Mozilla's
   roots.
-- All three are schema version 2 only (`fits_v1`): a kernel that knows
-  only version 1 keeps the record before, never runs without them.
 
 ## How it works
 

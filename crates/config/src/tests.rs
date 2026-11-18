@@ -4,26 +4,27 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 const FULL: &str = r#"
-version = 1
+version = 2
 
-[lan]
+[[network]]
+name = "lan"
 ipv4 = "10.10.0.1/24"
-domain = "home.lan"
 
-[lan.dhcp]
+[network.dhcp]
 range = ["10.10.0.50", "10.10.0.150"]
 lease_secs = 3600
 
-[[lan.dhcp.static]]
+[[network.dhcp.static]]
 mac = "52:54:00:00:00:05"
 ip = "10.10.0.10"
 hostname = "nas"
 
-[[lan.dhcp.static]]
+[[network.dhcp.static]]
 mac = "AA:BB:CC:DD:EE:01"
 ip = "10.10.0.60"
 
 [dns]
+domain = "home.lan"
 cache_entries = 1000
 rebind_protection = false
 
@@ -49,6 +50,11 @@ vlan_pcp = 1
 
 fn ip(a: u8, b: u8, c: u8, d: u8) -> core::net::Ipv4Addr {
     core::net::Ipv4Addr::new(a, b, c, d)
+}
+
+/// A one-network document (the LAN on `ipv4`), then `rest`.
+fn lan_doc(ipv4: &str, rest: &str) -> String {
+    alloc::format!("[[network]]\nname = \"lan\"\nipv4 = \"{ipv4}\"\n{rest}")
 }
 
 fn paths(e: Error) -> Vec<String> {
@@ -179,7 +185,7 @@ fn sparse_files_fill_in_defaults() {
     assert_eq!(c.shaping.up_kbit, Some(18000));
     assert_eq!(c.shaping.down_kbit, None);
     assert_eq!(c.networks, Config::default().networks);
-    let c = parse("[lan]\nipv4 = \"10.0.0.1/16\"\n").unwrap();
+    let c = parse(&lan_doc("10.0.0.1/16", "")).unwrap();
     assert_eq!(c.dns.domain, "lan");
     assert_eq!(c.networks[0].dhcp_range(), (ip(10, 0, 0, 100), ip(10, 0, 0, 199)));
 }
@@ -197,7 +203,7 @@ fn derived_range_in_small_subnets() {
 
 #[test]
 fn syntax_errors_name_the_line() {
-    let e = parse("[lan]\nipv4 = 10.10.0.1\n").unwrap_err();
+    let e = parse("[[network]]\nipv4 = 10.10.0.1\n").unwrap_err();
     let Error::Syntax(m) = &e else {
         panic!("{e:?}")
     };
@@ -206,14 +212,14 @@ fn syntax_errors_name_the_line() {
     let e = parse(&FULL.replace("domain", "domian")).unwrap_err();
     let m = e.to_string();
     assert!(
-        m.contains("unknown field `domian`") && m.contains("line 6"),
+        m.contains("unknown field `domian`") && m.contains("line 22"),
         "{m}"
     );
 
-    let e = parse("[lan]\nipv4 = \"10.10.0.1\"\n").unwrap_err();
+    let e = parse(&lan_doc("10.10.0.1", "")).unwrap_err();
     assert!(e.to_string().contains("expected a.b.c.d/len"), "{e}");
     let e =
-        parse("[[lan.dhcp.static]]\nmac = \"52:54:00:00:05\"\nip = \"192.168.1.5\"\n").unwrap_err();
+        parse(&lan_doc("192.168.1.1/24", "[[network.dhcp.static]]\nmac = \"52:54:00:00:05\"\nip = \"192.168.1.5\"\n")).unwrap_err();
     assert!(e.to_string().contains("six bytes"), "{e}");
     let e = parse("[shaping]\nqdisc = \"pfifo\"\n").unwrap_err();
     assert!(matches!(e, Error::Syntax(_)), "{e:?}");
@@ -224,7 +230,7 @@ fn syntax_errors_name_the_line() {
     ));
     // Reservations need mac and ip.
     assert!(matches!(
-        parse("[[lan.dhcp.static]]\nip = \"192.168.1.5\"\n"),
+        parse(&lan_doc("192.168.1.1/24", "[[network.dhcp.static]]\nip = \"192.168.1.5\"\n")),
         Err(Error::Syntax(_))
     ));
 }
@@ -240,6 +246,12 @@ fn size_and_version_limits() {
     let newer = "version = 3\n[firewall]\nzones = []\n";
     assert_eq!(parse(newer), Err(Error::NewerVersion(3)));
     assert_eq!(paths(parse("version = 0\n").unwrap_err()), ["version"]);
+    // Version 1 is no longer read, with or without its version line.
+    assert_eq!(parse("version = 1\n[lan]\nipv4 = \"10.0.0.1/16\"\n"), Err(Error::OldVersion(1)));
+    assert_eq!(parse("[lan]\ndomain = \"x\"\n"), Err(Error::OldVersion(1)));
+    assert_eq!(parse(&lan_doc("10.0.0.1/24", "")).map(|_| ()).err(), None);
+    assert!(parse("version = 1\n").unwrap_err().to_string().contains("[[network]]"));
+    assert!(matches!(parse("version = 2\n[lan]\nipv4 = \"10.0.0.1/24\"\n"), Err(Error::Syntax(_))));
     // Missing version = current.
     assert_eq!(
         parse("[dns]\ncache_entries = 100\n").unwrap().version,
@@ -274,7 +286,7 @@ fn lan_checks() {
             "{bad:?}"
         );
     }
-    assert!(parse("[lan]\ndomain = \"home.example-1.lan\"\n").is_ok());
+    assert!(parse("[dns]\ndomain = \"home.example-1.lan\"\n").is_ok());
 }
 
 #[test]
@@ -302,7 +314,7 @@ fn dhcp_checks() {
     );
 
     // A changed subnet must carry the range along: the derived one does.
-    let c = parse("[lan]\nipv4 = \"10.1.2.1/24\"\n").unwrap();
+    let c = parse(&lan_doc("10.1.2.1/24", "")).unwrap();
     assert_eq!(c.networks[0].dhcp_range().0, ip(10, 1, 2, 100));
 }
 
@@ -418,17 +430,15 @@ fn shaping_and_dns_checks() {
 }
 
 #[test]
-fn dns_prefetch_is_on_by_default_and_off_needs_v2() {
+fn dns_prefetch_is_on_by_default() {
     let c = Config::default();
     assert!(c.dns.prefetch);
     assert!(!c.to_toml().contains("prefetch"), "the default is written as nothing");
     let off = parse("version = 2\n[dns]\nprefetch = false\n").unwrap();
     assert!(!off.dns.prefetch);
-    assert!(!off.fits_v1());
     let toml = off.to_toml();
     assert!(toml.contains("prefetch = false"), "{toml}");
     assert_eq!(parse(&toml).unwrap(), off);
-    assert!(parse("version = 1\n[dns]\nprefetch = false\n").is_err(), "not in version 1");
 }
 
 #[test]
@@ -438,7 +448,6 @@ fn dns_serve_stale_window() {
     assert!(!c.to_toml().contains("stale"), "the default is written as nothing");
     let off = parse("version = 2\n[dns]\nstale_secs = 0\n").unwrap();
     assert_eq!(off.dns.stale_secs, 0);
-    assert!(!off.fits_v1());
     assert_eq!(parse(&off.to_toml()).unwrap(), off);
     assert_eq!(invalid(|c| c.dns.stale_secs = 604_801), ["dns.stale_secs"]);
     assert!(issues(|c| c.dns.stale_secs = 604_800).is_empty());
@@ -456,8 +465,6 @@ fn dns_upstreams_and_tls() {
     assert_eq!((ups[0].ip, ups[0].port(true), ups[0].name.as_deref()), (ip(1, 1, 1, 1), 853, Some("cloudflare-dns.com")));
     assert_eq!((ups[1].port, ups[1].name.as_deref()), (Some(853), Some("cloudflare-dns.com")), "names lowercased");
     assert_eq!(alloc::format!("{}", ups[1]), "1.0.0.1:853#cloudflare-dns.com");
-    // Version 2 only (an older kernel must not run without its DNS settings).
-    assert!(!c.fits_v1());
     assert!(c.unsupported().is_empty(), "implemented: {:?}", c.unsupported());
     assert!(c.to_toml().contains("tls = true"));
     assert_eq!(parse(&c.to_toml()).unwrap(), c, "round trip");
@@ -469,7 +476,6 @@ fn dns_upstreams_and_tls() {
     assert_eq!(plain.dns.upstream_list()[0].port(false), 53);
     // Defaults: the lease's servers, written as nothing.
     assert!(!Config::default().to_toml().contains("upstreams"));
-    assert!(Config::default().fits_v1());
 
     let set = |ups: &[&str], tls: bool| {
         issues(|c| {
@@ -493,7 +499,6 @@ fn dns_upstreams_and_tls() {
     assert_eq!(ca("not pem"), ["dns.tls_ca"]);
     assert_eq!(ca("-----BEGIN CERTIFICATE-----\n!!\n-----END CERTIFICATE-----\n"), ["dns.tls_ca"]);
     assert!(ca("-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n").is_empty());
-    assert!(!parse("version = 2\n[dns]\ntls_ca = \"-----BEGIN CERTIFICATE-----\\nMAA=\\n-----END CERTIFICATE-----\\n\"\n").unwrap().fits_v1());
 }
 
 #[test]
@@ -721,9 +726,9 @@ fn json_round_trips_with_the_same_checks() {
             .any(|p| p.starts_with("network.lan.dhcp.range"))
     );
     assert_eq!(parse_json(r#"{"version":3}"#), Err(Error::NewerVersion(3)));
-    // Version 1 JSON (an old export) is migrated like TOML.
-    let old = parse_json(r#"{"version":1,"lan":{"ipv4":"10.1.0.1/16","domain":"home"}}"#).unwrap();
-    assert_eq!((old.networks[0].ipv4, old.dns.domain.as_str()), (Cidr::new(ip(10, 1, 0, 1), 16), "home"));
+    // Version 1 JSON (an old export) is refused like TOML.
+    assert_eq!(parse_json(r#"{"version":1,"lan":{"ipv4":"10.1.0.1/16"}}"#), Err(Error::OldVersion(1)));
+    assert_eq!(parse_json(r#"{"lan":{"ipv4":"10.1.0.1/16"}}"#), Err(Error::OldVersion(1)));
     let big = alloc::format!(r#"{{"dns":{{"domain":"{}"}}}}"#, "x".repeat(MAX_LEN));
     assert!(matches!(parse_json(&big), Err(Error::TooLarge { .. })));
 }
@@ -944,7 +949,6 @@ fn v2_document_parses_and_round_trips() {
     let rd = &c.firewall.redirects[0];
     assert_eq!((rd.from.as_str(), rd.proto, rd.dst_port, rd.to), ("any", Proto::Udp, PortRange::one(123), Target { ip: ip(10, 10, 0, 10), port: None }), "UDP by default");
     assert_eq!(c.dns.domain, "home");
-    assert!(!c.fits_v1());
 
     let text = c.to_toml();
     assert!(text.starts_with("version = 2"), "{text}");
@@ -957,56 +961,13 @@ fn v2_document_parses_and_round_trips() {
 }
 
 #[test]
-fn written_as_version_1_while_it_fits() {
-    // Kernels that read only version 1 must still find their LAN.
-    let mut c = parse(FULL).unwrap();
-    c.dns.domain = "home".into();
-    let text = c.to_toml();
-    assert!(text.starts_with("version = 1") && text.contains("[lan]"), "{text}");
-    let old: v1::Config = toml::from_str(&text).unwrap();
-    assert_eq!((old.lan.ipv4, old.lan.domain.as_str()), (c.networks[0].ipv4, "home"));
-    assert_eq!(parse(&text).unwrap(), c);
-
-    // Each version 2 feature switches to version 2, with the reason.
-    type Case = (&'static str, fn(&mut Config));
-    let cases: [Case; 7] = [
-        ("network", |c| c.networks.push(Network { name: "guest".into(), vlan: 20, ipv4: Cidr::new(ip(10, 20, 0, 1), 24), ..Network::default() })),
-        ("network.lan.vlan", |c| c.networks[0].vlan = 5),
-        ("network.lan.dhcp.enabled", |c| c.networks[0].dhcp.enabled = false),
-        ("zone", |c| c.zones.push(Zone { name: "guest".into(), ..Zone::builtin_lan() })),
-        ("dns.host", |c| c.dns.hosts.push(DnsHost { name: "x".into(), ip: ip(10, 0, 0, 1), networks: vec![] })),
-        ("wan.static", |c| {
-            c.wan.mode = WanMode::Static;
-            c.wan.static_ip = Some(WanStatic { ipv4: Cidr::new(ip(203, 0, 113, 2), 30), gateway: ip(203, 0, 113, 1), dns: vec![] });
-        }),
-        ("network.main.name", |c| c.networks[0].name = "main".into()),
-    ];
-    for (path, f) in cases {
-        let mut d = Config::default();
-        f(&mut d);
-        assert!(!d.fits_v1(), "{path}");
-        let t = d.to_toml();
-        assert!(t.starts_with("version = 2"), "{path}: {t}");
-        assert_eq!(parse(&t), Ok(d), "{path}");
+fn always_written_as_version_2() {
+    for c in [Config::default(), parse(FULL).unwrap()] {
+        let t = c.to_toml();
+        assert!(t.starts_with("version = 2") && t.contains("[[network]]"), "{t}");
+        assert_eq!(parse(&t), Ok(c));
     }
     assert!(Config::default().unsupported().is_empty());
-}
-
-#[test]
-fn version_1_is_migrated() {
-    let c = parse("version = 1\n[lan]\nipv4 = \"10.0.0.1/16\"\ndomain = \"home\"\n").unwrap();
-    assert_eq!(c.version, VERSION);
-    assert_eq!(
-        c.networks,
-        vec![Network { ipv4: Cidr::new(ip(10, 0, 0, 1), 16), ..Network::default() }]
-    );
-    assert_eq!(c.dns.domain, "home");
-    // Without a version line, [lan] means version 1; v2 fields are not
-    // accepted in a version 1 document and vice versa.
-    assert_eq!(parse("[lan]\ndomain = \"x\"\n").unwrap().dns.domain, "x");
-    assert!(matches!(parse("version = 1\n[[network]]\nname = \"lan\"\nipv4 = \"10.0.0.1/24\"\n"), Err(Error::Syntax(_))));
-    assert!(matches!(parse("version = 2\n[lan]\nipv4 = \"10.0.0.1/24\"\n"), Err(Error::Syntax(_))));
-    assert_eq!(v1::Config::default().lan.ipv4, Config::default().networks[0].ipv4);
 }
 
 fn with_v2(f: impl FnOnce(&mut Config)) -> Vec<String> {
@@ -1135,9 +1096,8 @@ fn redirect_checks() {
 }
 
 #[test]
-fn firewall_needs_version_2() {
-    // The built-in zones only, but a port forward or redirect: version 1
-    // has no place for them, so the document must be version 2.
+fn firewall_entries_with_builtin_zones() {
+    // The built-in zones only, but a port forward, redirect or rule.
     for entry in [
         "[[firewall.forward]]\nname = \"web\"\nwan_port = 8080\nto = \"192.168.1.10:80\"\n",
         "[[firewall.redirect]]\nname = \"ntp\"\nfrom = \"any\"\ndst_port = 123\nto = \"192.168.1.10\"\n",
@@ -1145,9 +1105,7 @@ fn firewall_needs_version_2() {
     ] {
         let c = parse(&alloc::format!("version = 2\n{entry}")).unwrap();
         assert_eq!(c.validate(), Ok(()));
-        assert!(!c.fits_v1(), "{entry}");
         let text = c.to_toml();
-        assert!(text.starts_with("version = 2"), "{text}");
         assert_eq!(parse(&text).unwrap(), c, "kept: {text}");
     }
 }
@@ -1304,9 +1262,9 @@ fn management_password_is_hashed_and_secret() {
     assert!(c.mgmt.password.is_none());
     let h = c.mgmt.password_hash.clone().unwrap();
     assert!(auth::verify("correct horse", &h));
-    // Stored (version 2: older kernels do not know the field), never shown.
+    // Stored, never shown.
     let t = c.to_toml();
-    assert!(t.starts_with("version = 2") && t.contains("password_hash") && !t.contains("correct horse"), "{t}");
+    assert!(t.contains("password_hash") && !t.contains("correct horse"), "{t}");
     assert_eq!(parse(&t).unwrap(), c);
     let shown = c.without_secrets();
     for text in [shown.to_toml(), shown.to_json(), flat_lines(&shown).join("\n")] {
@@ -1365,11 +1323,8 @@ fn mdns_parses_and_round_trips() {
     assert_eq!(c.zone("iot").unwrap().allow, [Service::Dhcp, Service::Dns, Service::Mdns]);
     assert_eq!(parse(&c.to_toml()).unwrap(), c);
     assert_eq!(parse_json(&c.to_json()).unwrap(), c);
-    // Not written when empty; needs version 2.
+    // Not written when empty.
     assert!(!Config::default().to_toml().contains("mdns"));
-    let lan_only = Config { mdns: c.mdns.clone(), ..Config::default() };
-    assert!(!lan_only.fits_v1());
-    assert!(lan_only.beyond_v1_paths().contains(&"mdns.reflect".into()));
     assert!(parse("version = 2\n[mdns]\nreflector = true\n").is_err(), "unknown field");
 }
 
@@ -1463,13 +1418,9 @@ fn network_domain() {
     assert_eq!(c.networks[1].domain(&c.dns), "guest.home");
     assert_eq!(parse(&c.to_toml()).unwrap(), c);
     assert_eq!(parse_json(&c.to_json()).unwrap(), c);
-    // Not written when unset; needs version 2.
+    // Not written when unset.
     assert!(!Config::default().to_toml().contains("\ndomain = \"lan\"\n[[network"));
     assert!(!parse(FULL_V2).unwrap().to_toml().contains("guest.home"));
-    let mut lan_only = Config::default();
-    lan_only.networks[0].domain = Some("home.arpa".into());
-    assert!(!lan_only.fits_v1());
-    assert!(lan_only.beyond_v1_paths().contains(&"network.lan.domain".into()));
     // Validation and editing by path.
     for bad in ["", "a b", "-x.home", "x..home", "x_y"] {
         assert_eq!(invalid(|c| c.networks[0].domain = Some(bad.into())), ["network.lan.domain"], "{bad:?}");
@@ -1547,7 +1498,6 @@ fn dns_views_follow_the_firewall_on_the_home_topology() {
     const IOT: u32 = 2;
     const PS: u32 = 4;
     let c = parse(HOME_VIEWS).unwrap();
-    assert_eq!(c.doc_version(), 2);
     assert_eq!(c.unsupported(), vec![]);
     let v = c.name_visibility();
     assert_eq!(v.all_networks(), LAN | IOT | PS);

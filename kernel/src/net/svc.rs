@@ -426,14 +426,13 @@ async fn store_op(
     use crate::config::schema;
     let e = |e: crate::store::Error| alloc::format!("{e}");
     match op {
-        StoreOp::Save { toml, flags, cfg, .. } => {
-            // The header names the document's version (1 while the config
-            // fits it): an older kernel skips a version 2 record and keeps
-            // the one before it.
+        StoreOp::Save { toml, flags, .. } => {
+            // The header names the schema version: an older kernel skips a
+            // newer record and keeps the one before it.
             let (slot, h) = st
                 .write_record(
                     "config",
-                    cfg.doc_version(),
+                    schema::VERSION,
                     schema::VERSION,
                     toml.as_bytes(),
                     *flags,

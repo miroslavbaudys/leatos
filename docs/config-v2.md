@@ -1,8 +1,8 @@
 # Configuration schema v2: networks, zones, firewall
 
 Status (2026-11-17): **the schema is implemented** in `crates/config`
-(types, validation, migration, the v1-compatible writer, CLI editing by
-name). The kernel implements networks on `lan0` (untagged or VLANs, a
+(types, validation, CLI editing by name; version 1 is no longer read
+since 2026-11-18, §5). The kernel implements networks on `lan0` (untagged or VLANs, a
 DHCP server and DNS domain each, changed live), zones (forwarding between
 them, input policy), rules (incl. `reject`), port forwards with hairpin,
 redirects, WAN anti-spoofing, mDNS reflect rules (docs/mdns.md), and the
@@ -159,7 +159,7 @@ later without changing networks.
 
 Networks in the same zone may always forward to each other: the same zone
 means the same trust. Built-in zone `lan` (input accept, forward to `wan`)
-exists if the file defines none, so a v1 config needs no zones.
+exists if the file defines none, so a config with one LAN needs no zones.
 
 Management (`:80`) is reachable from a zone with `input = "accept"`, or
 from one that lists `mgmt` in `allow`. Today's rule, "LAN only unless
@@ -333,37 +333,29 @@ control `LAB_GUEST_DOMAIN=0`).
   `wan0`/`lan0`.
 
 ## 5. Migration and rollback
-- **v1 → v2 on load:**
-  - `[lan]` becomes `network "lan"` (ports `["lan0"]`, untagged, zone `lan`).
-  - `[lan.dhcp]` moves into it; `lan.domain` becomes `dns.domain`.
-  - A document without `version` is version 1 if it has `[lan]`, else
-    version 2 (hand-written files).
-  - Zones are the built-in `lan` and `wan`.
-  - Everything else carries over unchanged.
-- **Writing: v1 form while the config fits it.** An older kernel cannot
-  read `version = 2`. That could happen after a persistent-upgrade
-  rollback or with `image=golden`. So the canonical writer
-  (`Config::to_toml`) emits a v1 document whenever the config is
-  expressible in v1 (`Config::fits_v1`): exactly one network named `lan`,
-  untagged on `lan0`, in zone `lan`, DHCP on; no zones, rules, forwards
-  or DNS hosts; WAN on `wan0` in mode `dhcp` or `pppoe`. This is how
-  `[wan]` is already handled: it is written only when set.
-- **The record header names the document's version**
-  (`Config::doc_version`; `rrstore put` uses the file's own). The store
-  picks the newest record whose version the reader understands, so an
-  older kernel skips a version 2 record and boots the record before it
-  (the last v1 config), not the defaults. The A/B slots keep exactly one
-  older record.
-- No config is saved while a trial kernel runs (as before), so a v2
-  record is only written by a confirmed kernel.
-- **JSON** (`/api/config.json`, the web form) is always version 2;
-  `POST /api/config` takes either version.
+- **Version 1 is no longer read** (dropped 2026-11-18). It had one
+  `[lan]` instead of `[[network]]` and the local domain in `lan.domain`.
+  Until then it was migrated on load, and a config that fit it was written
+  as version 1 so kernels that read only version 1 kept their LAN after a
+  rollback. No such kernel is deployed any more (the apu4's config has
+  been version 2 since 2026-11-15), and every new feature had to be
+  listed as "beyond v1", so both directions were removed. A version 1
+  document (`version = 1`, or `[lan]` without a `version` line) is refused
+  with `Error::OldVersion` and a hint: write `[lan]` as `[[network]]` with
+  `name = "lan"`, and `lan.domain` as `dns.domain`. A stored version 1
+  record is rejected at boot (defaults, as for any rejected record).
+- **The record header names the schema version** (always `VERSION` now).
+  The store picks the newest record whose version the reader understands,
+  so a kernel skips a record of a newer schema and boots the one before it.
+- No config is saved while a trial kernel runs, so a record is only
+  written by a confirmed kernel.
+- **JSON** (`/api/config.json`, the web form) has the same schema.
 - **Boot arguments** keep overriding: `lan=` sets the first network's
   `ipv4`. `wan_*`/`pppoe_*` are unchanged.
 - **CLI** (`config set/unset`): entries by name, `network.guest.vlan = 20`,
   `network.guest = { ipv4 = "10.20.0.1/24", vlan = 20 }` (new entries go
   last), `config unset network.guest`; `lan.…` is the first network and
-  `lan.domain` is `dns.domain`, so version 1 commands keep working.
+  `lan.domain` is `dns.domain` (shorthands from version 1).
 
 ## 6. Datapath and services mapping (kernel work)
 - **Interfaces** ✅. A *port* is a NIC with its egress qdisc; a *link*

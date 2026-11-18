@@ -6,7 +6,7 @@
 //! `[[firewall.forward]]`, `[[firewall.redirect]]`, `[[mdns.reflect]]` are keyed by `name` (`network.guest.vlan = 20`,
 //! `firewall.rule.ssh = { from = "wan", to = "router", … }`). The order
 //! of existing entries is kept; new ones go last. `lan.…` means the first
-//! network (version 1's `[lan]`), `lan.domain` is `dns.domain`.
+//! network, `lan.domain` is `dns.domain`.
 
 use crate::{Config, Error, Network, Zone};
 use alloc::format;

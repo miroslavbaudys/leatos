@@ -225,8 +225,8 @@ fn put(path: &str, area: &str, file: &str, raw: bool, version: Option<u32>) -> R
             let list: Vec<String> = unsupported.iter().map(|i| i.to_string()).collect();
             return Err(format!("{file}: {}", list.join("; ")));
         }
-        // The header names the text's version, so older kernels skip it.
-        doc_version = config::document_version(text).map_err(|e| format!("{file}: {e}"))?;
+        // The header names the schema version, so older kernels skip it.
+        doc_version = config::VERSION;
     }
     let version = version.unwrap_or(doc_version);
     let mut img = Img::open(path)?;
@@ -411,21 +411,24 @@ mod tests {
     fn create_put_corrupt_reformat() {
         let img = tmp("img");
         let toml = tmp("toml");
-        std::fs::write(&toml, "version = 1\n[lan]\nipv4 = \"10.20.0.1/24\"\n").unwrap();
+        std::fs::write(&toml, "version = 2\n[[network]]\nname = \"lan\"\nipv4 = \"10.20.0.1/24\"\n").unwrap();
         create(&img, 17).unwrap();
         assert!(format(&img, false).is_err(), "refuses to reformat");
         assert_eq!(current(&img), None);
         put(&img, "config", &toml, false, None).unwrap();
         put(&img, "config", &toml, false, None).unwrap();
         let (slot, h) = current(&img).unwrap();
-        assert_eq!((slot, h.seq), (Slot::B, 2));
+        assert_eq!((slot, h.seq, h.version), (Slot::B, 2, config::VERSION));
         corrupt(&img, "config", None).unwrap();
         // The newer record is broken: the older one is current again.
         let (slot, h) = current(&img).unwrap();
         assert_eq!((slot, h.seq), (Slot::A, 1));
         // Invalid config is refused unless --raw.
-        std::fs::write(&toml, "version = 1\nbogus = 3\n").unwrap();
+        std::fs::write(&toml, "version = 2\nbogus = 3\n").unwrap();
         assert!(put(&img, "config", &toml, false, None).is_err());
+        // So is a version 1 document.
+        std::fs::write(&toml, "version = 1\n[lan]\nipv4 = \"10.20.0.1/24\"\n").unwrap();
+        assert!(put(&img, "config", &toml, false, None).unwrap_err().contains("no longer supported"));
         put(&img, "config", &toml, true, None).unwrap();
         format(&img, true).unwrap();
         assert_eq!(current(&img), None, "format clears old records");

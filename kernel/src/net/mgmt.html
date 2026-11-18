@@ -998,7 +998,7 @@ const setp = (o, path, v) => {
   }
   if (v === undefined) delete t[last]; else t[last] = v;
 };
-// The LAN page edits the first network (version 1's [lan]).
+// The LAN page edits the first network.
 let lanName = "lan";
 const lanPath = (rest) => `network.${lanName}.${rest}`;
 const cfgFields = () => [...document.querySelectorAll("form.cfg [data-path]")];

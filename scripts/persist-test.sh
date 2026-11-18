@@ -135,7 +135,7 @@ check "stored kernel runs as a trial" "store (slot A, seq 1)" "$(source_now)"
 check "trial announced on the console" 1 "$(count 'trial kernel: confirm within 20 s or it is rolled back')"
 check "trial seq in the status" 1 "$(trial_now)"
 check "record marked booted" "A: seq 1 version 1 $(wc -c <"$WORK/new.elf" | tr -d ' ') bytes trial booted | B: empty" "$(images)"
-check "config save during the trial -> 409" 409 "$(code -u admin:test -X POST --data-binary 'version = 1' "$URL/api/config")"
+check "config save during the trial -> 409" 409 "$(code -u admin:test -X POST --data-binary 'version = 2' "$URL/api/config")"
 check "in-RAM upgrade during the trial -> 409" 409 "$(upload "$WORK/new.elf" /api/upgrade)"
 check "confirm without password -> 401" 401 "$(code -X POST "$URL/api/upgrade/confirm")"
 if [[ "${PERSIST_TEST_CONTROL:-}" == no-confirm ]]; then
