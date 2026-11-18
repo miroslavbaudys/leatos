@@ -1356,7 +1356,7 @@ fn status_json(
         let (st, cached) = svc.dns_stats();
         let _ = write!(
             s,
-            ",\"dns\":{{\"source\":{},\"upstreams\":[{}],\"tls\":{},\"cached\":{},\"queries\":{},\"local\":{},\"hidden\":{},\"cache_hits\":{},\"forwarded\":{},\"merged\":{},\"timeouts\":{},\"servfails\":{},\"rebind_blocked\":{},\"prefetches\":{},\"prefetch_failed\":{},\"stale_answers\":{}}}",
+            ",\"dns\":{{\"source\":{},\"upstreams\":[{}],\"tls\":{},\"cached\":{},\"queries\":{},\"local\":{},\"hidden\":{},\"cache_hits\":{},\"forwarded\":{},\"merged\":{},\"timeouts\":{},\"servfails\":{},\"rebind_blocked\":{},\"prefetches\":{},\"prefetch_failed\":{},\"stale_answers\":{}",
             json_str(svc.upstream_source()),
             ups.join(","),
             svc.dot_status_json().unwrap_or_else(|| "null".into()),
@@ -1374,6 +1374,21 @@ fn status_json(
             st.prefetch_failed,
             st.stale_answers
         );
+        // Local names ([[dns.host]], config order) and the queries each
+        // answered.
+        s.push_str(",\"hosts\":[");
+        let hits = svc.dns_host_hits();
+        for (n, h) in config::get().dns.hosts.iter().enumerate() {
+            let _ = write!(
+                s,
+                "{}{{\"name\":{},\"ip\":\"{}\",\"hits\":{}}}",
+                if n > 0 { "," } else { "" },
+                json_str(&h.name),
+                h.ip,
+                hits.get(n).copied().unwrap_or(0)
+            );
+        }
+        s.push_str("]}");
     }
     // Wall clock (SNTP) and watchdog.
     let ntp = services.and_then(LanServices::ntp_status);

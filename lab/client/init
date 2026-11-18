@@ -467,7 +467,12 @@ if [ -n "$guest" ]; then
       if echo "$out" | $bb grep -v "^Server" | $bb grep -q "192.168.1.10$"; then pass "views: nas.lan visible to the guest (rule guest-ping-nas reaches it)"; else fail "views: nas.lan from the guest"; echo "$out" | $bb sed 's/^/    | /'; fi
       out=$($bb nslookup labclient.lan 192.168.1.1 2>&1)
       if echo "$out" | $bb grep -q "$ip"; then pass "views: labclient.lan still resolves on the LAN"; else fail "views: labclient.lan on the LAN"; echo "$out" | $bb sed 's/^/    | /'; fi
+      # Hits of the split.lan entries (/api/status dns.hosts), summed.
+      splith() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb sed -n 's/.*"hosts":\[\([^]]*\)\].*/\1/p' | $bb tr '{' '\n' | $bb grep '"name":"split"' | $bb sed -n 's/.*"hits":\([0-9]*\).*/\1/p' | $bb awk '{t+=$1} END {print t+0}'; }
+      sh0=$(splith)
       out_l=$($bb nslookup split.lan 192.168.1.1 2>&1); out_g=$(gl split.lan)
+      sh1=$(splith)
+      if [ "${sh1:-0}" -ge $((${sh0:-0} + 2)) ]; then pass "views: split.lan entries' hits ${sh0:-0} -> $sh1"; else fail "views: split.lan entries' hits ${sh0:-0} -> ${sh1:-0} (expected +2)"; fi
       if echo "$out_l" | $bb grep -q "192.168.1.50" && echo "$out_g" | $bb grep -q "10.20.0.50" && ! echo "$out_g" | $bb grep -q "192.168.1.50"; then
         pass "views: split.lan -> 192.168.1.50 on the LAN, 10.20.0.50 on the guest"
       else

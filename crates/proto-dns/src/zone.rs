@@ -65,6 +65,8 @@ struct Record {
     ip: Ipv4Addr,
     source: Source,
     seen_by: View,
+    /// The `[[dns.host]]` entry it comes from (index), for its hit counter.
+    host: Option<u16>,
 }
 
 /// The record `view` gets from `recs`: static before DHCP, then the
@@ -208,23 +210,43 @@ impl Zone {
     /// records of the same source; for the networks a static record
     /// covers, DHCP records stay unseen.
     pub fn add_in(&mut self, domain: &str, host: &str, ip: Ipv4Addr, source: Source, seen_by: View) {
+        self.add_record_in(domain, host, Record { ip, source, seen_by, host: None });
+    }
+
+    /// [`Self::add_in`] for `[[dns.host]]` entry `index` (static): queries
+    /// it answers are counted for it ([`Self::lookup_host`]).
+    pub fn add_host_in(&mut self, domain: &str, host: &str, ip: Ipv4Addr, seen_by: View, index: u16) {
+        let rec = Record { ip, source: Source::Static, seen_by, host: Some(index) };
+        self.add_record_in(domain, host, rec);
+    }
+
+    fn add_record_in(&mut self, domain: &str, host: &str, rec: Record) {
         let Some(d) = self.find_mut(domain) else {
             return;
         };
         let recs = d.hosts.entry(host.to_ascii_lowercase()).or_default();
-        put(recs, Record { ip, source, seen_by });
+        put(recs, rec);
     }
 
     /// Override the public name `name` (exact, outside the local domains;
     /// ignored otherwise) with `ip` for `seen_by`. Other networks resolve
     /// it upstream.
     pub fn add_override(&mut self, name: &str, ip: Ipv4Addr, seen_by: View) {
+        self.add_override_record(name, Record { ip, source: Source::Static, seen_by, host: None });
+    }
+
+    /// [`Self::add_override`] for `[[dns.host]]` entry `index`.
+    pub fn add_host_override(&mut self, name: &str, ip: Ipv4Addr, seen_by: View, index: u16) {
+        self.add_override_record(name, Record { ip, source: Source::Static, seen_by, host: Some(index) });
+    }
+
+    fn add_override_record(&mut self, name: &str, rec: Record) {
         let name = normalize(name);
         if name.is_empty() || self.is_local_name(&name) {
             return;
         }
         let recs = self.overrides.entry(name).or_default();
-        put(recs, Record { ip, source: Source::Static, seen_by });
+        put(recs, rec);
     }
 
     /// Remove a DHCP host from the default domain (only if it still points
@@ -277,10 +299,16 @@ impl Zone {
     /// `view` (one network, [`View::ROUTER`], or [`View::ALL`] to see
     /// everything).
     pub fn lookup(&self, name: &str, qtype: u16, view: View) -> Lookup {
+        self.lookup_host(name, qtype, view).0
+    }
+
+    /// [`Self::lookup`], plus the `[[dns.host]]` entry that answered a
+    /// forward name (A, or no data for another type), if one did.
+    pub fn lookup_host(&self, name: &str, qtype: u16, view: View) -> (Lookup, Option<u16>) {
         use crate::wire::{TYPE_A, TYPE_PTR};
         if let Some(ip) = parse_reverse(name) {
             if !self.in_subnet(ip) {
-                return Lookup::NotLocal;
+                return (Lookup::NotLocal, None);
             }
             let names = self.names_of(ip, view);
             if names.is_empty() {
@@ -288,9 +316,9 @@ impl Zone {
                     .domains
                     .iter()
                     .any(|d| d.hosts.values().flatten().any(|r| r.ip == ip));
-                return if anywhere { Lookup::Hidden } else { Lookup::NxDomain };
+                return (if anywhere { Lookup::Hidden } else { Lookup::NxDomain }, None);
             }
-            return if qtype == TYPE_PTR { Lookup::Ptr(names) } else { Lookup::NoData };
+            return (if qtype == TYPE_PTR { Lookup::Ptr(names) } else { Lookup::NoData }, None);
         }
         // The longest local domain the name is in.
         let Some(d) = self
@@ -302,22 +330,22 @@ impl Zone {
             // An override, for its networks only; any other type is NoData
             // there (a dual-stack client must not take the public AAAA).
             return match self.overrides.get(name).and_then(|recs| effective(recs, view)) {
-                Some(r) if qtype == TYPE_A => Lookup::A(alloc::vec![r.ip]),
-                Some(_) => Lookup::NoData,
-                None => Lookup::NotLocal,
+                Some(r) if qtype == TYPE_A => (Lookup::A(alloc::vec![r.ip]), r.host),
+                Some(r) => (Lookup::NoData, r.host),
+                None => (Lookup::NotLocal, None),
             };
         };
         if name == d.name {
-            return Lookup::NoData;
+            return (Lookup::NoData, None);
         }
         let host = &name[..name.len() - d.name.len() - 1];
         match d.hosts.get(host) {
             Some(recs) => match effective(recs, view) {
-                Some(r) if qtype == TYPE_A => Lookup::A(alloc::vec![r.ip]),
-                Some(_) => Lookup::NoData,
-                None => Lookup::Hidden,
+                Some(r) if qtype == TYPE_A => (Lookup::A(alloc::vec![r.ip]), r.host),
+                Some(r) => (Lookup::NoData, r.host),
+                None => (Lookup::Hidden, None),
             },
-            None => Lookup::NxDomain,
+            None => (Lookup::NxDomain, None),
         }
     }
 

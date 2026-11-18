@@ -58,6 +58,9 @@ pub struct LanServices {
     dns: Resolver,
     /// Who resolves which addresses' names (`dns.views`): new leases.
     names: NameVisibility,
+    /// The `[[dns.host]]` entries in the zone (their hits follow them
+    /// through config changes).
+    local_hosts: Vec<LocalHost>,
     upstream_sock: Option<SocketHandle>,
     /// The WAN lease's DNS servers (used without `dns.upstreams`).
     lease_dns: Vec<Ipv4Addr>,
@@ -145,14 +148,16 @@ fn build_zone<'a>(
         };
         zone.add_in(&n.domain, h, l.ip, Source::Dhcp, seen_by(names, l.ip));
     }
-    for h in hosts {
+    for (i, h) in hosts.iter().enumerate() {
         let view = match h.networks {
             Some(mask) => View(mask).union(View::ROUTER),
             None => seen_by(names, h.ip),
         };
+        // Tagged with the entry's index: its hits (`/api/status` dns.hosts).
+        let i = i as u16;
         match &h.name {
-            HostName::Local { domain, label } => zone.add_in(domain, label, h.ip, Source::Static, view),
-            HostName::Override(name) => zone.add_override(name, h.ip, view),
+            HostName::Local { domain, label } => zone.add_host_in(domain, label, h.ip, view, i),
+            HostName::Override(name) => zone.add_host_override(name, h.ip, view, i),
         }
     }
     zone
@@ -238,6 +243,7 @@ impl LanServices {
             nets,
             dns,
             names,
+            local_hosts,
             upstream_sock,
             lease_dns: Vec::new(),
             udp_ports: Vec::new(),
@@ -290,6 +296,11 @@ impl LanServices {
     /// The upstreams the resolver asks.
     pub fn upstreams(&self) -> &[Ipv4Addr] {
         self.dns.upstreams()
+    }
+
+    /// Queries answered per `[[dns.host]]` entry (config order).
+    pub fn dns_host_hits(&self) -> &[u64] {
+        &self.dns.host_hits
     }
 
     /// Resolver counters and the number of cached answers.
@@ -356,6 +367,17 @@ impl LanServices {
         }
         let (names, local_hosts) = config::dns_names();
         *self.dns.zone_mut() = build_zone(&cfgs, &names, &local_hosts, self.leases_by_network());
+        // Hit counters follow their entries (same name and address) to
+        // their new places; new entries start at 0.
+        let old_hits = core::mem::take(&mut self.dns.host_hits);
+        self.dns.host_hits = local_hosts
+            .iter()
+            .map(|h| {
+                let same = |o: &LocalHost| o.name == h.name && o.ip == h.ip;
+                self.local_hosts.iter().position(same).and_then(|k| old_hits.get(k).copied()).unwrap_or(0)
+            })
+            .collect();
+        self.local_hosts = local_hosts;
         self.names = names;
         self.dns.reconfigure(resolver_config(&dns_cfg));
         self.apply_upstreams(hosts);

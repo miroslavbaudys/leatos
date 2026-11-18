@@ -135,12 +135,13 @@
 #                        are NXDOMAIN (the guest zone cannot reach the LAN)
 #                        and the router's "hidden" counter rises, nas.lan
 #                        still resolves (rule guest-ping-nas reaches it);
-#                        split.lan answers per network; files.isp.example
+#                        split.lan answers per network (and its entries'
+#                        hits in /api/status dns.hosts rise); files.isp.example
 #                        is the client on the LAN and the ISP's answer on
 #                        the guest network. Negative controls:
 #                        LAB_DNS_VIEWS=0 (views "all": the hiding checks
-#                        fail), LAB_DNS_HOSTS=0 (no [[dns.host]]: split and
-#                        override fail), LAB_GUEST_RULES=0 (nas.lan hidden).
+#                        fail), LAB_DNS_HOSTS=0 (no [[dns.host]]: split,
+#                        its hits and override fail), LAB_GUEST_RULES=0 (nas.lan hidden).
 #   LAB_DOT=1            DNS over TLS, strict (docs/dns-over-tls.md): the
 #                        router boots from a store with dns.tls, upstream
 #                        203.0.113.1#dns.isp.example and a CA made for this

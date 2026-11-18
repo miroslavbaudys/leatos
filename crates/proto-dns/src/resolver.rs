@@ -186,6 +186,9 @@ pub struct Resolver {
     by_question: BTreeMap<Key, u16>,
     rng: u32,
     pub stats: Stats,
+    /// Queries answered per `[[dns.host]]` entry (index; A or other types,
+    /// not PTR), like a firewall rule's hits.
+    pub host_hits: Vec<u64>,
 }
 
 /// RFC 1918, loopback, link-local, "this network".
@@ -209,6 +212,7 @@ impl Resolver {
             by_question: BTreeMap::new(),
             rng: seed | 1,
             stats: Stats::default(),
+            host_hits: Vec::new(),
         }
     }
 
@@ -300,7 +304,14 @@ impl Resolver {
         }
 
         // 1. Local zone (authoritative, never forwarded).
-        let local = match self.zone.lookup(&q.name, q.qtype, view) {
+        let (found, host) = self.zone.lookup_host(&q.name, q.qtype, view);
+        if let Some(i) = host.map(usize::from) {
+            if self.host_hits.len() <= i {
+                self.host_hits.resize(i + 1, 0);
+            }
+            self.host_hits[i] += 1;
+        }
+        let local = match found {
             Lookup::A(ips) => Some((
                 wire::RCODE_NOERROR,
                 ips.into_iter().map(|a| (Rdata::A(a), LOCAL_TTL)).collect(),
@@ -1261,6 +1272,33 @@ mod tests {
         // Control: without views the guest would get it.
         let a = r.handle_query(0, client(1), &q);
         assert_eq!(rcode(reply(&a).1), RCODE_NOERROR);
+    }
+
+    #[test]
+    fn dns_host_entries_count_their_hits() {
+        use crate::wire::TYPE_AAAA;
+        use crate::zone::View;
+        let (lan, guest) = (View::network(0), View::network(1));
+        let mut r = resolver();
+        // Entry 0: split.lan for lan, entry 1: split.lan for guest, entry 2:
+        // an override for lan; nas.lan is a reservation (no entry).
+        r.zone_mut().add_host_in("lan", "split", Ipv4Addr::new(192, 168, 1, 50), lan, 0);
+        r.zone_mut().add_host_in("lan", "split", Ipv4Addr::new(10, 20, 0, 50), guest, 1);
+        r.zone_mut().add_host_override("files.example.com", Ipv4Addr::new(192, 168, 1, 200), lan, 2);
+        let ask = |r: &mut Resolver, v: View, name: &str, qtype: u16| {
+            r.handle_query_in(0, client(1), v, &build_query(1, name, qtype));
+        };
+        ask(&mut r, lan, "split.lan", TYPE_A);
+        ask(&mut r, lan, "SPLIT.lan", TYPE_AAAA);
+        ask(&mut r, guest, "split.lan", TYPE_A);
+        ask(&mut r, lan, "files.example.com", TYPE_A);
+        ask(&mut r, lan, "nas.lan", TYPE_A);
+        ask(&mut r, lan, "50.1.168.192.in-addr.arpa", TYPE_PTR);
+        assert_eq!(r.host_hits, [2, 1, 1]);
+        // The guest asks the override's name upstream: not a hit.
+        let a = r.handle_query_in(0, client(1), guest, &build_query(1, "files.example.com", TYPE_A));
+        assert!(matches!(a.as_slice(), [Action::Upstream { .. }]));
+        assert_eq!(r.host_hits, [2, 1, 1]);
     }
 
     #[test]

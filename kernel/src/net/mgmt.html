@@ -934,6 +934,7 @@ async function refresh() {
     : rows([["Networks", "none"]]);
   renderNetStatus();
   renderRuleHits();
+  renderHostHits();
   renderMdnsStats();
 }
 
@@ -1581,7 +1582,7 @@ function renderHosts(list) {
   const nets = netNames();
   const t = $("dnshosts");
   const box = (v, on, label) => el("label", { className: "check", style: "display:inline-flex;margin:0 8px 0 0" }, [el("input", { type: "checkbox", value: v, checked: on }), label]);
-  t.replaceChildren(el("tr", {}, ["Name", "Address", "Answered to", ""].map((h) => el("th", { textContent: h }))));
+  t.replaceChildren(el("tr", {}, ["Name", "Address", "Answered to", "Hits", ""].map((h) => el("th", { textContent: h }))));
   list.forEach((h, i) => {
     const tr = el("tr", { dataset: { orig: String(i) } });
     const to = el("td", { dataset: { key: "networks" } }, nets.map((x) => box(x, (h.networks ?? []).includes(x), x)));
@@ -1589,10 +1590,18 @@ function renderHosts(list) {
     tr.append(el("td", {}, [el("input", { value: h.name ?? "", placeholder: "nas", size: 22, dataset: { key: "name" } })]),
       el("td", {}, [el("input", { value: h.ip ?? "", placeholder: "192.168.1.10", size: 14, dataset: { key: "ip" } })]),
       to,
+      el("td", { className: "num", dataset: { hhits: `${(h.name ?? "").toLowerCase()}|${h.ip ?? ""}` } }),
       el("td", {}, [el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); hostPaths(); updatePending(); } })]));
     t.append(tr);
   });
   hostPaths();
+  renderHostHits();
+}
+// Queries each saved name answered (/api/status dns.hosts), by name and
+// address as saved; "–" for names not saved yet.
+function renderHostHits() {
+  const by = Object.fromEntries((st?.dns?.hosts ?? []).map((h) => [`${h.name.toLowerCase()}|${h.ip}`, h.hits]));
+  for (const td of document.querySelectorAll("#dnshosts [data-hhits]")) td.textContent = td.dataset.hhits in by ? n(by[td.dataset.hhits]) : "–";
 }
 function hostPaths() {
   [...$("dnshosts").rows].slice(1).forEach((tr, i) => {
