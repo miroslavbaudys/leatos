@@ -463,9 +463,10 @@ fn status(ctx: &Ctx, wan: &str) {
         );
         let (st, cached) = svc.dns_stats();
         println!(
-            "dns      : {} queries: {} local, {} cache hits, {} forwarded, {} merged, {} timeouts; {} cached; prefetch {} sent, {} failed; {} stale",
+            "dns      : {} queries: {} local ({} hidden), {} cache hits, {} forwarded, {} merged, {} timeouts; {} cached; prefetch {} sent, {} failed; {} stale",
             st.queries,
             st.local_answers,
+            st.hidden,
             st.cache_hits,
             st.forwarded,
             st.merged,

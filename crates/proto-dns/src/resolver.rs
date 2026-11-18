@@ -46,7 +46,7 @@
 
 use crate::cache::{Cache, Key};
 use crate::wire::{self, Rdata};
-use crate::zone::{Lookup, Zone};
+use crate::zone::{Lookup, View, Zone};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, SocketAddr};
@@ -121,6 +121,9 @@ pub struct Stats {
     pub prefetch_failed: u64,
     /// Stale answers given (RFC 8767).
     pub stale_answers: u64,
+    /// Local names withheld from the asking network (answered NXDOMAIN;
+    /// also counted in `local_answers`).
+    pub hidden: u64,
 }
 
 /// An Extended DNS Error (RFC 8914): INFO-CODE and EXTRA-TEXT.
@@ -266,8 +269,18 @@ impl Resolver {
         }
     }
 
-    /// A query datagram from a LAN client.
+    /// A query datagram, answered as if every network asked
+    /// ([`View::ALL`]): tests and callers without views. The router's
+    /// services use [`Self::handle_query_in`].
     pub fn handle_query(&mut self, now_ms: u64, client: SocketAddr, query: &[u8]) -> Vec<Action> {
+        self.handle_query_in(now_ms, client, View::ALL, query)
+    }
+
+    /// A query datagram from a client of the network(s) `view`: the local
+    /// zone answers what that network may see (docs/dns-views.md); a name
+    /// it may not see is NXDOMAIN ([`Stats::hidden`]). Cache and upstream
+    /// do not depend on the view (local answers are never cached).
+    pub fn handle_query_in(&mut self, now_ms: u64, client: SocketAddr, view: View, query: &[u8]) -> Vec<Action> {
         let Ok(h) = wire::Header::parse(query) else {
             return Vec::new();
         };
@@ -287,7 +300,7 @@ impl Resolver {
         }
 
         // 1. Local zone (authoritative, never forwarded).
-        let local = match self.zone.lookup(&q.name, q.qtype) {
+        let local = match self.zone.lookup(&q.name, q.qtype, view) {
             Lookup::A(ips) => Some((
                 wire::RCODE_NOERROR,
                 ips.into_iter().map(|a| (Rdata::A(a), LOCAL_TTL)).collect(),
@@ -301,6 +314,10 @@ impl Resolver {
             )),
             Lookup::NoData => Some((wire::RCODE_NOERROR, Vec::new())),
             Lookup::NxDomain => Some((wire::RCODE_NXDOMAIN, Vec::new())),
+            Lookup::Hidden => {
+                self.stats.hidden += 1;
+                Some((wire::RCODE_NXDOMAIN, Vec::new()))
+            }
             Lookup::NotLocal => None,
         };
         if let Some((rcode, answers)) = local {
@@ -1220,5 +1237,64 @@ mod tests {
         let a = r.handle_upstream(5, UP1, &fail);
         let (_, d) = reply(&a);
         assert_eq!((wire::Header::parse(d).unwrap().id, &d[2..]), (0x4242, &fail[2..]));
+    }
+
+    // ---- views (docs/dns-views.md) ----
+
+    #[test]
+    fn hidden_local_name_is_nxdomain_and_never_forwarded() {
+        use crate::zone::View;
+        let (lan, guest) = (View::network(0), View::network(1));
+        let mut r = resolver();
+        r.zone_mut()
+            .add_in("lan", "laptop", Ipv4Addr::new(192, 168, 1, 100), Source::Dhcp, lan);
+        let q = build_query(1, "laptop.lan", TYPE_A);
+        let a = r.handle_query_in(0, client(1), lan, &q);
+        assert_eq!(rcode(reply(&a).1), RCODE_NOERROR);
+        assert_eq!(r.stats.hidden, 0);
+        let a = r.handle_query_in(0, client(1), guest, &q);
+        assert_eq!(rcode(reply(&a).1), RCODE_NXDOMAIN);
+        let ptr = build_query(2, "100.1.168.192.in-addr.arpa", TYPE_PTR);
+        let a = r.handle_query_in(0, client(1), guest, &ptr);
+        assert_eq!(rcode(reply(&a).1), RCODE_NXDOMAIN);
+        assert_eq!((r.stats.hidden, r.stats.forwarded), (2, 0));
+        // Control: without views the guest would get it.
+        let a = r.handle_query(0, client(1), &q);
+        assert_eq!(rcode(reply(&a).1), RCODE_NOERROR);
+    }
+
+    #[test]
+    fn override_answers_its_networks_and_others_go_upstream_with_rebind_protection() {
+        use crate::wire::TYPE_AAAA;
+        use crate::zone::View;
+        let (lan, guest) = (View::network(0), View::network(1));
+        let inside = Ipv4Addr::new(192, 168, 1, 200);
+        let mut r = resolver();
+        r.zone_mut().add_override("files.example.com", inside, lan);
+        let q = build_query(1, "files.example.com", TYPE_A);
+        let (_, d) = {
+            let a = r.handle_query_in(0, client(1), lan, &q);
+            let (to, d) = reply(&a);
+            (*to, d.to_vec())
+        };
+        assert_eq!(wire::answer_ipv4s(&d, &wire::records(&d).unwrap()), vec![inside]);
+        let a = r.handle_query_in(0, client(1), lan, &build_query(2, "files.example.com", TYPE_AAAA));
+        let (_, d) = reply(&a);
+        assert_eq!((rcode(d), wire::Header::parse(d).unwrap().ancount), (RCODE_NOERROR, 0));
+        assert_eq!(r.stats.forwarded, 0);
+        // The guest asks upstream; a private answer there is still refused.
+        let (_, up) = upstream(&r.handle_query_in(0, client(2), guest, &q));
+        let a = r.handle_upstream(1, UP1, &answer(&up, inside, 60));
+        assert_eq!(rcode(reply(&a).1), RCODE_REFUSED);
+        assert_eq!(r.stats.rebind_blocked, 1);
+        // A public answer is cached, but never served to the LAN.
+        let (_, up) = upstream(&r.handle_query_in(10, client(2), guest, &q));
+        r.handle_upstream(11, UP1, &answer(&up, Ipv4Addr::new(93, 184, 216, 34), 300));
+        let a = r.handle_query_in(20, client(1), lan, &q);
+        let (_, d) = reply(&a);
+        assert_eq!(wire::answer_ipv4s(d, &wire::records(d).unwrap()), vec![inside]);
+        let a = r.handle_query_in(20, client(2), guest, &q);
+        let (_, d) = reply(&a);
+        assert_eq!(wire::answer_ipv4s(d, &wire::records(d).unwrap()), vec![Ipv4Addr::new(93, 184, 216, 34)]);
     }
 }

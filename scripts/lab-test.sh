@@ -126,6 +126,21 @@
 #                        _ssh, plus the router's IGMP joins on both
 #                        networks. Negative control: LAB_MDNS_RULES=0 (the
 #                        rule disabled: every mDNS check fails).
+#   LAB_DNS_VIEWS=1      (implies LAB_GUEST=1) split-horizon local DNS
+#                        (docs/dns-views.md): dns.views = "firewall", a
+#                        name with one address per network (split.lan:
+#                        .50 on each) and an override of a public name for
+#                        the LAN only (files.isp.example -> the client).
+#                        Checks: from the guest, labclient.lan and its PTR
+#                        are NXDOMAIN (the guest zone cannot reach the LAN)
+#                        and the router's "hidden" counter rises, nas.lan
+#                        still resolves (rule guest-ping-nas reaches it);
+#                        split.lan answers per network; files.isp.example
+#                        is the client on the LAN and the ISP's answer on
+#                        the guest network. Negative controls:
+#                        LAB_DNS_VIEWS=0 (views "all": the hiding checks
+#                        fail), LAB_DNS_HOSTS=0 (no [[dns.host]]: split and
+#                        override fail), LAB_GUEST_RULES=0 (nas.lan hidden).
 #   LAB_DOT=1            DNS over TLS, strict (docs/dns-over-tls.md): the
 #                        router boots from a store with dns.tls, upstream
 #                        203.0.113.1#dns.isp.example and a CA made for this
@@ -196,6 +211,9 @@ MDNS="${LAB_MDNS:-}"
 MDNS_RULES="${LAB_MDNS_RULES:-1}"
 [[ -n "$MDNS" ]] && GUEST=1
 WAN_OPEN="${LAB_WAN_OPEN:-}"
+DNS_VIEWS="${LAB_DNS_VIEWS:-}"
+DNS_HOSTS="${LAB_DNS_HOSTS:-1}"
+[[ -n "$DNS_VIEWS" ]] && GUEST=1
 [[ -n "$WAN_OPEN" ]] && GUEST=1
 GUEST_ZONE="${LAB_GUEST_ZONE:-guest}"
 GUEST_RULES="${LAB_GUEST_RULES:-1}"
@@ -245,10 +263,22 @@ if [[ -n "$DOT" ]]; then
   cat "$ISP_INITRD" "$WORK/isp-dot.cpio.gz" >"$WORK/isp-initrd.img"
   ISP_INITRD="$WORK/isp-initrd.img"
 fi
-# The router's [dns] section for LAB_DOT=1.
-dot_toml() {
-  printf '\n[dns]\ntls = true\nupstreams = ["203.0.113.1#%s"]\n' "$DOT_NAME"
-  if [[ "$DOT_CA" == 1 ]]; then printf 'tls_ca = """\n'; cat "$WORK/dot/ca.pem"; printf '"""\n'; fi
+# The router's [dns] section: DNS over TLS (LAB_DOT=1), views and local
+# records (LAB_DNS_VIEWS); nothing without either.
+dns_toml() {
+  [[ -n "$DOT$DNS_VIEWS" ]] || return 0
+  printf '\n[dns]\n'
+  if [[ -n "$DOT" ]]; then
+    printf 'tls = true\nupstreams = ["203.0.113.1#%s"]\n' "$DOT_NAME"
+    if [[ "$DOT_CA" == 1 ]]; then printf 'tls_ca = """\n'; cat "$WORK/dot/ca.pem"; printf '"""\n'; fi
+  fi
+  [[ "$DNS_VIEWS" == 1 ]] && printf 'views = "firewall"\n'
+  if [[ -n "$DNS_VIEWS" && "$DNS_HOSTS" == 1 ]]; then
+    printf '\n[[dns.host]]\nname = "split"\nip = "192.168.1.50"\nnetworks = ["lan"]\n'
+    printf '\n[[dns.host]]\nname = "split"\nip = "10.20.0.50"\nnetworks = ["guest"]\n'
+    printf '\n[[dns.host]]\nname = "files.isp.example"\nip = "192.168.1.100"\nnetworks = ["lan"]\n'
+  fi
+  return 0
 }
 
 echo "== start ISP (203.0.113.1${ISP_VLAN:+ on VLAN $ISP_VLAN}${ISP_PPPOE:+, PPPoE $ISP_PPPOE}${DOT:+, DNS over TLS})"
@@ -341,7 +371,7 @@ from = "any"
 dst_port = 123
 to = "192.168.1.101"
 CFG
-  [[ -n "$DOT" ]] && dot_toml >>"$WORK/config.toml"
+  dns_toml >>"$WORK/config.toml"
   cargo build -q -p rrstore --release
   target/release/rrstore create "$WORK/store.img" --mib 32 >/dev/null
   target/release/rrstore put "$WORK/store.img" config "$WORK/config.toml" >/dev/null
@@ -360,7 +390,7 @@ CFG
   ROUTER_STORE="$WORK/store.img"
   # Live config changes (LAB_GUEST_LIVE, the recheck check) need it.
   ROUTER_ARGS="$ROUTER_ARGS mgmt_pass=lab-pass"
-  echo "== router config${GUEST_LIVE:+ (added live by the client)}: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")$([[ "$REDIRECT" == 1 ]] && echo ", NTP redirect")$([[ "$GUEST_DOMAIN" == 1 ]] && echo ", domain guest.lan")$([[ -n "$MDNS" ]] && echo ", mdns reflect (enabled: $MDNS_RULES)")"
+  echo "== router config${GUEST_LIVE:+ (added live by the client)}: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")$([[ "$REDIRECT" == 1 ]] && echo ", NTP redirect")$([[ "$GUEST_DOMAIN" == 1 ]] && echo ", domain guest.lan")$([[ -n "$MDNS" ]] && echo ", mdns reflect (enabled: $MDNS_RULES)")$([[ -n "$DNS_VIEWS" ]] && echo ", dns views $([[ "$DNS_VIEWS" == 1 ]] && echo firewall || echo all), dns hosts $DNS_HOSTS")"
 fi
 
 if [[ -n "$DOT" && -z "$GUEST" ]]; then
@@ -376,7 +406,7 @@ mac = "52:54:00:00:00:05"
 ip = "192.168.1.10"
 hostname = "nas"
 CFG
-  dot_toml >>"$WORK/config.toml"
+  dns_toml >>"$WORK/config.toml"
   cargo build -q -p rrstore --release
   target/release/rrstore create "$WORK/store.img" --mib 32 >/dev/null
   target/release/rrstore put "$WORK/store.img" config "$WORK/config.toml" >/dev/null
@@ -396,7 +426,7 @@ PIDS+=($!)
 
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so

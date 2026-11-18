@@ -634,15 +634,63 @@ fn dns(c: &Config, x: &mut Issues) {
         x.add("dns.host", format!("at most {MAX_DNS_HOSTS} records"));
     }
     upstreams(d, x);
-    let mut seen = BTreeMap::new();
-    for (i, h) in d.hosts.iter().enumerate() {
-        if !is_domain(&h.name) {
-            x.add(format!("dns.host[{i}].name"), "must be a DNS name");
+    dns_hosts(c, x);
+}
+
+/// `[[dns.host]]` (docs/dns-views.md §5): names, networks, overlaps.
+fn dns_hosts(c: &Config, x: &mut Issues) {
+    use crate::HostName;
+    let hosts = c.local_hosts();
+    for (i, (h, l)) in c.dns.hosts.iter().zip(&hosts).enumerate() {
+        let path = format!("dns.host[{i}]");
+        let mut seen = BTreeSet::new();
+        for (j, n) in h.networks.iter().enumerate() {
+            if c.network(n).is_none() {
+                x.add(format!("{path}.networks[{j}]"), format!("no network \"{n}\""));
+            } else if !seen.insert(n) {
+                x.add(format!("{path}.networks[{j}]"), format!("\"{n}\" is listed twice"));
+            }
         }
-        if let Some(j) = seen.insert(h.name.to_ascii_lowercase(), i) {
+        if !is_domain(&h.name) {
+            x.add(format!("{path}.name"), "must be a DNS name");
+            continue;
+        }
+        match &l.name {
+            HostName::Local { domain, label } if label.is_empty() => {
+                x.add(format!("{path}.name"), format!("\"{domain}\" is a local domain itself"));
+                continue;
+            }
+            HostName::Override(n) if n.ends_with(".arpa") => {
+                x.add(format!("{path}.name"), "reverse names are made from the records");
+                continue;
+            }
+            HostName::Override(_) if h.networks.is_empty() => x.add(
+                format!("{path}.networks"),
+                "a name outside the local domains overrides a public name: list the networks that get it",
+            ),
+            _ => {}
+        }
+        // Each name once per network.
+        let mask = |l: &crate::LocalHost| l.networks.unwrap_or(u32::MAX);
+        if let Some(j) = hosts[..i].iter().position(|o| o.name == l.name && mask(o) & mask(l) != 0) {
             x.add(
-                format!("dns.host[{i}].name"),
-                format!("\"{}\" is already in dns.host[{j}]", h.name),
+                format!("{path}.name"),
+                format!("\"{}\" is already in dns.host[{j}] for some of the same networks", h.name),
+            );
+        }
+        // A reservation's hostname: only for some networks (they take it over).
+        if let (HostName::Local { domain, label }, None) = (&l.name, l.networks)
+            && let Some(n) = c.networks.iter().find(|n| {
+                n.domain(&c.dns).eq_ignore_ascii_case(domain)
+                    && n.dhcp.statics.iter().any(|s| s.hostname.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(label)))
+            })
+        {
+            x.add(
+                format!("{path}.name"),
+                format!(
+                    "\"{}\" is a reservation's hostname in network {}: list the networks this record is for",
+                    h.name, n.name
+                ),
             );
         }
     }

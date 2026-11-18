@@ -29,11 +29,13 @@
 extern crate alloc;
 
 mod edit;
+mod names;
 mod types;
 pub mod v1;
 mod validate;
 
 pub use edit::{diff_lines, flat_lines};
+pub use names::{HostName, LocalHost, NameVisibility};
 pub use types::{Cidr, Mac, Net, PortRange, Target};
 pub use validate::Issue;
 pub use validate::{MAX_NETWORKS, MAX_VLAN_ID};
@@ -480,7 +482,12 @@ pub struct Dns {
     /// Local DNS zone of all networks: DHCP clients become
     /// `<hostname>.<domain>` (version 1: `lan.domain`).
     pub domain: String,
-    /// Local A records beside the DHCP names.
+    /// Which networks resolve each other's local names
+    /// (docs/dns-views.md): `all` (default) or by the `firewall`.
+    #[serde(skip_serializing_if = "DnsViews::is_all")]
+    pub views: DnsViews,
+    /// Local A records beside the DHCP names, and overrides of public
+    /// names for some networks.
     #[serde(rename = "host", skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<DnsHost>,
     /// Upstream resolvers instead of the WAN lease's, in order of
@@ -510,6 +517,7 @@ impl Default for Dns {
             prefetch: true,
             stale_secs: DEFAULT_STALE_SECS,
             domain: "lan".into(),
+            views: DnsViews::All,
             hosts: Vec::new(),
             upstreams: Vec::new(),
             tls: false,
@@ -580,9 +588,33 @@ impl Dns {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DnsHost {
-    /// A label (in `dns.domain`) or a full name.
+    /// A label (in `dns.domain`), a name in a local domain
+    /// (`nas.iot.home.arpa`), or a public name to override
+    /// (`files.example.com`, needs `networks`).
     pub name: String,
     pub ip: Ipv4Addr,
+    /// The networks that get this answer; empty = as `dns.views` decides
+    /// for the address (docs/dns-views.md).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub networks: Vec<String>,
+}
+
+/// `dns.views` (docs/dns-views.md §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsViews {
+    /// Every network resolves every local name (before views).
+    #[default]
+    All,
+    /// A network resolves the names of the networks its zone reaches
+    /// (same zone, `forward_to`, accept rules to the address).
+    Firewall,
+}
+
+impl DnsViews {
+    pub fn is_all(&self) -> bool {
+        *self == DnsViews::All
+    }
 }
 
 /// Egress AQM (`docs/bufferbloat-cake.md`).
@@ -997,6 +1029,9 @@ impl Config {
         if !self.dns.hosts.is_empty() {
             add("dns.host".into(), "local DNS records");
         }
+        if !self.dns.views.is_all() {
+            add("dns.views".into(), "DNS views");
+        }
         if !self.dns.upstreams.is_empty() {
             add("dns.upstreams".into(), "DNS servers of its own");
         }
@@ -1030,9 +1065,9 @@ impl Config {
     /// Settings this kernel does not implement yet (docs/config-v2.md §9):
     /// a save or a stored config with them is refused. Implemented:
     /// networks on `lan0` (untagged or VLANs), zones, DHCP per network,
-    /// rules, port forwards, redirects, mDNS reflection. Not yet: other ports
-    /// (bridging), DNS hosts,
-    /// another WAN port, a static WAN.
+    /// rules, port forwards, redirects, mDNS reflection, DNS hosts and
+    /// views. Not yet: other ports (bridging), another WAN port, a static
+    /// WAN.
     pub fn unsupported(&self) -> Vec<Issue> {
         let mut out = Vec::new();
         let mut add = |path: String, what: &str| {
@@ -1045,9 +1080,6 @@ impl Config {
             if n.ports.len() != 1 || n.ports[0] != PORT_LAN {
                 add(alloc::format!("network.{}.ports", n.name), "ports other than lan0");
             }
-        }
-        if !self.dns.hosts.is_empty() {
-            add("dns.host".into(), "local DNS records");
         }
         if self.wan.port != PORT_WAN {
             add("wan.port".into(), "a WAN port other than wan0");

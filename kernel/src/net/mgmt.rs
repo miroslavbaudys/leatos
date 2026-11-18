@@ -1326,13 +1326,14 @@ fn status_json(
         let (st, cached) = svc.dns_stats();
         let _ = write!(
             s,
-            ",\"dns\":{{\"source\":{},\"upstreams\":[{}],\"tls\":{},\"cached\":{},\"queries\":{},\"local\":{},\"cache_hits\":{},\"forwarded\":{},\"merged\":{},\"timeouts\":{},\"servfails\":{},\"rebind_blocked\":{},\"prefetches\":{},\"prefetch_failed\":{},\"stale_answers\":{}}}",
+            ",\"dns\":{{\"source\":{},\"upstreams\":[{}],\"tls\":{},\"cached\":{},\"queries\":{},\"local\":{},\"hidden\":{},\"cache_hits\":{},\"forwarded\":{},\"merged\":{},\"timeouts\":{},\"servfails\":{},\"rebind_blocked\":{},\"prefetches\":{},\"prefetch_failed\":{},\"stale_answers\":{}}}",
             json_str(svc.upstream_source()),
             ups.join(","),
             svc.dot_status_json().unwrap_or_else(|| "null".into()),
             cached,
             st.queries,
             st.local_answers,
+            st.hidden,
             st.cache_hits,
             st.forwarded,
             st.merged,

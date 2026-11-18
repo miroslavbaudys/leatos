@@ -1,11 +1,21 @@
 //! Local authoritative zone: one or more local domains (one per network,
 //! or shared), each with `router.<domain>`, static hosts and DHCP
-//! hostnames, plus reverse (PTR) records for them.
+//! hostnames, plus reverse (PTR) records for them, and overrides of
+//! single public names.
 //!
 //! Names under a local domain (and reverse lookups for the router's
 //! subnets) are **never forwarded** upstream: unknown ones get NXDOMAIN.
 //! Domains may nest (`home.arpa` and `iot.home.arpa`): a name belongs to
 //! the longest local domain it ends in.
+//!
+//! **Views** (split horizon, docs/dns-views.md): every record carries the
+//! set of networks it is answered to ([`View`]), and every lookup the
+//! network that asks. A name in a local domain without a record for the
+//! asking network is NXDOMAIN there ([`Lookup::Hidden`]); the same name may
+//! have other records (other addresses) for other networks. A static
+//! record wins over a DHCP one for the networks it covers. An override
+//! ([`Zone::add_override`]) is an exact name outside the local domains:
+//! answered to its networks, forwarded upstream for the others.
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -19,11 +29,71 @@ pub enum Source {
     Dhcp,
 }
 
+/// A set of networks: bit `k` = network `k` (config order), plus
+/// [`View::ROUTER`] for the router's own lookups. A record's view says who
+/// gets it; a query's view is the one network it came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct View(pub u32);
+
+impl View {
+    /// Every network and the router.
+    pub const ALL: View = View(u32::MAX);
+    /// The router's own lookups (SNTP server names, …).
+    pub const ROUTER: View = View(1 << 31);
+    /// Nobody.
+    pub const NONE: View = View(0);
+    /// Networks `0..MAX_NETWORKS` have a bit of their own.
+    pub const MAX_NETWORKS: usize = 31;
+
+    /// Network `k` (`k` < [`View::MAX_NETWORKS`]; larger ones get no bit).
+    pub const fn network(k: usize) -> View {
+        if k < Self::MAX_NETWORKS { View(1 << k) } else { View(0) }
+    }
+
+    pub const fn union(self, other: View) -> View {
+        View(self.0 | other.0)
+    }
+
+    pub const fn overlaps(self, other: View) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+/// One answer for a name, given to the networks in `seen_by`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Record {
+    ip: Ipv4Addr,
+    source: Source,
+    seen_by: View,
+}
+
+/// The record `view` gets from `recs`: static before DHCP, then the
+/// earliest added.
+fn effective(recs: &[Record], view: View) -> Option<&Record> {
+    let mut seen = recs.iter().filter(|r| r.seen_by.overlaps(view));
+    let first = seen.next()?;
+    if first.source == Source::Static {
+        return Some(first);
+    }
+    Some(seen.find(|r| r.source == Source::Static).unwrap_or(first))
+}
+
+/// Add `rec` to `recs`: it takes over its networks from the records of
+/// its source (a new lease, a changed static record, a `[[dns.host]]`
+/// over a reservation for some networks); they keep the others.
+fn put(recs: &mut Vec<Record>, rec: Record) {
+    for r in recs.iter_mut().filter(|r| r.source == rec.source) {
+        r.seen_by = View(r.seen_by.0 & !rec.seen_by.0);
+    }
+    recs.retain(|r| r.seen_by != View::NONE);
+    recs.push(rec);
+}
+
 /// One local domain and its hosts.
 struct Domain {
     name: String,
-    /// host label → (address, source)
-    hosts: BTreeMap<String, (Ipv4Addr, Source)>,
+    /// host label → its records
+    hosts: BTreeMap<String, Vec<Record>>,
 }
 
 pub struct Zone {
@@ -32,8 +102,11 @@ pub struct Zone {
     /// The router's subnets (address, prefix length): their reverse zones
     /// are local too.
     subnets: Vec<(Ipv4Addr, u8)>,
+    /// Exact names outside the local domains, answered to some networks.
+    overrides: BTreeMap<String, Vec<Record>>,
 }
 
+#[derive(Debug)]
 pub enum Lookup {
     /// The name is ours and has addresses / PTR targets.
     A(Vec<Ipv4Addr>),
@@ -42,6 +115,8 @@ pub enum Lookup {
     NoData,
     /// The name is in our zone but doesn't exist.
     NxDomain,
+    /// The name exists, but not for the asking network: answer NXDOMAIN.
+    Hidden,
     /// Not our zone: forward upstream.
     NotLocal,
 }
@@ -80,13 +155,15 @@ impl Zone {
         let mut z = Self {
             domains: Vec::new(),
             subnets: alloc::vec![subnet],
+            overrides: BTreeMap::new(),
         };
         z.add_domain(domain, router_ip);
         z
     }
 
-    /// Another local domain with `router.<domain>` = `router_ip`. A domain
-    /// that is already local keeps its hosts (and its router address).
+    /// Another local domain with `router.<domain>` = `router_ip` (for
+    /// everyone). A domain that is already local keeps its hosts (and its
+    /// router address).
     pub fn add_domain(&mut self, domain: &str, router_ip: Ipv4Addr) {
         let name = normalize(domain);
         if self.domains.iter().any(|d| d.name == name) {
@@ -96,7 +173,7 @@ impl Zone {
             name: name.clone(),
             hosts: BTreeMap::new(),
         });
-        self.add_in(&name, "router", router_ip, Source::Static);
+        self.add_in(&name, "router", router_ip, Source::Static, View::ALL);
     }
 
     /// Another subnet whose reverse zone is local (a second network).
@@ -109,7 +186,8 @@ impl Zone {
         &self.domains[0].name
     }
 
-    /// `name` (lowercase, no trailing dot) is in a local domain.
+    /// `name` (lowercase, no trailing dot) is in a local domain. Overrides
+    /// are not: upstream answers for them keep rebind protection.
     pub fn is_local_name(&self, name: &str) -> bool {
         self.domains.iter().any(|d| under(name, &d.name))
     }
@@ -119,27 +197,34 @@ impl Zone {
         self.domains.iter_mut().find(|d| d.name == name)
     }
 
-    /// Add or replace a host in the default domain.
+    /// Add or replace a host in the default domain, for everyone.
     pub fn add(&mut self, host: &str, ip: Ipv4Addr, source: Source) {
         let first = self.domains[0].name.clone();
-        self.add_in(&first, host, ip, source);
+        self.add_in(&first, host, ip, source, View::ALL);
     }
 
-    /// Add or replace a host in local domain `domain` (ignored if it is not
-    /// local). DHCP entries never override static ones.
-    pub fn add_in(&mut self, domain: &str, host: &str, ip: Ipv4Addr, source: Source) {
+    /// Add a host in local domain `domain` (ignored if it is not local),
+    /// answered to `seen_by`. It takes over those networks from the host's
+    /// records of the same source; for the networks a static record
+    /// covers, DHCP records stay unseen.
+    pub fn add_in(&mut self, domain: &str, host: &str, ip: Ipv4Addr, source: Source, seen_by: View) {
         let Some(d) = self.find_mut(domain) else {
             return;
         };
-        let host = host.to_ascii_lowercase();
-        if source == Source::Dhcp
-            && d.hosts
-                .get(&host)
-                .is_some_and(|(_, s)| *s == Source::Static)
-        {
+        let recs = d.hosts.entry(host.to_ascii_lowercase()).or_default();
+        put(recs, Record { ip, source, seen_by });
+    }
+
+    /// Override the public name `name` (exact, outside the local domains;
+    /// ignored otherwise) with `ip` for `seen_by`. Other networks resolve
+    /// it upstream.
+    pub fn add_override(&mut self, name: &str, ip: Ipv4Addr, seen_by: View) {
+        let name = normalize(name);
+        if name.is_empty() || self.is_local_name(&name) {
             return;
         }
-        d.hosts.insert(host, (ip, source));
+        let recs = self.overrides.entry(name).or_default();
+        put(recs, Record { ip, source: Source::Static, seen_by });
     }
 
     /// Remove a DHCP host from the default domain (only if it still points
@@ -149,14 +234,18 @@ impl Zone {
         self.remove_dhcp_in(&first, host, ip);
     }
 
-    /// Remove a DHCP host from `domain` (only if it still points at `ip`).
+    /// Remove a DHCP host from `domain` (only its records pointing at
+    /// `ip`).
     pub fn remove_dhcp_in(&mut self, domain: &str, host: &str, ip: Ipv4Addr) {
         let Some(d) = self.find_mut(domain) else {
             return;
         };
         let host = host.to_ascii_lowercase();
-        if d.hosts.get(&host) == Some(&(ip, Source::Dhcp)) {
-            d.hosts.remove(&host);
+        if let Some(recs) = d.hosts.get_mut(&host) {
+            recs.retain(|r| r.source != Source::Dhcp || r.ip != ip);
+            if recs.is_empty() {
+                d.hosts.remove(&host);
+            }
         }
     }
 
@@ -171,28 +260,37 @@ impl Zone {
         })
     }
 
-    /// Resolve `name` (lowercase, no trailing dot) for `qtype`.
-    pub fn lookup(&self, name: &str, qtype: u16) -> Lookup {
+    /// The names (`host.domain`) whose record for `view` is `ip`.
+    fn names_of(&self, ip: Ipv4Addr, view: View) -> Vec<String> {
+        self.domains
+            .iter()
+            .flat_map(|d| {
+                d.hosts
+                    .iter()
+                    .filter(move |(_, recs)| effective(recs, view).is_some_and(|r| r.ip == ip))
+                    .map(move |(h, _)| format!("{h}.{}", d.name))
+            })
+            .collect()
+    }
+
+    /// Resolve `name` (lowercase, no trailing dot) for `qtype`, asked from
+    /// `view` (one network, [`View::ROUTER`], or [`View::ALL`] to see
+    /// everything).
+    pub fn lookup(&self, name: &str, qtype: u16, view: View) -> Lookup {
         use crate::wire::{TYPE_A, TYPE_PTR};
         if let Some(ip) = parse_reverse(name) {
             if !self.in_subnet(ip) {
                 return Lookup::NotLocal;
             }
-            let names: Vec<String> = self
-                .domains
-                .iter()
-                .flat_map(|d| {
-                    d.hosts
-                        .iter()
-                        .filter(move |(_, (a, _))| *a == ip)
-                        .map(move |(h, _)| format!("{h}.{}", d.name))
-                })
-                .collect();
-            return match (names.is_empty(), qtype == TYPE_PTR) {
-                (true, _) => Lookup::NxDomain,
-                (false, true) => Lookup::Ptr(names),
-                (false, false) => Lookup::NoData,
-            };
+            let names = self.names_of(ip, view);
+            if names.is_empty() {
+                let anywhere = self
+                    .domains
+                    .iter()
+                    .any(|d| d.hosts.values().flatten().any(|r| r.ip == ip));
+                return if anywhere { Lookup::Hidden } else { Lookup::NxDomain };
+            }
+            return if qtype == TYPE_PTR { Lookup::Ptr(names) } else { Lookup::NoData };
         }
         // The longest local domain the name is in.
         let Some(d) = self
@@ -201,15 +299,24 @@ impl Zone {
             .filter(|d| under(name, &d.name))
             .max_by_key(|d| d.name.len())
         else {
-            return Lookup::NotLocal;
+            // An override, for its networks only; any other type is NoData
+            // there (a dual-stack client must not take the public AAAA).
+            return match self.overrides.get(name).and_then(|recs| effective(recs, view)) {
+                Some(r) if qtype == TYPE_A => Lookup::A(alloc::vec![r.ip]),
+                Some(_) => Lookup::NoData,
+                None => Lookup::NotLocal,
+            };
         };
         if name == d.name {
             return Lookup::NoData;
         }
         let host = &name[..name.len() - d.name.len() - 1];
         match d.hosts.get(host) {
-            Some((ip, _)) if qtype == TYPE_A => Lookup::A(alloc::vec![*ip]),
-            Some(_) => Lookup::NoData,
+            Some(recs) => match effective(recs, view) {
+                Some(r) if qtype == TYPE_A => Lookup::A(alloc::vec![r.ip]),
+                Some(_) => Lookup::NoData,
+                None => Lookup::Hidden,
+            },
             None => Lookup::NxDomain,
         }
     }
@@ -224,6 +331,8 @@ mod tests {
     use super::*;
     use crate::wire::{TYPE_A, TYPE_AAAA, TYPE_PTR};
 
+    const ALL: View = View::ALL;
+
     fn zone() -> Zone {
         let mut z = Zone::new(
             "lan",
@@ -234,26 +343,33 @@ mod tests {
         z
     }
 
+    fn a_of(z: &Zone, n: &str, view: View) -> Option<Ipv4Addr> {
+        match z.lookup(n, TYPE_A, view) {
+            Lookup::A(v) => Some(v[0]),
+            _ => None,
+        }
+    }
+
     #[test]
     fn forward_and_reverse() {
         let mut z = zone();
         z.add("laptop", Ipv4Addr::new(192, 168, 1, 100), Source::Dhcp);
         assert!(
-            matches!(z.lookup("nas.lan", TYPE_A), Lookup::A(v) if v == [Ipv4Addr::new(192, 168, 1, 10)])
+            matches!(z.lookup("nas.lan", TYPE_A, ALL), Lookup::A(v) if v == [Ipv4Addr::new(192, 168, 1, 10)])
         );
-        assert!(matches!(z.lookup("router.lan", TYPE_A), Lookup::A(_)));
-        assert!(matches!(z.lookup("nas.lan", TYPE_AAAA), Lookup::NoData));
-        assert!(matches!(z.lookup("ghost.lan", TYPE_A), Lookup::NxDomain));
-        assert!(matches!(z.lookup("example.com", TYPE_A), Lookup::NotLocal));
+        assert!(matches!(z.lookup("router.lan", TYPE_A, ALL), Lookup::A(_)));
+        assert!(matches!(z.lookup("nas.lan", TYPE_AAAA, ALL), Lookup::NoData));
+        assert!(matches!(z.lookup("ghost.lan", TYPE_A, ALL), Lookup::NxDomain));
+        assert!(matches!(z.lookup("example.com", TYPE_A, ALL), Lookup::NotLocal));
         assert!(
-            matches!(z.lookup("100.1.168.192.in-addr.arpa", TYPE_PTR), Lookup::Ptr(v) if v == ["laptop.lan"])
+            matches!(z.lookup("100.1.168.192.in-addr.arpa", TYPE_PTR, ALL), Lookup::Ptr(v) if v == ["laptop.lan"])
         );
         assert!(matches!(
-            z.lookup("200.1.168.192.in-addr.arpa", TYPE_PTR),
+            z.lookup("200.1.168.192.in-addr.arpa", TYPE_PTR, ALL),
             Lookup::NxDomain
         ));
         assert!(matches!(
-            z.lookup("8.8.8.8.in-addr.arpa", TYPE_PTR),
+            z.lookup("8.8.8.8.in-addr.arpa", TYPE_PTR, ALL),
             Lookup::NotLocal
         ));
         assert_eq!(
@@ -266,27 +382,24 @@ mod tests {
     fn dhcp_cannot_hijack_static_and_removal_is_exact() {
         let mut z = zone();
         z.add("nas", Ipv4Addr::new(192, 168, 1, 150), Source::Dhcp);
-        assert!(
-            matches!(z.lookup("nas.lan", TYPE_A), Lookup::A(v) if v == [Ipv4Addr::new(192, 168, 1, 10)])
-        );
+        assert_eq!(a_of(&z, "nas.lan", ALL), Some(Ipv4Addr::new(192, 168, 1, 10)));
         z.add("pc", Ipv4Addr::new(192, 168, 1, 101), Source::Dhcp);
         z.remove_dhcp("pc", Ipv4Addr::new(192, 168, 1, 199)); // stale removal: ignored
-        assert!(matches!(z.lookup("pc.lan", TYPE_A), Lookup::A(_)));
+        assert!(matches!(z.lookup("pc.lan", TYPE_A, ALL), Lookup::A(_)));
         z.remove_dhcp("pc", Ipv4Addr::new(192, 168, 1, 101));
-        assert!(matches!(z.lookup("pc.lan", TYPE_A), Lookup::NxDomain));
+        assert!(matches!(z.lookup("pc.lan", TYPE_A, ALL), Lookup::NxDomain));
     }
 
     #[test]
     fn reverse_zones_of_every_subnet_are_local() {
-        use crate::wire::TYPE_PTR;
         let mut z = Zone::new("lan", Ipv4Addr::new(10, 10, 0, 1), (Ipv4Addr::new(10, 10, 0, 1), 24));
         z.add("tv", Ipv4Addr::new(10, 20, 0, 5), Source::Dhcp);
         let q = Zone::reverse_of(Ipv4Addr::new(10, 20, 0, 5));
-        assert!(matches!(z.lookup(&q, TYPE_PTR), Lookup::NotLocal));
+        assert!(matches!(z.lookup(&q, TYPE_PTR, ALL), Lookup::NotLocal));
         z.add_subnet((Ipv4Addr::new(10, 20, 0, 1), 24));
-        assert!(matches!(z.lookup(&q, TYPE_PTR), Lookup::Ptr(_)));
+        assert!(matches!(z.lookup(&q, TYPE_PTR, ALL), Lookup::Ptr(_)));
         let other = Zone::reverse_of(Ipv4Addr::new(10, 20, 0, 6));
-        assert!(matches!(z.lookup(&other, TYPE_PTR), Lookup::NxDomain));
+        assert!(matches!(z.lookup(&other, TYPE_PTR, ALL), Lookup::NxDomain));
     }
 
     #[test]
@@ -296,33 +409,148 @@ mod tests {
         z.add_subnet((Ipv4Addr::new(192, 168, 2, 1), 24));
         z.add_domain("home.arpa", Ipv4Addr::new(10, 0, 0, 1)); // already local: kept
         z.add("pc", Ipv4Addr::new(192, 168, 1, 100), Source::Dhcp);
-        z.add_in("iot.home.arpa", "boiler", Ipv4Addr::new(192, 168, 2, 82), Source::Static);
-        z.add_in("other.example", "x", Ipv4Addr::new(192, 168, 2, 9), Source::Static); // not local
-        fn a_of(z: &Zone, n: &str) -> Option<Ipv4Addr> {
-            match z.lookup(n, TYPE_A) {
-                Lookup::A(v) => Some(v[0]),
-                _ => None,
-            }
-        }
-        assert_eq!(a_of(&z, "router.home.arpa"), Some(Ipv4Addr::new(192, 168, 1, 1)));
-        assert_eq!(a_of(&z, "router.iot.home.arpa"), Some(Ipv4Addr::new(192, 168, 2, 1)));
-        assert_eq!(a_of(&z, "boiler.iot.home.arpa"), Some(Ipv4Addr::new(192, 168, 2, 82)));
-        assert_eq!(a_of(&z, "pc.home.arpa"), Some(Ipv4Addr::new(192, 168, 1, 100)));
+        z.add_in("iot.home.arpa", "boiler", Ipv4Addr::new(192, 168, 2, 82), Source::Static, ALL);
+        z.add_in("other.example", "x", Ipv4Addr::new(192, 168, 2, 9), Source::Static, ALL); // not local
+        assert_eq!(a_of(&z, "router.home.arpa", ALL), Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(a_of(&z, "router.iot.home.arpa", ALL), Some(Ipv4Addr::new(192, 168, 2, 1)));
+        assert_eq!(a_of(&z, "boiler.iot.home.arpa", ALL), Some(Ipv4Addr::new(192, 168, 2, 82)));
+        assert_eq!(a_of(&z, "pc.home.arpa", ALL), Some(Ipv4Addr::new(192, 168, 1, 100)));
         // Each name in its own domain only.
-        assert!(matches!(z.lookup("boiler.home.arpa", TYPE_A), Lookup::NxDomain));
-        assert!(matches!(z.lookup("pc.iot.home.arpa", TYPE_A), Lookup::NxDomain));
-        assert!(matches!(z.lookup("iot.home.arpa", TYPE_A), Lookup::NoData));
-        assert!(matches!(z.lookup("x.other.example", TYPE_A), Lookup::NotLocal));
+        assert!(matches!(z.lookup("boiler.home.arpa", TYPE_A, ALL), Lookup::NxDomain));
+        assert!(matches!(z.lookup("pc.iot.home.arpa", TYPE_A, ALL), Lookup::NxDomain));
+        assert!(matches!(z.lookup("iot.home.arpa", TYPE_A, ALL), Lookup::NoData));
+        assert!(matches!(z.lookup("x.other.example", TYPE_A, ALL), Lookup::NotLocal));
         assert!(z.is_local_name("a.iot.home.arpa") && z.is_local_name("home.arpa"));
         assert!(!z.is_local_name("xhome.arpa") && !z.is_local_name("example.com"));
         let ptr = Zone::reverse_of(Ipv4Addr::new(192, 168, 2, 82));
-        assert!(matches!(z.lookup(&ptr, TYPE_PTR), Lookup::Ptr(v) if v == ["boiler.iot.home.arpa"]));
+        assert!(matches!(z.lookup(&ptr, TYPE_PTR, ALL), Lookup::Ptr(v) if v == ["boiler.iot.home.arpa"]));
         // Removal is per domain.
-        z.add_in("iot.home.arpa", "pc", Ipv4Addr::new(192, 168, 2, 100), Source::Dhcp);
+        z.add_in("iot.home.arpa", "pc", Ipv4Addr::new(192, 168, 2, 100), Source::Dhcp, ALL);
         z.remove_dhcp("pc", Ipv4Addr::new(192, 168, 2, 100)); // wrong domain: no effect
-        assert_eq!(a_of(&z, "pc.iot.home.arpa"), Some(Ipv4Addr::new(192, 168, 2, 100)));
+        assert_eq!(a_of(&z, "pc.iot.home.arpa", ALL), Some(Ipv4Addr::new(192, 168, 2, 100)));
         z.remove_dhcp_in("iot.home.arpa", "pc", Ipv4Addr::new(192, 168, 2, 100));
-        assert!(matches!(z.lookup("pc.iot.home.arpa", TYPE_A), Lookup::NxDomain));
-        assert_eq!(a_of(&z, "pc.home.arpa"), Some(Ipv4Addr::new(192, 168, 1, 100)));
+        assert!(matches!(z.lookup("pc.iot.home.arpa", TYPE_A, ALL), Lookup::NxDomain));
+        assert_eq!(a_of(&z, "pc.home.arpa", ALL), Some(Ipv4Addr::new(192, 168, 1, 100)));
+    }
+
+    // ---- views (docs/dns-views.md) ----
+
+    const LAN: View = View::network(0);
+    const GUEST: View = View::network(1);
+    const IOT: View = View::network(2);
+
+    /// lan 192.168.1.0/24 (network 0), guest 192.168.20.0/24 (1), iot
+    /// 192.168.2.0/24 (2), all in `lan`.
+    fn three() -> Zone {
+        let mut z = zone();
+        z.add_subnet((Ipv4Addr::new(192, 168, 20, 1), 24));
+        z.add_subnet((Ipv4Addr::new(192, 168, 2, 1), 24));
+        z
+    }
+
+    #[test]
+    fn view_hides_a_name_forward_and_reverse() {
+        let mut z = three();
+        let ip = Ipv4Addr::new(192, 168, 1, 100);
+        z.add_in("lan", "laptop", ip, Source::Dhcp, LAN.union(IOT));
+        assert_eq!(a_of(&z, "laptop.lan", LAN), Some(ip));
+        assert_eq!(a_of(&z, "laptop.lan", IOT), Some(ip));
+        assert!(matches!(z.lookup("laptop.lan", TYPE_A, GUEST), Lookup::Hidden));
+        assert!(matches!(z.lookup("laptop.lan", TYPE_AAAA, GUEST), Lookup::Hidden));
+        let ptr = Zone::reverse_of(ip);
+        assert!(matches!(z.lookup(&ptr, TYPE_PTR, LAN), Lookup::Ptr(v) if v == ["laptop.lan"]));
+        assert!(matches!(z.lookup(&ptr, TYPE_PTR, GUEST), Lookup::Hidden));
+        // Unknown stays NXDOMAIN (not Hidden), for every view.
+        assert!(matches!(z.lookup("ghost.lan", TYPE_A, GUEST), Lookup::NxDomain));
+        let none = Zone::reverse_of(Ipv4Addr::new(192, 168, 1, 222));
+        assert!(matches!(z.lookup(&none, TYPE_PTR, GUEST), Lookup::NxDomain));
+        // The router's own lookups and ALL see it.
+        assert_eq!(a_of(&z, "laptop.lan", View::ROUTER.union(LAN)), Some(ip));
+        assert_eq!(a_of(&z, "laptop.lan", ALL), Some(ip));
+        assert!(matches!(z.lookup("laptop.lan", TYPE_A, View::ROUTER), Lookup::Hidden));
+        // `router.<domain>` is everyone's.
+        assert!(a_of(&z, "router.lan", GUEST).is_some());
+    }
+
+    #[test]
+    fn same_name_other_answer_per_view() {
+        let mut z = three();
+        let (a, b) = (Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(192, 168, 2, 10));
+        z.add_in("lan", "srv", a, Source::Static, LAN);
+        z.add_in("lan", "srv", b, Source::Static, IOT.union(GUEST));
+        assert_eq!(a_of(&z, "srv.lan", LAN), Some(a));
+        assert_eq!(a_of(&z, "srv.lan", IOT), Some(b));
+        assert_eq!(a_of(&z, "srv.lan", GUEST), Some(b));
+        // A newer static record takes over its networks only.
+        let c = Ipv4Addr::new(192, 168, 2, 11);
+        z.add_in("lan", "srv", c, Source::Static, IOT);
+        assert_eq!(a_of(&z, "srv.lan", IOT), Some(c));
+        assert_eq!(a_of(&z, "srv.lan", LAN), Some(a));
+        assert_eq!(a_of(&z, "srv.lan", GUEST), Some(b));
+        // Taking over every network of a record removes it.
+        z.add_in("lan", "srv", a, Source::Static, LAN.union(GUEST));
+        assert_eq!(a_of(&z, "srv.lan", GUEST), Some(a));
+        assert!(!matches!(z.lookup(&Zone::reverse_of(b), TYPE_PTR, ALL), Lookup::Ptr(_)));
+        // PTR per view.
+        let ptr = Zone::reverse_of(c);
+        assert!(matches!(z.lookup(&ptr, TYPE_PTR, IOT), Lookup::Ptr(v) if v == ["srv.lan"]));
+        assert!(matches!(z.lookup(&ptr, TYPE_PTR, LAN), Lookup::Hidden));
+    }
+
+    #[test]
+    fn static_wins_over_dhcp_only_within_its_view() {
+        let mut z = three();
+        let (st, dh) = (Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(192, 168, 1, 150));
+        z.add_in("lan", "box", st, Source::Static, LAN);
+        z.add_in("lan", "box", dh, Source::Dhcp, ALL);
+        assert_eq!(a_of(&z, "box.lan", LAN), Some(st));
+        assert_eq!(a_of(&z, "box.lan", IOT), Some(dh));
+        // Order of adding does not matter.
+        let mut y = three();
+        y.add_in("lan", "box", dh, Source::Dhcp, ALL);
+        y.add_in("lan", "box", st, Source::Static, LAN);
+        assert_eq!(a_of(&y, "box.lan", LAN), Some(st));
+        assert_eq!(a_of(&y, "box.lan", IOT), Some(dh));
+        // The shadowed DHCP address has no PTR where the static one wins.
+        let ptr = Zone::reverse_of(dh);
+        assert!(matches!(y.lookup(&ptr, TYPE_PTR, LAN), Lookup::Hidden));
+        assert!(matches!(y.lookup(&ptr, TYPE_PTR, IOT), Lookup::Ptr(_)));
+        // Removing the lease leaves the static record.
+        y.remove_dhcp_in("lan", "box", dh);
+        assert_eq!(a_of(&y, "box.lan", LAN), Some(st));
+        assert!(matches!(y.lookup("box.lan", TYPE_A, IOT), Lookup::Hidden));
+    }
+
+    #[test]
+    fn dhcp_lease_in_two_networks_of_one_domain() {
+        let mut z = three();
+        let (a, b) = (Ipv4Addr::new(192, 168, 1, 50), Ipv4Addr::new(192, 168, 2, 50));
+        z.add_in("lan", "phone", a, Source::Dhcp, LAN);
+        z.add_in("lan", "phone", b, Source::Dhcp, IOT);
+        assert_eq!(a_of(&z, "phone.lan", LAN), Some(a));
+        assert_eq!(a_of(&z, "phone.lan", IOT), Some(b));
+        z.remove_dhcp_in("lan", "phone", a);
+        assert!(matches!(z.lookup("phone.lan", TYPE_A, LAN), Lookup::Hidden));
+        assert_eq!(a_of(&z, "phone.lan", IOT), Some(b));
+        z.remove_dhcp_in("lan", "phone", b);
+        assert!(matches!(z.lookup("phone.lan", TYPE_A, IOT), Lookup::NxDomain));
+    }
+
+    #[test]
+    fn override_of_a_public_name() {
+        let mut z = three();
+        let ip = Ipv4Addr::new(192, 168, 1, 200);
+        z.add_override("Files.Example.com.", ip, LAN);
+        assert_eq!(a_of(&z, "files.example.com", LAN), Some(ip));
+        assert!(matches!(z.lookup("files.example.com", TYPE_AAAA, LAN), Lookup::NoData));
+        // Others go upstream; exact name only; not a local name.
+        assert!(matches!(z.lookup("files.example.com", TYPE_A, GUEST), Lookup::NotLocal));
+        assert!(matches!(z.lookup("files.example.com", TYPE_AAAA, GUEST), Lookup::NotLocal));
+        assert!(matches!(z.lookup("a.files.example.com", TYPE_A, LAN), Lookup::NotLocal));
+        assert!(matches!(z.lookup("example.com", TYPE_A, LAN), Lookup::NotLocal));
+        assert!(!z.is_local_name("files.example.com"));
+        // Under a local domain it is not an override (use add_in).
+        z.add_override("x.lan", ip, LAN);
+        assert!(matches!(z.lookup("x.lan", TYPE_A, LAN), Lookup::NxDomain));
     }
 }

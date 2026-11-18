@@ -449,6 +449,37 @@ if [ -n "$guest" ]; then
     else
       pass "guest: router web interface blocked (input policy)"
     fi
+    # Split-horizon DNS (docs/dns-views.md, LAB_DNS_VIEWS): what each
+    # network may resolve. lab_dns_views=1: dns.views = "firewall" (0 = the
+    # negative control, "all"); lab_dns_hosts=1: split.lan per network and
+    # files.isp.example overridden for the LAN (0 = the control: none).
+    dviews=$($bb sed -n 's/.*lab_dns_views=\([01]\).*/\1/p' /proc/cmdline)
+    if [ -n "$dviews" ]; then
+      nx() { echo "$1" | $bb grep -q "NXDOMAIN\|can't find"; }
+      dnsstat; hid0=$(dnsc hidden)
+      out=$(gl labclient.lan)
+      if nx "$out"; then pass "views: labclient.lan hidden from the guest (NXDOMAIN)"; else fail "views: labclient.lan resolved from the guest"; echo "$out" | $bb sed 's/^/    | /'; fi
+      out=$(gl 192.168.1.100)
+      if nx "$out"; then pass "views: PTR of 192.168.1.100 hidden from the guest"; else fail "views: PTR of 192.168.1.100 answered to the guest"; echo "$out" | $bb sed 's/^/    | /'; fi
+      dnsstat; hid1=$(dnsc hidden)
+      if [ -n "$hid1" ] && [ "$hid1" -ge $((${hid0:-0} + 2)) ]; then pass "views: router hidden counter ${hid0:-?} -> $hid1"; else fail "views: router hidden counter ${hid0:-?} -> ${hid1:-?} (expected +2)"; fi
+      out=$(gl nas.lan)
+      if echo "$out" | $bb grep -v "^Server" | $bb grep -q "192.168.1.10$"; then pass "views: nas.lan visible to the guest (rule guest-ping-nas reaches it)"; else fail "views: nas.lan from the guest"; echo "$out" | $bb sed 's/^/    | /'; fi
+      out=$($bb nslookup labclient.lan 192.168.1.1 2>&1)
+      if echo "$out" | $bb grep -q "$ip"; then pass "views: labclient.lan still resolves on the LAN"; else fail "views: labclient.lan on the LAN"; echo "$out" | $bb sed 's/^/    | /'; fi
+      out_l=$($bb nslookup split.lan 192.168.1.1 2>&1); out_g=$(gl split.lan)
+      if echo "$out_l" | $bb grep -q "192.168.1.50" && echo "$out_g" | $bb grep -q "10.20.0.50" && ! echo "$out_g" | $bb grep -q "192.168.1.50"; then
+        pass "views: split.lan -> 192.168.1.50 on the LAN, 10.20.0.50 on the guest"
+      else
+        fail "views: split.lan per network"; { echo "$out_l"; echo "$out_g"; } | $bb sed 's/^/    | /'
+      fi
+      out_l=$($bb nslookup files.isp.example 192.168.1.1 2>&1); out_g=$(gl files.isp.example)
+      if echo "$out_l" | $bb grep -v "^Server" | $bb grep -q "192.168.1.100$" && echo "$out_g" | $bb grep -q "203.0.113.83"; then
+        pass "views: files.isp.example overridden on the LAN (client), the ISP's 203.0.113.83 on the guest"
+      else
+        fail "views: files.isp.example override"; { echo "$out_l"; echo "$out_g"; } | $bb sed 's/^/    | /'
+      fi
+    fi
     before=$(fwdrops)
     $bb ping -c 3 -W 1 -I "$gip" 192.168.1.20 >/dev/null 2>&1
     after=$(fwdrops)

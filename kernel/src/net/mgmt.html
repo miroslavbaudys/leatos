@@ -295,6 +295,16 @@
         <label>Extra trust anchors (PEM, for a private server; usually empty)<textarea id="dnsca" data-x data-path="dns.tls_ca" rows="3" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----"></textarea></label>
       </form>
     </div>
+    <form class="card cfg" autocomplete="off" id="dnshostform"><h3>Local names</h3>
+      <label>Which networks resolve which local names<select data-path="dns.views" data-default="all">
+        <option value="all">All: every network resolves every local name</option>
+        <option value="firewall">By the firewall: a network resolves only the names of devices its zone can reach</option></select></label>
+      <p class="hint">Local names are DHCP host names, reservations and the names below. <b>By the firewall</b>: a network sees the names of its own zone, of the zones it may open connections to, and of devices an accept rule lets it reach; other names answer "no such name", forward and reverse. Guests then cannot list your devices.</p>
+      <div class="tw"><table id="dnshosts"></table></div>
+      <div class="row"><button type="button" id="adddnshost" class="plain">Add name</button>
+        <span class="hint">A name without a dot is in the local domain (<i>nas</i> = nas.<span id="dnsdom">lan</span>); a longer one in the local domain it ends in. Any other name (<i>files.example.com</i>) overrides the public name for the networks checked; the others get the public answer. Check networks to give one name another address per network; none checked = as chosen above.</span></div>
+      <div id="dnshostwarn"></div>
+    </form>
   </section>
 
   <!-- ================= Firewall ================= -->
@@ -786,8 +796,10 @@ async function refresh() {
   const tls = (d?.tls ?? []).map((t) => [`TLS ${esc(t.server)}`, esc(t.state) + (t.tls ? ` · ${esc(t.tls)}` : "")
     + ` · ${n(t.queries)} queries, ${n(t.answers)} answers, ${n(t.connects)} connects` + (t.failures ? `, ${n(t.failures)} failures` : "")
     + (t.dropped ? `, ${n(t.dropped)} dropped while failing` : "") + (t.error ? ` · last error: ${esc(t.error)}` : "")]);
+  const views = cfgOrig?.dns?.views === "firewall" ? "by the firewall" : "all networks see all";
   $("dnsst").innerHTML = rows([["Upstream", ups], ...tls,
-    ["Local names", `DHCP host names and reservations, as <i>name</i>.${esc(cfgOrig?.dns?.domain ?? "lan")}`]]);
+    ["Local names", `DHCP host names, reservations and ${n((cfgOrig?.dns?.host ?? []).length)} record(s), as <i>name</i>.${esc(cfgOrig?.dns?.domain ?? "lan")}; ${views}`],
+    ...(d ? [["Answers", `${n(d.local)} local · ${n(d.hidden ?? 0)} hidden from the asking network · ${n(d.cache_hits)} from the cache · ${n(d.forwarded)} forwarded`]] : [])]);
 
   // Firewall
   const dr = st.drop_reasons ?? {};
@@ -962,6 +974,8 @@ function fillForm(c) {
   renderFwds(c.firewall?.forward ?? []);
   renderRedirs(c.firewall?.redirect ?? []);
   renderMdns(c.mdns?.reflect ?? []);
+  renderHosts(c.dns?.host ?? []);
+  $("dnsdom").textContent = c.dns?.domain ?? "lan";
 }
 function readForm() {
   const c = structuredClone(cfgOrig);
@@ -981,6 +995,9 @@ function readForm() {
   if (!Object.keys(c.firewall).length) delete c.firewall;
   const md = readMdns();
   if (md.length) c.mdns = { ...(c.mdns ?? {}), reflect: md }; else delete c.mdns;
+  const hs = readHosts();
+  c.dns = { ...(c.dns ?? {}) };
+  if (hs.length) c.dns.host = hs; else delete c.dns.host;
   for (const e of fields()) {
     let v;
     if (e.type === "checkbox") v = e.checked;
@@ -997,6 +1014,7 @@ function readForm() {
   setp(c, "dns.upstreams", ups.length ? ups : undefined);
   setp(c, "dns.tls_ca", $("dnsca").value.trim() ? $("dnsca").value.trim() + "\n" : undefined);
   if (!c.dns?.tls) setp(c, "dns.tls", undefined);
+  if (c.dns?.views === "all") setp(c, "dns.views", undefined); // the default: left out
   const sts = readStatics();
   setp(c, lanPath("dhcp.static"), sts.length ? sts : undefined);
   // A new password only when both fields agree.
@@ -1469,6 +1487,65 @@ $("addmdns").onclick = () => {
 };
 $("mdns").addEventListener("input", mdnsPaths);
 
+// ---- Local DNS names (docs/dns-views.md): [[dns.host]], by index (as the
+// router's validation names them: dns.host[2].name).
+let hostsOrig = [];
+function renderHosts(list) {
+  hostsOrig = list.map((h) => structuredClone(h));
+  const nets = netNames();
+  const t = $("dnshosts");
+  const box = (v, on, label) => el("label", { className: "check", style: "display:inline-flex;margin:0 8px 0 0" }, [el("input", { type: "checkbox", value: v, checked: on }), label]);
+  t.replaceChildren(el("tr", {}, ["Name", "Address", "Answered to", ""].map((h) => el("th", { textContent: h }))));
+  list.forEach((h, i) => {
+    const tr = el("tr", { dataset: { orig: String(i) } });
+    const to = el("td", { dataset: { key: "networks" } }, nets.map((x) => box(x, (h.networks ?? []).includes(x), x)));
+    for (const g of (h.networks ?? []).filter((x) => !nets.includes(x))) to.append(box(g, true, g + " (gone)"));
+    tr.append(el("td", {}, [el("input", { value: h.name ?? "", placeholder: "nas", size: 22, dataset: { key: "name" } })]),
+      el("td", {}, [el("input", { value: h.ip ?? "", placeholder: "192.168.1.10", size: 14, dataset: { key: "ip" } })]),
+      to,
+      el("td", {}, [el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); hostPaths(); updatePending(); } })]));
+    t.append(tr);
+  });
+  hostPaths();
+}
+function hostPaths() {
+  [...$("dnshosts").rows].slice(1).forEach((tr, i) => {
+    for (const e of tr.querySelectorAll("[data-key]")) e.dataset.path = `dns.host[${i}].${e.dataset.key}`;
+  });
+}
+function readHosts() {
+  if (!$("dnshosts").rows.length) return cfgOrig?.dns?.host ?? [];
+  return [...$("dnshosts").rows].slice(1).map((tr) => {
+    const o = structuredClone(hostsOrig[Number(tr.dataset.orig)] ?? {});
+    const v = (k) => tr.querySelector(`[data-key="${k}"]`);
+    o.name = v("name").value.trim();
+    o.ip = v("ip").value.trim();
+    const ns = [...v("networks").querySelectorAll("input:checked")].map((b) => b.value);
+    if (ns.length) o.networks = ns; else delete o.networks;
+    return o;
+  });
+}
+// Before saving: names outside the local domains override public names.
+function renderHostWarn(c) {
+  const doms = [c.dns?.domain ?? "lan", ...(c.network ?? []).map((x) => x.domain).filter((d) => d)].map((d) => d.toLowerCase());
+  const out = [];
+  for (const h of c.dns?.host ?? []) {
+    const name = (h.name ?? "").toLowerCase();
+    if (!name.includes(".") || doms.some((d) => name === d || name.endsWith("." + d))) continue;
+    out.push(h.networks?.length
+      ? `${h.name}: not in a local domain, so it overrides the public name on ${h.networks.join(", ")}. Devices that check DNSSEC for it refuse the local answer.`
+      : `${h.name}: not in a local domain, so it overrides a public name: check the networks that get it (the router refuses it for everyone).`);
+  }
+  $("dnshostwarn").replaceChildren(...out.map((m) => el("p", { className: "hint warn", textContent: m })));
+}
+$("adddnshost").onclick = () => {
+  const hs = readHosts();
+  hs.push({ name: "", ip: "" });
+  renderHosts(hs);
+  [...$("dnshosts").rows].at(-1).querySelector('[data-key="name"]').focus();
+  updatePending();
+};
+
 // Zone matrix of the working copy: who may open connections to whom.
 function renderMatrix(c) {
   const defs = c.zone ?? [];
@@ -1516,7 +1593,7 @@ function changes() {
 }
 function updatePending() {
   const ch = changes();
-  if (cfgOrig) { const c = readForm(); renderMatrix(c); renderMdnsWarn(c); }
+  if (cfgOrig) { const c = readForm(); renderMatrix(c); renderMdnsWarn(c); renderHostWarn(c); }
   $("pending").hidden = !ch.length && !$("pmsg").textContent;
   $("pcount").textContent = ch.length ? `${ch.length} unsaved change${ch.length > 1 ? "s" : ""}` : "";
   const blocked = !st?.store ? "no store: changes cannot be saved" : st?.trial ? "confirm or revert the trial first"

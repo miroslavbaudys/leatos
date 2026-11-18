@@ -974,7 +974,7 @@ fn written_as_version_1_while_it_fits() {
         ("network.lan.vlan", |c| c.networks[0].vlan = 5),
         ("network.lan.dhcp.enabled", |c| c.networks[0].dhcp.enabled = false),
         ("zone", |c| c.zones.push(Zone { name: "guest".into(), ..Zone::builtin_lan() })),
-        ("dns.host", |c| c.dns.hosts.push(DnsHost { name: "x".into(), ip: ip(10, 0, 0, 1) })),
+        ("dns.host", |c| c.dns.hosts.push(DnsHost { name: "x".into(), ip: ip(10, 0, 0, 1), networks: vec![] })),
         ("wan.static", |c| {
             c.wan.mode = WanMode::Static;
             c.wan.static_ip = Some(WanStatic { ipv4: Cidr::new(ip(203, 0, 113, 2), 30), gateway: ip(203, 0, 113, 1), dns: vec![] });
@@ -1262,12 +1262,9 @@ fn v2_value_types() {
 #[test]
 fn what_the_kernel_supports() {
     // Networks on lan0, VLANs, zones, DHCP off: supported.
-    let mut c = parse(FULL_V2).unwrap();
-    c.dns.hosts.clear();
+    let c = parse(FULL_V2).unwrap();
     assert_eq!(c.unsupported(), vec![]);
-    // Not yet: DNS hosts, other ports, static WAN (rules, forwards are in).
-    let p = parse(FULL_V2).unwrap().unsupported().into_iter().map(|i| i.path).collect::<Vec<_>>();
-    assert_eq!(p, ["dns.host"]);
+    // Not yet: other ports, static WAN (rules, forwards, DNS hosts are in).
     let mut d = c.clone();
     d.networks[1].ports = vec!["lan1".into()];
     assert_eq!(d.unsupported()[0].path, "network.guest.ports");
@@ -1480,4 +1477,204 @@ fn network_domain() {
     let d = c.with_assignment(r#"network.iot.domain = "iot.home""#).unwrap();
     assert_eq!(d.networks[2].domain(&d.dns), "iot.home");
     assert_eq!(d.without("network.iot.domain").unwrap().networks[2].domain, None);
+}
+
+// ---- DNS views (docs/dns-views.md) ----
+
+/// The home topology (target/apu4/config-home.toml, trimmed): lan sees
+/// everything, iot has no forwarding but a rule to Home Assistant,
+/// powerstream forwards to the WAN only.
+const HOME_VIEWS: &str = r#"
+version = 2
+
+[[network]]
+name = "lan"
+ipv4 = "192.168.1.1/24"
+
+[[network]]
+name = "iot"
+vlan = 2
+ipv4 = "192.168.2.1/24"
+zone = "iot"
+domain = "iot.home.arpa"
+
+[[network]]
+name = "powerstream"
+vlan = 3
+ipv4 = "192.168.3.1/24"
+zone = "powerstream"
+domain = "ps.home.arpa"
+
+[[zone]]
+name = "lan"
+input = "accept"
+forward_to = ["wan", "iot", "powerstream"]
+
+[[zone]]
+name = "iot"
+input = "drop"
+allow = ["dhcp", "dns"]
+forward_to = []
+
+[[zone]]
+name = "powerstream"
+input = "drop"
+allow = ["dhcp", "dns"]
+forward_to = ["wan"]
+
+[[firewall.rule]]
+name = "homeassistant"
+from = "iot"
+to = "lan"
+dst = "192.168.1.200"
+action = "accept"
+
+[[firewall.rule]]
+name = "no-rfc1918-wan-10"
+from = "any"
+to = "wan"
+dst = "10.0.0.0/8"
+action = "reject"
+
+[dns]
+domain = "home.arpa"
+views = "firewall"
+"#;
+
+#[test]
+fn dns_views_follow_the_firewall_on_the_home_topology() {
+    const LAN: u32 = 1;
+    const IOT: u32 = 2;
+    const PS: u32 = 4;
+    let c = parse(HOME_VIEWS).unwrap();
+    assert_eq!(c.doc_version(), 2);
+    assert_eq!(c.unsupported(), vec![]);
+    let v = c.name_visibility();
+    assert_eq!(v.all_networks(), LAN | IOT | PS);
+    assert_eq!(v.seen_by(ip(192, 168, 1, 50)), LAN, "a LAN laptop: lan only");
+    assert_eq!(v.seen_by(ip(192, 168, 1, 200)), LAN | IOT, "Home Assistant: the iot rule reaches it");
+    assert_eq!(v.seen_by(ip(192, 168, 2, 10)), LAN | IOT, "an iot device: lan forwards to iot");
+    assert_eq!(v.seen_by(ip(192, 168, 3, 5)), LAN | PS);
+    assert_eq!(v.seen_by(ip(8, 8, 8, 8)), LAN | IOT | PS, "outside every network");
+    // Controls: views = all; the rule disabled; a drop rule instead.
+    let mut all = c.clone();
+    all.dns.views = DnsViews::All;
+    assert_eq!(all.name_visibility().seen_by(ip(192, 168, 1, 50)), LAN | IOT | PS);
+    assert!(!all.to_toml().contains("views"), "the default is not written");
+    let mut off = c.clone();
+    off.firewall.rules[0].enabled = false;
+    assert_eq!(off.name_visibility().seen_by(ip(192, 168, 1, 200)), LAN);
+    let mut drop = c.clone();
+    drop.firewall.rules[0].action = Action::Drop;
+    assert_eq!(drop.name_visibility().seen_by(ip(192, 168, 1, 200)), LAN);
+    // A rule without dst opens the whole network; from/to any.
+    let mut wide = c.clone();
+    wide.firewall.rules[0].dst = None;
+    assert_eq!(wide.name_visibility().seen_by(ip(192, 168, 1, 50)), LAN | IOT);
+    wide.firewall.rules[0].from = "any".into();
+    assert_eq!(wide.name_visibility().seen_by(ip(192, 168, 1, 50)), LAN | IOT | PS);
+    let mut to_any = c.clone();
+    to_any.firewall.rules[0].to = "any".into();
+    assert_eq!(to_any.name_visibility().seen_by(ip(192, 168, 1, 200)), LAN | IOT);
+    assert_eq!(to_any.name_visibility().seen_by(ip(192, 168, 3, 200)), LAN | PS, "dst still limits");
+    // Rules to the router reach no names.
+    let mut router = c.clone();
+    router.firewall.rules[0].to = "router".into();
+    router.firewall.rules[0].dst = None;
+    assert_eq!(router.name_visibility().seen_by(ip(192, 168, 1, 200)), LAN);
+    // JSON keeps it.
+    assert_eq!(parse_json(&c.to_json()).unwrap(), c);
+}
+
+#[test]
+fn dns_host_names_resolve_to_a_domain_or_an_override() {
+    let mut c = parse(HOME_VIEWS).unwrap();
+    let h = |name: &str, nets: &[&str]| DnsHost {
+        name: name.into(),
+        ip: ip(192, 168, 1, 10),
+        networks: nets.iter().map(|n| String::from(*n)).collect(),
+    };
+    c.dns.hosts = vec![
+        h("nas", &[]),
+        h("Boiler.IoT.home.arpa", &["iot", "lan"]),
+        h("a.b.home.arpa", &[]),
+        h("files.example.com", &["lan"]),
+    ];
+    assert_eq!(c.local_domains(), ["home.arpa", "iot.home.arpa", "ps.home.arpa"]);
+    let local = |d: &str, l: &str| HostName::Local { domain: d.into(), label: l.into() };
+    let got: Vec<(HostName, Option<u32>)> = c.local_hosts().into_iter().map(|l| (l.name, l.networks)).collect();
+    assert_eq!(
+        got,
+        [
+            (local("home.arpa", "nas"), None),
+            (local("iot.home.arpa", "boiler"), Some(3)),
+            (local("home.arpa", "a.b"), None),
+            (HostName::Override("files.example.com".into()), Some(1)),
+        ]
+    );
+    assert_eq!(c.validate(), Ok(()));
+    let t = c.to_toml();
+    assert!(t.contains("networks = [\"lan\"]") && parse(&t).unwrap() == c);
+    assert_eq!(parse_json(&c.to_json()).unwrap(), c);
+}
+
+#[test]
+fn dns_host_checks() {
+    fn check(hosts: &[(&str, &[&str])]) -> Vec<String> {
+        let mut c = parse(HOME_VIEWS).unwrap();
+        c.networks[0].dhcp.statics.push(StaticLease {
+            mac: "52:54:00:00:00:05".parse().unwrap(),
+            ip: ip(192, 168, 1, 10),
+            hostname: Some("NAS".into()),
+        });
+        c.dns.hosts = hosts
+            .iter()
+            .map(|(n, nets)| DnsHost {
+                name: (*n).into(),
+                ip: ip(192, 168, 1, 11),
+                networks: nets.iter().map(|n| String::from(*n)).collect(),
+            })
+            .collect();
+        match c.validate() {
+            Ok(()) => Vec::new(),
+            Err(v) => v.into_iter().map(|i| i.path).collect(),
+        }
+    }
+    assert_eq!(check(&[("srv", &[]), ("srv", &["lan"])]), ["dns.host[1].name"], "overlap");
+    assert_eq!(check(&[("srv", &["lan"]), ("SRV.home.arpa", &["iot", "lan"])]), ["dns.host[1].name"]);
+    assert_eq!(check(&[("srv", &["lan"]), ("srv", &["iot"])]), Vec::<String>::new(), "other answer per network");
+    assert_eq!(check(&[("srv", &[]), ("srv.iot.home.arpa", &[])]), Vec::<String>::new(), "other domain");
+    assert_eq!(check(&[("srv", &["guest"])]), ["dns.host[0].networks[0]"]);
+    assert_eq!(check(&[("srv", &["lan", "lan"])]), ["dns.host[0].networks[1]"]);
+    assert_eq!(check(&[("example.com", &[])]), ["dns.host[0].networks"], "override needs networks");
+    assert_eq!(check(&[("example.com", &["iot"])]), Vec::<String>::new());
+    assert_eq!(check(&[("iot.home.arpa", &[])]), ["dns.host[0].name"], "a domain itself");
+    assert_eq!(check(&[("1.1.168.192.in-addr.arpa", &["lan"])]), ["dns.host[0].name"]);
+    assert_eq!(check(&[("bad name", &[])]), ["dns.host[0].name"]);
+    assert_eq!(check(&[("nas", &[])]), ["dns.host[0].name"], "a reservation's hostname for everyone");
+    assert_eq!(check(&[("nas", &["iot"])]), Vec::<String>::new(), "for some networks: takes it over");
+    assert_eq!(check(&[("router", &[])]), Vec::<String>::new());
+}
+
+#[test]
+fn dns_views_and_hosts_from_the_cli() {
+    let c = parse(HOME_VIEWS).unwrap();
+    let c = c.with_assignment(r#"dns.views = "all""#).unwrap();
+    assert_eq!(c.dns.views, DnsViews::All);
+    let c = c.with_assignment(r#"dns.views = "firewall""#).unwrap();
+    assert_eq!(c.dns.views, DnsViews::Firewall);
+    assert!(c.with_assignment(r#"dns.views = "some""#).is_err());
+    let c = c
+        .with_assignment(r#"dns.host = [{ name = "nas", ip = "192.168.1.10", networks = ["lan"] }, { name = "nas", ip = "192.168.2.10", networks = ["iot"] }]"#)
+        .unwrap();
+    assert_eq!(c.dns.hosts.len(), 2);
+    assert_eq!(c.dns.hosts[1].networks, ["iot"]);
+    let d = diff_lines(&parse(HOME_VIEWS).unwrap(), &c);
+    assert!(d.iter().any(|l| l.starts_with("+ dns.host[1].networks")), "{d:?}");
+    // Validation (at `config save`) refuses an overlapping name.
+    let overlap = c.with_assignment(r#"dns.host = [{ name = "nas", ip = "192.168.1.10" }, { name = "nas", ip = "192.168.2.10" }]"#).unwrap();
+    assert_eq!(overlap.validate().unwrap_err()[0].path, "dns.host[1].name");
+    // Unset: back to none.
+    assert!(c.without("dns.host").unwrap().dns.hosts.is_empty());
+    assert_eq!(c.without("dns.views").unwrap().dns.views, DnsViews::All);
 }

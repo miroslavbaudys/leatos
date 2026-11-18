@@ -16,6 +16,7 @@
 //! (`net::mdns`).
 
 use crate::config;
+use crate::config::schema::{HostName, LocalHost, NameVisibility};
 use crate::net::dot::Dot;
 use crate::net::mdns::Mdns;
 use crate::net::ntp::{self, Ntp};
@@ -29,7 +30,7 @@ use proto_dhcp::v4::packet::{CLIENT_PORT, SERVER_PORT};
 use proto_dhcp::v4::persist;
 use proto_dhcp::v4::server::{self as dhcp, Event as DhcpEvent};
 use proto_dns::resolver::{self, Action, Resolver};
-use proto_dns::zone::{Source, Zone};
+use proto_dns::zone::{Source, View, Zone};
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::udp;
 use smoltcp::wire::IpEndpoint;
@@ -52,8 +53,11 @@ struct Net {
 
 pub struct LanServices {
     nets: Vec<Net>,
-    /// One forwarder and cache for all networks; one local zone.
+    /// One forwarder and cache for all networks; one local zone, answered
+    /// per network (docs/dns-views.md).
     dns: Resolver,
+    /// Who resolves which addresses' names (`dns.views`): new leases.
+    names: NameVisibility,
     upstream_sock: Option<SocketHandle>,
     /// The WAN lease's DNS servers (used without `dns.upstreams`).
     lease_dns: Vec<Ipv4Addr>,
@@ -103,11 +107,25 @@ fn resolver_config(d: &config::Dns) -> resolver::Config {
     }
 }
 
+/// Who gets a name of `ip` (docs/dns-views.md): the networks
+/// `dns.views` lets see it, and the router itself.
+fn seen_by(names: &NameVisibility, ip: Ipv4Addr) -> View {
+    View(names.seen_by(ip)).union(View::ROUTER)
+}
+
 /// The local zone: every network's domain with `router.<domain>` (the
 /// address of the first network using that domain), reservations with a
 /// hostname, and bound DHCP leases with a hostname, each in its network's
-/// domain; reverse lookups for all their subnets.
-fn build_zone<'a>(nets: &[config::Lan], leases: impl Iterator<Item = (&'a str, &'a dhcp::Lease)>) -> Zone {
+/// domain, then `[[dns.host]]` (taking names over for their networks);
+/// reverse lookups for all their subnets. Each record is answered to the
+/// networks that see its address (`dns.views`), or to a host's own
+/// `networks`.
+fn build_zone<'a>(
+    nets: &[config::Lan],
+    names: &NameVisibility,
+    hosts: &[LocalHost],
+    leases: impl Iterator<Item = (&'a str, &'a dhcp::Lease)>,
+) -> Zone {
     let first = &nets[0];
     let mut zone = Zone::new(&first.domain, first.addr, (first.addr, first.prefix));
     for n in &nets[1..] {
@@ -117,7 +135,7 @@ fn build_zone<'a>(nets: &[config::Lan], leases: impl Iterator<Item = (&'a str, &
     for n in nets {
         for s in &n.statics {
             if let Some(h) = &s.hostname {
-                zone.add_in(&n.domain, h, s.ip, Source::Static);
+                zone.add_in(&n.domain, h, s.ip, Source::Static, seen_by(names, s.ip));
             }
         }
     }
@@ -125,7 +143,17 @@ fn build_zone<'a>(nets: &[config::Lan], leases: impl Iterator<Item = (&'a str, &
         let (Some(h), Some(n)) = (&l.hostname, nets.iter().find(|n| n.name == net)) else {
             continue;
         };
-        zone.add_in(&n.domain, h, l.ip, Source::Dhcp);
+        zone.add_in(&n.domain, h, l.ip, Source::Dhcp, seen_by(names, l.ip));
+    }
+    for h in hosts {
+        let view = match h.networks {
+            Some(mask) => View(mask).union(View::ROUTER),
+            None => seen_by(names, h.ip),
+        };
+        match &h.name {
+            HostName::Local { domain, label } => zone.add_in(domain, label, h.ip, Source::Static, view),
+            HostName::Override(name) => zone.add_override(name, h.ip, view),
+        }
     }
     zone
 }
@@ -188,7 +216,8 @@ impl LanServices {
             return None;
         }
         let dns_cfg = config::dns();
-        let zone = build_zone(&cfgs, core::iter::empty());
+        let (names, local_hosts) = config::dns_names();
+        let zone = build_zone(&cfgs, &names, &local_hosts, core::iter::empty());
         let dns = Resolver::new(resolver_config(&dns_cfg), zone, timer::ticks() as u32);
         let nets = cfgs
             .into_iter()
@@ -208,6 +237,7 @@ impl LanServices {
         let mut me = Self {
             nets,
             dns,
+            names,
             upstream_sock,
             lease_dns: Vec::new(),
             udp_ports: Vec::new(),
@@ -324,7 +354,9 @@ impl LanServices {
             sockets.remove(net.dns_sock);
             println!("  lan services    : {}: removed", net.cfg.name);
         }
-        *self.dns.zone_mut() = build_zone(&cfgs, self.leases_by_network());
+        let (names, local_hosts) = config::dns_names();
+        *self.dns.zone_mut() = build_zone(&cfgs, &names, &local_hosts, self.leases_by_network());
+        self.names = names;
         self.dns.reconfigure(resolver_config(&dns_cfg));
         self.apply_upstreams(hosts);
         if let Some(n) = self.ntp.as_mut() {
@@ -368,7 +400,8 @@ impl LanServices {
             };
             for ev in server.restore(now_secs(), &s.leases) {
                 if let DhcpEvent::Bound { ip, hostname: Some(h), .. } = ev {
-                    self.dns.zone_mut().add_in(&net.cfg.domain, &h, ip, Source::Dhcp);
+                    let view = seen_by(&self.names, ip);
+                    self.dns.zone_mut().add_in(&net.cfg.domain, &h, ip, Source::Dhcp, view);
                 }
                 restored += 1;
             }
@@ -419,7 +452,7 @@ impl LanServices {
         self.mdns.status()
     }
 
-    fn apply_dhcp_events(dns: &mut Resolver, net: &str, domain: &str, events: Vec<DhcpEvent>) {
+    fn apply_dhcp_events(dns: &mut Resolver, names: &NameVisibility, net: &str, domain: &str, events: Vec<DhcpEvent>) {
         for ev in events {
             match ev {
                 DhcpEvent::Bound { mac, ip, hostname } => {
@@ -429,7 +462,7 @@ impl LanServices {
                         hostname.as_deref().unwrap_or("-")
                     );
                     if let Some(h) = hostname {
-                        dns.zone_mut().add_in(domain, &h, ip, Source::Dhcp);
+                        dns.zone_mut().add_in(domain, &h, ip, Source::Dhcp, seen_by(names, ip));
                     }
                 }
                 DhcpEvent::Released { ip, hostname, .. } => {
@@ -504,15 +537,16 @@ impl LanServices {
                     let ep = IpEndpoint::new(IpAddr::V4(Ipv4Addr::BROADCAST).into(), CLIENT_PORT);
                     let _ = sockets.get_mut::<udp::Socket>(*sock).send_slice(&reply, ep);
                 }
-                Self::apply_dhcp_events(&mut self.dns, &net.cfg.name, &net.cfg.domain, out.events);
+                Self::apply_dhcp_events(&mut self.dns, &self.names, &net.cfg.name, &net.cfg.domain, out.events);
             }
             if expire {
                 let ev = server.expire(now_secs());
-                Self::apply_dhcp_events(&mut self.dns, &net.cfg.name, &net.cfg.domain, ev);
+                Self::apply_dhcp_events(&mut self.dns, &self.names, &net.cfg.name, &net.cfg.domain, ev);
             }
         }
 
-        // DNS: client queries, on every network.
+        // DNS: client queries, on every network, answered as that network
+        // (the socket it came in on, not the source address: views).
         let mut qbuf = [0u8; 1500];
         for i in 0..self.nets.len() {
             let (host, sock) = (self.nets[i].host, self.nets[i].dns_sock);
@@ -522,7 +556,7 @@ impl LanServices {
                     break;
                 };
                 let client = SocketAddr::new(meta.endpoint.addr.into(), meta.endpoint.port);
-                let actions = self.dns.handle_query(now_ms(), client, &qbuf[..n]);
+                let actions = self.dns.handle_query_in(now_ms(), client, View::network(i), &qbuf[..n]);
                 self.send_dns(hosts, actions);
             }
         }
@@ -553,7 +587,7 @@ impl LanServices {
         // SNTP: our own name lookups, then the protocol.
         let queries = self.ntp.as_mut().map(|n| n.lookups(now_ms())).unwrap_or_default();
         for q in queries {
-            let actions = self.dns.handle_query(now_ms(), ntp::SELF_CLIENT, &q);
+            let actions = self.dns.handle_query_in(now_ms(), ntp::SELF_CLIENT, View::ROUTER, &q);
             self.send_dns(hosts, actions);
         }
         if let Some(n) = self.ntp.as_mut() {

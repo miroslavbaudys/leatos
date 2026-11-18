@@ -6,9 +6,10 @@ name). The kernel implements networks on `lan0` (untagged or VLANs, a
 DHCP server and DNS domain each, changed live), zones (forwarding between
 them, input policy), rules (incl. `reject`), port forwards with hairpin,
 redirects, WAN anti-spoofing, mDNS reflect rules (docs/mdns.md), and the
-web interface's Networks and Firewall pages (§9). All of it runs on the
-apu4 as the developer's home router. DNS hosts, ports other than
-`wan0`/`lan0` and a static WAN are refused as unsupported
+web interface's Networks and Firewall pages (§9), DNS hosts and
+split-horizon DNS views (docs/dns-views.md; in QEMU, 2026-11-18). All of
+it but the DNS views runs on the apu4 as the developer's home router.
+Ports other than `wan0`/`lan0` and a static WAN are refused as unsupported
 (`Config::unsupported`). Schema v1 is
 in `docs/config-and-storage.md` §5. v2 is the data model the multipage
 web interface is built against (Networks and Firewall pages). It also covers
@@ -101,9 +102,11 @@ cache_entries = 4096
 rebind_protection = true
 prefetch = true             # default; false needs version 2
 stale_secs = 86400          # serve-stale window (RFC 8767), 0 = off, max a week
+views = "firewall"          # "all" (default): who resolves which local names
 [[dns.host]]                # local records beside DHCP names
-name = "router"
-ip = "10.10.0.1"
+name = "nas"
+ip = "10.10.0.10"
+networks = ["lan"]          # optional: who gets this answer (docs/dns-views.md)
 
 [shaping]                   # unchanged from v1
 [mgmt]                      # on_wan, password_hash (PBKDF2-SHA256, crates/auth)
@@ -282,9 +285,16 @@ they are about. A zone-limited redirect thus also puts the other zones'
 connections to those ports in that shard (their NAT ports come from it,
 so the WAN side finds them); keep redirects to small services.
 
-### `[[dns.host]]`
+### `[[dns.host]]` and `[dns] views`
 Static A records in the local zone (`name` + `ip`), beside the DHCP-derived
-names. A name is relative to `dns.domain` unless it contains a dot.
+names. A name without a dot is in `dns.domain`; a dotted one in the
+longest local domain it ends in; any other name overrides a public name
+(needs `networks`). `networks` lists who gets the answer (the same name may
+have another address for other networks); without it `dns.views`
+decides. `views = "firewall"` lets a network resolve only the names of
+addresses its zone can reach (same zone, `forward_to`, accept rules); the
+default `all` lets every network resolve every local name. Design, rules
+and lab check (`LAB_DNS_VIEWS=1`): docs/dns-views.md.
 
 ### `[dns] domain`
 The default local domain (version 1's `lan.domain`, default `lan`): DHCP
@@ -319,8 +329,8 @@ control `LAB_GUEST_DOMAIN=0`).
   unsupported (`Config::unsupported`, separate from validation so the
   crate accepts the whole schema): by a save (web, CLI), by `rrstore
   put`, and a stored config with them is not used (defaults, as for any
-  rejected record). Today that is `[[dns.host]]`, a static WAN, and ports
-  other than `wan0`/`lan0`.
+  rejected record). Today that is a static WAN and ports other than
+  `wan0`/`lan0`.
 
 ## 5. Migration and rollback
 - **v1 → v2 on load:**
@@ -440,7 +450,8 @@ control `LAB_GUEST_DOMAIN=0`).
 - **Services** ✅. One DHCP server (`proto-dhcp`) per network with DHCP
   on, and a DNS socket on every network's address (the input policy
   decides who reaches it); one resolver and one local zone
-  (`dns.domain`), with reverse lookups for every network's subnet. The
+  (`dns.domain`), with reverse lookups for every network's subnet,
+  answered per network (`dns.views`, docs/dns-views.md). The
   web interface listens on the networks whose zone reaches it.
 - **Status API** ✅. `/api/status` has `networks[]` (name, vlan, ipv4,
   zone, dhcp, mgmt, bound leases), leases name their network,
@@ -555,8 +566,9 @@ In rough order of value:
      target), e.g. "fragmentation needed" from the internet about a
      forwarded server's answers. Host tests with a control (the old
      mapping misses each kind).
-8. **Small schema items the kernel still refuses:** `[[dns.host]]`
-   (local A records), a static WAN (`mode = "static"`, `[wan.static]`).
+8. **Small schema items the kernel still refuses:** a static WAN
+   (`mode = "static"`, `[wan.static]`). `[[dns.host]]` ✅ (QEMU,
+   2026-11-18) with split-horizon views, docs/dns-views.md.
 9. ✅ (2026-11-15) **Web interface gaps.** Every network's DHCP pool,
    lease time and reservations (a DHCP panel per network on the Networks
    page; "Reserve" on the Clients page for any network); the management

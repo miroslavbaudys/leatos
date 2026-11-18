@@ -753,6 +753,13 @@ pub fn dns() -> Dns {
     }
 }
 
+/// Local DNS names per network (docs/dns-views.md): who resolves which
+/// addresses' names, and the `[[dns.host]]` records.
+pub fn dns_names() -> (schema::NameVisibility, Vec<schema::LocalHost>) {
+    let c = get();
+    (c.name_visibility(), c.local_hosts())
+}
+
 /// Management web interface (`net::mgmt`): HTTP on port 80.
 pub struct Mgmt {
     /// Also listen on the WAN (`mgmt.on_wan`, boot argument `mgmt=wan`).
