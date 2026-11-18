@@ -407,7 +407,7 @@
       </div>
     </div>
     <div class="card"><h3>Backup and restore</h3>
-      <div class="row"><a href="/api/config" download="config.toml">Export config.toml</a>
+      <div class="row"><a id="export" href="/api/config" download="config.toml">Export config.toml</a>
         <label class="check" style="margin:0">Import:<input id="import" type="file" accept=".toml,text/plain"></label>
         <button id="effective" class="plain" hidden title="Fill the forms with the values the router runs with, boot arguments included; then save, and remove those boot arguments">Use values in effect</button></div>
       <p class="hint">The export leaves out secrets (the PPPoE password); an import without them keeps the stored ones.</p>
@@ -558,11 +558,12 @@ async function ensureLogin() {
 // One API call with the session. A 401 (no session, expired, the router
 // rebooted, the password changed) shows the login screen; once logged in
 // the call is sent again.
-async function api(method, path, { body, type, headers = {} } = {}) {
+// raw: j is the response body as text (downloads) instead of parsed JSON.
+async function api(method, path, { body, type, headers = {}, raw = false } = {}) {
   for (;;) {
     const r = await fetch(path, { method, cache: "no-store", body,
       headers: { ...authHeaders(), ...(type ? { "Content-Type": type } : {}), ...headers } });
-    const j = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
+    const j = raw && r.status !== 401 ? await r.text() : await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
     if (r.status !== 401) return { r, j };
     authAvailable = true; // a 401 means there is a password
     const had = token !== null;
@@ -1800,6 +1801,22 @@ $("effective").onclick = async () => {
   } catch (e) { $("bkmsg").textContent = "Could not load the values in effect: " + e; }
 };
 $("addstatic").onclick = () => { staticRow(); updatePending(); };
+// Not a plain link: a navigation carries no session token (it lives in
+// localStorage), so the router would answer 401 and the browser would show
+// its own Basic login.
+$("export").onclick = async (ev) => {
+  ev.preventDefault();
+  $("bkmsg").textContent = "";
+  try {
+    const { r, j } = await api("GET", "/api/config", { raw: true });
+    if (!r.ok) { $("bkmsg").textContent = `Export failed (HTTP ${r.status})`; return; }
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([j], { type: "application/toml" }));
+    a.download = "config.toml";
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  } catch (e) { $("bkmsg").textContent = "Export failed: " + e.message; }
+};
 $("import").onchange = async () => {
   const f = $("import").files[0];
   $("import").value = "";
