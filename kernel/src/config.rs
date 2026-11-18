@@ -355,7 +355,7 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
     if let Some(v) = arg(args, "pppoe_ac") {
         p.ac_name = String::from(v);
     }
-    if let Some(m) = arg_u64(args, "pppoe_mtu").filter(|m| (1280..=1492).contains(m)) {
+    if let Some(m) = arg_u64(args, "pppoe_mtu").filter(|m| (1280..=1500).contains(m)) {
         p.mtu = m as u16;
     }
     let s = &mut c.shaping;

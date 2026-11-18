@@ -60,6 +60,7 @@ const EIMC: usize = 0x1528;
 const EIAC: usize = 0x152c;
 const EITR0: usize = 0x1680;
 const IVAR0: usize = 0x1700;
+const RLPML: usize = 0x5004;
 const RAL0: usize = 0x5400;
 const RAH0: usize = 0x5404;
 const RDBAL0: usize = 0xc000;
@@ -88,6 +89,9 @@ const STATUS_FD: u32 = 1 << 0;
 const STATUS_LU: u32 = 1 << 1;
 const RCTL_EN: u32 = 1 << 1;
 const RCTL_MPE: u32 = 1 << 4;
+/// Long packets: frames above 1522 B, up to `RLPML` (PPPoE with RFC 4638
+/// on a VLAN: 1526 B).
+const RCTL_LPE: u32 = 1 << 5;
 const RCTL_BAM: u32 = 1 << 15;
 const RCTL_SECRC: u32 = 1 << 26;
 const TCTL_EN: u32 = 1 << 1;
@@ -330,8 +334,11 @@ impl Igb {
         arch::cpu::dma_barrier();
         self.regs.write32(RDT0, (RX_RING - 1) as u32);
         // Accept broadcast and all multicast (IPv6 ND), strip the CRC.
+        // Frames up to one buffer: larger ones are dropped by the NIC, so a
+        // frame never spans descriptors.
+        self.regs.write32(RLPML, RX_AREA as u32);
         self.regs
-            .write32(RCTL, RCTL_EN | RCTL_BAM | RCTL_MPE | RCTL_SECRC);
+            .write32(RCTL, RCTL_EN | RCTL_BAM | RCTL_MPE | RCTL_SECRC | RCTL_LPE);
         Ok(())
     }
 

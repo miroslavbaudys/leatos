@@ -97,6 +97,18 @@ impl Pppoe {
                 }
                 Event::Up(link) => {
                     self.sessions += 1;
+                    if let Some(t) = self.client.rfc4638_trace() {
+                        let v = |o: Option<u16>| o.map_or(String::from("none"), |m| format!("{m}"));
+                        println!(
+                            "  pppoe {}     : RFC 4638: PADO {}, PADS {}, our MRU {}, peer MRU {}, echo {}",
+                            port.name,
+                            v(t.pado),
+                            v(t.pads),
+                            v(t.our_mru),
+                            v(t.peer_mru),
+                            t.echo.map_or(String::from("none"), |(g, s)| format!("{g} B back for {s} B"))
+                        );
+                    }
                     if u32::from(link.mtu) != port.mtu.load(Ordering::Relaxed) {
                         // smoltcp reads the MTU when the interface is made.
                         port.mtu.store(u32::from(link.mtu), Ordering::Relaxed);
@@ -139,6 +151,11 @@ impl Pppoe {
                         println!("  pppoe {}     : down: {reason}", port.name);
                     } else {
                         println!("  pppoe {}     : attempt failed: {reason}", port.name);
+                        if reason == proto_pppoe::Reason::JumboFailed
+                            && let Some((g, s)) = self.client.last_jumbo_reply()
+                        {
+                            println!("  pppoe {}     : RFC 4638 echo: {g} B back for {s} B", port.name);
+                        }
                     }
                     self.link = None;
                     self.last_down = Some(format!("{reason}"));
@@ -151,20 +168,24 @@ impl Pppoe {
     /// Move the client's frames into the WAN qdisc.
     fn transmit(&mut self, port: &PortShared) -> bool {
         let mut queued = false;
-        let now_ns = crate::net::datapath::now_ns();
         while let Some(f) = self.client.poll_transmit() {
-            let Some(mut pkt) = PacketBuf::alloc() else {
-                continue; // pool empty: lost, retransmitted by the client
-            };
-            pkt.set_len(f.len());
-            pkt.data_mut().copy_from_slice(&f);
-            pkt.meta.wire_len = f.len() as u32;
-            pkt.meta.enqueue_ts = now_ns;
-            if port.qdisc.lock().enqueue(pkt, now_ns).is_ok() {
-                queued = true;
-            }
+            queued |= self.send(port, &f);
         }
         queued
+    }
+
+    /// One frame into the WAN qdisc (pool empty: lost, retransmitted by
+    /// the client).
+    fn send(&self, port: &PortShared, f: &[u8]) -> bool {
+        let now_ns = crate::net::datapath::now_ns();
+        let Some(mut pkt) = PacketBuf::alloc() else {
+            return false;
+        };
+        pkt.set_len(f.len());
+        pkt.data_mut().copy_from_slice(f);
+        pkt.meta.wire_len = f.len() as u32;
+        pkt.meta.enqueue_ts = now_ns;
+        port.qdisc.lock().enqueue(pkt, now_ns).is_ok()
     }
 
     /// End the session (LCP Terminate-Request, PADT): before switching the
@@ -202,13 +223,28 @@ impl Pppoe {
             None => ("null".into(), "null".into(), "null".into()),
         };
         format!(
-            "{{\"state\":{},\"session\":{session},\"ac\":{ac},\"mtu\":{mtu},\"sessions\":{},\"last_error\":{}}}",
+            "{{\"state\":{},\"session\":{session},\"ac\":{ac},\"mtu\":{mtu},\"sessions\":{},\"last_error\":{},\"rfc4638\":{}}}",
             json_str(&format!("{}", self.client.state())),
             self.sessions,
             self.last_down
                 .as_deref()
                 .map(json_str)
-                .unwrap_or_else(|| "null".into())
+                .unwrap_or_else(|| "null".into()),
+            // Asked for (MTU above 1492): in use, or fell back to 1492.
+            {
+                let recv_big = self
+                    .client
+                    .rfc4638_trace()
+                    .is_some_and(|t| t.our_mru.is_some_and(|m| m > proto_pppoe::MAX_MTU));
+                match (self.client.config().mtu > proto_pppoe::MAX_MTU, self.client.jumbo_failed(), &self.link) {
+                    (false, _, _) => "null",
+                    (true, true, _) => "\"fell back to 1492: larger frames did not pass\"",
+                    (true, false, Some(l)) if l.mtu > proto_pppoe::MAX_MTU => "\"in use\"",
+                    (true, false, Some(_)) if recv_big => "\"receive only: the access concentrator takes 1492 from us\"",
+                    (true, false, Some(_)) => "\"not offered by the access concentrator\"",
+                    (true, false, None) => "\"asked\"",
+                }
+            }
         )
     }
 

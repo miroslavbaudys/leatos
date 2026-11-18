@@ -22,7 +22,7 @@ clamping and ICMP "fragmentation needed" in `crates/fwd`. Lab:
 ISP VM, also with `LAB_VLAN=848`), `scripts/pppoe-test.sh` (live switch
 between DHCP and PPPoE). PPPoE runs on the apu4 against the developer's ISP (VLAN 848, no
 authentication, since 2026-11-15). Open: IPv6CP + DHCPv6-PD over the
-session (M7), RFC 4638, IPv4 fragmentation of non-DF packets above the MTU
+session (M7), RFC 4638 on hardware (implemented, see below), IPv4 fragmentation of non-DF packets above the MTU
 (dropped today), long-run stability (forced daily disconnects).
 
 | Stage | Details |
@@ -42,6 +42,32 @@ Pitfalls:
   is implemented (software tag in `net::datapath`; boot argument
   `wan_vlan=`); PPPoE runs inside it (lab: `LAB_PPPOE=pap LAB_VLAN=848`).
 - RFC 4638 (MTU 1500 over PPPoE) is optional and only works if the ISP supports it.
+  Implemented 2026-11-18 (`crates/proto-pppoe`): `wan.pppoe.mtu = 1500`
+  (or `pppoe_mtu=1500`) puts PPP-Max-Payload in the PADI, and in the PADR
+  only if the PADO echoed it; with the PADS echoing it too, LCP asks for
+  MRU 1500 (the peer's MRU defaults to 1492 unless it offers more). Before
+  the link counts as up, a full-size LCP Echo-Request (1500 B) must come
+  back full size within 3 tries of 1 s: then MTU 1500 (no MSS clamping,
+  no frag-needed below 1500). Otherwise the session ends (`JumboFailed`)
+  and the client stays at 1492 until restarted. `/api/status`
+  `pppoe.rfc4638`: in use, not offered by the access concentrator, or
+  fell back. The igb accepts frames up to 2048 B (`RCTL.LPE`, `RLPML`):
+  1500 B over PPPoE on a VLAN is a 1526 B frame. The lab's rp-pppoe does
+  not support it (session at 1492, checked with `pppoe_mtu=1500`); the
+  1500 path is host-tested against a simulated AC (agreeing, not agreeing,
+  path losing large frames, short echo replies, an AC asking MRU 1492 in LCP
+  that takes or refuses our Configure-Nak suggesting 1500). The log line
+  `RFC 4638: PADO …, PADS …, our MRU …, peer MRU …, echo …` shows each step.
+  On the developer's line (2026-11-18) the AC echoes 1500 in PADO and PADS
+  but asks MRU 1492 in LCP and keeps it after our Nak, and its echo replies
+  carry no data (8 B for 1500 B): we could receive 1500 but send only 1492,
+  and the downstream direction cannot be proven, so the client falls back
+  to 1492. Proving the downstream with such an AC would need an IP-level
+  check (a full-size ping through the session), not done.
+  To check a line: boot once with `pppoe_mtu=1500` (the stored config
+  stays as it is) and read that log line. A separate discovery probe while
+  the session runs was tried and dropped: ACs that allow one session per
+  line (the developer's does) ignore further PADIs from it.
 - Reconnect with exponential backoff. Send PADT on shutdown so the ISP
   doesn't keep a stale session. Handle forced daily disconnects.
 - On multi-core hardware, NIC RSS can't hash inside PPPoE, so all traffic

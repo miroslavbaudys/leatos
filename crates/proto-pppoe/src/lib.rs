@@ -18,8 +18,15 @@
 //! ([`wire::encap_ipv4`], [`wire::decap_ipv4`]) for the [`Session`] the
 //! client reports.
 //!
-//! Not supported (rejected in negotiation): IPv6CP, compression, multilink,
-//! RFC 4638 (MTU above 1492).
+//! RFC 4638 (MTU above 1492, "baby jumbo" frames): with [`Config::mtu`]
+//! above 1492 the PADI and PADR carry PPP-Max-Payload; only if the AC echoes
+//! it in both PADO and PADS does LCP ask for the larger MRU. Before the link
+//! counts as up, a full-size LCP Echo-Request must come back full size (the
+//! modem and the NICs carry the frames both ways); otherwise the session is
+//! ended and every later one uses 1492 ([`Reason::JumboFailed`]).
+//! [`Client::rfc4638_trace`] says what each step answered.
+//!
+//! Not supported (rejected in negotiation): IPv6CP, compression, multilink.
 //!
 //! `#![no_std]` + `alloc`, sans-IO, no unsafe; time is milliseconds.
 
@@ -42,6 +49,11 @@ pub use wire::{Mac, Session};
 
 /// Largest payload of a PPPoE session on Ethernet (1500 − 8).
 pub const MAX_MTU: u16 = 1492;
+/// Largest MTU asked for with RFC 4638 (1508 B PPPoE payload on the wire).
+pub const MAX_MTU_RFC4638: u16 = 1500;
+/// RFC 4638 path check: a full-size LCP echo, retried this often.
+const JUMBO_CHECK_MS: u64 = 1_000;
+const JUMBO_CHECK_TRIES: u32 = 3;
 const PADI_FIRST_MS: u64 = 1_000;
 const PADI_MAX_MS: u64 = 32_000;
 const PADR_MS: u64 = 2_000;
@@ -68,7 +80,9 @@ pub struct Config {
     pub service: String,
     /// Only accept offers from this access concentrator; empty = the first.
     pub ac_name: String,
-    /// MRU we ask for and largest packet we send (≤ [`MAX_MTU`]).
+    /// MRU we ask for and largest packet we send: ≤ [`MAX_MTU`], or up to
+    /// [`MAX_MTU_RFC4638`] if the AC and the path carry it (RFC 4638; else
+    /// [`MAX_MTU`]).
     pub mtu: u16,
     /// LCP echo request interval in seconds; 0 = no keepalive.
     pub echo_interval_secs: u32,
@@ -117,6 +131,9 @@ pub enum Reason {
     AuthTimeout,
     /// LCP or IPCP gave up (no answer, nak loop, no address assigned).
     Negotiation(&'static str),
+    /// RFC 4638: the full-size echo did not come back full size, so frames
+    /// above 1492 B of payload do not pass; the next sessions use 1492.
+    JumboFailed,
     /// PADS with an error tag or session 0.
     Refused(String),
     /// [`Client::stop`].
@@ -133,6 +150,7 @@ impl fmt::Display for Reason {
             Reason::AuthFailed(m) => write!(f, "authentication failed: {m}"),
             Reason::AuthTimeout => f.write_str("authentication timed out"),
             Reason::Negotiation(m) => write!(f, "negotiation failed: {m}"),
+            Reason::JumboFailed => f.write_str("frames above 1492 B do not pass (RFC 4638): falling back to 1492"),
             Reason::Refused(m) => write!(f, "session refused: {m}"),
             Reason::Stopped => f.write_str("stopped"),
         }
@@ -221,8 +239,13 @@ struct Lcp {
     max_mru: u16,
     magic: u32,
     rng: Rng,
-    /// The peer's MRU (what we may send), default 1500.
+    /// The peer's MRU (what we may send), default 1492 on PPPoE.
     peer_mru: u16,
+    /// The peer sent an MRU option.
+    peer_mru_sent: bool,
+    /// RFC 4638: a peer MRU below ours was nak'd once (suggesting ours);
+    /// the second time it is taken as it is.
+    peer_mru_nakked: bool,
     peer_magic: u32,
     /// What the peer requires from us.
     auth: Option<Auth>,
@@ -269,7 +292,15 @@ impl Options for Lcp {
         let mut auth = None;
         for &(k, v) in opts {
             match (k, v.len()) {
-                (LCP_MRU, 2) => self.peer_mru = get16(v, 0),
+                // RFC 4638: suggest the larger MRU once, then take theirs.
+                (LCP_MRU, 2) if self.max_mru > MAX_MTU && get16(v, 0) < self.max_mru && !self.peer_mru_nakked => {
+                    self.peer_mru_nakked = true;
+                    j.nak(LCP_MRU, &self.max_mru.to_be_bytes());
+                }
+                (LCP_MRU, 2) => {
+                    self.peer_mru = get16(v, 0);
+                    self.peer_mru_sent = true;
+                }
                 // Meaningless on PPPoE (no async framing), harmless to ack.
                 (LCP_ACCM, 4) => {}
                 (LCP_AUTH, 2) if get16(v, 0) == PPP_PAP => auth = Some(Auth::Pap),
@@ -387,6 +418,18 @@ struct Sess {
     echo_outstanding: u32,
     /// Identifiers for LCP packets outside the negotiation.
     lcp_id: u8,
+    /// RFC 4638: IPCP is up, waiting for the full-size echo to come back
+    /// before reporting `link`.
+    jumbo_check: Option<JumboCheck>,
+}
+
+struct JumboCheck {
+    id: u8,
+    tries: u32,
+    next: u64,
+    /// The echo's size: our MRU (what the AC may now send us).
+    size: u16,
+    link: Link,
 }
 
 enum Phase {
@@ -416,13 +459,36 @@ pub struct Client {
     backoff: u64,
     tx: VecDeque<Vec<u8>>,
     events: VecDeque<Event>,
+    /// RFC 4638: the last accepted PADO's PPP-Max-Payload.
+    pado_max_payload: Option<u16>,
+    /// RFC 4638 failed its path check: no more asking (this client).
+    jumbo_failed: bool,
+    /// The last PADS's PPP-Max-Payload (RFC 4638 trace).
+    pads_max_payload: Option<u16>,
+    /// The last RFC 4638 path check's echo reply: LCP length, and what
+    /// was sent.
+    jumbo_reply: Option<(usize, u16)>,
+}
+
+/// What each RFC 4638 step said, for the log ([`Client::rfc4638_trace`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rfc4638Trace {
+    /// PPP-Max-Payload in the PADO / the PADS (`None`: no tag).
+    pub pado: Option<u16>,
+    pub pads: Option<u16>,
+    /// The MRU we asked for in LCP (`None`: rejected).
+    pub our_mru: Option<u16>,
+    /// The MRU the peer asked for (`None`: it sent no MRU option).
+    pub peer_mru: Option<u16>,
+    /// The path check's echo: (reply length, request length).
+    pub echo: Option<(usize, u16)>,
 }
 
 impl Client {
     /// A client for the WAN port with MAC `mac`; `seed` varies magic
     /// numbers and Host-Uniq. Starts [`State::Idle`].
     pub fn new(mut cfg: Config, mac: Mac, seed: u64) -> Self {
-        cfg.mtu = cfg.mtu.clamp(576, MAX_MTU);
+        cfg.mtu = cfg.mtu.clamp(576, MAX_MTU_RFC4638);
         let mut rng = Rng(seed | 1);
         let host_uniq = rng.next().to_be_bytes();
         Client {
@@ -434,7 +500,44 @@ impl Client {
             backoff: BACKOFF_FIRST_MS,
             tx: VecDeque::new(),
             events: VecDeque::new(),
+            pado_max_payload: None,
+            jumbo_failed: false,
+            pads_max_payload: None,
+            jumbo_reply: None,
         }
+    }
+
+    /// With an MTU above 1492: what the PADO, PADS and LCP said, during or
+    /// after a session's negotiation.
+    pub fn rfc4638_trace(&self) -> Option<Rfc4638Trace> {
+        if self.cfg.mtu <= MAX_MTU {
+            return None;
+        }
+        let Phase::Session(s) = &self.phase else { return None };
+        Some(Rfc4638Trace {
+            pado: self.pado_max_payload,
+            pads: self.pads_max_payload,
+            our_mru: s.lcp_opts.mru,
+            peer_mru: s.lcp_opts.peer_mru_sent.then_some(s.lcp_opts.peer_mru),
+            echo: self.jumbo_reply,
+        })
+    }
+
+    /// The trace of the attempt that just failed (no session any more):
+    /// what the last path check got.
+    pub fn last_jumbo_reply(&self) -> Option<(usize, u16)> {
+        self.jumbo_reply
+    }
+
+    /// RFC 4638 is asked for: an MTU above 1492 that has not failed.
+    fn wants_jumbo(&self) -> bool {
+        self.cfg.mtu > MAX_MTU && !self.jumbo_failed
+    }
+
+    /// The path check of an RFC 4638 session failed earlier: sessions use
+    /// 1492 now.
+    pub fn jumbo_failed(&self) -> bool {
+        self.jumbo_failed
     }
 
     pub fn config(&self) -> &Config {
@@ -544,16 +647,15 @@ impl Client {
     }
 
     fn send_padi(&mut self, now: u64, tries: u32, interval: u64) {
-        let f = discovery(
-            BROADCAST,
-            self.mac,
-            PADI,
-            0,
-            &[
-                (TAG_SERVICE_NAME, self.cfg.service.as_bytes()),
-                (TAG_HOST_UNIQ, &self.host_uniq),
-            ],
-        );
+        let ask = self.wants_jumbo().then_some(self.cfg.mtu.to_be_bytes());
+        let mut t: Vec<(u16, &[u8])> = alloc::vec![
+            (TAG_SERVICE_NAME, self.cfg.service.as_bytes()),
+            (TAG_HOST_UNIQ, &self.host_uniq),
+        ];
+        if let Some(a) = &ask {
+            t.push((TAG_PPP_MAX_PAYLOAD, a));
+        }
+        let f = discovery(BROADCAST, self.mac, PADI, 0, &t);
         self.push_tx(f);
         self.phase = Phase::Padi {
             tries,
@@ -663,6 +765,18 @@ impl Client {
             }
             out.extend(f.out.drain(..).map(|b| (PPP_IPCP, b)));
         }
+        if let Some(j) = &mut s.jumbo_check
+            && now >= j.next
+        {
+            if j.tries >= JUMBO_CHECK_TRIES {
+                self.jumbo_failed = true;
+                failed = failed.or(Some(Reason::JumboFailed));
+            } else {
+                j.tries += 1;
+                j.next = now + JUMBO_CHECK_MS;
+                out.push((PPP_LCP, jumbo_echo(j.id, s.lcp_opts.magic, j.size)));
+            }
+        }
         if s.up && self.cfg.echo_interval_secs > 0 && now >= s.next_echo {
             if s.echo_outstanding >= self.cfg.echo_failures.max(1) {
                 failed = failed.or(Some(Reason::EchoTimeout));
@@ -732,6 +846,14 @@ impl Client {
                         t.push((tag, Vec::from(v)));
                     }
                 }
+                let echo = max_payload(p.payload);
+                self.pado_max_payload = echo;
+                // RFC 4638: ask again in the PADR only if the AC echoed it.
+                if self.wants_jumbo()
+                    && let Some(m) = echo.filter(|&m| m > MAX_MTU)
+                {
+                    t.push((TAG_PPP_MAX_PAYLOAD, Vec::from(m.min(self.cfg.mtu).to_be_bytes())));
+                }
                 let ac_name = String::from_utf8_lossy(ac_name).into();
                 self.send_padr(p.src, &t);
                 self.phase = Phase::Padr {
@@ -742,7 +864,7 @@ impl Client {
                     next: now + PADR_MS,
                 };
             }
-            (PADS, Phase::Padr { ac, ac_name, .. }) if p.src == *ac && self.uniq_ok(p.payload) => {
+            (PADS, Phase::Padr { ac, ac_name, tags: asked, .. }) if p.src == *ac && self.uniq_ok(p.payload) => {
                 let err = tags(p.payload).find(|(t, _)| {
                     matches!(
                         *t,
@@ -760,8 +882,18 @@ impl Client {
                     id: p.session,
                     peer: *ac,
                 };
+                // RFC 4638: the larger MRU once PADR asked and PADS echoed.
+                let asked = asked
+                    .iter()
+                    .find(|(t, _)| *t == TAG_PPP_MAX_PAYLOAD)
+                    .and_then(|(_, v)| max_payload_value(v));
+                self.pads_max_payload = max_payload(p.payload);
+                let mru = match (asked, max_payload(p.payload)) {
+                    (Some(a), Some(e)) if e > MAX_MTU => a.min(e),
+                    _ => self.cfg.mtu.min(MAX_MTU),
+                };
                 let ac_name = ac_name.clone();
-                self.open_session(now, s, ac_name);
+                self.open_session(now, s, ac_name, mru);
             }
             (PADT, Phase::Session(s)) if p.session == s.s.id && p.src == s.s.peer => {
                 self.fail(now, Reason::Padt, false);
@@ -770,13 +902,17 @@ impl Client {
         }
     }
 
-    fn open_session(&mut self, now: u64, s: Session, ac_name: String) {
+    fn open_session(&mut self, now: u64, s: Session, ac_name: String, mru: u16) {
         let lcp_opts = Lcp {
-            mru: Some(self.cfg.mtu),
-            max_mru: self.cfg.mtu,
+            mru: Some(mru),
+            max_mru: mru,
             magic: self.rng.nonzero32(),
             rng: Rng(self.rng.next() | 1),
-            peer_mru: 1500,
+            // Unless the peer says more (RFC 4638 §7: above 1492 only when
+            // negotiated).
+            peer_mru: MAX_MTU,
+            peer_mru_sent: false,
+            peer_mru_nakked: false,
             peer_magic: 0,
             auth: None,
         };
@@ -794,6 +930,7 @@ impl Client {
             echo_id: 0,
             echo_outstanding: 0,
             lcp_id: first_id.wrapping_add(128),
+            jumbo_check: None,
         }));
         self.events.push_back(Event::Session(s));
         self.flush_session_out();
@@ -898,8 +1035,26 @@ impl Client {
                     .data
                     .get(..4)
                     .map(|m| u32::from_be_bytes([m[0], m[1], m[2], m[3]]));
-                if magic != Some(s.lcp_opts.magic) || s.lcp_opts.magic == 0 {
+                let looped = magic == Some(s.lcp_opts.magic) && s.lcp_opts.magic != 0;
+                if !looped {
                     s.echo_outstanding = 0;
+                }
+                // RFC 4638 path check: the full-size echo came back full
+                // size (both directions carry the frames), or it did not.
+                if !looped
+                    && let Some(j) = s.jumbo_check.take_if(|j| j.id == p.id)
+                {
+                    let got = 4 + p.data.len();
+                    self.jumbo_reply = Some((got, j.size));
+                    // A short reply (an AC that does not copy the data, as
+                    // RFC 1661 allows) proves only the upstream direction:
+                    // not enough.
+                    if got >= usize::from(j.size) {
+                        self.go_up(now, j.link);
+                    } else {
+                        self.jumbo_failed = true;
+                        self.fail(now, Reason::JumboFailed, true);
+                    }
                 }
             }
             PROTO_REJ => {
@@ -1019,19 +1174,33 @@ impl Client {
                             dns.push(d);
                         }
                     }
+                    let our_mru = s.lcp_opts.mru.unwrap_or(MAX_MTU);
+                    let mtu = our_mru.min(s.lcp_opts.peer_mru);
                     let link = Link {
                         session: sess,
                         local: o.addr,
                         remote: o.remote.unwrap_or(DEFAULT_REMOTE),
                         dns,
-                        mtu: self.cfg.mtu.min(s.lcp_opts.peer_mru),
+                        mtu,
                         ac_name: s.ac_name.clone(),
                     };
-                    s.up = true;
-                    s.echo_outstanding = 0;
-                    s.next_echo = now + u64::from(self.cfg.echo_interval_secs) * 1000;
-                    self.backoff = BACKOFF_FIRST_MS;
-                    self.events.push_back(Event::Up(link));
+                    if our_mru > MAX_MTU {
+                        // RFC 4638: the AC may send us frames this large
+                        // (whatever it takes from us): prove the path first.
+                        let id = s.lcp_id;
+                        s.lcp_id = id.wrapping_add(1);
+                        let echo = jumbo_echo(id, s.lcp_opts.magic, our_mru);
+                        s.jumbo_check = Some(JumboCheck {
+                            id,
+                            tries: 1,
+                            next: now + JUMBO_CHECK_MS,
+                            size: our_mru,
+                            link,
+                        });
+                        self.send_ppp(sess, PPP_LCP, &echo);
+                    } else {
+                        self.go_up(now, link);
+                    }
                 }
                 Change::Down => {
                     self.flush_session_out();
@@ -1047,6 +1216,38 @@ impl Client {
             _ => {}
         }
     }
+}
+
+impl Client {
+    /// The link is up: keepalive starts, [`Event::Up`].
+    fn go_up(&mut self, now: u64, link: Link) {
+        let Phase::Session(s) = &mut self.phase else {
+            return;
+        };
+        s.up = true;
+        s.echo_outstanding = 0;
+        s.next_echo = now + u64::from(self.cfg.echo_interval_secs) * 1000;
+        self.backoff = BACKOFF_FIRST_MS;
+        self.events.push_back(Event::Up(link));
+    }
+}
+
+/// A PPP-Max-Payload tag's value (2 bytes).
+fn max_payload_value(v: &[u8]) -> Option<u16> {
+    (v.len() == 2).then(|| u16::from_be_bytes([v[0], v[1]]))
+}
+
+/// The PPP-Max-Payload tag of a discovery payload.
+fn max_payload(payload: &[u8]) -> Option<u16> {
+    find_tag(payload, TAG_PPP_MAX_PAYLOAD).and_then(max_payload_value)
+}
+
+/// An LCP Echo-Request exactly `mtu` bytes long (the PPP payload of a
+/// full-size frame): magic number, then zeros.
+fn jumbo_echo(id: u8, magic: u32, mtu: u16) -> Vec<u8> {
+    let mut d = Vec::from(magic.to_be_bytes());
+    d.resize(usize::from(mtu).saturating_sub(4), 0);
+    ctrl(ECHO_REQ, id, &d)
 }
 
 fn pap_request(id: u8, cfg: &Config) -> Vec<u8> {

@@ -274,7 +274,7 @@
         <label>Password<input data-path="wan.pppoe.password" data-secret type="password" placeholder="empty = keep the stored one" autocomplete="new-password"></label>
         <label>Service name (empty = any)<input data-path="wan.pppoe.service"></label>
         <label>Access concentrator (empty = first to answer)<input data-path="wan.pppoe.ac_name"></label>
-        <label>MTU<input data-path="wan.pppoe.mtu" data-opt type="number" min="1280" max="1492" placeholder="1492"></label>
+        <label>MTU (1500: RFC 4638, if the ISP and modem carry it; else 1492)<input data-path="wan.pppoe.mtu" data-opt type="number" min="1280" max="1500" placeholder="1492"></label>
         <label>LCP echo interval, s (0 = off)<input data-path="wan.pppoe.lcp_echo_interval" data-opt type="number" min="0" max="3600" placeholder="10"></label>
         <label>LCP echo failures before reconnecting<input data-path="wan.pppoe.lcp_echo_failure" data-opt type="number" min="1" max="100" placeholder="5"></label>
       </div>

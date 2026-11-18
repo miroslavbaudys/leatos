@@ -42,6 +42,9 @@ pub const TAG_AC_NAME: u16 = 0x0102;
 pub const TAG_HOST_UNIQ: u16 = 0x0103;
 pub const TAG_AC_COOKIE: u16 = 0x0104;
 pub const TAG_RELAY_SESSION_ID: u16 = 0x0110;
+/// RFC 4638: the largest PPP payload the sender can take (above 1492 =
+/// "baby jumbo" frames on the Ethernet).
+pub const TAG_PPP_MAX_PAYLOAD: u16 = 0x0120;
 pub const TAG_SERVICE_NAME_ERROR: u16 = 0x0201;
 pub const TAG_AC_SYSTEM_ERROR: u16 = 0x0202;
 pub const TAG_GENERIC_ERROR: u16 = 0x0203;

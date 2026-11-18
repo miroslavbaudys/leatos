@@ -805,7 +805,9 @@ pub struct Pppoe {
     /// Only use the access concentrator with this name; empty = the first
     /// that answers.
     pub ac_name: String,
-    /// MRU asked for and largest IP packet sent (1280–1492).
+    /// MRU asked for and largest IP packet sent (1280–1500). Above 1492:
+    /// RFC 4638 ("baby jumbo" frames), used only if the access concentrator
+    /// agrees and a full-size echo passes; else 1492.
     pub mtu: u16,
     /// Seconds between LCP echo requests (0 = no keepalive).
     pub lcp_echo_interval: u32,

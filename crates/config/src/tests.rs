@@ -525,10 +525,19 @@ fn pppoe_checks() {
     let mut anon = Config::default();
     anon.wan.mode = WanMode::Pppoe;
     assert_eq!(parse(&anon.to_toml()).unwrap(), anon);
+    // Up to 1500 with RFC 4638; above, or below IPv4's minimum for PPPoE use: refused.
     assert_eq!(invalid(|c| {
         pppoe(c);
-        c.wan.pppoe.mtu = 1500;
+        c.wan.pppoe.mtu = 1501;
     }), ["wan.pppoe.mtu"]);
+    assert_eq!(invalid(|c| {
+        pppoe(c);
+        c.wan.pppoe.mtu = 1279;
+    }), ["wan.pppoe.mtu"]);
+    let mut j = Config::default();
+    pppoe(&mut j);
+    j.wan.pppoe.mtu = 1500;
+    assert!(j.validate().is_ok(), "{:?}", j.validate());
     assert_eq!(invalid(|c| {
         pppoe(c);
         c.wan.pppoe.password = Some("x".repeat(256));

@@ -35,6 +35,21 @@ struct Ac {
     dns2: Ipv4Addr,
     /// Send no PADS (lost).
     drop_padr: bool,
+    /// RFC 4638: echo PPP-Max-Payload in the PADO and PADS, and offer
+    /// that MRU in LCP.
+    rfc4638: bool,
+    /// The PADR's PPP-Max-Payload (the session's, when echoed).
+    padr_max: Option<u16>,
+    /// Largest PPP payload the path (modem, NICs) carries either way;
+    /// larger frames are lost.
+    path_mtu: usize,
+    /// Echo replies without the request's data (a short reply).
+    echo_short: bool,
+    /// The MRU the AC asks for in LCP (default: the session's); the real
+    /// AC asks 1492 even after agreeing to 1500 in discovery.
+    ac_mru: Option<u16>,
+    /// Take an MRU the client suggests in a Configure-Nak.
+    take_mru_nak: bool,
     lcp_req_id: u8,
     lcp_ours_acked: bool,
     lcp_theirs_acked: bool,
@@ -64,6 +79,12 @@ impl Ac {
             offer_ipv6cp: false,
             dns2: DNS2,
             drop_padr: false,
+            rfc4638: false,
+            padr_max: None,
+            path_mtu: 1500,
+            echo_short: false,
+            ac_mru: None,
+            take_mru_nak: false,
             lcp_req_id: 0,
             lcp_ours_acked: false,
             lcp_theirs_acked: false,
@@ -86,7 +107,7 @@ impl Ac {
     fn lcp_request(&mut self) -> Vec<u8> {
         self.lcp_req_id = self.lcp_req_id.wrapping_add(1);
         let mut o = Vec::new();
-        put_option(&mut o, LCP_MRU, &1492u16.to_be_bytes());
+        put_option(&mut o, LCP_MRU, &self.ac_mru.unwrap_or(self.session_mru()).to_be_bytes());
         match self.auth {
             SimAuth::Pap => put_option(&mut o, LCP_AUTH, &[0xc0, 0x23]),
             SimAuth::Chap => put_option(&mut o, LCP_AUTH, &[0xc2, 0x23, 5]),
@@ -97,6 +118,11 @@ impl Ac {
         put_option(&mut o, LCP_MAGIC, &0x0bad_cafe_u32.to_be_bytes());
         let b = ctrl(CONF_REQ, self.lcp_req_id, &o);
         self.ppp(PPP_LCP, &b)
+    }
+
+    /// MRU of this session: the RFC 4638 one when agreed in discovery.
+    fn session_mru(&self) -> u16 {
+        self.padr_max.filter(|_| self.rfc4638).unwrap_or(1492)
     }
 
     fn after_lcp(&mut self, out: &mut Vec<Vec<u8>>) {
@@ -134,6 +160,18 @@ impl Ac {
     }
 
     fn input(&mut self, f: &[u8]) -> Vec<Vec<u8>> {
+        let p = parse(f).expect("client sent a valid PPPoE frame");
+        // Lost on the way (too large for the path).
+        if p.ethertype == ETHERTYPE_SESSION && p.payload.len() > self.path_mtu + 2 {
+            return Vec::new();
+        }
+        let mut out = self.answer(f);
+        let path = self.path_mtu;
+        out.retain(|r| parse(r).is_none_or(|q| q.ethertype != ETHERTYPE_SESSION || q.payload.len() <= path + 2));
+        out
+    }
+
+    fn answer(&mut self, f: &[u8]) -> Vec<Vec<u8>> {
         self.got.push(f.to_vec());
         let mut out = Vec::new();
         let p = parse(f).expect("client sent a valid PPPoE frame");
@@ -144,32 +182,38 @@ impl Ac {
             match p.code {
                 PADI => {
                     assert_eq!(p.dst, BROADCAST);
-                    out.push(discovery(
-                        CLIENT,
-                        self.mac,
-                        PADO,
-                        0,
-                        &[
-                            (TAG_AC_NAME, self.name.as_bytes()),
-                            (TAG_SERVICE_NAME, b""),
-                            (TAG_SERVICE_NAME, b"internet"),
-                            (TAG_HOST_UNIQ, &uniq),
-                            (TAG_AC_COOKIE, b"cookie"),
-                        ],
-                    ));
+                    let max = find_tag(p.payload, TAG_PPP_MAX_PAYLOAD).filter(|_| self.rfc4638).map(<[u8]>::to_vec);
+                    let mut t: Vec<(u16, &[u8])> = alloc::vec![
+                        (TAG_AC_NAME, self.name.as_bytes()),
+                        (TAG_SERVICE_NAME, b""),
+                        (TAG_SERVICE_NAME, b"internet"),
+                        (TAG_HOST_UNIQ, &uniq),
+                        (TAG_AC_COOKIE, b"cookie"),
+                    ];
+                    if let Some(m) = &max {
+                        t.push((TAG_PPP_MAX_PAYLOAD, m));
+                    }
+                    out.push(discovery(CLIENT, self.mac, PADO, 0, &t));
                 }
                 PADR if p.dst == self.mac => {
                     assert_eq!(find_tag(p.payload, TAG_AC_COOKIE), Some(&b"cookie"[..]));
+                    self.padr_max = find_tag(p.payload, TAG_PPP_MAX_PAYLOAD).map(|v| get16(v, 0));
+                    // A new session: negotiation starts over.
+                    self.lcp_ours_acked = false;
+                    self.lcp_theirs_acked = false;
+                    self.authed = false;
+                    self.ipcp_sent = false;
+                    self.ipcp_up = false;
+                    self.challenge_sent = false;
                     if self.drop_padr {
                         return out;
                     }
-                    out.push(discovery(
-                        CLIENT,
-                        self.mac,
-                        PADS,
-                        self.session,
-                        &[(TAG_SERVICE_NAME, b""), (TAG_HOST_UNIQ, &uniq)],
-                    ));
+                    let max = self.padr_max.filter(|_| self.rfc4638).map(u16::to_be_bytes);
+                    let mut t: Vec<(u16, &[u8])> = alloc::vec![(TAG_SERVICE_NAME, b""), (TAG_HOST_UNIQ, &uniq)];
+                    if let Some(m) = &max {
+                        t.push((TAG_PPP_MAX_PAYLOAD, m));
+                    }
+                    out.push(discovery(CLIENT, self.mac, PADS, self.session, &t));
                     out.push(self.lcp_request());
                 }
                 PADT => self.padts += 1,
@@ -184,9 +228,10 @@ impl Ac {
             PPP_LCP => match c.code {
                 CONF_REQ => {
                     let opts = options(c.data).unwrap();
+                    let mru = self.session_mru();
                     assert!(
                         opts.iter()
-                            .any(|&(k, v)| k == LCP_MRU && get16(v, 0) <= 1492)
+                            .any(|&(k, v)| k == LCP_MRU && get16(v, 0) <= mru)
                     );
                     out.push(self.ppp(PPP_LCP, &ctrl(CONF_ACK, c.id, c.data)));
                     self.lcp_theirs_acked = true;
@@ -198,15 +243,26 @@ impl Ac {
                 }
                 CONF_NAK => {
                     let opts = options(c.data).unwrap();
-                    assert_eq!(opts, vec![(LCP_AUTH, &[0xc2, 0x23, 5][..])]);
-                    self.use_chap = true;
+                    for (k, v) in opts {
+                        match k {
+                            LCP_MRU if self.take_mru_nak => self.ac_mru = Some(get16(v, 0)),
+                            LCP_MRU => {}
+                            LCP_AUTH => {
+                                assert_eq!(v, &[0xc2, 0x23, 5][..]);
+                                self.use_chap = true;
+                            }
+                            _ => panic!("unexpected nak of option {k}"),
+                        }
+                    }
                     out.push(self.lcp_request());
                 }
                 ECHO_REQ => {
                     self.echo_requests += 1;
                     if self.answer_echo {
                         let mut d = 0x0bad_cafe_u32.to_be_bytes().to_vec();
-                        d.extend_from_slice(&c.data[4..]);
+                        if !self.echo_short {
+                            d.extend_from_slice(&c.data[4..]);
+                        }
                         out.push(self.ppp(PPP_LCP, &ctrl(ECHO_REPLY, c.id, &d)));
                     }
                 }
@@ -421,16 +477,16 @@ fn smaller_mtu_from_config() {
     });
     r.run(&mut [&mut ac], 1000);
     assert_eq!(r.up(), Some(&expected_link(1480)));
-    // Above what PPPoE carries: clamped.
+    // Above what PPPoE carries even with RFC 4638: clamped.
     let c = Client::new(
         Config {
-            mtu: 1500,
+            mtu: 1600,
             ..Config::default()
         },
         CLIENT,
         1,
     );
-    assert_eq!(c.config().mtu, MAX_MTU);
+    assert_eq!(c.config().mtu, MAX_MTU_RFC4638);
 }
 
 #[test]
@@ -939,4 +995,130 @@ fn fuzz_frames() {
             }),
         );
     }
+}
+
+// ---- RFC 4638: MTU 1500 over PPPoE --------------------------------------
+
+fn jumbo() -> Run {
+    Run::new(Config {
+        username: "alice@isp".into(),
+        password: "s3cret".into(),
+        mtu: 1500,
+        ..Config::default()
+    })
+}
+
+fn tag_of(f: &[u8]) -> Option<u16> {
+    find_tag(parse(f).unwrap().payload, TAG_PPP_MAX_PAYLOAD).map(|v| get16(v, 0))
+}
+
+fn first(ac: &Ac, code: u8) -> Vec<u8> {
+    ac.got
+        .iter()
+        .find(|f| get16(f, 12) == ETHERTYPE_DISCOVERY && f[15] == code)
+        .unwrap()
+        .clone()
+}
+
+/// The full-size echo requests the client sent (LCP length = 1500).
+fn jumbo_echoes(ac: &Ac) -> usize {
+    ac.got
+        .iter()
+        .filter(|f| {
+            let p = parse(f).unwrap();
+            p.ethertype == ETHERTYPE_SESSION
+                && get16(p.payload, 0) == PPP_LCP
+                && p.payload[2] == ECHO_REQ
+                && p.payload.len() == 2 + 1500
+        })
+        .count()
+}
+
+#[test]
+fn rfc4638_session_at_1500() {
+    let mut ac = Ac::new(SimAuth::Pap);
+    ac.rfc4638 = true;
+    let mut r = jumbo();
+    r.run(&mut [&mut ac], 2000);
+    assert_eq!(r.up(), Some(&expected_link(1500)));
+    assert_eq!(tag_of(&first(&ac, PADI)), Some(1500));
+    assert_eq!(tag_of(&first(&ac, PADR)), Some(1500));
+    assert_eq!(jumbo_echoes(&ac), 1, "the path was checked once");
+    assert!(!r.c.jumbo_failed());
+}
+
+#[test]
+fn rfc4638_without_ac_support_is_1492() {
+    let mut ac = Ac::new(SimAuth::Pap);
+    let mut r = jumbo();
+    r.run(&mut [&mut ac], 2000);
+    assert_eq!(r.up(), Some(&expected_link(1492)));
+    assert_eq!(tag_of(&first(&ac, PADI)), Some(1500), "asked");
+    assert_eq!(tag_of(&first(&ac, PADR)), None, "not echoed: not asked again");
+    assert_eq!(jumbo_echoes(&ac), 0);
+}
+
+/// The AC agrees, but the path loses large frames, or its echo comes back
+/// short: the session ends and the next one is a plain 1492 one.
+#[test]
+fn rfc4638_falls_back_when_the_path_does_not_carry_it() {
+    for (path, short) in [(1492, false), (1500, true)] {
+        let mut ac = Ac::new(SimAuth::Pap);
+        ac.rfc4638 = true;
+        ac.path_mtu = path;
+        ac.echo_short = short;
+        let mut r = jumbo();
+        r.run(&mut [&mut ac], 10_000);
+        assert!(
+            r.events.contains(&Event::Down { reason: Reason::JumboFailed, was_up: false }),
+            "{:?}",
+            r.events
+        );
+        assert!(r.c.jumbo_failed());
+        assert_eq!(r.up(), Some(&expected_link(1492)), "path {path}, short {short}");
+        assert_eq!(ac.padts, 1, "the jumbo session was ended");
+        // The second PADI asks no more.
+        let padis: Vec<_> = ac
+            .got
+            .iter()
+            .filter(|f| get16(f, 12) == ETHERTYPE_DISCOVERY && f[15] == PADI)
+            .collect();
+        assert_eq!(tag_of(padis.last().unwrap()), None);
+        // Before the fallback, no Up was reported at 1500.
+        assert!(!r.events.iter().any(|e| matches!(e, Event::Up(l) if l.mtu == 1500)));
+    }
+}
+
+/// The real AC's way: 1500 agreed in discovery, MRU 1492 asked in LCP.
+#[test]
+fn rfc4638_ac_asking_1492_is_asked_for_1500() {
+    // It takes the suggestion: 1500 both ways.
+    let mut ac = Ac::new(SimAuth::Pap);
+    ac.rfc4638 = true;
+    ac.ac_mru = Some(1492);
+    ac.take_mru_nak = true;
+    let mut r = jumbo();
+    r.run(&mut [&mut ac], 2000);
+    assert_eq!(r.up(), Some(&expected_link(1500)));
+    // It insists: we send 1492, it may send us 1500 (checked on the path).
+    let mut ac = Ac::new(SimAuth::Pap);
+    ac.rfc4638 = true;
+    ac.ac_mru = Some(1492);
+    let mut r = jumbo();
+    r.run(&mut [&mut ac], 2000);
+    assert_eq!(r.up(), Some(&expected_link(1492)));
+    assert_eq!(jumbo_echoes(&ac), 1, "the receive direction was checked");
+    assert!(!r.c.jumbo_failed());
+    let t = r.c.rfc4638_trace().unwrap();
+    assert_eq!((t.pado, t.pads, t.our_mru, t.peer_mru), (Some(1500), Some(1500), Some(1500), Some(1492)));
+    // It insists and the path loses large frames: back to 1492 both ways.
+    let mut ac = Ac::new(SimAuth::Pap);
+    ac.rfc4638 = true;
+    ac.ac_mru = Some(1492);
+    ac.path_mtu = 1492;
+    let mut r = jumbo();
+    r.run(&mut [&mut ac], 10_000);
+    assert!(r.c.jumbo_failed());
+    assert_eq!(r.up(), Some(&expected_link(1492)));
+    assert_eq!(r.c.rfc4638_trace().unwrap().our_mru, Some(1492));
 }

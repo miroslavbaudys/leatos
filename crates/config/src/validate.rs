@@ -262,8 +262,8 @@ fn pppoe(c: &Config, x: &mut Issues) {
             x.add(path, "must not contain control characters");
         }
     }
-    if !(1280..=1492).contains(&p.mtu) {
-        x.add("wan.pppoe.mtu", "must be 1280–1492");
+    if !(1280..=1500).contains(&p.mtu) {
+        x.add("wan.pppoe.mtu", "must be 1280–1500 (above 1492: RFC 4638, if the ISP and the modem carry it)");
     }
     if p.lcp_echo_interval > 3600 {
         x.add("wan.pppoe.lcp_echo_interval", "must be 0–3600 seconds (0 = off)");
