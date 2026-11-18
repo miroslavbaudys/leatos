@@ -582,6 +582,29 @@ fn pppoe_password_is_a_secret() {
 }
 
 #[test]
+fn static_wan_through_assignments() {
+    // The CLI's path: the whole table at once (both fields are required),
+    // then single fields; the mode switches separately.
+    let c = Config::default();
+    let s = c
+        .with_assignment(r#"wan.static = { ipv4 = "203.0.113.50/24", gateway = "203.0.113.1" }"#)
+        .unwrap();
+    assert_eq!(s.wan.static_ip.as_ref().unwrap().gateway, ip(203, 0, 113, 1));
+    assert!(c.with_assignment(r#"wan.static.ipv4 = "203.0.113.50/24""#).is_err(), "gateway missing");
+    let s = s.with_assignment(r#"wan.static.dns = ["203.0.113.1"]"#).unwrap();
+    let s = s.with_assignment(r#"wan.mode = "static""#).unwrap();
+    assert!(s.validate().is_ok(), "{:?}", s.validate());
+    assert_eq!(s.unsupported(), vec![]);
+    let t = s.to_toml();
+    assert!(t.contains("mode = \"static\"") && t.contains("[wan.static]"), "{t}");
+    assert_eq!(parse(&t).unwrap(), s);
+    // Back to DHCP: the static settings stay for later, unused.
+    let d = s.with_assignment(r#"wan.mode = "dhcp""#).unwrap();
+    assert!(d.validate().is_ok());
+    assert!(d.wan.static_ip.is_some());
+}
+
+#[test]
 fn dhcp_wan_leaves_pppoe_out_of_the_canonical_form() {
     // Kernels from before PPPoE know [wan] with vlan/vlan_pcp only.
     let mut c = Config::default();
@@ -1222,12 +1245,15 @@ fn what_the_kernel_supports() {
     // Networks on lan0, VLANs, zones, DHCP off: supported.
     let c = parse(FULL_V2).unwrap();
     assert_eq!(c.unsupported(), vec![]);
-    // Not yet: other ports, static WAN (rules, forwards, DNS hosts are in).
+    // Not yet: other ports (rules, forwards, DNS hosts, a static WAN are in).
     let mut d = c.clone();
     d.networks[1].ports = vec!["lan1".into()];
     assert_eq!(d.unsupported()[0].path, "network.guest.ports");
-    d.wan.mode = WanMode::Static;
-    assert!(d.unsupported().iter().any(|i| i.path == "wan.static"));
+    let mut s = c.clone();
+    s.wan.mode = WanMode::Static;
+    s.wan.static_ip = Some(WanStatic { ipv4: Cidr::new(ip(203, 0, 113, 50), 24), gateway: ip(203, 0, 113, 1), dns: vec![] });
+    assert_eq!(s.unsupported(), vec![]);
+    assert!(s.validate().is_ok(), "{:?}", s.validate());
 }
 
 #[test]

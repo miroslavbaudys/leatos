@@ -990,8 +990,8 @@ impl Config {
     /// a save or a stored config with them is refused. Implemented:
     /// networks on `lan0` (untagged or VLANs), zones, DHCP per network,
     /// rules, port forwards, redirects, mDNS reflection, DNS hosts and
-    /// views. Not yet: other ports (bridging), another WAN port, a static
-    /// WAN.
+    /// views, a static WAN. Not yet: other ports (bridging), another WAN
+    /// port.
     pub fn unsupported(&self) -> Vec<Issue> {
         let mut out = Vec::new();
         let mut add = |path: String, what: &str| {
@@ -1007,9 +1007,6 @@ impl Config {
         }
         if self.wan.port != PORT_WAN {
             add("wan.port".into(), "a WAN port other than wan0");
-        }
-        if self.wan.mode == WanMode::Static || self.wan.static_ip.is_some() {
-            add("wan.static".into(), "a static WAN address");
         }
         out
     }

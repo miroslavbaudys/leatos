@@ -75,6 +75,17 @@ impl Pinger {
         }
     }
 
+    /// A new WAN gateway (`None` = none): ping it again from seq 0, so
+    /// every WAN (re)start shows whether the gateway answers.
+    fn retarget(&mut self, target: Option<Ipv4Address>) {
+        if target != self.target {
+            self.target = target;
+            self.seq = 0;
+            self.sent_at = [None; PING_COUNT as usize];
+            self.next_send = timer::Instant::now();
+        }
+    }
+
     fn step(&mut self, sockets: &mut SocketSet<'static>) {
         let Some(target) = self.target else { return };
         let sock = sockets.get_mut::<icmp::Socket>(self.socket);
@@ -180,21 +191,9 @@ fn handle_dhcp(name: &str, host: &mut HostIf, pinger: &mut Pinger) -> Option<Lea
                     .unwrap_or_else(|| "-".into()),
                 dns.join(", ")
             );
-            for n in crate::config::networks() {
-                let lan = smoltcp::wire::Ipv4Cidr::new(n.addr, n.prefix);
-                let shorter = cfg.address.prefix_len().min(lan.prefix_len());
-                let net = |a: Ipv4Address| {
-                    u32::from(a) & (u32::MAX.checked_shl(32 - shorter as u32).unwrap_or(0))
-                };
-                if net(cfg.address.address()) == net(lan.address()) {
-                    println!(
-                        "  net WARNING     : WAN {} overlaps network {} {lan}: forwarding between them breaks; boot with e.g. lan=10.10.0.1/24",
-                        cfg.address, n.name
-                    );
-                }
-            }
+            warn_overlap(cfg.address);
             DHCP_OK.store(true, Ordering::Release);
-            pinger.target = cfg.router;
+            pinger.retarget(cfg.router);
             Some(LeaseChange {
                 addr: Some((cfg.address.address(), cfg.address.prefix_len())),
                 gateway: cfg.router,
@@ -210,10 +209,64 @@ fn handle_dhcp(name: &str, host: &mut HostIf, pinger: &mut Pinger) -> Option<Lea
             host.iface.update_ip_addrs(|a| a.clear());
             host.iface.routes_mut().remove_default_ipv4_route();
             DHCP_OK.store(false, Ordering::Release);
-            pinger.target = None;
+            pinger.retarget(None);
             Some(LeaseChange::lost())
         }
         None => None,
+    }
+}
+
+/// A WAN address inside one of the networks breaks forwarding between them.
+fn warn_overlap(wan: smoltcp::wire::Ipv4Cidr) {
+    for n in crate::config::networks() {
+        let lan = smoltcp::wire::Ipv4Cidr::new(n.addr, n.prefix);
+        let shorter = wan.prefix_len().min(lan.prefix_len());
+        let net = |a: Ipv4Address| {
+            u32::from(a) & (u32::MAX.checked_shl(32 - shorter as u32).unwrap_or(0))
+        };
+        if net(wan.address()) == net(lan.address()) {
+            println!(
+                "  net WARNING     : WAN {} overlaps network {} {lan}: forwarding between them breaks; boot with e.g. lan=10.10.0.1/24",
+                wan, n.name
+            );
+        }
+    }
+}
+
+/// A static WAN (`wan.mode = "static"`): the address and default route on
+/// the router-stack interface, reported like a lease that never expires.
+fn configure_static(
+    name: &str,
+    host: &mut HostIf,
+    pinger: &mut Pinger,
+    s: &crate::config::WanStatic,
+) -> LeaseChange {
+    let cidr = smoltcp::wire::Ipv4Cidr::new(s.addr, s.prefix);
+    host.iface.update_ip_addrs(|a| {
+        a.clear();
+        a.push(IpCidr::Ipv4(cidr)).expect("wan addr");
+    });
+    host.iface
+        .routes_mut()
+        .add_default_ipv4_route(s.gateway)
+        .expect("route");
+    let dns: Vec<_> = s.dns.iter().map(|d| alloc::format!("{d}")).collect();
+    println!(
+        "  net {}         : static {} gw {} dns [{}]",
+        name,
+        cidr,
+        s.gateway,
+        dns.join(", ")
+    );
+    warn_overlap(cidr);
+    DHCP_OK.store(true, Ordering::Release);
+    pinger.retarget(Some(s.gateway));
+    LeaseChange {
+        addr: Some((s.addr, s.prefix)),
+        gateway: Some(s.gateway),
+        dns: s.dns.clone(),
+        mtu: fwd::forwarder::DEFAULT_MTU,
+        via: Some(String::from("static")),
     }
 }
 
@@ -263,52 +316,62 @@ fn dhcp_socket(host: &HostIf) -> Option<SocketHandle> {
 }
 
 /// Restart the WAN on new link settings: end a PPPoE session, switch the
-/// port and its router-stack interface between DHCP (Ethernet) and PPPoE
-/// (IP only), and start the client for `new` (`None` = DHCP). Returns the
-/// lost address, except when DHCP stays: then the DHCP client's
-/// `Deconfigured` event reports it.
+/// port and its router-stack interface between Ethernet (DHCP, static)
+/// and PPPoE (IP only), and start what `new` needs: the DHCP client, the
+/// PPPoE client, or the static address (returned as the new lease).
+/// Otherwise returns the lost address, except when DHCP stays: then the
+/// DHCP client's `Deconfigured` event reports it.
 fn restart_wan(
     sh: &Shared,
     wan: &mut HostIf,
     pppoe: &mut Option<Pppoe>,
-    new: Option<proto_pppoe::Config>,
+    pinger: &mut Pinger,
+    new: crate::config::WanLink,
 ) -> Option<LeaseChange> {
+    use crate::config::WanLink;
     let port = &sh.ports[0];
     if let Some(mut p) = pppoe.take()
         && p.stop(port, wan)
     {
         sh.tx_kick[0].signal();
     }
-    let want = new.is_some();
-    if !want && !port.is_pppoe() {
+    let dhcp = new == WanLink::Dhcp;
+    if dhcp && !port.is_pppoe()
+        && let Some(h) = dhcp_socket(wan)
+    {
         // The lease belongs to the old link: ask again on the new one.
-        if let Some(h) = dhcp_socket(wan) {
-            wan.sockets.get_mut::<dhcpv4::Socket>(h).reset();
-        }
+        wan.sockets.get_mut::<dhcpv4::Socket>(h).reset();
         return None;
     }
-    if port.is_pppoe() != want {
-        port.pppoe_mode.store(want, Ordering::Relaxed);
-        let mtu = new.as_ref().map_or(fwd::forwarder::DEFAULT_MTU, |c| c.mtu);
+    let want_pppoe = matches!(new, WanLink::Pppoe(_));
+    if port.is_pppoe() != want_pppoe {
+        port.pppoe_mode.store(want_pppoe, Ordering::Relaxed);
+        let mtu = match &new {
+            WanLink::Pppoe(c) => c.mtu,
+            _ => fwd::forwarder::DEFAULT_MTU,
+        };
         port.mtu.store(u32::from(mtu), Ordering::Relaxed);
         // Another medium: a new interface (the sockets stay).
         wan.iface = stack::new_iface(port);
-        match (want, dhcp_socket(wan)) {
-            (true, Some(h)) => {
-                wan.sockets.remove(h);
-            }
-            (false, None) => {
-                wan.sockets.add(dhcpv4::Socket::new());
-            }
-            _ => {}
+    }
+    // The DHCP client runs only in DHCP mode.
+    match (dhcp, dhcp_socket(wan)) {
+        (false, Some(h)) => {
+            wan.sockets.remove(h);
         }
+        (true, None) => {
+            wan.sockets.add(dhcpv4::Socket::new());
+        }
+        _ => {}
     }
     wan.iface.update_ip_addrs(|a| a.clear());
     wan.iface.routes_mut().remove_default_ipv4_route();
     DHCP_OK.store(false, Ordering::Release);
-    *pppoe = new.map(|c| Pppoe::new(c, port));
-    if pppoe.is_none() {
-        println!("  net {}       : DHCP", port.name);
+    pinger.retarget(None);
+    match new {
+        WanLink::Pppoe(c) => *pppoe = Some(Pppoe::new(c, port)),
+        WanLink::Dhcp => println!("  net {}       : DHCP", port.name),
+        WanLink::Static(s) => return Some(configure_static(port.name, wan, pinger, &s)),
     }
     Some(LeaseChange::lost())
 }
@@ -320,30 +383,30 @@ fn apply_saved(
     (cfg, source): (crate::config::schema::Config, String),
     sh: &Shared,
     hosts: &mut [HostIf],
-    pppoe: &mut Option<Pppoe>,
+    (pppoe, pinger): (&mut Option<Pppoe>, &mut Pinger),
     services: Option<&mut LanServices>,
     mgmt: &mut Mgmt,
     slots: &mut Vec<Option<String>>,
 ) -> Option<LeaseChange> {
     let old = crate::config::qos();
     let old_tag = crate::config::wan_tci();
-    let old_pppoe = crate::config::pppoe();
+    let old_link = crate::config::wan_link();
     let old_nets = crate::config::networks();
     crate::config::apply(cfg, source);
     let tag = crate::config::wan_tci();
-    let new_pppoe = crate::config::pppoe();
+    let new_link = crate::config::wan_link();
     let mut change = None;
     if let Some(port) = sh.ports.first()
-        && (tag != old_tag || new_pppoe != old_pppoe)
+        && (tag != old_tag || new_link != old_link)
     {
         port.set_vlan(tag);
         println!(
             "  net {}       : now {}, restarting {}",
             port.name,
             tag.map_or(String::from("untagged"), stack::vlan_text),
-            if new_pppoe.is_some() { "PPPoE" } else { "DHCP" }
+            new_link.name()
         );
-        change = restart_wan(sh, &mut hosts[0], pppoe, new_pppoe);
+        change = restart_wan(sh, &mut hosts[0], pppoe, pinger, new_link);
     }
     // Also picks up the WAN tag's 4 bytes and PPPoE's 8 of shaper overhead.
     stack::apply_qos(sh, &old, &crate::config::qos());
@@ -575,6 +638,10 @@ pub async fn run(
     let mut mgmt = Mgmt::new(&mut hosts, &links, store.is_some());
     let mut cli = Cli::new(store.is_some());
     let mut pppoe = crate::config::pppoe().map(|c| Pppoe::new(c, &sh.ports[0]));
+    if let crate::config::WanLink::Static(s) = crate::config::wan_link() {
+        let c = configure_static(sh.ports[0].name, &mut hosts[0], &mut pinger, &s);
+        publish_wan(&c, sh, &mut mgmt, &mut cli, services.as_mut());
+    }
     // Serial input wakes the task too (the CLI).
     let rx = crate::console::rx_event();
     let events: Vec<&'static crate::irq::IrqEvent> =
@@ -594,7 +661,7 @@ pub async fn run(
                 }
                 if let Some(c) = &change {
                     DHCP_OK.store(c.addr.is_some(), Ordering::Release);
-                    pinger.target = c.gateway;
+                    pinger.retarget(c.gateway);
                 }
                 if p.status_changed() || change.is_some() {
                     mgmt.set_wan_pppoe(Some(p.status_json()));
@@ -635,7 +702,7 @@ pub async fn run(
                 // Saved without a trial: run it now, no reboot.
                 let cfg = (**cfg).clone();
                 let svc = services.as_mut();
-                if let Some(c) = apply_saved((cfg, source.clone()), sh, &mut hosts, &mut pppoe, svc, &mut mgmt, &mut slots) {
+                if let Some(c) = apply_saved((cfg, source.clone()), sh, &mut hosts, (&mut pppoe, &mut pinger), svc, &mut mgmt, &mut slots) {
                     publish_wan(&c, sh, &mut mgmt, &mut cli, services.as_mut());
                 }
             }
@@ -679,7 +746,7 @@ pub async fn run(
                                 action = Some(crate::net::mgmt::Action::Reboot);
                             } else if let Some(source) = source {
                                 let svc = services.as_mut();
-                                if let Some(c) = apply_saved((*cfg, source), sh, &mut hosts, &mut pppoe, svc, &mut mgmt, &mut slots) {
+                                if let Some(c) = apply_saved((*cfg, source), sh, &mut hosts, (&mut pppoe, &mut pinger), svc, &mut mgmt, &mut slots) {
                                     publish_wan(&c, sh, &mut mgmt, &mut cli, services.as_mut());
                                 }
                             }

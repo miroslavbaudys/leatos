@@ -183,7 +183,7 @@ pub fn bring_up(
             let link = LinkShared::new(port_ix, true);
             let iface = new_iface(&port);
             let mut sockets = SocketSet::new(Vec::new());
-            if !pppoe {
+            if crate::config::wan_link() == crate::config::WanLink::Dhcp {
                 sockets.add(dhcpv4::Socket::new());
             }
             hosts.push(HostIf { iface, sockets });

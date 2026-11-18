@@ -9,7 +9,7 @@ redirects, WAN anti-spoofing, mDNS reflect rules (docs/mdns.md), and the
 web interface's Networks and Firewall pages (§9), DNS hosts and
 split-horizon DNS views (docs/dns-views.md; in QEMU, 2026-11-18). All of
 it but the DNS views runs on the apu4 as the developer's home router.
-Ports other than `wan0`/`lan0` and a static WAN are refused as unsupported
+Ports other than `wan0`/`lan0` are refused as unsupported
 (`Config::unsupported`). Schema v1 is
 in `docs/config-and-storage.md` §5. v2 is the data model the multipage
 web interface is built against (Networks and Firewall pages). It also covers
@@ -119,6 +119,16 @@ Unchanged from v1, with two additions:
 - `port` (default `"wan0"`): which physical port. The datapath keeps one
   WAN, and the per-direction core layout (`docs/smp.md`) assumes that.
 - `mode = "static"` with `[wan.static]` (`ipv4`, `gateway`, `dns`).
+  Implemented 2026-11-18 (`config::wan_link`, `net/svc.rs`
+  `configure_static`): the address and default route on the WAN's
+  router-stack interface, reported like a lease that never expires
+  (`via = "static"`), `dns` used as the WAN's servers unless
+  `dns.upstreams` names its own. Applied live like the other modes
+  (DHCP ⇄ PPPoE ⇄ static); `[wan.static]` stays when another mode is
+  chosen. Boot arguments `wan_mode=static wan_ip=a.b.c.d/len
+  wan_gw=a.b.c.d wan_dns=a,b`. CLI: `config set wan.static = { ipv4 =
+  "…", gateway = "…" }` (both are required, so the table first), then
+  `config set wan.mode = "static"`.
 
 The WAN is always zone `wan`, a built-in zone: input drop, masquerade on,
 `forward_to` empty. Input drop is silent: no RST, no ICMP port
@@ -372,8 +382,7 @@ control `LAB_GUEST_DOMAIN=0`).
   unsupported (`Config::unsupported`, separate from validation so the
   crate accepts the whole schema): by a save (web, CLI), by `rrstore
   put`, and a stored config with them is not used (defaults, as for any
-  rejected record). Today that is a static WAN and ports other than
-  `wan0`/`lan0`.
+  rejected record). Today that is ports other than `wan0`/`lan0`.
 
 ## 5. Migration and rollback
 - **Version 1 is no longer read** (dropped 2026-11-18). It had one
@@ -602,9 +611,13 @@ In rough order of value:
      target), e.g. "fragmentation needed" from the internet about a
      forwarded server's answers. Host tests with a control (the old
      mapping misses each kind).
-8. **Small schema items the kernel still refuses:** a static WAN
-   (`mode = "static"`, `[wan.static]`). `[[dns.host]]` ✅ (QEMU,
-   2026-11-18) with split-horizon views, docs/dns-views.md.
+8. ✅ (QEMU, 2026-11-18) **Small schema items the kernel refused:** a
+   static WAN (`mode = "static"`, `[wan.static]`, §3): web WAN page,
+   CLI, boot arguments; `LAB_WAN_STATIC=1 scripts/lab-test.sh` (the ISP
+   runs no DHCP server; negative control `LAB_ROUTER_ARGS=wan_mode=dhcp`)
+   and `scripts/vlan-test.sh` (DHCP → static → DHCP live). Open: the
+   apu4 (no static line at home). `[[dns.host]]` ✅ (QEMU, 2026-11-18)
+   with split-horizon views, docs/dns-views.md.
 9. ✅ (2026-11-15) **Web interface gaps.** Every network's DHCP pool,
    lease time and reservations (a DHCP panel per network on the Networks
    page; "Reserve" on the Clients page for any network); the management

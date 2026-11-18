@@ -60,6 +60,14 @@
 #                        negative control: LAB_PPPOE=pap
 #                        LAB_PPPOE_ANON=1 (no user name against an ISP
 #                        requiring PAP: no session).
+#   LAB_WAN_STATIC=1     the ISP runs no DHCP server; the router gets
+#                        wan_mode=static wan_ip=203.0.113.60/24
+#                        wan_gw=203.0.113.1 wan_dns=203.0.113.1 (LAB_ROUTER_ARGS
+#                        win). Checks: the router's static line and the ISP
+#                        seeing 203.0.113.60 as the NATed source; all other
+#                        checks run through it. Negative control:
+#                        LAB_ROUTER_ARGS=wan_mode=dhcp (no address, everything
+#                        fails).
 #   LAB_GUEST=1          the router boots from a store (tools/rrstore) with a
 #                        second network: VLAN 20 on lan0, 10.20.0.1/24, zone
 #                        "guest" (input: DHCP, DNS, ping; forwards to the
@@ -214,6 +222,8 @@ if [[ -n "$ISP_PPPOE" ]]; then
   fi
   BIG_PING="${LAB_BIG_PING:-1464}"
 fi
+ISP_STATIC="${LAB_WAN_STATIC:-}"
+[[ -n "$ISP_STATIC" ]] && ROUTER_ARGS="$ROUTER_ARGS wan_mode=static wan_ip=203.0.113.60/24 wan_gw=203.0.113.1 wan_dns=203.0.113.1"
 GUEST="${LAB_GUEST:-}"
 GUEST_LIVE="${LAB_GUEST_LIVE:-}"
 [[ -n "$GUEST_LIVE" ]] && GUEST=1
@@ -508,6 +518,19 @@ if [[ -n "$ISP_PPPOE" ]]; then
   else
     echo "  LAB FAIL: pppoe ($ISP_PPPOE): no session (${up:-no 'up' line in the router log})"
     tr -d '\r' <"$WORK/router.log" | grep "pppoe " | tail -3 | sed 's/^/    | /'
+    router_fails=$((router_fails + 1))
+  fi
+fi
+
+# Static WAN: the router configured its address (no DHCP server at the
+# ISP), and the ISP saw it as the NATed source.
+if [[ -n "$ISP_STATIC" ]]; then
+  st=$(tr -d '\r' <"$WORK/router.log" | grep "net wan0 .*: static " | head -1 || true)
+  seen=$(tr -d '\r' <"$WORK/client.log" | grep "LAB PASS: nat: ISP sees source" | head -1 || true)
+  if echo "$st" | grep -q "static 203.0.113.60/24 gw 203.0.113.1 dns \[203.0.113.1\]" && echo "$seen" | grep -q "source 203.0.113.60 "; then
+    echo "  LAB PASS: static wan: ${st##*: } (NATed source 203.0.113.60)"
+  else
+    echo "  LAB FAIL: static wan: ${st:-no 'static' line in the router log}; ${seen:-no NAT pass from the client}"
     router_fails=$((router_fails + 1))
   fi
 fi

@@ -235,6 +235,9 @@ pub fn overrides() -> Vec<(String, &'static str)> {
         ("pppoe_service", "wan.pppoe.service"),
         ("pppoe_ac", "wan.pppoe.ac_name"),
         ("pppoe_mtu", "wan.pppoe.mtu"),
+        ("wan_ip", "wan.static.ipv4"),
+        ("wan_gw", "wan.static.gateway"),
+        ("wan_dns", "wan.static.dns"),
         ("shape_up", "shaping.up_kbit"),
         ("shape_down", "shaping.down_kbit"),
         ("shape_overhead", "shaping.overhead"),
@@ -305,6 +308,38 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
     match arg(args, "wan_mode") {
         Some("pppoe") => c.wan.mode = schema::WanMode::Pppoe,
         Some("dhcp") => c.wan.mode = schema::WanMode::Dhcp,
+        Some("static") => c.wan.mode = schema::WanMode::Static,
+        _ => {}
+    }
+    // A static WAN: `wan_ip=a.b.c.d/len wan_gw=a.b.c.d [wan_dns=a,b]`
+    // (`wan_dns=` = none). Each replaces its field of a stored
+    // `[wan.static]`; without one, address and gateway are both needed.
+    let ip = arg(args, "wan_ip").and_then(|v| v.parse::<schema::Cidr>().ok());
+    let gw = arg(args, "wan_gw").and_then(|v| v.parse::<core::net::Ipv4Addr>().ok());
+    let dns = arg(args, "wan_dns").map(|l| {
+        l.split(',')
+            .filter_map(|d| d.parse::<core::net::Ipv4Addr>().ok())
+            .collect::<Vec<_>>()
+    });
+    match (&mut c.wan.static_ip, ip, gw) {
+        (Some(s), ip, gw) => {
+            if let Some(ip) = ip {
+                s.ipv4 = ip;
+            }
+            if let Some(gw) = gw {
+                s.gateway = gw;
+            }
+            if let Some(dns) = dns {
+                s.dns = dns;
+            }
+        }
+        (None, Some(ipv4), Some(gateway)) => {
+            c.wan.static_ip = Some(schema::WanStatic {
+                ipv4,
+                gateway,
+                dns: dns.unwrap_or_default(),
+            })
+        }
         _ => {}
     }
     let p = &mut c.wan.pppoe;
@@ -760,6 +795,56 @@ pub fn pppoe() -> Option<proto_pppoe::Config> {
         echo_interval_secs: p.lcp_echo_interval,
         echo_failures: p.lcp_echo_failure,
     })
+}
+
+/// A fixed WAN address (`wan.mode = "static"`, `[wan.static]`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WanStatic {
+    pub addr: core::net::Ipv4Addr,
+    pub prefix: u8,
+    pub gateway: core::net::Ipv4Addr,
+    /// The WAN's DNS servers (used unless `dns.upstreams` names its own).
+    pub dns: Vec<core::net::Ipv4Addr>,
+}
+
+/// How the WAN gets its address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WanLink {
+    /// DHCP client on the WAN Ethernet.
+    Dhcp,
+    /// A PPPoE session ([`pppoe`]).
+    Pppoe(proto_pppoe::Config),
+    /// A fixed address on the WAN Ethernet.
+    Static(WanStatic),
+}
+
+impl WanLink {
+    pub fn name(&self) -> &'static str {
+        match self {
+            WanLink::Dhcp => "DHCP",
+            WanLink::Pppoe(_) => "PPPoE",
+            WanLink::Static(_) => "static",
+        }
+    }
+}
+
+/// The WAN link in use: `wan.mode` with its settings. `mode = "static"`
+/// without `[wan.static]` (only possible through boot arguments, reported
+/// as a warning at boot) falls back to DHCP.
+pub fn wan_link() -> WanLink {
+    if let Some(p) = pppoe() {
+        return WanLink::Pppoe(p);
+    }
+    let c = get();
+    match (&c.wan.static_ip, c.wan.mode) {
+        (Some(s), schema::WanMode::Static) => WanLink::Static(WanStatic {
+            addr: s.ipv4.addr,
+            prefix: s.ipv4.prefix,
+            gateway: s.gateway,
+            dns: s.dns.clone(),
+        }),
+        _ => WanLink::Dhcp,
+    }
 }
 
 pub struct Dns {

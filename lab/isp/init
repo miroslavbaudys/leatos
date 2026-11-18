@@ -15,6 +15,8 @@
 #   password lab-secret, PAP or CHAP required, or none), the session gets
 #   203.0.113.50 and DNS 203.0.113.1; no DHCP server, so a router not
 #   speaking PPPoE gets no address.
+# lab_static=1 (scripts/lab-test.sh LAB_WAN_STATIC=1): no DHCP server; the
+#   router must use its static WAN address (203.0.113.60).
 # /etc/dot/server.pem + server.key (scripts/lab-test.sh LAB_DOT=1 adds them,
 #   made per run under a lab CA): DNS over TLS on 203.0.113.1:853, stunnel
 #   in front of dnsmasq (TCP on 127.0.0.1:5300) with dnsd's names plus
@@ -36,6 +38,7 @@ $bb ifconfig lo 127.0.0.1 up
 IF=eth0
 vlan=$($bb sed -n 's/.*lab_vlan=\([0-9]*\).*/\1/p' /proc/cmdline)
 pppoe=$($bb sed -n 's/.*lab_pppoe=\([a-z]*\).*/\1/p' /proc/cmdline)
+static=$($bb sed -n 's/.*lab_static=\([0-9]*\).*/\1/p' /proc/cmdline)
 if [ -n "$vlan" ] || [ -n "$pppoe" ]; then
   for m in virtio_blk squashfs; do modprobe "$m" 2>/dev/null || $bb modprobe "$m" 2>/dev/null; done
   $bb mkdir -p /.modloop
@@ -77,6 +80,8 @@ if [ -n "$pppoe" ]; then
     -C isp-ac -S internet -O /tmp/pppoe-server-options \
     || { echo "LAB FAIL: isp: pppoe-server did not start"; $bb poweroff -f; }
   echo "LAB isp: PPPoE access concentrator ($pppoe) on $IF"
+elif [ -n "$static" ]; then
+  echo "LAB isp: no DHCP server (static WAN)"
 else
   $bx udhcpd -S /tmp/udhcpd.conf
 fi

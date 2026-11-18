@@ -262,7 +262,12 @@
     </div>
     <form class="card cfg" autocomplete="off"><h3>Connection</h3>
       <div class="form">
-        <label>Type<select data-path="wan.mode" id="wanmode"><option value="dhcp">DHCP</option><option value="pppoe">PPPoE</option></select></label>
+        <label>Type<select data-path="wan.mode" id="wanmode"><option value="dhcp">DHCP</option><option value="pppoe">PPPoE</option><option value="static">Static</option></select></label>
+      </div>
+      <div class="form" id="staticfields">
+        <label>Address/prefix<input id="wsip" data-x data-path="wan.static.ipv4" placeholder="e.g. 203.0.113.50/24"></label>
+        <label>Gateway<input id="wsgw" data-x data-path="wan.static.gateway" placeholder="e.g. 203.0.113.1"></label>
+        <label>DNS servers (comma-separated)<input id="wsdns" data-x data-path="wan.static.dns" placeholder="the ISP's; empty = none (set DNS upstreams)"></label>
       </div>
       <div class="form" id="pppoefields">
         <label>User name<input data-path="wan.pppoe.username" placeholder="empty = no authentication" autocomplete="off"></label>
@@ -273,7 +278,7 @@
         <label>LCP echo interval, s (0 = off)<input data-path="wan.pppoe.lcp_echo_interval" data-opt type="number" min="0" max="3600" placeholder="10"></label>
         <label>LCP echo failures before reconnecting<input data-path="wan.pppoe.lcp_echo_failure" data-opt type="number" min="1" max="100" placeholder="5"></label>
       </div>
-      <p class="hint">A change restarts the WAN (DHCP client or PPPoE session). The PPPoE password is never shown.</p>
+      <p class="hint">A change restarts the WAN (DHCP client, PPPoE session or static address). The PPPoE password is never shown.</p>
     </form>
   </section>
 
@@ -1068,6 +1073,9 @@ function fillForm(c) {
   $("ntp").value = (c.time?.ntp_servers ?? []).join(", ");
   $("dnsups").value = (c.dns?.upstreams ?? []).join(", ");
   $("dnsca").value = c.dns?.tls_ca ?? "";
+  $("wsip").value = c.wan?.static?.ipv4 ?? "";
+  $("wsgw").value = c.wan?.static?.gateway ?? "";
+  $("wsdns").value = (c.wan?.static?.dns ?? []).join(", ");
   staticHead();
   (getp(c, lanPath("dhcp.static")) ?? []).forEach((s) => staticRow(s));
   pppoeVisibility();
@@ -1118,6 +1126,10 @@ function readForm() {
   setp(c, "time.ntp_servers", $("ntp").value.split(",").map((x) => x.trim()).filter((x) => x));
   const ups = $("dnsups").value.split(",").map((x) => x.trim()).filter((x) => x);
   setp(c, "dns.upstreams", ups.length ? ups : undefined);
+  // [wan.static]: kept while another mode is chosen, left out when empty.
+  const sip = $("wsip").value.trim(), sgw = $("wsgw").value.trim();
+  const sdns = $("wsdns").value.split(",").map((x) => x.trim()).filter((x) => x);
+  setp(c, "wan.static", sip || sgw || sdns.length ? { ipv4: sip, gateway: sgw, ...(sdns.length ? { dns: sdns } : {}) } : undefined);
   setp(c, "dns.tls_ca", $("dnsca").value.trim() ? $("dnsca").value.trim() + "\n" : undefined);
   if (!c.dns?.tls) setp(c, "dns.tls", undefined);
   if (c.dns?.views === "all") setp(c, "dns.views", undefined); // the default: left out
@@ -1793,7 +1805,7 @@ const pSay = (t, err) => { $("pmsg").textContent = t; $("pmsg").className = "msg
 document.addEventListener("input", (ev) => { if (ev.target.closest("form.cfg")) { if ($("pmsg").className.includes("err")) pSay(""); updatePending(); } });
 document.addEventListener("change", (ev) => { if (ev.target.closest("form.cfg")) updatePending(); });
 for (const f of document.querySelectorAll("form.cfg")) f.onsubmit = (ev) => ev.preventDefault();
-function pppoeVisibility() { $("pppoefields").hidden = $("wanmode").value !== "pppoe"; }
+function pppoeVisibility() { $("pppoefields").hidden = $("wanmode").value !== "pppoe"; $("staticfields").hidden = $("wanmode").value !== "static"; }
 $("wanmode").addEventListener("change", pppoeVisibility);
 
 function markIssues(issues) {

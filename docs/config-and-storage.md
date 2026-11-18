@@ -230,8 +230,7 @@ so they never end up in a hardware config.
 DHCP pool and reservations lie inside the LAN subnet, no two reservations
 share an address or MAC, forward targets are on a LAN, names are unique.
 Settings the kernel does not implement yet are rejected as unsupported
-(`Config::unsupported`: today `[[dns.host]]`, a static WAN, ports other
-than `wan0`/`lan0`).
+(`Config::unsupported`: today ports other than `wan0`/`lan0`).
 
 ### Schema versions
 `version` in the document. A newer kernel migrates older documents on
