@@ -90,7 +90,7 @@ for c in $CASES; do
     boot)
       boot smoke-test
       ok=0
-      if has "rrouter: boot ok" && has "net self-test   : ok" && ! has "PANIC" && ! has "UNHANDLED"; then ok=1; fi
+      if has "rrouter: boot ok" && has "net self-test   : ok" && has "temp self-test  : ok" && ! has "PANIC" && ! has "UNHANDLED"; then ok=1; fi
       # With QEMU_SMP=N (N > 1, up to 4): every core online and the
       # cross-core wake works. Negative control: QEMU_APPEND=cores=1 with
       # QEMU_SMP=4 must fail this case.

@@ -5,6 +5,9 @@
 //! "Datapath" is the `net` task (forwarding, CAKE); "service" is the
 //! service-priority tasks, mainly `svc` (router stack, DHCP, DNS, web).
 //!
+//! The CPU temperature's history (`drivers::cputemp`) and the heap use
+//! ([`memory_history`]) are sampled here too.
+//!
 //! The executor accounts the time ([`executor::cpu_ticks`]): idle = time
 //! in `wfi`/`hlt` plus hybrid-idle spinning (waiting, not work), and the
 //! duration of every task poll per priority. With the `idle-poll` feature
@@ -29,25 +32,49 @@ pub struct Sample {
     pub service: u16,
 }
 
-struct History {
-    buf: [Sample; HISTORY],
+/// The last [`HISTORY`] values of something sampled every [`INTERVAL`].
+pub struct Ring<T: Copy> {
+    buf: [T; HISTORY],
     /// Next slot to write.
     head: usize,
     len: usize,
 }
 
+impl<T: Copy> Ring<T> {
+    pub const fn new(zero: T) -> Self {
+        Self {
+            buf: [zero; HISTORY],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    pub fn push(&mut self, x: T) {
+        self.buf[self.head] = x;
+        self.head = (self.head + 1) % HISTORY;
+        self.len = (self.len + 1).min(HISTORY);
+    }
+
+    /// Oldest first.
+    pub fn for_each(&self, mut f: impl FnMut(T)) {
+        let start = (self.head + HISTORY - self.len) % HISTORY;
+        for i in 0..self.len {
+            f(self.buf[(start + i) % HISTORY]);
+        }
+    }
+}
+
 /// One history per core.
-static HIST: [Mutex<History>; MAX_CORES] = [const {
-    Mutex::new(History {
-        buf: [Sample {
-            busy: 0,
-            datapath: 0,
-            service: 0,
-        }; HISTORY],
-        head: 0,
-        len: 0,
-    })
+static HIST: [Mutex<Ring<Sample>>; MAX_CORES] = [const {
+    Mutex::new(Ring::new(Sample {
+        busy: 0,
+        datapath: 0,
+        service: 0,
+    }))
 }; MAX_CORES];
+
+/// Heap in use, KiB.
+static MEM: Mutex<Ring<u32>> = Mutex::new(Ring::new(0));
 
 fn permille(part: u64, whole: u64) -> u16 {
     (part.min(whole) * 1000).checked_div(whole).unwrap_or(0) as u16
@@ -65,12 +92,13 @@ fn sample(a: &CpuTicks, b: &CpuTicks) -> Sample {
 }
 
 /// `core`'s samples, oldest first.
-pub fn history(core: usize, mut f: impl FnMut(Sample)) {
-    let h = HIST[core].lock();
-    let start = (h.head + HISTORY - h.len) % HISTORY;
-    for i in 0..h.len {
-        f(h.buf[(start + i) % HISTORY]);
-    }
+pub fn history(core: usize, f: impl FnMut(Sample)) {
+    HIST[core].lock().for_each(f);
+}
+
+/// Heap in use (KiB) per interval, oldest first.
+pub fn memory_history(f: impl FnMut(u32)) {
+    MEM.lock().for_each(f);
 }
 
 /// The sampling task (service priority; it only takes a snapshot).
@@ -82,12 +110,11 @@ pub async fn sampler() {
             let now = executor::cpu_ticks(core);
             let s = sample(prev, &now);
             *prev = now;
-            let mut h = HIST[core].lock();
-            let head = h.head;
-            h.buf[head] = s;
-            h.head = (head + 1) % HISTORY;
-            h.len = (h.len + 1).min(HISTORY);
+            HIST[core].lock().push(s);
         }
+        let (used, _) = crate::mm::heap::usage();
+        MEM.lock().push((used >> 10) as u32);
+        crate::drivers::cputemp::sample();
     }
 }
 

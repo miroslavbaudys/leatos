@@ -515,6 +515,17 @@ fn status(ctx: &Ctx, wan: &str) {
         }
     }
     println!("cpu      : {} (last second)", if cpu.is_empty() { "-" } else { &cpu });
+    {
+        use crate::drivers::cputemp;
+        match cputemp::read() {
+            Some(t) => println!(
+                "temp     : {}{}",
+                cputemp::fmt_mc(t),
+                cputemp::htc().map(|h| alloc::format!(" (throttles at {})", cputemp::fmt_mc(h))).unwrap_or_default()
+            ),
+            None => println!("temp     : - (no sensor)"),
+        }
+    }
     let (used, free) = crate::mm::heap::usage();
     println!(
         "memory   : heap {} KiB used, {} MiB free; forwarded {}, connections {}",

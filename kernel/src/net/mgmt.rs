@@ -1118,11 +1118,41 @@ fn status_json(
         first = false;
     });
     cpu.push_str("]}");
+    // CPU temperature (milli-°C; null without a sensor, e.g. in QEMU),
+    // with a history at the CPU load's interval.
+    let temp = {
+        use crate::drivers::cputemp;
+        let mut hist = String::new();
+        let found = cputemp::history(|t| {
+            let _ = write!(hist, "{}{t}", if hist.is_empty() { "" } else { "," });
+        });
+        match cputemp::read() {
+            Some(now) if found => format!(
+                "{{\"cpu_mc\":{now},\"htc_mc\":{},\"history_mc\":[{hist}]}}",
+                cputemp::htc().map(|h| format!("{h}")).unwrap_or_else(|| "null".into())
+            ),
+            _ => "null".into(),
+        }
+    };
+    // Heap use history (KiB per cpuload interval) and the RAM layout.
+    let memory = {
+        let mut hist = String::new();
+        crate::cpuload::memory_history(|k| {
+            let _ = write!(hist, "{}{k}", if hist.is_empty() { "" } else { "," });
+        });
+        match crate::mm::heap::layout() {
+            Some(l) => format!(
+                "{{\"ram\":{},\"kernel\":{},\"staging\":{},\"heap\":{},\"history_used_kib\":[{hist}]}}",
+                l.ram, l.kernel, l.staging, l.heap
+            ),
+            None => "null".into(),
+        }
+    };
     let _ = write!(
         s,
         "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"vlan_drops\":{},\"conntrack\":{},\"revoked\":{},\"rejected\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
-         \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
+         \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"temp\":{temp},\"memory\":{memory},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
          \"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
         json_str(env!("CARGO_PKG_VERSION")),
         json_str(env!("RROUTER_BUILD")),

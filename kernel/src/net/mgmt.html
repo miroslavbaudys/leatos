@@ -6,10 +6,10 @@
 <title>rrouter</title>
 <style>
   :root { --bg:#f4f5f7; --card:#fff; --fg:#1d2330; --muted:#6b7280; --line:#e3e6eb; --ok:#15803d; --bad:#b91c1c; --warn:#b45309; --accent:#2563eb;
-          --nav:#fff; --navsel:#e8effd; --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --shadow:0 1px 2px rgba(0,0,0,.05); }
+          --nav:#fff; --navsel:#e8effd; --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#8a5cd6; --shadow:0 1px 2px rgba(0,0,0,.05); }
   @media (prefers-color-scheme: dark) {
     :root { --bg:#111418; --card:#1a1f26; --fg:#e6e9ee; --muted:#9aa3af; --line:#2a313b; --ok:#4ade80; --bad:#f87171; --warn:#fbbf24; --accent:#60a5fa;
-            --nav:#161a20; --navsel:#1f2a3a; --s1:#3987e5; --s2:#d95926; --s3:#199e70; --shadow:none; }
+            --nav:#161a20; --navsel:#1f2a3a; --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#9d76ea; --shadow:none; }
   }
   * { box-sizing: border-box; }
   html, body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
@@ -182,10 +182,21 @@
       <div class="legend"><span><i style="background:var(--s1)"></i>Download</span><span><i style="background:var(--s2)"></i>Upload</span><span>since this page was opened, every 2 s</span></div>
       <div class="chart"><svg id="ratechart" role="img" aria-label="WAN throughput"></svg><div id="ratetip" class="tip" hidden></div></div>
     </div>
-    <div class="card"><h3>CPU load per core</h3>
+    <div class="card"><h3 id="cpuhead">CPU load per core</h3>
       <div class="legend"><span><i style="background:var(--s1)"></i>Datapath (forwarding, CAKE)</span><span><i style="background:var(--s2)"></i>Services (DHCP, DNS, web)</span><span><i style="background:var(--s3)"></i>Other (IRQs, timers)</span></div>
       <div id="cpucharts"></div>
+      <div id="tempbox" hidden>
+        <div class="stat"><div><b>Temperature</b></div><div><b id="t-temp">–</b> <span>last second</span></div>
+          <div><b id="t-tempavg">–</b> <span id="t-tempavgl">average</span></div><div><span id="t-temp2"></span></div></div>
+        <div class="chart"><svg id="tempchart" role="img" aria-label="CPU temperature (one sensor for the whole chip) over the last 5 minutes"></svg><div id="temptip" class="tip" hidden></div></div>
+      </div>
       <details><summary>Last 10 seconds as a table</summary><div class="tw"><table id="cputab"></table></div></details>
+    </div>
+    <div class="card" id="memcard" hidden><h3>Memory</h3>
+      <div class="legend"><span><i style="background:var(--s1)"></i>Heap in use (connections, DNS cache, leases, buffers)</span></div>
+      <div class="stat"><div><b id="m-used">–</b> <span id="m-usedl">used</span></div><div><b id="m-peak">–</b> <span id="m-peakl">peak</span></div></div>
+      <div class="legend"><span id="m-info"></span></div>
+      <div class="chart"><svg id="memchart" role="img" aria-label="Heap in use over the last 5 minutes"></svg><div id="memtip" class="tip" hidden></div></div>
     </div>
   </section>
 
@@ -468,7 +479,7 @@ function route() {
   }
   const sec = document.querySelector(`.page[data-page="${page}"]`);
   document.title = (page ? sec.dataset.title + " · " : "") + "rrouter";
-  if (page === "") { cpuCores.forEach((_, c) => drawCpu(c)); drawRate(); }
+  if (page === "") { cpuCores.forEach((_, c) => drawCpu(c)); drawRate(); drawLine("temp"); drawLine("mem"); }
   if (page === "logs") loadLog();
 }
 window.addEventListener("hashchange", route);
@@ -639,7 +650,79 @@ function cpuHover(c, ev) {
     ["var(--s2)", "Services: " + pct(sv)], ["var(--s3)", "Other: " + pct(Math.max(busy - dp - sv, 0))], [null, "Total: " + pct(busy)]]);
   placeTip(tip, hx, r, m.W);
 }
-window.addEventListener("resize", () => { cpuCores.forEach((_, c) => drawCpu(c)); drawRate(); });
+window.addEventListener("resize", () => { cpuCores.forEach((_, c) => drawCpu(c)); drawRate(); drawLine("temp"); drawLine("mem"); });
+// Single-series charts over the last 5 minutes, one sample per cpu.interval_s
+// (temperature, memory): lines[id] = {s, lo, hi, axis(v), tip(v), label, color}.
+const lines = {}, lineEv = {};
+function drawLine(id) {
+  const svg = $(id + "chart"), o = lines[id];
+  if (!o || page !== "") return;
+  const s = o.s, N = 300, { lo, hi } = o;
+  const W = Math.max(svg.clientWidth, 200), H = cpuCores.length > 1 ? 110 : 150, L = 56, R = 6, T = 8, B = 20;
+  svg.style.height = H + "px";
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const x = (i) => L + (W - L - R) * (N - s.length + i) / (N - 1);
+  const y = (v) => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
+  let g = "";
+  for (const v of [lo, (lo + hi) / 2, hi]) g += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${o.axis(v)}</text>`;
+  g += `<text x="${L}" y="${H - 4}">5 min ago</text><text x="${W - R}" y="${H - 4}" text-anchor="end">now</text>`;
+  if (s.length >= 2) g += `<polyline points="${s.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ")}" fill="none" stroke="var(${o.color})" stroke-width="2" stroke-linejoin="round"/>`;
+  else g += `<text x="${(L + W) / 2}" y="${H / 2}" text-anchor="middle">collecting…</text>`;
+  g += `<line id="${id}hair" class="hair" y1="${T}" y2="${H - B}" visibility="hidden"/>`;
+  svg.innerHTML = g;
+  svg.lineMap = { x, L, R, W, N };
+  if (lineEv[id]) lineHover(id, lineEv[id]);
+}
+function lineHover(id, ev) {
+  lineEv[id] = ev;
+  const svg = $(id + "chart"), m = svg.lineMap, o = lines[id], s = o?.s || [];
+  if (!m || !s.length) return;
+  const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) * m.W / r.width;
+  const i = Math.max(0, Math.min(s.length - 1, Math.round((px - m.L) / (m.W - m.L - m.R) * (m.N - 1)) - (m.N - s.length)));
+  const hx = m.x(i), h = $(id + "hair"), ago = (s.length - 1 - i) * cpuInterval;
+  h.setAttribute("x1", hx); h.setAttribute("x2", hx); h.setAttribute("visibility", "visible");
+  tipLines($(id + "tip"), [[null, o.label + ", " + (ago ? `${ago} s ago` : "last second")], [`var(${o.color})`, o.tip(s[i])]]);
+  placeTip($(id + "tip"), hx, r, m.W);
+}
+for (const id of ["temp", "mem"]) {
+  $(id + "chart").addEventListener("pointermove", (ev) => lineHover(id, ev));
+  $(id + "chart").addEventListener("pointerleave", () => { lineEv[id] = null; $(id + "tip").hidden = true; const h = $(id + "hair"); if (h) h.setAttribute("visibility", "hidden"); });
+}
+const avgLabel = (len) => { const secs = len * cpuInterval; return secs >= 60 ? `average, last ${Math.round(secs / 60)} min` : `average, last ${secs} s`; };
+const avg = (s) => s.reduce((a, v) => a + v, 0) / s.length;
+// temp = {cpu_mc, htc_mc, history_mc} (milli-°C) or null.
+const degC = (mc) => (mc / 1000).toFixed(1) + " °C";
+function showTemp(t) {
+  $("tempbox").hidden = !t;
+  $("cpuhead").textContent = t ? "CPU load per core and temperature" : "CPU load per core";
+  if (!t) { delete lines.temp; return; }
+  const s = t.history_mc;
+  // Whole-5 °C range around the samples (at least 10 °C tall).
+  let lo = Math.floor(Math.min(...s, t.cpu_mc) / 5000) * 5000, hi = Math.ceil(Math.max(...s, t.cpu_mc) / 5000) * 5000;
+  if (hi - lo < 10000) hi = lo + 10000;
+  lines.temp = { s, lo, hi, axis: (v) => (v / 1000).toFixed(0) + " °C", tip: degC, label: "chip", color: "--s4" };
+  $("t-temp").textContent = degC(t.cpu_mc);
+  $("t-tempavg").textContent = s.length ? degC(avg(s)) : "–";
+  $("t-tempavgl").textContent = avgLabel(s.length);
+  $("t-temp2").textContent = "one sensor for the whole chip" + (t.htc_mc != null ? ` · throttles at ${degC(t.htc_mc)}` : "");
+  drawLine("temp");
+}
+// memory = {ram, kernel, staging, heap (bytes), history_used_kib} or null;
+// heap.used = now.
+function showMem(m, heap, pool) {
+  $("memcard").hidden = !m;
+  if (!m) { delete lines.mem; return; }
+  const s = m.history_used_kib.map((k) => k * 1024), MiB = 1 << 20;
+  const hi = niceMax(Math.max(...s, heap.used) / MiB) * MiB;
+  lines.mem = { s, lo: 0, hi, axis: bytes, tip: (v) => bytes(v) + " used", label: "heap", color: "--s1" };
+  $("m-used").textContent = bytes(heap.used);
+  $("m-usedl").textContent = `of ${bytes(m.heap)} heap (${(heap.used / m.heap * 100).toFixed(1)} %)`;
+  $("m-peak").textContent = s.length ? bytes(Math.max(...s)) : "–";
+  $("m-peakl").textContent = avgLabel(s.length).replace("average", "peak");
+  $("m-info").textContent = `RAM ${bytes(m.ram)}: kernel ${bytes(m.kernel)}` + (m.staging ? `, upgrade staging ${bytes(m.staging)}` : "") +
+    `, heap ${bytes(m.heap)} · packet buffers ${n(pool.capacity - pool.free)} of ${n(pool.capacity)} in use (incl. NIC receive rings)`;
+  drawLine("mem");
+}
 function showCpu(cpu) {
   cpuCores = cpu.cores; cpuInterval = cpu.interval_s;
   cpuCores.forEach((s, c) => {
@@ -748,6 +831,8 @@ async function refresh() {
   $("offline").hidden = true;
   trackRates(st);
   if (st.cpu) showCpu(st.cpu);
+  showTemp(st.temp);
+  showMem(st.memory, st.heap, st.pool);
   if (page === "") drawRate();
   authAvailable = !!st.mgmt.auth; showLogin();
   $("ver").textContent = `v${st.version} · ${st.build ?? "?"} · ${st.arch}`;

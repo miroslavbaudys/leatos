@@ -34,6 +34,24 @@ fn heap_self_test() {
     println!("  heap self-test  : ok");
 }
 
+/// The temperature registers' decoding (the sensor itself exists only on
+/// AMD hardware, so this is what QEMU can check).
+fn cputemp_self_test() {
+    use crate::drivers::cputemp::{decode_htc, decode_temp, fmt_mc};
+    // CurTmp 433 × 0.125 °C = 54.125 °C.
+    assert_eq!(decode_temp(433 << 21), 54_125);
+    // Range select (bit 19) or CurTmpTjSel = 11b: 49 °C lower.
+    assert_eq!(decode_temp(433 << 21 | 1 << 19), 5_125);
+    assert_eq!(decode_temp(433 << 21 | 3 << 16), 5_125);
+    assert_eq!(decode_temp(433 << 21 | 1 << 16), 54_125);
+    // HtcTmpLmt 76: 52 + 38 = 90 °C; HtcEn clear = no limit.
+    assert_eq!(decode_htc(76 << 16 | 1), Some(90_000));
+    assert_eq!(decode_htc(76 << 16), None);
+    assert_eq!(fmt_mc(54_125), "54.1 °C");
+    assert_eq!(fmt_mc(-1_500), "-1.5 °C");
+    println!("  temp self-test  : ok");
+}
+
 /// ECN marking on a real packet buffer: ECT(0) → CE with a valid header
 /// checksum; Not-ECT is refused (the AQM drops those instead).
 fn ecn_self_test() {
@@ -72,6 +90,7 @@ fn ecn_self_test() {
 pub fn fault_tests() {
     heap_self_test();
     ecn_self_test();
+    cputemp_self_test();
 
     #[cfg(feature = "fault-wx")]
     {

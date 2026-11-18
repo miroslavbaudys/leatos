@@ -59,6 +59,7 @@ impl PciDevice {
             (0x8086, 0x25ab) => "i6300esb watchdog",
             (0x1022, 0x780b) => "AMD FCH SMBus (watchdog)",
             (0x1022, 0x1537) => "AMD crypto coprocessor (unused)",
+            (0x1022, 0x1533 | 0x1583) => "AMD NB misc (temperature)",
             (0x8086, _) if self.info.class == 0x02 => "Intel NIC",
             _ if (self.info.class, self.info.subclass) == (0x08, 0x05) => "SD host (SDHCI)",
             _ => match self.info.class {

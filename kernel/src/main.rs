@@ -85,6 +85,9 @@ pub fn kmain(boot_arg: usize) -> ! {
     if let Some(pci) = &pci {
         pci::print(pci);
     }
+    if let Some(pci) = pci.as_mut() {
+        drivers::cputemp::probe(pci);
+    }
     // The config may live on a disk, so it is loaded once PCI is up. Code
     // above this line reads only boot arguments, never `config::get`.
     let mut store = pci.as_mut().and_then(store::open);

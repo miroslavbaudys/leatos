@@ -90,6 +90,8 @@ send "help"; expect "help lists the commands" "config set <setting> = <value>"
 send "status"; expect "status: uptime" ", up "
 expect "status: WAN port" "^wan0 "
 expect "status: watchdog" "^watchdog : "
+# No temperature sensor in QEMU (drivers/cputemp.rs: AMD family 16h only).
+expect "status: temperature" "^temp     : - (no sensor)"
 send "leases"; expect "leases answers" "no leases"
 # Line editing: "statsx" + 2 backspaces + "us" = "status".
 send $'statsx\x7f\x7fus'; expect "backspace edits the line" ", up "

@@ -20,6 +20,23 @@ static STAGING_TAKEN: AtomicBool = AtomicBool::new(false);
 #[global_allocator]
 static HEAP: LockedHeap = LockedHeap::empty();
 
+/// How the RAM region the kernel runs in is split (bytes), for the
+/// management page.
+#[derive(Clone, Copy, Debug)]
+pub struct Layout {
+    pub ram: usize,
+    /// Kernel image, stacks and whatever lies below it in the region.
+    pub kernel: usize,
+    pub staging: usize,
+    pub heap: usize,
+}
+
+static LAYOUT: Once<Layout> = Once::new();
+
+pub fn layout() -> Option<Layout> {
+    LAYOUT.get().copied()
+}
+
 pub fn init(info: &BootInfo) {
     let start = sym::kernel_end();
     let end = info.ram.0 + info.ram.1;
@@ -31,6 +48,12 @@ pub fn init(info: &BootInfo) {
         end = s;
     }
     let size = end - start;
+    LAYOUT.call_once(|| Layout {
+        ram: info.ram.1,
+        kernel: start - info.ram.0,
+        staging: STAGING.get().map_or(0, |&(_, l)| l),
+        heap: size,
+    });
     // SAFETY: [start, end) is RAM after the kernel image, mapped Normal RW
     // (boot map, later mm::mmu), used by nothing else; called exactly once.
     unsafe { HEAP.lock().init(start as *mut u8, size) };
