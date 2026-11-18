@@ -1658,9 +1658,12 @@ function renderMatrix(c) {
 // path → shown value; arrays of plain values stay one entry, entries with
 // a name are named by it (as in the router's validation messages).
 const KEYED = ["network", "zone", "firewall.rule", "firewall.forward", "firewall.redirect", "mdns.reflect"];
+// Keyed lists whose order matters (first match wins): the order is one more entry.
+const ORDERED = ["firewall.rule"];
 function flatten(o, pre = "", out = {}, named = false) {
   if (Array.isArray(o) && o.some((x) => x && typeof x === "object")) {
     const byName = KEYED.includes(pre);
+    if (byName && ORDERED.includes(pre)) out[`${pre}[order]`] = o.map((x) => x?.name).join(", ");
     o.forEach((x, i) => flatten(x, byName ? `${pre}.${x?.name}` : `${pre}[${i}]`, out, byName));
   } else if (o && typeof o === "object" && !Array.isArray(o)) {
     for (const [k, v] of Object.entries(o)) if (!(named && k === "name")) flatten(v, pre ? `${pre}.${k}` : k, out);
