@@ -23,6 +23,9 @@ pub const MAX_ZONES: usize = 16;
 pub const MAX_RULES: usize = 256;
 pub const MAX_FORWARDS: usize = 128;
 pub const MAX_REDIRECTS: usize = 32;
+/// Static routes (each smoltcp interface holds the ones of its link, and
+/// DHCP option 121 must fit one option: 16 × 9 bytes + the default).
+pub const MAX_ROUTES: usize = 16;
 pub const MAX_DNS_HOSTS: usize = 256;
 /// `dns.upstreams` entries.
 pub const MAX_DNS_UPSTREAMS: usize = 4;
@@ -135,6 +138,7 @@ pub(crate) fn check(c: &Config) -> Result<(), Vec<Issue>> {
     rules(c, &mut x);
     forwards(c, &mut x);
     redirects(c, &mut x);
+    routes(c, &mut x);
     dns(c, &mut x);
     mdns(c, &mut x);
     let s = &c.shaping;
@@ -612,6 +616,88 @@ fn redirects(c: &Config, x: &mut Issues) {
             }
         }
     }
+}
+
+// ---- routes ----------------------------------------------------------------
+
+fn routes(c: &Config, x: &mut Issues) {
+    let r = &c.routes;
+    if r.len() > MAX_ROUTES {
+        x.add("route", format!("at most {MAX_ROUTES} routes"));
+    }
+    let paths = entry_paths("route", r.iter().map(|r| r.name.as_str()), 32);
+    check_names(x, &paths, r.iter().map(|r| r.name.as_str()), 32, &[]);
+    let mut subnets: Vec<(String, Cidr)> =
+        c.networks.iter().zip(net_paths(c)).map(|(n, np)| (format!("{np}.ipv4"), n.ipv4)).collect();
+    if let Some(s) = &c.wan.static_ip {
+        subnets.push(("wan.static.ipv4".into(), s.ipv4));
+    }
+    for (i, (rt, p)) in r.iter().zip(&paths).enumerate() {
+        let dst = rt.dst.0;
+        let dp = format!("{p}.dst");
+        if dst.prefix == 0 {
+            x.add(&dp, "the default route is the WAN's");
+        } else if !rt.dst.is_network() {
+            net_ok(x, dp.clone(), &Some(rt.dst));
+        } else if let Some(why) = special(&dst) {
+            x.add(&dp, format!("{} is {why}", subnet(&dst)));
+        }
+        // Inside a network's subnet: that stays connected. Around one is
+        // fine (the subnet is the longer match).
+        for (np, net) in &subnets {
+            if inside(&dst, net) {
+                x.add(&dp, format!("{} is inside {np} ({})", subnet(&dst), subnet(net)));
+            }
+        }
+        if let Some(j) = r[..i].iter().position(|o| o.dst.0.network() == dst.network() && o.dst.0.prefix == dst.prefix) {
+            x.add(&dp, format!("the same destination as {}", paths[j]));
+        }
+        let vp = format!("{p}.via");
+        match c.route_via(rt) {
+            crate::RouteVia::Network(n) => {
+                if n.ipv4.addr == rt.via {
+                    x.add(&vp, "is the router's own address");
+                } else if !n.ipv4.is_host(rt.via) {
+                    x.add(&vp, format!("is not a host address in {}", subnet(&n.ipv4)));
+                }
+            }
+            // Only the WAN's (DHCP) subnet could hold it, and the route
+            // would take that over.
+            crate::RouteVia::Wan if dst.prefix > 0 && dst.contains(rt.via) => {
+                x.add(&vp, "is inside the destination itself");
+            }
+            crate::RouteVia::Wan => match (&c.wan.static_ip, c.wan.mode) {
+                (_, WanMode::Pppoe) => x.add(
+                    &vp,
+                    format!("{} is in none of the networks (a PPPoE WAN has no other routers)", rt.via),
+                ),
+                (Some(s), _) if !s.ipv4.is_host(rt.via) || s.ipv4.addr == rt.via => x.add(
+                    &vp,
+                    format!("must be a host in one of the networks or in the WAN's {}", subnet(&s.ipv4)),
+                ),
+                _ if special(&Cidr::new(rt.via, 32)).is_some() || rt.via.is_broadcast() => {
+                    x.add(&vp, "must be a unicast address")
+                }
+                _ => {}
+            },
+        }
+    }
+}
+
+/// Address ranges no route may point into.
+fn special(c: &Cidr) -> Option<&'static str> {
+    let ranges = [
+        (Cidr::new(Ipv4Addr::new(0, 0, 0, 0), 8), "\"this network\" (0.0.0.0/8)"),
+        (Cidr::new(Ipv4Addr::new(127, 0, 0, 0), 8), "loopback"),
+        (Cidr::new(Ipv4Addr::new(169, 254, 0, 0), 16), "link-local"),
+        (Cidr::new(Ipv4Addr::new(224, 0, 0, 0), 3), "multicast or reserved"),
+    ];
+    ranges.into_iter().find(|(r, _)| inside(c, r)).map(|(_, w)| w)
+}
+
+/// `a` is `b` or a part of it.
+fn inside(a: &Cidr, b: &Cidr) -> bool {
+    a.prefix >= b.prefix && b.contains(a.network())
 }
 
 // ---- DNS -------------------------------------------------------------------

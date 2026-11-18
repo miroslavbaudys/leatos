@@ -146,6 +146,7 @@
   <div class="grp">Network</div>
   <a href="#/wan">WAN</a>
   <a href="#/networks">Networks</a>
+  <a href="#/routes">Routes</a>
   <a href="#/lan">LAN &amp; DHCP</a>
   <a href="#/dns">DNS</a>
   <a href="#/firewall">Firewall</a>
@@ -230,6 +231,20 @@
       <div class="row"><button type="button" id="addnet" class="plain">Add network</button>
         <span class="hint">The first network is the main LAN: edit it under <a href="#/lan">LAN &amp; DHCP</a>.</span></div>
       <p class="hint">Adding, removing or changing a network (VLAN, address, zone) applies at once, without a reboot; changing the address of the network you use for this page boots as a trial. A VLAN needs a switch or access point that tags it on the LAN cable.</p>
+    </form>
+  </section>
+
+  <!-- ================= Routes ================= -->
+  <section class="page" data-page="routes" data-title="Routes" hidden>
+    <h2>Routes</h2>
+    <p class="lead">Where the router sends packets: its networks, the WAN's gateway, and subnets behind other routers.</p>
+    <div class="card"><h3>Routing table</h3><div class="tw"><table id="rtab"></table></div>
+      <p class="hint">The most specific matching route wins. <b>connected</b>: a network's own subnet; <b>default</b>: everything else, to the WAN's gateway; <b>static</b>: configured below.</p></div>
+    <form class="card cfg" autocomplete="off" id="routesform"><h3>Static routes</h3>
+      <div class="tw"><table id="routes"></table></div>
+      <div class="row"><button type="button" id="addroute" class="plain">Add route</button>
+        <span class="hint">A subnet behind another router (a lab router, a VPN box, a second building) and that router's address. Applied at once.</span></div>
+      <p class="hint">The router must be a host on one of the networks, or on the WAN's subnet. DHCP clients of its network learn the route (option 121) and send to it directly; devices with a fixed address need the route themselves, since the router does not send a packet back out the network it came from. Hosts behind it belong to that network's zone, and are NATed to the internet like the network's own.</p>
     </form>
   </section>
 
@@ -934,6 +949,7 @@ async function refresh() {
     : rows([["Networks", "none"]]);
   renderNetStatus();
   renderRuleHits();
+  renderRouteTable();
   renderHostHits();
   renderMdnsStats();
 }
@@ -1060,6 +1076,7 @@ function fillForm(c) {
   renderRules(c.firewall?.rule ?? []);
   renderFwds(c.firewall?.forward ?? []);
   renderRedirs(c.firewall?.redirect ?? []);
+  renderRoutes(c.route ?? []);
   renderMdns(c.mdns?.reflect ?? []);
   renderHosts(c.dns?.host ?? []);
   $("dnsdom").textContent = c.dns?.domain ?? "lan";
@@ -1080,6 +1097,8 @@ function readForm() {
   const redirs = readRedirs();
   if (redirs.length) c.firewall.redirect = redirs; else delete c.firewall.redirect;
   if (!Object.keys(c.firewall).length) delete c.firewall;
+  const routes = readRoutes();
+  if (routes.length) c.route = routes; else delete c.route;
   const md = readMdns();
   if (md.length) c.mdns = { ...(c.mdns ?? {}), reflect: md }; else delete c.mdns;
   const hs = readHosts();
@@ -1414,6 +1433,64 @@ $("addfwd").onclick = () => {
 };
 $("fwds").addEventListener("input", fwdPaths);
 
+// ---- Static routes, and the routing table in use.
+let routeOrig = [];
+function renderRoutes(list) {
+  routeOrig = list.map((r) => structuredClone(r));
+  const t = $("routes");
+  t.replaceChildren(el("tr", {}, ["On", "Name", "Destination", "Via router", "State", ""].map((h) => el("th", { textContent: h }))));
+  list.forEach((r, i) => {
+    const tr = el("tr", { dataset: { orig: String(i) } });
+    const inp = (key, v, ph, size) => el("td", {}, [el("input", { value: v ?? "", placeholder: ph, size, dataset: { key } })]);
+    tr.append(el("td", {}, [el("input", { type: "checkbox", checked: r.enabled !== false, dataset: { key: "enabled" } })]),
+      inp("name", r.name, "lab", 12), inp("dst", r.dst, "10.20.0.0/24", 18), inp("via", r.via, "192.168.1.2", 15),
+      el("td", { dataset: { rstate: r.name ?? "" } }),
+      el("td", {}, [el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); updatePending(); } })]));
+    t.append(tr);
+  });
+  routePaths();
+  renderRouteTable();
+}
+function routePaths() {
+  for (const tr of [...$("routes").rows].slice(1)) {
+    const name = tr.querySelector('[data-key="name"]').value.trim();
+    for (const e of tr.querySelectorAll("[data-key]")) e.dataset.path = `route.${name}.${e.dataset.key}`;
+  }
+}
+function readRoutes() {
+  if (!$("routes").rows.length) return cfgOrig?.route ?? [];
+  return [...$("routes").rows].slice(1).map((tr) => {
+    const o = structuredClone(routeOrig[Number(tr.dataset.orig)] ?? {});
+    const v = (k) => tr.querySelector(`[data-key="${k}"]`);
+    o.name = v("name").value.trim();
+    if (v("enabled").checked) delete o.enabled; else o.enabled = false;
+    o.dst = v("dst").value.trim();
+    o.via = v("via").value.trim();
+    return o;
+  });
+}
+function renderRouteTable() {
+  const rs = st?.routes ?? [];
+  $("rtab").innerHTML = rs.length
+    ? "<tr><th>Destination</th><th>Via</th><th>Interface</th><th>Type</th><th>Route</th></tr>" +
+      rs.map((r) => `<tr${r.active ? "" : " class=muted"}><td>${esc(r.dst === "0.0.0.0/0" ? "default (0.0.0.0/0)" : r.dst)}</td><td>${esc(r.via ?? "direct")}</td><td>${esc(r.dev)}</td>` +
+        `<td>${esc(r.kind)}${r.active ? "" : " (not in use)"}</td><td>${esc(r.name ?? "")}</td></tr>`).join("")
+    : rows([["Routes", st ? "none (no address yet)" : "–"]]);
+  const by = Object.fromEntries(rs.filter((r) => r.name).map((r) => [r.name, r]));
+  for (const td of document.querySelectorAll("#routes [data-rstate]")) {
+    const r = by[td.dataset.rstate];
+    td.textContent = !r ? "–" : r.active ? `in use, via ${r.dev}` : "not in use: no network or WAN subnet holds the router";
+  }
+}
+$("addroute").onclick = () => {
+  const rs = readRoutes();
+  rs.push({ name: "", dst: "", via: "" });
+  renderRoutes(rs);
+  [...$("routes").rows].at(-1).querySelector('[data-key="name"]').focus();
+  updatePending();
+};
+$("routes").addEventListener("input", routePaths);
+
 // ---- Redirects: connections to outside servers, to a device inside.
 let redirOrig = [];
 function renderRedirs(list) {
@@ -1666,7 +1743,7 @@ function renderMatrix(c) {
 
 // path → shown value; arrays of plain values stay one entry, entries with
 // a name are named by it (as in the router's validation messages).
-const KEYED = ["network", "zone", "firewall.rule", "firewall.forward", "firewall.redirect", "mdns.reflect"];
+const KEYED = ["network", "zone", "route", "firewall.rule", "firewall.forward", "firewall.redirect", "mdns.reflect"];
 // Keyed lists whose order matters (first match wins): the order is one more entry.
 const ORDERED = ["firewall.rule"];
 function flatten(o, pre = "", out = {}, named = false) {

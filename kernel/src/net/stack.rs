@@ -384,15 +384,22 @@ pub fn place_networks(
             })
             .collect(),
         policy: crate::config::firewall(),
+        routes: crate::config::static_routes(),
     };
     (slots, links, msg)
 }
 
 /// The router stack's addresses: each network's on its slot's interface,
-/// none on the others.
+/// none on the others; and its `[[route]]`s (the WAN's: those through a
+/// router on the WAN's subnet), so the router answers hosts behind them.
 pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: &[usize]) {
+    if let Some(wan) = hosts.first_mut() {
+        set_host_routes(&mut wan.iface, &crate::config::wan_routes());
+    }
     for (i, host) in hosts.iter_mut().enumerate().skip(1) {
-        let want = links.iter().position(|&l| l == i).map(|k| cidr(&nets[k]));
+        let k = links.iter().position(|&l| l == i);
+        set_host_routes(&mut host.iface, k.map_or(&[][..], |k| &nets[k].routes));
+        let want = k.map(|k| cidr(&nets[k]));
         let have = host.iface.ip_addrs().first().copied();
         if have != want.map(IpCidr::Ipv4) {
             host.iface.update_ip_addrs(|a| {
@@ -403,6 +410,28 @@ pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: 
             });
         }
     }
+}
+
+/// An interface's routes: `routes`, plus the default route it has (the
+/// WAN's, from the lease or PPPoE). smoltcp holds at most
+/// `iface-max-route-count` (Cargo feature) of them.
+pub fn set_host_routes(iface: &mut Interface, routes: &[(core::net::Ipv4Addr, u8, core::net::Ipv4Addr)]) {
+    use smoltcp::iface::Route;
+    use smoltcp::wire::IpAddress;
+    iface.routes_mut().update(|table| {
+        table.retain(|r| r.cidr.prefix_len() == 0);
+        for &(dst, len, via) in routes {
+            let route = Route {
+                cidr: IpCidr::Ipv4(Ipv4Cidr::new(dst, len)),
+                via_router: IpAddress::Ipv4(via),
+                preferred_until: None,
+                expires_at: None,
+            };
+            if table.push(route).is_err() {
+                println!("  routes          : table full, {dst}/{len} via {via} left out");
+            }
+        }
+    });
 }
 
 /// One line per network (boot, and after a change).

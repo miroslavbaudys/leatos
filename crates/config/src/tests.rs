@@ -1628,3 +1628,119 @@ fn dns_views_and_hosts_from_the_cli() {
     assert!(c.without("dns.host").unwrap().dns.hosts.is_empty());
     assert_eq!(c.without("dns.views").unwrap().dns.views, DnsViews::All);
 }
+
+fn route(name: &str, dst: &str, via: core::net::Ipv4Addr) -> Route {
+    Route { name: name.into(), enabled: true, dst: dst.parse().unwrap(), via }
+}
+
+#[test]
+fn routes_parse_round_trip_and_feed_option_121() {
+    let doc = lan_doc(
+        "192.168.1.1/24",
+        "[[route]]\nname = \"lab\"\ndst = \"10.20.0.0/24\"\nvia = \"192.168.1.2\"\n\n\
+         [[route]]\nname = \"vpn\"\nenabled = false\ndst = \"10.30.0.0/16\"\nvia = \"192.168.1.3\"\n\n\
+         [[route]]\nname = \"modem\"\ndst = \"192.168.100.1\"\nvia = \"100.64.0.2\"\n",
+    );
+    let c = parse(&doc).unwrap();
+    assert_eq!(c.routes.len(), 3);
+    assert_eq!(c.routes[2].dst.0.prefix, 32, "an address is a /32");
+    assert_eq!(parse(&c.to_toml()).unwrap(), c, "{}", c.to_toml());
+    assert!(!c.to_toml().contains("enabled = true"));
+    assert_eq!(c.route_via(&c.routes[0]), RouteVia::Network(&c.networks[0]));
+    assert_eq!(c.route_via(&c.routes[2]), RouteVia::Wan);
+    // Only enabled routes through this network's routers.
+    assert_eq!(c.network_routes("lan"), vec![(ip(10, 20, 0, 0), 24, ip(192, 168, 1, 2))]);
+    assert_eq!(c.network_routes("nosuch"), vec![]);
+    assert_eq!(parse_json(&c.to_json()).unwrap(), c);
+    assert!(!Config::default().to_toml().contains("route"));
+}
+
+#[test]
+fn route_checks() {
+    let gw = ip(192, 168, 1, 2);
+    let one = |dst: &'static str, via| issues(move |c| c.routes.push(route("r", dst, via)));
+    assert!(one("10.20.0.0/24", gw).is_empty());
+    assert!(one("10.0.0.0/8", gw).is_empty());
+    assert!(one("192.168.0.0/16", gw).is_empty(), "around the LAN: the LAN is the longer match");
+    assert_eq!(one("10.20.0.5/24", gw), ["route.r.dst"], "host bits");
+    assert_eq!(one("0.0.0.0/0", gw), ["route.r.dst"], "the default route");
+    assert_eq!(one("192.168.1.128/25", gw), ["route.r.dst"], "inside the LAN");
+    assert_eq!(one("192.168.1.0/24", gw), ["route.r.dst"], "the LAN itself");
+    assert_eq!(one("127.0.0.0/8", gw), ["route.r.dst"]);
+    assert_eq!(one("224.0.0.0/4", gw), ["route.r.dst"]);
+    assert_eq!(one("10.20.0.0/24", ip(192, 168, 1, 1)), ["route.r.via"], "the router itself");
+    assert_eq!(one("10.20.0.0/24", ip(192, 168, 1, 255)), ["route.r.via"], "broadcast");
+    // Through the WAN (DHCP): anything unicast, not inside dst.
+    assert!(one("10.20.0.0/24", ip(100, 64, 0, 2)).is_empty());
+    assert_eq!(one("100.64.0.0/10", ip(100, 64, 0, 2)), ["route.r.via"]);
+    assert_eq!(one("10.20.0.0/24", ip(127, 0, 0, 1)), ["route.r.via"]);
+    assert_eq!(
+        issues(|c| {
+            c.wan.mode = WanMode::Pppoe;
+            c.routes.push(route("r", "10.20.0.0/24", ip(100, 64, 0, 2)));
+        }),
+        ["route.r.via"],
+        "PPPoE has no other routers"
+    );
+    assert!(
+        issues(|c| {
+            c.wan.mode = WanMode::Pppoe;
+            c.routes.push(route("r", "10.20.0.0/24", gw));
+        })
+        .is_empty(),
+        "a LAN route with PPPoE"
+    );
+    // Names, duplicates, the limit.
+    assert_eq!(
+        issues(|c| {
+            c.routes.push(route("a", "10.20.0.0/24", gw));
+            c.routes.push(route("b", "10.20.0.0/24", ip(192, 168, 1, 3)));
+        }),
+        ["route.b.dst"]
+    );
+    assert_eq!(
+        issues(|c| {
+            c.routes.push(route("a", "10.20.0.0/24", gw));
+            c.routes.push(route("a", "10.21.0.0/24", gw));
+        }),
+        ["route[1].name"]
+    );
+    assert_eq!(
+        issues(|c| {
+            for k in 0..=validate::MAX_ROUTES as u8 {
+                c.routes.push(route(&alloc::format!("r{k}"), &alloc::format!("10.{k}.0.0/16"), gw));
+            }
+        }),
+        ["route"]
+    );
+}
+
+#[test]
+fn routes_by_name_on_the_cli() {
+    let c = Config::default()
+        .with_assignment(r#"route.lab = { dst = "10.20.0.0/24", via = "192.168.1.2" }"#)
+        .unwrap();
+    assert_eq!(c.routes, vec![route("lab", "10.20.0.0/24", ip(192, 168, 1, 2))]);
+    let c = c.with_assignment("route.lab.enabled = false").unwrap();
+    assert!(!c.routes[0].enabled);
+    let c = c.without("route.lab.enabled").unwrap();
+    assert!(c.routes[0].enabled);
+    assert!(c.with_assignment(r#"route.lab.via = "192.168.1.1""#).unwrap().validate().is_err());
+    assert!(c.without("route.lab").unwrap().routes.is_empty());
+}
+
+#[test]
+fn routed_subnets_belong_to_their_routers_network_in_dns_views() {
+    const LAN: u32 = 1;
+    let mut c = parse(HOME_VIEWS).unwrap();
+    // Behind a router on the iot network: iot's names.
+    let iot = c.networks[1].ipv4.host(2);
+    c.routes.push(route("behind-iot", "10.40.0.0/16", iot));
+    c.routes.push(route("behind-lan", "10.40.1.0/24", ip(192, 168, 1, 2)));
+    c.validate().unwrap();
+    let v = c.name_visibility();
+    assert_eq!(v.seen_by(ip(10, 40, 9, 9)), v.seen_by(c.networks[1].ipv4.host(10)), "as iot");
+    assert_eq!(v.seen_by(ip(10, 40, 1, 9)), LAN, "the longer route wins");
+    c.routes[0].enabled = false;
+    assert_eq!(c.name_visibility().seen_by(ip(10, 40, 9, 9)), LAN | 2 | 4, "a disabled route: outside");
+}

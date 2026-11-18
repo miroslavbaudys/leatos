@@ -36,6 +36,10 @@ const OPT_MESSAGE: u8 = 56;
 const OPT_RENEWAL_T1: u8 = 58;
 const OPT_REBINDING_T2: u8 = 59;
 const OPT_CLIENT_ID: u8 = 61;
+/// Classless static routes (RFC 3442).
+pub const OPT_CLASSLESS_ROUTES: u8 = 121;
+/// The same, under Microsoft's private code (Windows XP/2003 ask for it).
+pub const OPT_MS_CLASSLESS_ROUTES: u8 = 249;
 const OPT_END: u8 = 255;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +101,48 @@ pub struct Options {
     pub domain: Option<String>,
     pub broadcast: Option<Ipv4Addr>,
     pub message: Option<String>,
+    /// Option 121 (RFC 3442): (destination, prefix length, router). A
+    /// client that takes it ignores option 3, so the default route goes
+    /// in here too.
+    pub classless_routes: Vec<Route>,
+    /// Option 249: the same routes for clients asking under that code.
+    pub ms_classless_routes: Vec<Route>,
+}
+
+/// A classless static route: (destination, prefix length, router).
+pub type Route = (Ipv4Addr, u8, Ipv4Addr);
+
+/// RFC 3442 §3: per route its width, the significant octets of the
+/// destination, then the router.
+pub fn encode_routes(routes: &[Route]) -> Vec<u8> {
+    let mut b = Vec::new();
+    for &(dst, len, via) in routes {
+        let len = len.min(32);
+        b.push(len);
+        b.extend_from_slice(&dst.octets()[..len.div_ceil(8) as usize]);
+        b.extend_from_slice(&via.octets());
+    }
+    b
+}
+
+/// The routes of option 121/249; `None` if malformed (RFC 3442: then the
+/// whole option is ignored).
+pub fn decode_routes(mut data: &[u8]) -> Option<Vec<Route>> {
+    let mut out = Vec::new();
+    while let Some((&len, rest)) = data.split_first() {
+        if len > 32 {
+            return None;
+        }
+        let n = len.div_ceil(8) as usize;
+        if rest.len() < n + 4 {
+            return None;
+        }
+        let mut dst = [0; 4];
+        dst[..n].copy_from_slice(&rest[..n]);
+        out.push((Ipv4Addr::from(dst), len, ip(&rest[n..n + 4])));
+        data = &rest[n + 4..];
+    }
+    Some(out)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,6 +251,8 @@ impl Message {
                 OPT_MESSAGE if len > 0 => o.message = Some(text(data)),
                 OPT_CLIENT_ID if len > 0 => o.client_id = Some(data.to_vec()),
                 OPT_PARAM_REQUEST => o.param_request = data.to_vec(),
+                OPT_CLASSLESS_ROUTES => o.classless_routes = decode_routes(data).unwrap_or_default(),
+                OPT_MS_CLASSLESS_ROUTES => o.ms_classless_routes = decode_routes(data).unwrap_or_default(),
                 OPT_LEASE_TIME => o.lease_time = u32_be(data),
                 OPT_RENEWAL_T1 => o.renewal_t1 = u32_be(data),
                 OPT_REBINDING_T2 => o.rebinding_t2 = u32_be(data),
@@ -272,6 +320,14 @@ impl Message {
         if let Some(d) = &o.domain {
             opt(OPT_DOMAIN, d.as_bytes());
         }
+        for (code, routes) in [
+            (OPT_CLASSLESS_ROUTES, &o.classless_routes),
+            (OPT_MS_CLASSLESS_ROUTES, &o.ms_classless_routes),
+        ] {
+            if !routes.is_empty() {
+                opt(code, &encode_routes(routes));
+            }
+        }
         if let Some(h) = &o.hostname {
             opt(OPT_HOSTNAME, h.as_bytes());
         }
@@ -326,6 +382,28 @@ mod tests {
         let bytes = m.emit();
         assert!(bytes.len() >= MIN_LEN);
         assert_eq!(Message::parse(&bytes).unwrap(), m);
+    }
+
+    #[test]
+    fn classless_routes_rfc3442_examples() {
+        let routes = vec![
+            (Ipv4Addr::new(10, 17, 0, 0), 16, Ipv4Addr::new(10, 27, 129, 1)),
+            (Ipv4Addr::new(10, 229, 0, 128), 25, Ipv4Addr::new(10, 229, 0, 1)),
+            (Ipv4Addr::new(10, 198, 122, 47), 32, Ipv4Addr::new(10, 198, 122, 1)),
+            (Ipv4Addr::UNSPECIFIED, 0, Ipv4Addr::new(192, 168, 1, 1)),
+        ];
+        let b = encode_routes(&routes);
+        // RFC 3442 §3: 10.17/16 → 16.10.17, /25 → 25.10.229.0.128, /0 → 0.
+        assert_eq!(&b[..7], &[16, 10, 17, 10, 27, 129, 1]);
+        assert_eq!(&b[7..16], &[25, 10, 229, 0, 128, 10, 229, 0, 1]);
+        assert_eq!(&b[b.len() - 5..], &[0, 192, 168, 1, 1]);
+        assert_eq!(decode_routes(&b), Some(routes.clone()));
+        assert_eq!(decode_routes(&[33, 0, 0, 0, 0, 0, 0, 0, 0]), None, "width above 32");
+        assert_eq!(decode_routes(&b[..b.len() - 1]), None, "truncated");
+        let mut m = sample();
+        m.options.classless_routes = routes.clone();
+        m.options.ms_classless_routes = routes;
+        assert_eq!(Message::parse(&m.emit()).unwrap(), m);
     }
 
     #[test]

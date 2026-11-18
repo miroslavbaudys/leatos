@@ -15,6 +15,28 @@ pub struct Route {
     pub egress: IfIndex,
     /// `None` = directly connected (next hop is the destination itself).
     pub gateway: Option<Ipv4Addr>,
+    pub kind: RouteKind,
+}
+
+/// Where a route comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteKind {
+    /// An interface's own subnet.
+    Connected,
+    /// The WAN's gateway (lease, PPPoE peer).
+    Default,
+    /// Configured (`[[route]]`), through a router on a connected subnet.
+    Static,
+}
+
+impl RouteKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Default => "default",
+            Self::Static => "static",
+        }
+    }
 }
 
 fn mask(len: u8) -> u32 {
@@ -70,6 +92,17 @@ impl RouteTable {
     pub fn iter(&self) -> impl Iterator<Item = &Route> {
         self.routes.iter()
     }
+
+    /// Remove every route of one kind.
+    pub fn remove_kind(&mut self, kind: RouteKind) {
+        self.routes.retain(|r| r.kind != kind);
+    }
+
+    /// The route for exactly (prefix, len).
+    pub fn get(&self, prefix: Ipv4Addr, len: u8) -> Option<&Route> {
+        let p = Ipv4Addr::from(u32::from(prefix) & mask(len));
+        self.routes.iter().find(|x| x.prefix == p && x.len == len)
+    }
 }
 
 #[cfg(test)]
@@ -84,12 +117,14 @@ mod tests {
             len: 0,
             egress: 0,
             gateway: Some(Ipv4Addr::new(203, 0, 113, 1)),
+            kind: RouteKind::Default,
         });
         t.set(Route {
             prefix: Ipv4Addr::new(192, 168, 1, 77),
             len: 24,
             egress: 1,
             gateway: None,
+            kind: RouteKind::Connected,
         });
         assert_eq!(t.lookup(Ipv4Addr::new(192, 168, 1, 5)).unwrap().egress, 1);
         assert_eq!(t.lookup(Ipv4Addr::new(8, 8, 8, 8)).unwrap().egress, 0);

@@ -94,6 +94,7 @@ fn dhcp_config(cfg: &config::Lan) -> dhcp::Config {
         range: cfg.dhcp_range,
         lease_secs: cfg.lease_secs,
         statics: cfg.statics.clone(),
+        routes: cfg.routes.clone(),
     }
 }
 

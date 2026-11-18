@@ -26,7 +26,10 @@ pass() { echo "LAB PASS: $*"; }
 fail() { echo "LAB FAIL: $*"; fails=$((fails + 1)); }
 
 # --- DHCP ---------------------------------------------------------------
-if $bb udhcpc -i eth0 -n -q -t 10 -T 1 -x hostname:labclient -s /udhcpc.sh; then
+# Static routes (lab_routes=): ask for option 121 too.
+ropt=""
+$bb grep -q 'lab_routes=' /proc/cmdline && ropt="-O staticroutes"
+if $bb udhcpc -i eth0 -n -q -t 10 -T 1 -x hostname:labclient $ropt -s /udhcpc.sh; then
   . /tmp/lease
   pass "dhcp lease ip=$ip router=$router dns=$dns domain=$domain"
 else
@@ -341,6 +344,49 @@ if [ -n "$fw" ]; then
   else
     fail "anti-spoofing: spoofed $sp0 -> $sp1 (want more), lab-web hits ${wh0:-none} -> ${wh1:-none} (want unchanged) ($r)"
   fi
+fi
+
+# --- static routes (scripts/lab-test.sh LAB_ROUTES) ----------------------------------
+# The router has [[route]] lab-behind: 10.30.0.0/24 via us (192.168.1.100);
+# 10.30.0.5 lives on our loopback, a host "behind" a LAN router. Option 121
+# carries it (and the default route) to us; the router forwards replies for
+# 10.30.0.5 to us, answers it itself, lists the route, and drops WAN
+# packets claiming to come from it. lab_routes=0 (the route disabled) is the
+# negative control: every check fails.
+if $bb grep -q 'lab_routes=' /proc/cmdline; then
+  want="10.30.0.0/24 192.168.1.100 0.0.0.0/0 192.168.1.1"
+  if [ "$staticroutes" = "$want" ]; then pass "routes: DHCP option 121 '$staticroutes'"
+  else fail "routes: DHCP option 121 '$staticroutes', expected '$want'"; fi
+  $bb ip addr add 10.30.0.5/32 dev lo
+  if $bb ping -c 2 -W 2 -I 10.30.0.5 "$ISP" >/tmp/rping 2>&1; then
+    pass "routes: 10.30.0.5 (behind 192.168.1.100) reaches the ISP through NAT, replies routed back"
+  else
+    fail "routes: ping $ISP from 10.30.0.5"; $bb tail -2 /tmp/rping | $bb sed "s/^/    | /"
+  fi
+  if $bb ping -c 2 -W 2 -I 10.30.0.5 192.168.1.1 >/tmp/rping 2>&1; then
+    pass "routes: the router answers 10.30.0.5 itself (its stack has the route)"
+  else
+    fail "routes: ping 192.168.1.1 from 10.30.0.5"; $bb tail -2 /tmp/rping | $bb sed "s/^/    | /"
+  fi
+  rst=$($bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb sed -n 's/.*"routes":\[\([^]]*\)\].*/\1/p')
+  if echo "$rst" | $bb grep -q '"dst":"10.30.0.0/24","via":"192.168.1.100","dev":"lan","kind":"static","name":"lab-behind","active":true'; then
+    pass "routes: /api/status lists lab-behind in use on lan"
+  else
+    fail "routes: /api/status routes: $rst"
+  fi
+  # The ISP forges 10.30.0.5 towards the port forward: inside, so spoofed.
+  if $bb grep -q 'lab_forward=1' /proc/cmdline; then
+    sp() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb grep -o '"spoofed":[0-9]*' | $bb cut -d: -f2; }
+    sp0=$(sp)
+    r=$($bb wget -q -T 15 -O - "http://$ISP/cgi-bin/spoof?8080&src=10.30.0.5" 2>&1)
+    sp1=$(sp)
+    if echo "$r" | $bb grep -q "spoof=SENT" && [ -n "$sp0" ] && [ -n "$sp1" ] && [ "$sp1" -gt "$sp0" ]; then
+      pass "routes: forged 10.30.0.5 from the WAN dropped as spoofed ($((sp1 - sp0)) packet(s))"
+    else
+      fail "routes: forged 10.30.0.5 from the WAN: spoofed ${sp0:-?} -> ${sp1:-?} ($r)"
+    fi
+  fi
+  $bb ip addr del 10.30.0.5/32 dev lo
 fi
 
 # --- shaping (M6): throughput ~ shaped rate, latency stays low under load ------------

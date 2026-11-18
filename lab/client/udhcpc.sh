@@ -7,7 +7,7 @@ case "$1" in
     [ -n "$router" ] && $bb route add default gw "${router%% *}" dev "$interface" 2>/dev/null
     : > /etc/resolv.conf
     for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; done
-    echo "ip=$ip router=${router%% *} dns=\"$dns\" domain=$domain" > /tmp/lease
+    echo "ip=$ip router=${router%% *} dns=\"$dns\" domain=$domain staticroutes=\"$staticroutes\"" > /tmp/lease
     ;;
 esac
 exit 0

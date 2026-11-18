@@ -62,11 +62,14 @@ expiry, hostname sanitising, and `Bound`/`Released` events to DNS. Replies
 are always broadcast. One server per network (`[[network]]`, VLANs,
 docs/config-v2.md) with its own domain (option 15). Leases persist in the
 store (`persist`, `Server::restore`; docs/config-and-storage.md §4).
-Open: conflict probe, option 121, option 42 (no NTP server), relay.
+Option 121 (RFC 3442, and 249 for clients asking for it) carries the
+`[[route]]`s through routers on the client's network plus the default
+route (docs/config-v2.md `[[route]]`). Open: conflict probe, option 42
+(no NTP server), relay.
 
 - Pools, static reservations by MAC, lease time, T1/T2, DECLINE, RELEASE, INFORM.
 - Options: 1 subnet mask, 3 router, 6 DNS (= router IP), 15/119 domain, 42 NTP,
-  12 hostname (from the client), optionally 121 classless routes.
+  12 hostname (from the client), 121/249 classless routes (when asked for and `[[route]]`s exist).
 - Lease persistence: in memory, flushed periodically and on shutdown. Batch
   writes to limit flash wear. ✅
 - Optional ARP or ICMP probe before handing out an address.

@@ -49,6 +49,7 @@ pub enum Command {
     Help,
     Status,
     Leases,
+    Routes,
     /// `log [N|all|clear]`: the last N lines of the RAM log (`None` = all).
     Log(LogArg),
     Show(Which),
@@ -65,6 +66,7 @@ pub const HELP: &str = "\
 commands:
   status                         system, ports, WAN, time, watchdog, CPU
   leases                         DHCP leases
+  routes                         routing table
   log [N|all|clear]              messages since boot (default: last 40 lines)
   config show [running|stored|pending]
   config set <setting> = <value> edit (TOML), e.g. config set shaping.up_kbit = 18000
@@ -88,6 +90,7 @@ pub fn parse(line: &str) -> Result<Option<Command>, String> {
         ("help" | "?", []) => Command::Help,
         ("status", []) => Command::Status,
         ("leases", []) => Command::Leases,
+        ("routes", []) => Command::Routes,
         ("log", []) => Command::Log(LogArg::Last(LOG_DEFAULT_LINES)),
         ("log", ["all"]) => Command::Log(LogArg::All),
         ("log", ["clear"]) => Command::Log(LogArg::Clear),
@@ -120,7 +123,7 @@ pub fn parse(line: &str) -> Result<Option<Command>, String> {
         ("config", ["discard"]) => Command::Discard,
         ("config", _) => return bad("usage: config show|set|unset|diff|save|discard"),
         (
-            "help" | "?" | "status" | "leases" | "reboot",
+            "help" | "?" | "status" | "leases" | "routes" | "reboot",
             _,
         ) => return Err(alloc::format!("{first} takes no arguments")),
         _ => return Err(alloc::format!("unknown command: {first} (try help)")),

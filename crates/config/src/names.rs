@@ -20,8 +20,10 @@ pub struct NameVisibility {
     firewall: bool,
     /// Every network.
     all: u32,
-    /// The networks' subnets, in config order.
-    subnets: Vec<Cidr>,
+    /// The networks' subnets (owner = config index), then the subnets
+    /// routed through a router on a network (owner = that network),
+    /// longest first: the first match owns an address.
+    subnets: Vec<(Cidr, usize)>,
     /// Per owner network: the networks that see its names through the
     /// zones (same zone, or `forward_to` its zone).
     by_zone: Vec<u32>,
@@ -43,7 +45,7 @@ impl NameVisibility {
         if !self.firewall {
             return self.all;
         }
-        let Some(owner) = self.subnets.iter().position(|s| s.contains(ip)) else {
+        let Some(&(_, owner)) = self.subnets.iter().find(|(s, _)| s.contains(ip)) else {
             return self.all;
         };
         let bit = 1u32 << owner;
@@ -152,10 +154,22 @@ impl Config {
             .map(|r| (self.zone_mask(&r.from), self.zone_mask(&r.to), r.dst))
             .filter(|(from, to, _)| *from != 0 && *to != 0)
             .collect();
+        let mut subnets: Vec<(Cidr, usize)> = self.networks.iter().enumerate().map(|(k, n)| (n.ipv4, k)).collect();
+        let mut routed: Vec<(Cidr, usize)> = self
+            .routes
+            .iter()
+            .filter(|r| r.enabled)
+            .filter_map(|r| match self.route_via(r) {
+                crate::RouteVia::Network(n) => Some((r.dst.0, self.networks.iter().position(|m| m.name == n.name)?)),
+                crate::RouteVia::Wan => None,
+            })
+            .collect();
+        routed.sort_by_key(|(c, _)| core::cmp::Reverse(c.prefix));
+        subnets.extend(routed);
         NameVisibility {
             firewall: self.dns.views == DnsViews::Firewall,
             all,
-            subnets: self.networks.iter().map(|n| n.ipv4).collect(),
+            subnets,
             by_zone,
             rules,
         }

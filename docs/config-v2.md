@@ -285,6 +285,49 @@ they are about. A zone-limited redirect thus also puts the other zones'
 connections to those ports in that shard (their NAT ports come from it,
 so the WAN side finds them); keep redirects to small services.
 
+### `[[route]]`
+Static routes to subnets behind other routers (a lab router, a VPN box):
+
+```toml
+[[route]]
+name = "lab"            # key
+dst = "10.30.0.0/24"    # subnet (host bits zero) or one address
+via = "192.168.1.2"     # the next router
+# enabled = true
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `name` | required | key; unique |
+| `enabled` | `true` | |
+| `dst` | required | not `0.0.0.0/0` (the WAN's), not inside a network's subnet (around one is fine: the subnet is the longer match), not loopback, link-local or multicast; unique |
+| `via` | required | a host on one of the networks (not the router), or else on the WAN's subnet (not with PPPoE; with a DHCP WAN the route is used while the lease's subnet holds it); not inside `dst` for a WAN route |
+
+At most 16. The route leaves through the network whose subnet holds `via`
+(`Config::route_via`):
+- **Forwarding** (`fwd::Forwarder::set_static_routes`): in the table
+  (`RouteKind::Static`) while a connected subnet holds `via`; a connected
+  route or the default with the same destination wins. Hosts behind a
+  network's router count as inside for WAN anti-spoofing, redirects,
+  `recheck` (their connections came in on that network, in its zone) and
+  shard selection (`ShardHints::routed`); they are NATed to the internet
+  like the network's own.
+- **DHCP option 121** (RFC 3442; 249 for clients asking for that one
+  instead): each network's DHCP clients that ask for it get the routes
+  through routers on their network, plus the default route via the router
+  (such clients ignore option 3). They send to the other router directly;
+  the router never sends a packet back out the link it came in on
+  (drop reason `hairpin`), so devices with a fixed address need the route
+  themselves.
+- **The router's own stack** (smoltcp, per link): each link's interface
+  holds the routes through its routers, so the router answers hosts
+  behind them (DNS, web interface, ping); the WAN's holds WAN routes.
+- **DNS views:** a routed subnet belongs to `via`'s network.
+- **Status:** `/api/status` `routes` (the table in use, then configured
+  routes not in use, `active: false`), CLI `routes`, web page Routes.
+
+Lab: `LAB_ROUTES=1 scripts/lab-test.sh` (negative control `LAB_ROUTES=0`).
+
 ### `[[dns.host]]` and `[dns] views`
 Static A records in the local zone (`name` + `ip`), beside the DHCP-derived
 names. A name without a dot is in `dns.domain`; a dotted one in the
@@ -484,6 +527,7 @@ control `LAB_GUEST_DOMAIN=0`).
 | Page | Sections |
 |---|---|
 | Networks | `[[network]]` list + editor (VLAN, subnet, zone, domain), a DHCP panel per network (pool, lease time, reservations) |
+| Routes | the routing table in use; `[[route]]` list (enable toggle, destination, router, state) |
 | WAN | `[wan]` (mode, VLAN, PPPoE) |
 | LAN & DHCP | the first network's address and DHCP |
 | Clients | leases of all networks, "Reserve" |

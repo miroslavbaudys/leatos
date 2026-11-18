@@ -1292,6 +1292,23 @@ fn status_json(
         );
     }
     s.push(']');
+    // The routing table, then configured routes not in use.
+    s.push_str(",\"routes\":[");
+    for (n, r) in sh.route_rows().iter().enumerate() {
+        let _ = write!(
+            s,
+            "{}{{\"dst\":\"{}/{}\",\"via\":{},\"dev\":{},\"kind\":\"{}\",\"name\":{},\"active\":{}}}",
+            if n > 0 { "," } else { "" },
+            r.dst.0,
+            r.dst.1,
+            r.via.map_or_else(|| "null".into(), |v| format!("\"{v}\"")),
+            json_str(&r.dev),
+            r.kind,
+            r.name.as_deref().map_or_else(|| "null".into(), json_str),
+            r.active
+        );
+    }
+    s.push(']');
     // Firewall rules in effect (enabled ones) and the packets they decided.
     s.push_str(",\"rules\":[");
     let hits = sh.rule_hits.lock().clone();

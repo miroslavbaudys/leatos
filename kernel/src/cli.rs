@@ -275,6 +275,7 @@ impl Cli {
             Command::Help => println!("{}", cli::HELP),
             Command::Status => status(ctx, &self.wan),
             Command::Leases => leases(ctx),
+            Command::Routes => routes(ctx),
             Command::Log(arg) => self.log(arg),
             Command::Show(w) => {
                 let c = match w {
@@ -534,6 +535,20 @@ fn status(ctx: &Ctx, wan: &str) {
         crate::net::datapath::FORWARDED.load(core::sync::atomic::Ordering::Relaxed),
         ctx.sh.conntrack()
     );
+}
+
+fn routes(ctx: &Ctx) {
+    for r in ctx.sh.route_rows() {
+        let dst = alloc::format!("{}/{}", r.dst.0, r.dst.1);
+        let via = r.via.map_or_else(|| String::from("-"), |v| alloc::format!("{v}"));
+        println!(
+            "{dst:<18} via {via:<15} dev {:<8} {}{}{}",
+            r.dev,
+            r.kind,
+            r.name.map(|n| alloc::format!(" {n}")).unwrap_or_default(),
+            if r.active { "" } else { " (inactive: no network holds its router)" }
+        );
+    }
 }
 
 fn leases(ctx: &Ctx) {

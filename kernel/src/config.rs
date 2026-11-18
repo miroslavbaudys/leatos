@@ -446,6 +446,9 @@ pub struct Lan {
     pub zone_name: String,
     /// The web interface is reachable from this network's zone.
     pub mgmt: bool,
+    /// Enabled `[[route]]`s through a router on this network: (subnet,
+    /// prefix length, router), for DHCP option 121 and the router stack.
+    pub routes: Vec<(Ipv4Addr, u8, Ipv4Addr)>,
 }
 
 impl Lan {
@@ -507,7 +510,40 @@ pub fn networks() -> Vec<Lan> {
             zone: zone_index(&names, &n.zone),
             zone_name: n.zone.clone(),
             mgmt: c.zone(&n.zone).is_some_and(|z| z.reaches_mgmt()),
+            routes: c.network_routes(&n.name),
         })
+        .collect()
+}
+
+/// The enabled `[[route]]`s: (subnet, prefix length, router). The
+/// forwarder puts each on the interface whose subnet holds its router.
+pub fn static_routes() -> Vec<(Ipv4Addr, u8, Ipv4Addr)> {
+    let c = get();
+    c.routes
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| (r.dst.0.network(), r.dst.0.prefix, r.via))
+        .collect()
+}
+
+/// The enabled `[[route]]`s with their names: (name, subnet, prefix
+/// length, router).
+pub fn named_routes() -> Vec<(String, Ipv4Addr, u8, Ipv4Addr)> {
+    let c = get();
+    c.routes
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| (r.name.clone(), r.dst.0.network(), r.dst.0.prefix, r.via))
+        .collect()
+}
+
+/// The enabled `[[route]]`s through a router on the WAN's subnet.
+pub fn wan_routes() -> Vec<(Ipv4Addr, u8, Ipv4Addr)> {
+    let c = get();
+    c.routes
+        .iter()
+        .filter(|r| r.enabled && c.route_via(r) == schema::RouteVia::Wan)
+        .map(|r| (r.dst.0.network(), r.dst.0.prefix, r.via))
         .collect()
 }
 

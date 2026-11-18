@@ -3,7 +3,7 @@
 //!
 //! List entries with a name are addressed by it: the config is edited as
 //! a table in which `[[network]]`, `[[zone]]`, `[[firewall.rule]]` and
-//! `[[firewall.forward]]`, `[[firewall.redirect]]`, `[[mdns.reflect]]` are keyed by `name` (`network.guest.vlan = 20`,
+//! `[[firewall.forward]]`, `[[firewall.redirect]]`, `[[route]]`, `[[mdns.reflect]]` are keyed by `name` (`network.guest.vlan = 20`,
 //! `firewall.rule.ssh = { from = "wan", to = "router", … }`). The order
 //! of existing entries is kept; new ones go last. `lan.…` means the first
 //! network, `lan.domain` is `dns.domain`.
@@ -15,8 +15,9 @@ use alloc::vec::Vec;
 use toml::{Table, Value};
 
 /// Lists keyed by `name`, as paths.
-const KEYED: [&[&str]; 6] = [
+const KEYED: [&[&str]; 7] = [
     &["network"],
+    &["route"],
     &["zone"],
     &["firewall", "rule"],
     &["firewall", "forward"],
@@ -67,6 +68,7 @@ fn from_table(mut t: Table, order: &Config) -> Result<Config, Error> {
         match path {
             ["network"] => order.networks.iter().map(|n| n.name.clone()).collect(),
             ["zone"] => order.zones.iter().map(|z| z.name.clone()).collect(),
+            ["route"] => order.routes.iter().map(|r| r.name.clone()).collect(),
             ["firewall", "rule"] => order.firewall.rules.iter().map(|r| r.name.clone()).collect(),
             ["mdns", "reflect"] => order.mdns.reflect.iter().map(|r| r.name.clone()).collect(),
             ["firewall", "redirect"] => order.firewall.redirects.iter().map(|r| r.name.clone()).collect(),
@@ -242,7 +244,7 @@ fn template(list: &[&str]) -> Option<Table> {
     let mut t = match list {
         ["network"] => Table::try_from(Network::default()),
         ["zone"] => Table::try_from(Zone::builtin_lan()),
-        _ => return Some(Table::new()), // rules, forwards, redirects: required fields only
+        _ => return Some(Table::new()), // rules, forwards, redirects, routes: required fields only
     }
     .ok()?;
     t.remove("name");
@@ -277,6 +279,8 @@ fn optional_known(path: &str) -> bool {
             | "firewall.redirect"
             | "firewall.redirect.*.enabled"
             | "firewall.redirect.*.proto"
+            | "route"
+            | "route.*.enabled"
             | "dns.host"
             | "mgmt.password"
             | "mgmt.password_hash"

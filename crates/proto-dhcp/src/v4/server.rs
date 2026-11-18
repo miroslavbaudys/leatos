@@ -15,7 +15,10 @@
 //!   [`super::persist`]).
 //! - Relayed requests (giaddr != 0) are ignored.
 
-use super::packet::{FLAG_BROADCAST, Message, MessageType, OP_REPLY, OP_REQUEST, Options};
+use super::packet::{
+    FLAG_BROADCAST, Message, MessageType, OPT_CLASSLESS_ROUTES, OPT_MS_CLASSLESS_ROUTES, OP_REPLY, OP_REQUEST, Options,
+    Route,
+};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -46,6 +49,10 @@ pub struct Config {
     pub range: (Ipv4Addr, Ipv4Addr),
     pub lease_secs: u32,
     pub statics: Vec<StaticLease>,
+    /// Static routes through other routers on this network (option 121,
+    /// and 249 for clients asking for that one; with the default route
+    /// via `router` appended, since such clients ignore option 3).
+    pub routes: Vec<Route>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,6 +213,16 @@ impl Server {
             o.routers = c.router.into_iter().collect();
             o.dns = c.dns.clone();
             o.domain = c.domain.clone();
+            if !c.routes.is_empty() {
+                let mut routes = c.routes.clone();
+                routes.extend(c.router.map(|r| (Ipv4Addr::UNSPECIFIED, 0, r)));
+                let asks = |code| req.options.param_request.contains(&code);
+                if asks(OPT_CLASSLESS_ROUTES) {
+                    o.classless_routes = routes;
+                } else if asks(OPT_MS_CLASSLESS_ROUTES) {
+                    o.ms_classless_routes = routes;
+                }
+            }
             if with_lease {
                 o.lease_time = Some(c.lease_secs);
                 o.renewal_t1 = Some(c.lease_secs / 2);
@@ -533,6 +550,7 @@ mod tests {
                 ip: Ipv4Addr::new(192, 168, 1, 10),
                 hostname: Some("nas".to_string()),
             }],
+            routes: Vec::new(),
         }
     }
 
@@ -617,6 +635,40 @@ mod tests {
         let mut s = Server::new(cfg());
         let ev = s.restore(0, &[Saved { mac: NAS, ip: Ipv4Addr::new(192, 168, 1, 10), hostname: Some("old".into()) }]);
         assert_eq!(ev, [Event::Bound { mac: NAS, ip: Ipv4Addr::new(192, 168, 1, 10), hostname: Some("nas".into()) }]);
+    }
+
+    #[test]
+    fn classless_routes_go_to_clients_that_ask() {
+        let lab = (Ipv4Addr::new(10, 20, 0, 0), 24, Ipv4Addr::new(192, 168, 1, 2));
+        let mut c = cfg();
+        c.routes = vec![lab];
+        let mut s = Server::new(c);
+        let mut d = client_msg(A, MessageType::Discover);
+        d.options.param_request = vec![1, 3, 6, 121];
+        let offer = reply_of(&s.handle(0, &d.emit()));
+        // The default route too: such clients ignore option 3.
+        assert_eq!(offer.options.classless_routes, vec![lab, (Ipv4Addr::UNSPECIFIED, 0, SERVER)]);
+        assert!(offer.options.ms_classless_routes.is_empty());
+        assert_eq!(offer.options.routers, vec![SERVER], "option 3 for the others");
+        let mut r = client_msg(A, MessageType::Request);
+        r.options.server_id = Some(SERVER);
+        r.options.requested_ip = Some(offer.yiaddr);
+        r.options.param_request = vec![1, 3, 121];
+        assert_eq!(reply_of(&s.handle(1, &r.emit())).options.classless_routes.len(), 2, "in the ACK");
+        // Option 249 only for clients asking for it (and not for 121).
+        d.chaddr = B;
+        d.options.param_request = vec![1, 3, 249];
+        let offer = reply_of(&s.handle(2, &d.emit()));
+        assert!(offer.options.classless_routes.is_empty());
+        assert_eq!(offer.options.ms_classless_routes.len(), 2);
+        // Not asked: neither (negative control).
+        d.options.param_request = vec![1, 3, 6];
+        let offer = reply_of(&s.handle(3, &d.emit()));
+        assert!(offer.options.classless_routes.is_empty() && offer.options.ms_classless_routes.is_empty());
+        // No routes: nothing, even when asked.
+        let mut s = Server::new(cfg());
+        d.options.param_request = vec![121];
+        assert!(reply_of(&s.handle(0, &d.emit())).options.classless_routes.is_empty());
     }
 
     #[test]
@@ -838,6 +890,7 @@ mod reconfigure_tests {
             ),
             lease_secs: 3600,
             statics,
+            routes: Vec::new(),
         }
     }
 

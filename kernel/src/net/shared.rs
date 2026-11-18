@@ -185,6 +185,8 @@ pub struct NetSlot {
 pub struct Networks {
     pub nets: Vec<NetSlot>,
     pub policy: fwd::forwarder::Policy,
+    /// `[[route]]`s: (subnet, prefix length, router).
+    pub routes: Vec<(Ipv4Addr, u8, Ipv4Addr)>,
 }
 
 /// Which network each slot holds (`slots[i]` = link `1 + i`), keeping a
@@ -251,6 +253,25 @@ pub struct Shared {
     pub forward_hits: Mutex<Vec<u64>>,
     /// New connections each redirect took (`config::redirect_names`).
     pub redirect_hits: Mutex<Vec<u64>>,
+    /// The forwarder's routing table (published by the datapath).
+    pub routes: Mutex<Vec<fwd::route::Route>>,
+}
+
+/// One line of the routing table as shown (`/api/status` `routes`, CLI
+/// `routes`).
+pub struct RouteRow {
+    pub dst: (Ipv4Addr, u8),
+    /// The next router; `None` = connected.
+    pub via: Option<Ipv4Addr>,
+    /// `wan`, a network's name, or `-` (a configured route not in use).
+    pub dev: alloc::string::String,
+    /// `connected`, `default` or `static`.
+    pub kind: &'static str,
+    /// A `[[route]]`'s name.
+    pub name: Option<alloc::string::String>,
+    /// In the table (a configured route is not while no connected subnet
+    /// holds its router, e.g. the WAN without a lease).
+    pub active: bool,
 }
 
 static SHARED: Once<&'static Shared> = Once::new();
@@ -270,6 +291,7 @@ pub fn init(ports: Vec<PortShared>, links: Vec<LinkShared>) -> &'static Shared {
             rule_hits: Mutex::new(Vec::new()),
             forward_hits: Mutex::new(Vec::new()),
             redirect_hits: Mutex::new(Vec::new()),
+            routes: Mutex::new(Vec::new()),
         }))
     })
 }
@@ -293,5 +315,51 @@ impl Shared {
 
     pub fn conntrack(&self) -> usize {
         self.conntrack.load(Ordering::Relaxed)
+    }
+
+    /// The routing table in use (longest prefix first), then the
+    /// configured routes that are not in it.
+    pub fn route_rows(&self) -> Vec<RouteRow> {
+        use fwd::route::RouteKind;
+        let table = self.routes.lock().clone();
+        let nets = crate::config::networks();
+        let named = crate::config::named_routes();
+        let dev = |r: &fwd::route::Route| -> alloc::string::String {
+            if r.egress == 0 {
+                return "wan".into();
+            }
+            // The network whose subnet holds the router, or is the route.
+            let ip = r.gateway.unwrap_or(r.prefix);
+            nets.iter()
+                .find(|n| n.contains(ip) && (r.gateway.is_some() || n.prefix == r.len))
+                .map_or_else(|| "-".into(), |n| n.name.clone())
+        };
+        let mut rows: Vec<RouteRow> = table
+            .iter()
+            .map(|r| RouteRow {
+                dst: (r.prefix, r.len),
+                via: r.gateway,
+                dev: dev(r),
+                kind: r.kind.as_str(),
+                name: (r.kind == RouteKind::Static)
+                    .then(|| named.iter().find(|n| (n.1, n.2) == (r.prefix, r.len)).map(|n| n.0.clone()))
+                    .flatten(),
+                active: true,
+            })
+            .collect();
+        for (name, dst, len, via) in named {
+            let used = table.iter().any(|r| r.kind == RouteKind::Static && (r.prefix, r.len) == (dst, len));
+            if !used {
+                rows.push(RouteRow {
+                    dst: (dst, len),
+                    via: Some(via),
+                    dev: "-".into(),
+                    kind: RouteKind::Static.as_str(),
+                    name: Some(name),
+                    active: false,
+                });
+            }
+        }
+        rows
     }
 }

@@ -49,6 +49,7 @@ smoltcp = { version = "0.14", default-features = false, features = [
     "socket-icmp", "socket-udp", "socket-tcp", "socket-dhcpv4", "socket-dns",
     "auto-icmp-echo-reply", # the router answers pings on its own addresses
     "multicast",            # 224.0.0.251 for the mDNS reflector (net::mdns)
+    "iface-max-route-count-32", # `[[route]]`s (at most 16) + the default route
 ] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]

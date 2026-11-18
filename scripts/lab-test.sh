@@ -169,6 +169,15 @@
 #   LAB_WAN_OPEN=1       (implies LAB_GUEST=1) negative control for the WAN
 #                        input check: a rule accepting wan -> router, so the
 #                        router answers the ISP's probes (RST, ping) again.
+#   LAB_ROUTES=1         (implies LAB_GUEST=1) static routes: [[route]]
+#                        lab-behind = 10.30.0.0/24 via the client
+#                        (192.168.1.100), which puts 10.30.0.5 on its
+#                        loopback. Checks: DHCP option 121 (the route plus
+#                        the default), 10.30.0.5 reaches the ISP through
+#                        NAT and the router itself, /api/status lists the
+#                        route, the ISP forging 10.30.0.5 is dropped as
+#                        spoofed. Negative control: LAB_ROUTES=0 (the route
+#                        disabled: every check fails).
 #   LAB_GUEST_LIVE=1     the same, but added live: the router boots with the
 #                        main LAN only (and mgmt_pass=lab-pass); the client
 #                        POSTs the guest config (in its initrd) to
@@ -213,6 +222,8 @@ MDNS_RULES="${LAB_MDNS_RULES:-1}"
 [[ -n "$MDNS" ]] && GUEST=1
 WAN_OPEN="${LAB_WAN_OPEN:-}"
 DNS_VIEWS="${LAB_DNS_VIEWS:-}"
+ROUTES="${LAB_ROUTES:-}"
+[[ -n "$ROUTES" ]] && GUEST=1
 DNS_HOSTS="${LAB_DNS_HOSTS:-1}"
 [[ -n "$DNS_VIEWS" ]] && GUEST=1
 [[ -n "$WAN_OPEN" ]] && GUEST=1
@@ -372,6 +383,14 @@ from = "any"
 dst_port = 123
 to = "192.168.1.101"
 CFG
+  [[ -n "$ROUTES" ]] && cat >>"$WORK/config.toml" <<CFG
+
+[[route]]
+name = "lab-behind"
+enabled = $([[ "$ROUTES" == 1 ]] && echo true || echo false)
+dst = "10.30.0.0/24"
+via = "192.168.1.100"
+CFG
   dns_toml >>"$WORK/config.toml"
   cargo build -q -p rrstore --release
   target/release/rrstore create "$WORK/store.img" --mib 32 >/dev/null
@@ -391,7 +410,7 @@ CFG
   ROUTER_STORE="$WORK/store.img"
   # Live config changes (LAB_GUEST_LIVE, the recheck check) need it.
   ROUTER_ARGS="$ROUTER_ARGS mgmt_pass=lab-pass"
-  echo "== router config${GUEST_LIVE:+ (added live by the client)}: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")$([[ "$REDIRECT" == 1 ]] && echo ", NTP redirect")$([[ "$GUEST_DOMAIN" == 1 ]] && echo ", domain guest.lan")$([[ -n "$MDNS" ]] && echo ", mdns reflect (enabled: $MDNS_RULES)")$([[ -n "$DNS_VIEWS" ]] && echo ", dns views $([[ "$DNS_VIEWS" == 1 ]] && echo firewall || echo all), dns hosts $DNS_HOSTS")"
+  echo "== router config${GUEST_LIVE:+ (added live by the client)}: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")$([[ "$REDIRECT" == 1 ]] && echo ", NTP redirect")$([[ "$GUEST_DOMAIN" == 1 ]] && echo ", domain guest.lan")$([[ -n "$MDNS" ]] && echo ", mdns reflect (enabled: $MDNS_RULES)")$([[ -n "$ROUTES" ]] && echo ", route lab-behind (enabled: $([[ "$ROUTES" == 1 ]] && echo yes || echo no))")$([[ -n "$DNS_VIEWS" ]] && echo ", dns views $([[ "$DNS_VIEWS" == 1 ]] && echo firewall || echo all), dns hosts $DNS_HOSTS")"
 fi
 
 if [[ -n "$DOT" && -z "$GUEST" ]]; then
@@ -427,7 +446,7 @@ PIDS+=($!)
 
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so

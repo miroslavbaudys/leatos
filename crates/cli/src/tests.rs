@@ -88,6 +88,8 @@ fn commands() {
     assert_eq!(p("?"), Command::Help);
     assert_eq!(p(" status "), Command::Status);
     assert_eq!(p("leases"), Command::Leases);
+    assert_eq!(p("routes"), Command::Routes);
+    assert!(parse("routes all").is_err());
     assert_eq!(p("reboot"), Command::Reboot);
     assert_eq!(p("log"), Command::Log(LogArg::Last(LOG_DEFAULT_LINES)));
     assert_eq!(p("log 5"), Command::Log(LogArg::Last(5)));

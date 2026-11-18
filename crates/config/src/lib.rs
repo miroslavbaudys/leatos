@@ -70,6 +70,9 @@ pub struct Config {
     pub zones: Vec<Zone>,
     #[serde(skip_serializing_if = "Firewall::is_empty")]
     pub firewall: Firewall,
+    /// Static routes to subnets behind other routers.
+    #[serde(rename = "route", skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<Route>,
     pub dns: Dns,
     #[serde(skip_serializing_if = "Mdns::is_empty")]
     pub mdns: Mdns,
@@ -86,6 +89,7 @@ impl Default for Config {
             networks: vec![Network::default()],
             zones: Vec::new(),
             firewall: Firewall::default(),
+            routes: Vec::new(),
             dns: Dns::default(),
             mdns: Mdns::default(),
             shaping: Shaping::default(),
@@ -427,6 +431,34 @@ impl Firewall {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty() && self.forwards.is_empty() && self.redirects.is_empty()
     }
+}
+
+// ---- routes ----------------------------------------------------------------
+
+/// A static route (docs/config-v2.md §3a): `dst` is reached through the
+/// router `via`. A `via` inside a network makes it a route on that network
+/// (its DHCP clients learn it through option 121 and go there directly);
+/// otherwise `via` must be on the WAN's subnet (the route is used while
+/// the WAN lease's subnet holds it).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Route {
+    pub name: String,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    /// Destination subnet (host bits zero) or address.
+    pub dst: Net,
+    /// The next router.
+    pub via: Ipv4Addr,
+}
+
+/// Where a [`Route`] leaves the router.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteVia<'a> {
+    /// A network: `via` is a host on it.
+    Network(&'a Network),
+    /// The WAN (a gateway next to the ISP's).
+    Wan,
 }
 
 // ---- services --------------------------------------------------------------
@@ -1006,6 +1038,25 @@ impl Config {
 
     pub fn network(&self, name: &str) -> Option<&Network> {
         self.networks.iter().find(|n| n.name == name)
+    }
+
+    /// Where a route leaves: the network whose subnet holds `via`, else
+    /// the WAN.
+    pub fn route_via(&self, r: &Route) -> RouteVia<'_> {
+        match self.networks.iter().find(|n| n.ipv4.contains(r.via)) {
+            Some(n) => RouteVia::Network(n),
+            None => RouteVia::Wan,
+        }
+    }
+
+    /// The enabled routes through a router on network `net`, as DHCP
+    /// option 121 sends them: (subnet, prefix length, router).
+    pub fn network_routes(&self, net: &str) -> Vec<(Ipv4Addr, u8, Ipv4Addr)> {
+        self.routes
+            .iter()
+            .filter(|r| r.enabled && matches!(self.route_via(r), RouteVia::Network(n) if n.name == net))
+            .map(|r| (r.dst.0.network(), r.dst.0.prefix, r.via))
+            .collect()
     }
 
     /// A zone's policy, built-in ones included.

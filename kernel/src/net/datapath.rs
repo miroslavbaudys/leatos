@@ -163,12 +163,20 @@ struct Topo {
     port_links: Vec<Vec<(u16, IfIndex)>>,
     /// The networks' prefixes (`shard_of`: flows between them).
     internal: Vec<(Ipv4Addr, u8)>,
+    /// Subnets routed through a router on a network (`shard_of`: inside).
+    routed: Vec<(Ipv4Addr, u8)>,
     /// The port forwards (`shard_of`: DNAT and hairpin connections live in
     /// their target's shard).
     forwards: Vec<PortForward>,
     /// The redirects (`shard_of`: their connections live in their
     /// target's shard).
     redirects: Vec<Redirect>,
+}
+
+/// `ip` is in the subnet of the interface address `(a, l)`.
+fn fwd_inside((a, l): (Ipv4Addr, u8), ip: Ipv4Addr) -> bool {
+    let m = if l == 0 { 0 } else { u32::MAX << (32 - l as u32) };
+    u32::from(a) & m == u32::from(ip) & m
 }
 
 pub struct Datapath {
@@ -297,6 +305,15 @@ impl Datapath {
             f.set_default_route(gateway.filter(|_| addr.is_some()).map(|gw| (WAN, gw)));
         }
         *self.addrs[WAN as usize].lock() = addr;
+        self.publish_routes();
+    }
+
+    /// The routing table for status pages (every shard has the same).
+    fn publish_routes(&self) {
+        if let Some(s) = self.shards.first() {
+            let table = s.lock().routes.iter().copied().collect();
+            *self.sh.routes.lock() = table;
+        }
     }
 
     /// Put networks and the firewall into effect (boot, or a saved config,
@@ -325,12 +342,14 @@ impl Datapath {
         let mut revoked = 0;
         for s in &self.shards {
             let mut f = s.lock();
+            f.set_static_routes(&n.routes);
             f.set_policy(Some(n.policy.clone()));
             if crate::config::fw_recheck() {
                 revoked += f.recheck();
             }
         }
         REVOKED.fetch_add(revoked as u64, Ordering::Relaxed);
+        self.publish_routes();
         if revoked > 0 {
             crate::println!("fwd   : {revoked} tracked connections refused by the new policy, removed");
         }
@@ -343,6 +362,12 @@ impl Datapath {
         *self.topo.lock() = alloc::sync::Arc::new(Topo {
             port_links,
             internal: n.nets.iter().map(|x| x.addr).collect(),
+            routed: n
+                .routes
+                .iter()
+                .filter(|&&(_, _, via)| n.nets.iter().any(|x| fwd_inside(x.addr, via)))
+                .map(|&(dst, len, _)| (dst, len))
+                .collect(),
             forwards: n.policy.forwards,
             redirects: n.policy.redirects,
         });
@@ -476,6 +501,7 @@ impl Datapath {
         let topo = self.topo.lock().clone();
         let hints = ShardHints {
             internal: &topo.internal,
+            routed: &topo.routed,
             wan: self.addrs[WAN as usize].lock().map(|(a, _)| a),
             forwards: &topo.forwards,
             redirects: &topo.redirects,

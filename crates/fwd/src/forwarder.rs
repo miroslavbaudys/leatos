@@ -25,7 +25,7 @@
 
 use crate::IfIndex;
 use crate::conntrack::{Conn, Conntrack, Dir, Tuple};
-use crate::route::{Route, RouteTable};
+use crate::route::{Route, RouteKind, RouteTable};
 use crate::wire::{
     self, ETH_HDR, ETHERTYPE_ARP, ETHERTYPE_IPV4, ICMP_DEST_UNREACH, ICMP_TIME_EXCEEDED, Ipv4View,
     Mac, PROTO_ICMP, PROTO_TCP, PROTO_UDP,
@@ -215,6 +215,9 @@ fn not_unicast(ip: Ipv4Addr) -> bool {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShardHints<'a> {
     pub internal: &'a [(Ipv4Addr, u8)],
+    /// Subnets routed through a router on one of the networks: inside,
+    /// like the networks' own (flows between them and a network are pairs).
+    pub routed: &'a [(Ipv4Addr, u8)],
     pub wan: Option<Ipv4Addr>,
     pub forwards: &'a [PortForward],
     /// The redirects: their connections, and everything to and from their
@@ -455,6 +458,9 @@ pub struct Forwarder {
     /// Per interface: largest IP packet it sends (PPPoE: 1492).
     mtus: Vec<u16>,
     pub routes: RouteTable,
+    /// Configured routes (destination, prefix length, router); in
+    /// `routes` while a connected subnet holds their router.
+    statics: Vec<(Ipv4Addr, u8, Ipv4Addr)>,
     pub ct: Conntrack,
     pub stats: Stats,
     icmp_tokens: u64,
@@ -627,6 +633,7 @@ pub fn shard_of(role: Role, frame: &[u8], shards: usize, hash_key: u64, hints: &
     let inside = |ip: Ipv4Addr| {
         internal
             .iter()
+            .chain(hints.routed)
             .any(|&(a, l)| broadcast_of(a, l) == broadcast_of(ip, l))
     };
     let key = extract_key(frame, &v);
@@ -724,6 +731,7 @@ impl Forwarder {
             ifs: Vec::new(),
             mtus: Vec::new(),
             routes: RouteTable::new(),
+            statics: Vec::new(),
             ct: Conntrack::new_shard(max_conns, hash_key, shards, shard),
             stats: Stats::default(),
             icmp_tokens: ICMP_BURST,
@@ -763,10 +771,42 @@ impl Forwarder {
                 len: l,
                 egress: ifx,
                 gateway: None,
+                kind: RouteKind::Connected,
             });
         }
         if self.ifs[ifx as usize].role == Role::Wan && old.map(|o| o.0) != addr.map(|a| a.0) {
             self.ct.flush_nat();
+        }
+        self.sync_static_routes();
+    }
+
+    /// The configured routes: (destination, prefix length, router). Each
+    /// leaves through the interface whose subnet holds its router, while
+    /// one does; a connected subnet or the default route with the same
+    /// destination wins.
+    pub fn set_static_routes(&mut self, routes: &[(Ipv4Addr, u8, Ipv4Addr)]) {
+        self.statics = routes.to_vec();
+        self.sync_static_routes();
+    }
+
+    fn sync_static_routes(&mut self) {
+        self.routes.remove_kind(RouteKind::Static);
+        for &(prefix, len, via) in &self.statics {
+            let Some(egress) = self.ifs.iter().position(|i| {
+                i.addr.is_some_and(|(a, l)| a != via && broadcast_of(a, l) == broadcast_of(via, l))
+            }) else {
+                continue;
+            };
+            if self.routes.get(prefix, len).is_some() {
+                continue;
+            }
+            self.routes.set(Route {
+                prefix,
+                len,
+                egress: egress as IfIndex,
+                gateway: Some(via),
+                kind: RouteKind::Static,
+            });
         }
     }
 
@@ -794,6 +834,7 @@ impl Forwarder {
                 len: 0,
                 egress,
                 gateway: Some(gw),
+                kind: RouteKind::Default,
             }),
             None => self.routes.remove(Ipv4Addr::UNSPECIFIED, 0),
         }
@@ -854,11 +895,12 @@ impl Forwarder {
         let Some(wan) = self.ifs.iter().position(|i| i.role == Role::Wan) else {
             return true;
         };
-        // Where its first packet came from: a network it is on, else the WAN.
+        // Where its first packet came from: the network it is on or
+        // routed through, else the WAN.
         let ingress = self
             .routes
             .lookup(t.src)
-            .filter(|r| r.gateway.is_none())
+            .filter(|r| self.ifs[r.egress as usize].role == Role::Lan)
             .map_or(wan as IfIndex, |r| r.egress);
         let iface = self.ifs[ingress as usize];
         let ported = matches!(t.proto, PROTO_TCP | PROTO_UDP);
@@ -911,9 +953,16 @@ impl Forwarder {
     /// misconfiguration) keeps reaching its gateway.
     fn spoofed_from_wan(&self, wan: &Interface, src: Ipv4Addr) -> bool {
         let inside = |(a, l): (Ipv4Addr, u8)| broadcast_of(a, l) == broadcast_of(src, l);
-        src.is_loopback()
-            || (self.ifs.iter().any(|i| i.role == Role::Lan && i.addr.is_some_and(inside))
-                && !wan.addr.is_some_and(inside))
+        src.is_loopback() || (self.inside_networks(src) && !wan.addr.is_some_and(inside))
+    }
+
+    /// `ip` is on one of the networks or routed through a router on one.
+    fn inside_networks(&self, ip: Ipv4Addr) -> bool {
+        let inside = |(a, l): (Ipv4Addr, u8)| broadcast_of(a, l) == broadcast_of(ip, l);
+        self.ifs.iter().any(|i| i.role == Role::Lan && i.addr.is_some_and(inside))
+            || self.routes.iter().any(|r| {
+                r.kind == RouteKind::Static && self.ifs[r.egress as usize].role == Role::Lan && r.contains(ip)
+            })
     }
 
     fn wan_addr(&self) -> Option<Ipv4Addr> {
@@ -951,9 +1000,7 @@ impl Forwarder {
             if router_serves(t.proto, t.dport) {
                 return None;
             }
-        } else if self.ifs.iter().any(|i| {
-            i.role == Role::Lan && i.addr.is_some_and(|(a, l)| broadcast_of(a, l) == broadcast_of(t.dst, l))
-        }) {
+        } else if self.inside_networks(t.dst) {
             return None; // inside a network (the target itself included)
         }
         rds.iter().enumerate().find_map(|(i, r)| {
@@ -2552,6 +2599,85 @@ mod tests {
         assert!(matches!(run(&mut fw, 3, WAN, &mut syn(HOST)), Verdict::Forward { .. }));
     }
 
+    const LAB_GW: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 2);
+    const LAB_HOST: Ipv4Addr = Ipv4Addr::new(10, 30, 0, 5);
+    const LAB: (Ipv4Addr, u8, Ipv4Addr) = (Ipv4Addr::new(10, 30, 0, 0), 24, LAB_GW);
+
+    #[test]
+    fn static_routes_go_through_their_router() {
+        let mut fw = router();
+        zoned(&mut fw);
+        fw.set_static_routes(&[LAB, (Ipv4Addr::new(10, 31, 0, 0), 16, Ipv4Addr::new(172, 16, 0, 1))]);
+        // Only the one whose router is on a connected subnet.
+        let statics: Vec<_> = fw.routes.iter().filter(|r| r.kind == RouteKind::Static).copied().collect();
+        assert_eq!(statics.len(), 1);
+        assert_eq!((statics[0].prefix, statics[0].len, statics[0].egress, statics[0].gateway), (LAB.0, 24, LAN, Some(LAB_GW)));
+        // Guest → the routed subnet: out on the LAN to its router (no NAT).
+        let mut f = tcp_frame(GUEST_MAC, GUEST_HOST, LAB_HOST, 5000, 80, TCP_SYN);
+        fw.set_policy(Some(Policy { forward: vec![0, 0b111, 0b011], ..Policy::default() }));
+        let Verdict::Forward { egress, next_hop, len, .. } = run(&mut fw, 0, GUEST, &mut f) else { panic!() };
+        assert_eq!((egress, next_hop), (LAN, LAB_GW));
+        assert_eq!(view(&f[..len]).src(&f), GUEST_HOST);
+        // A routed host to the internet: masqueraded; the reply goes back to its router.
+        let mut f = tcp_frame(LAN_MAC, LAB_HOST, SERVER, 7000, 80, TCP_SYN);
+        let Verdict::Forward { egress, len, .. } = run(&mut fw, 0, LAN, &mut f) else { panic!() };
+        assert_eq!(egress, WAN);
+        let v = view(&f[..len]);
+        let port = wire::get16(&f, v.l4);
+        let mut r = tcp_frame(WAN_MAC, SERVER, ROUTER_WAN, 80, port, TCP_SYN | TCP_ACK);
+        let Verdict::Forward { egress, next_hop, .. } = run(&mut fw, 1, WAN, &mut r) else { panic!() };
+        assert_eq!((egress, next_hop), (LAN, LAB_GW));
+        // From the LAN itself: back out the same link, not ours to forward.
+        let mut f = tcp_frame(LAN_MAC, HOST, LAB_HOST, 5001, 80, TCP_SYN);
+        assert_eq!(run(&mut fw, 2, LAN, &mut f), Verdict::Drop(DropReason::Hairpin));
+    }
+
+    #[test]
+    fn static_routes_follow_their_routers_subnet() {
+        let mut fw = router();
+        fw.set_static_routes(&[LAB]);
+        let lab = |fw: &Forwarder| fw.routes.lookup(LAB_HOST).map(|r| (r.kind, r.egress));
+        assert_eq!(lab(&fw), Some((RouteKind::Static, LAN)));
+        // The LAN goes away: so does the route (the default takes over).
+        fw.set_addr(LAN, None);
+        assert_eq!(lab(&fw), Some((RouteKind::Default, WAN)));
+        fw.set_addr(LAN, Some((ROUTER_LAN, 24)));
+        assert_eq!(lab(&fw), Some((RouteKind::Static, LAN)));
+        // A connected subnet with the same destination wins.
+        fw.set_addr(LAN, Some((Ipv4Addr::new(10, 30, 0, 1), 24)));
+        assert_eq!(lab(&fw), Some((RouteKind::Connected, LAN)));
+        // Routes through the WAN's subnet.
+        fw.set_static_routes(&[(Ipv4Addr::new(100, 64, 0, 0), 10, Ipv4Addr::new(203, 0, 113, 2))]);
+        let r = fw.routes.lookup(Ipv4Addr::new(100, 64, 1, 1)).unwrap();
+        assert_eq!((r.kind, r.egress, r.gateway), (RouteKind::Static, WAN, Some(Ipv4Addr::new(203, 0, 113, 2))));
+        fw.set_static_routes(&[]);
+        assert!(fw.routes.iter().all(|r| r.kind != RouteKind::Static));
+    }
+
+    #[test]
+    fn routed_subnets_are_inside_for_antispoofing_and_recheck() {
+        let mut fw = router();
+        with_forwards(&mut fw, vec![fwd(8443, 8443, Some(443), None, true)]);
+        let mut syn = tcp_frame(WAN_MAC, LAB_HOST, ROUTER_WAN, 5555, 8443, TCP_SYN);
+        // Without the route it is an outside address (negative control).
+        assert!(matches!(run(&mut fw, 0, WAN, &mut syn.clone()), Verdict::Forward { .. }));
+        fw.set_static_routes(&[LAB]);
+        assert_eq!(run(&mut fw, 1, WAN, &mut syn), Verdict::Drop(DropReason::Spoofed));
+        // A routed host's connection out survives a recheck under the same
+        // policy (it came in on the LAN, not the WAN).
+        let mut f = tcp_frame(LAN_MAC, LAB_HOST, SERVER, 7000, 80, TCP_SYN);
+        assert!(matches!(run(&mut fw, 2, LAN, &mut f), Verdict::Forward { .. }));
+        assert_eq!(fw.recheck(), 0);
+        // Shard hints: a flow from a network to the routed subnet is a pair.
+        let internal = [(ROUTER_LAN, 24u8), (Ipv4Addr::new(10, 20, 0, 1), 24)];
+        let routed = [(LAB.0, 24u8)];
+        let there = tcp_frame(GUEST_MAC, GUEST_HOST, LAB_HOST, 5000, 80, TCP_SYN);
+        let back = tcp_frame(LAN_MAC, LAB_HOST, GUEST_HOST, 80, 5000, TCP_SYN | TCP_ACK);
+        let hints = ShardHints { internal: &internal, routed: &routed, ..Default::default() };
+        let (a, b) = (shard_of(Role::Lan, &there[..there.len() - 64], 16, 42, &hints), shard_of(Role::Lan, &back[..back.len() - 64], 16, 42, &hints));
+        assert_eq!(a, b);
+    }
+
     #[test]
     fn wan_overlapping_a_network_keeps_its_own_subnet() {
         let mut fw = router();
@@ -2606,7 +2732,7 @@ mod tests {
     fn forwarded_and_hairpin_connections_keep_one_shard() {
         let forwards = [fwd(8443, 8443, Some(443), None, true)];
         let internal = [(ROUTER_LAN, 24)];
-        let hints = ShardHints { internal: &internal, wan: Some(ROUTER_WAN), forwards: &forwards, redirects: &[] };
+        let hints = ShardHints { internal: &internal, routed: &[], wan: Some(ROUTER_WAN), forwards: &forwards, redirects: &[] };
         let mut fws = shards();
         for fw in &mut fws {
             with_forwards(fw, forwards.to_vec());
@@ -2678,7 +2804,7 @@ mod tests {
     fn forward_target_going_out_keeps_one_shard() {
         let forwards = [PortForward { protos: proto::TCP | proto::UDP, ..fwd(8443, 8443, Some(443), None, true) }];
         let internal = [(ROUTER_LAN, 24)];
-        let hints = ShardHints { internal: &internal, wan: Some(ROUTER_WAN), forwards: &forwards, redirects: &[] };
+        let hints = ShardHints { internal: &internal, routed: &[], wan: Some(ROUTER_WAN), forwards: &forwards, redirects: &[] };
         let mut fws = shards();
         for fw in &mut fws {
             with_forwards(fw, forwards.to_vec());
@@ -2717,7 +2843,7 @@ mod tests {
     fn icmp_errors_about_forwarded_and_hairpin_connections_find_their_shard() {
         let forwards = [fwd(8443, 8443, Some(443), None, true)];
         let internal = [(ROUTER_LAN, 24)];
-        let hints = ShardHints { internal: &internal, wan: Some(ROUTER_WAN), forwards: &forwards, redirects: &[] };
+        let hints = ShardHints { internal: &internal, routed: &[], wan: Some(ROUTER_WAN), forwards: &forwards, redirects: &[] };
         // Negative control: the hints without the forwards (the old
         // mapping) put some of them elsewhere.
         let blind = ShardHints { forwards: &[], ..hints };
@@ -3188,7 +3314,7 @@ mod tests {
         let internal = [(ROUTER_LAN, 24), (ROUTER_GUEST, 24)];
         for from in [None, Some(2)] {
             let redirects = [ntp_to(target, from)];
-            let hints = ShardHints { internal: &internal, wan: Some(ROUTER_WAN), forwards: &[], redirects: &redirects };
+            let hints = ShardHints { internal: &internal, routed: &[], wan: Some(ROUTER_WAN), forwards: &[], redirects: &redirects };
             let mut fws = shards();
             for fw in &mut fws {
                 with_redirects(fw, redirects.to_vec());
