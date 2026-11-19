@@ -37,6 +37,8 @@ pub struct Pkt {
     /// Host ids for host isolation (CAKE).
     pub src_host: u32,
     pub dst_host: u32,
+    /// IPv4 bytes if this is a pure TCP ACK (ACK filter tests).
+    pub ack: Option<Vec<u8>>,
 }
 
 impl Drop for Pkt {
@@ -72,6 +74,9 @@ impl Packet for Pkt {
             self.dst_host.wrapping_mul(0x85eb_ca6b),
         )
     }
+    fn pure_ack(&self) -> Option<&[u8]> {
+        self.ack.as_deref()
+    }
 }
 
 pub fn pkt(flow: u32, len: usize, seq: u64) -> Pkt {
@@ -85,7 +90,16 @@ pub fn pkt(flow: u32, len: usize, seq: u64) -> Pkt {
         delivered: false,
         src_host: 0,
         dst_host: 0,
+        ack: None,
     }
+}
+
+/// A pure ACK of connection `sport` acknowledging `ack`, in flow `flow`.
+pub fn ack_pkt(flow: u32, sport: u16, ack: u32, seq: u64) -> Pkt {
+    let bytes = crate::ack_filter::build_ack(sport, ack, 0x10, None, &[]);
+    let mut p = pkt(flow, bytes.len() + 14, seq);
+    p.ack = Some(bytes);
+    p
 }
 
 pub fn take(q: &mut impl Qdisc<Pkt>, now: u64) -> Option<Pkt> {

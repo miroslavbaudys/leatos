@@ -679,7 +679,7 @@ pub enum Isolation {
 
 /// Shaping and AQM; the same settings as the boot arguments `shape_up=`,
 /// `shape_down=`, `shape_overhead=`, `ecn_up=`, `ecn_down=`, `qdisc=`,
-/// `isolation=`, `queue_ms=`.
+/// `isolation=`, `queue_ms=`, `ack_filter=`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Shaping {
@@ -703,6 +703,11 @@ pub struct Shaping {
     /// Left out at the default, so older kernels still read the config.
     #[serde(skip_serializing_if = "is_default_queue_ms")]
     pub queue_ms: u32,
+    /// CAKE's ACK filter on the upload (WAN egress): drop queued TCP ACKs
+    /// that a newer one of the same connection makes redundant. Left out
+    /// when off, so older kernels still read the config.
+    #[serde(skip_serializing_if = "is_false")]
+    pub ack_filter: bool,
 }
 
 /// Default [`Shaping::queue_ms`].
@@ -710,6 +715,10 @@ pub const DEFAULT_QUEUE_MS: u32 = 100;
 
 fn is_default_queue_ms(ms: &u32) -> bool {
     *ms == DEFAULT_QUEUE_MS
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Default for Shaping {
@@ -723,6 +732,7 @@ impl Default for Shaping {
             qdisc: Qdisc::Cake,
             isolation: Isolation::Triple,
             queue_ms: DEFAULT_QUEUE_MS,
+            ack_filter: false,
         }
     }
 }

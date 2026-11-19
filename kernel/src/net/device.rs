@@ -50,7 +50,8 @@ pub enum Aqm {
 }
 
 impl Aqm {
-    pub fn new(qos: &Qos, ecn: bool, max_packets: usize, limit_bytes: usize, seed: u64) -> Self {
+    /// `ack_filter`: CAKE's ACK filter (WAN egress only; FQ-CoDel has none).
+    pub fn new(qos: &Qos, ecn: bool, ack_filter: bool, max_packets: usize, limit_bytes: usize, seed: u64) -> Self {
         let codel = qdisc::codel::Params {
             max_packets,
             limit_bytes,
@@ -62,6 +63,7 @@ impl Aqm {
                 codel,
                 isolation: qos.isolation,
                 seed,
+                ack_filter,
                 ..Default::default()
             })),
             AqmKind::FqCodel | AqmKind::Codel => Self::FqCodel(FqCodel::new(FqParams {
@@ -78,8 +80,11 @@ impl Aqm {
             Self::Cake(c) => {
                 let p = c.params();
                 format!(
-                    "CAKE ({:?}, {} flows, {}-way, COBALT)",
-                    p.isolation, p.flows, p.ways
+                    "CAKE ({:?}, {} flows, {}-way, COBALT{})",
+                    p.isolation,
+                    p.flows,
+                    p.ways,
+                    if p.ack_filter { ", ACK filter" } else { "" }
                 )
             }
             Self::FqCodel(f) if f.flows() == 1 => String::from("CoDel (single queue)"),
@@ -93,6 +98,21 @@ impl Aqm {
         match self {
             Self::Cake(c) => c.params().codel.limit_bytes,
             Self::FqCodel(f) => f.limit_bytes(),
+        }
+    }
+
+    /// Switch the ACK filter in place (live shaping change, queue kept).
+    pub fn set_ack_filter(&mut self, on: bool) {
+        if let Self::Cake(c) = self {
+            c.set_ack_filter(on);
+        }
+    }
+
+    /// Redundant ACKs the ACK filter dropped (part of `stats().dropped`).
+    pub fn ack_drops(&self) -> u64 {
+        match self {
+            Self::Cake(c) => c.ack_drops,
+            Self::FqCodel(_) => 0,
         }
     }
 
@@ -118,8 +138,8 @@ impl Aqm {
                 let (n, o) = c.active_flows();
                 let (sh, dh) = c.active_hosts();
                 format!(
-                    "flows {n} new + {o} old (activations {}, collisions {}), hosts {sh} src / {dh} dst, blue drops {}, ",
-                    c.new_flow_count, c.way_collisions, c.blue_drops
+                    "flows {n} new + {o} old (activations {}, collisions {}), hosts {sh} src / {dh} dst, blue drops {}, ack drops {}, ",
+                    c.new_flow_count, c.way_collisions, c.blue_drops, c.ack_drops
                 )
             }
             Self::FqCodel(f) => {

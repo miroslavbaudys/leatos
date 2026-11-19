@@ -21,6 +21,12 @@
 #   LAB_SHAPE_KBIT=10000 router shapes both directions at this rate and the
 #                        client checks throughput + latency under load
 #                        (0 = unshaped router, shaping checks skipped)
+#   LAB_ACK=1            asymmetric line for CAKE's ACK filter: upload shaped
+#                        at LAB_ACK_UP_KBIT (150) with ack_filter=1, download
+#                        at LAB_SHAPE_KBIT; the client runs only the download
+#                        (its ACKs, ~230 kbit/s, queue on the upload), the
+#                        router must drop redundant ACKs and the download
+#                        must arrive whole. Negative control LAB_ACK_FILTER=0
 #   LAB_EXPECT_KBIT=N    what the client expects (default: LAB_SHAPE_KBIT);
 #                        set it with LAB_SHAPE_KBIT=0 as a negative control
 #   LAB_ROUTER_ARGS="…"  extra router boot arguments, e.g. qdisc=codel (single
@@ -226,6 +232,8 @@ SHAPE_KBIT="${LAB_SHAPE_KBIT:-10000}"
 EXPECT_KBIT="${LAB_EXPECT_KBIT:-$SHAPE_KBIT}"
 ROUTER_ARGS=""
 [[ "$SHAPE_KBIT" != 0 ]] && ROUTER_ARGS="shape_up=$SHAPE_KBIT shape_down=$SHAPE_KBIT"
+ACK="${LAB_ACK:-}"
+[[ -n "$ACK" && "$SHAPE_KBIT" != 0 ]] && ROUTER_ARGS="shape_up=${LAB_ACK_UP_KBIT:-150} shape_down=$SHAPE_KBIT ack_filter=${LAB_ACK_FILTER:-1}"
 ROUTER_ARGS="$ROUTER_ARGS ${LAB_ROUTER_ARGS:-}"
 # The first ntp= wins: only add the default when the caller sets none.
 [[ " ${LAB_ROUTER_ARGS:-} " == *" ntp="* ]] || ROUTER_ARGS="$ROUTER_ARGS ntp=ntp.isp.example"
@@ -494,7 +502,7 @@ PIDS+=($!)
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
   VM_NIC2="${PORTS:+52:54:00:00:00:11 $((LAN1_PORT + 1)) $LAN1_PORT}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${ACK:+ lab_ack=1} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so
@@ -531,7 +539,10 @@ if [[ "$SHAPE_KBIT" != 0 ]]; then
   if [[ -n "${LAB_EXPECT_ECN:-}" ]]; then up=${LAB_EXPECT_ECN%%:*}; down=${LAB_EXPECT_ECN##*:}; fi
   downq=ingress
   [[ " $ROUTER_ARGS " == *" shape_ingress=0 "* ]] && downq=lan0
-  for pair in "wan0 upload $up" "$downq download $down"; do
+  pairs=("wan0 upload $up" "$downq download $down")
+  # ACK mode: no upload phase, so only the download's ECN is checked.
+  [[ -n "$ACK" ]] && pairs=("$downq download $down")
+  for pair in "${pairs[@]}"; do
     set -- $pair
     line=$(tr -d '\r' <"$WORK/router.log" | grep "qdisc $1 " | tail -1)
     drops=$(echo "$line" | sed -n 's/.*aqm drops \([0-9]*\).*/\1/p')
@@ -553,12 +564,28 @@ if [[ "$SHAPE_KBIT" != 0 ]]; then
   # else the check is invalid), and the worst delay of a full queue stays
   # near LAB_EXPECT_QUEUE_MS (default 100) + 20 ms. Negative control
   # LAB_ROUTER_ARGS=queue_ms=0 (the fixed 384 packets: ~465 ms at 10 Mbit/s).
+  # ACK filter (LAB_ACK=1): the download's ACKs queue on the slow upload;
+  # CAKE must drop redundant ones (its "ack drops" counter on wan0), and
+  # the client's download check shows TCP still delivered the file whole.
+  # Negative control LAB_ACK_FILTER=0: no ACK drops, the check fails.
+  if [[ -n "$ACK" ]]; then
+    wl=$(tr -d '\r' <"$WORK/router.log" | grep "qdisc wan0 " | tail -1)
+    ackd=$(echo "$wl" | sed -n 's/.*ack drops \([0-9]*\).*/\1/p')
+    sent=$(echo "$wl" | sed -n 's/.*, sent \([0-9]*\),.*/\1/p')
+    if [[ -n "$ackd" && "$ackd" -gt 0 ]]; then
+      echo "  LAB PASS: ack filter: wan0 dropped $ackd redundant ACKs, sent ${sent:-?}"
+    else
+      echo "  LAB FAIL: ack filter: wan0 ack drops ${ackd:-?} (sent ${sent:-?})"; router_fails=$((router_fails + 1))
+    fi
+  fi
   qms=${LAB_EXPECT_QUEUE_MS:-100}
   wq=$(tr -d '\r' <"$WORK/router.log" | grep "qdisc wan0 ")
   ovf=$(echo "$wq" | tail -1 | sed -n 's/.*overflow drops \([0-9]*\).*/\1/p')
   worst=$(echo "$wq" | sed -n 's/.*max sojourn \([0-9]*\)\.[0-9]* ms.*/\1/p' | sort -n | tail -1)
   what="wan0 worst sojourn ${worst:-?} ms, overflow drops ${ovf:-?} (expected <= $((qms + 20)) ms)"
-  if [[ -z "$ovf" || -z "$worst" ]]; then
+  if [[ -n "$ACK" ]]; then
+    echo "  LAB INFO: queue limit: not checked in ACK mode (no upload burst)"
+  elif [[ -z "$ovf" || -z "$worst" ]]; then
     echo "  LAB FAIL: queue limit: no router counters"; router_fails=$((router_fails + 1))
   elif [[ "$ovf" == 0 ]]; then
     echo "  LAB FAIL: queue limit: INVALID, the burst never filled the queue ($what)"; router_fails=$((router_fails + 1))

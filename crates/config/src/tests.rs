@@ -120,6 +120,7 @@ fn full_document_parses() {
             qdisc: Qdisc::FqCodel,
             isolation: Isolation::DualDstHost,
             queue_ms: DEFAULT_QUEUE_MS,
+            ack_filter: false,
         }
     );
     assert!(c.mgmt.on_wan);
@@ -1807,4 +1808,14 @@ fn queue_ms_written_only_when_set() {
     assert_eq!(c.shaping.queue_ms, 50);
     assert!(c.to_toml().contains("queue_ms = 50"));
     assert_eq!(parse(&c.to_toml()).unwrap().shaping.queue_ms, 50);
+}
+
+/// `shaping.ack_filter` likewise: left out while off.
+#[test]
+fn ack_filter_written_only_when_on() {
+    assert!(!Config::default().to_toml().contains("ack_filter"));
+    let c = parse("[shaping]\nack_filter = true\n").unwrap();
+    assert!(c.shaping.ack_filter);
+    assert!(c.to_toml().contains("ack_filter = true"));
+    assert!(parse(&c.to_toml()).unwrap().shaping.ack_filter);
 }

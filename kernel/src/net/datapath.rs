@@ -1031,6 +1031,7 @@ impl Datapath {
         let aqm = qdisc.inner_mut();
         let max_sojourn = aqm.take_max_sojourn_ns();
         let flows = aqm.diag();
+        let ack_drops = aqm.ack_drops();
         drop(qdisc); // the console is slow: print without holding the lock
         let shaped = match rate {
             Some(r) => alloc::format!(
@@ -1046,7 +1047,7 @@ impl Datapath {
             s.dequeued,
             s.aqm_actions - s.marked,
             s.marked,
-            s.dropped - (s.aqm_actions - s.marked),
+            s.dropped - (s.aqm_actions - s.marked) - ack_drops,
             s.backlog_packets,
             max_sojourn / 1_000_000,
             (max_sojourn / 1_000) % 1_000

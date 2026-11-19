@@ -178,6 +178,7 @@ ecn_down = true
 qdisc = "cake"           # cake | fq_codel | codel
 isolation = "triple-isolate"
 queue_ms = 100           # shaped queue limit as time at its rate; 0 = fixed 384 packets
+ack_filter = false       # CAKE's ACK filter on the upload (asymmetric lines)
 
 [mgmt]
 on_wan = false

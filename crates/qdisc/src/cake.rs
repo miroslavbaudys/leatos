@@ -80,6 +80,10 @@ pub struct CakeParams {
     /// interval of a signal plus the queue's own delay: the default 2
     /// leaves room for both. 0 = every overflow counts (as in CAKE).
     pub blue_after: u32,
+    /// Drop a queued pure TCP ACK that a newly queued one of the same
+    /// connection makes redundant ([`crate::ack_filter`]). For the upload
+    /// of an asymmetric line; off by default (as in CAKE).
+    pub ack_filter: bool,
 }
 
 impl Default for CakeParams {
@@ -94,6 +98,7 @@ impl Default for CakeParams {
             blue: true,
             seed: 0x2545_f491_4f6c_dd1d,
             blue_after: 2,
+            ack_filter: false,
         }
     }
 }
@@ -103,6 +108,10 @@ impl Default for CakeParams {
 /// `target`).
 const BLUE_INC: u32 = 1 << 24;
 const BLUE_DEC: u32 = 1 << 20;
+
+/// Packets of a flow the ACK filter looks at per enqueue (bounds the work;
+/// a backlogged ACK flow stays far shorter than this when filtered).
+const ACK_SCAN: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Blue {
@@ -211,6 +220,9 @@ pub struct Cake<P> {
     pub blue_drops: u64,
     /// Flows that had to share a queue because their set was full.
     pub way_collisions: u64,
+    /// Redundant ACKs dropped by the ACK filter (subset of `dropped`; not
+    /// AQM actions).
+    pub ack_drops: u64,
 }
 
 impl<P: Packet> Cake<P> {
@@ -246,6 +258,7 @@ impl<P: Packet> Cake<P> {
             overflow_drops: 0,
             blue_drops: 0,
             way_collisions: 0,
+            ack_drops: 0,
             p: CakeParams {
                 flows,
                 hosts,
@@ -257,6 +270,49 @@ impl<P: Packet> Cake<P> {
 
     pub fn params(&self) -> &CakeParams {
         &self.p
+    }
+
+    /// Switch the ACK filter (a live shaping change).
+    pub fn set_ack_filter(&mut self, on: bool) {
+        self.p.ack_filter = on;
+    }
+
+    /// ACK filter: the packet just queued at the tail of flow `fi` is a
+    /// pure ACK. If at least two queued ACKs (within the first
+    /// [`ACK_SCAN`] packets) are redundant to it, drop the oldest of them.
+    /// Like CAKE's conservative mode: one per enqueue, and one older ACK
+    /// always stays next to the new one, so a backlogged ACK flow keeps
+    /// two ACKs queued instead of a growing line of them.
+    fn filter_ack(&mut self, fi: usize) {
+        let q = self.flows[fi].q;
+        let tail = q.tail();
+        let Some(new) = self.slab.get(tail).and_then(|(p, _)| p.pure_ack()) else {
+            return;
+        };
+        let (mut prev, mut i) = (NIL, q.head());
+        let (mut oldest, mut redundant) = (None, 0);
+        for _ in 0..ACK_SCAN {
+            if i == tail || i == NIL {
+                break;
+            }
+            let Some((p, next)) = self.slab.get(i) else {
+                break;
+            };
+            if p.pure_ack().is_some_and(|old| crate::ack_filter::supersedes(new, old)) {
+                redundant += 1;
+                oldest = oldest.or(Some((prev, i)));
+            }
+            (prev, i) = (i, next);
+        }
+        let (Some((prev, i)), 2..) = (oldest, redundant) else {
+            return;
+        };
+        if let Some(p) = self.flows[fi].q.unlink(&mut self.slab, prev, i) {
+            self.packets -= 1;
+            self.bytes -= p.len_bytes();
+            self.stats.dropped += 1;
+            self.ack_drops += 1;
+        }
     }
 
     /// Change the byte limit in place (a live shaping change). A backlog
@@ -469,6 +525,9 @@ impl<P: Packet> Qdisc<P> for Cake<P> {
         self.packets += 1;
         self.bytes += n;
         self.stats.enqueued += 1;
+        if self.p.ack_filter {
+            self.filter_ack(fi);
+        }
         if self.flows[fi].list == List::None {
             self.activate(fi, hashes);
         }
@@ -955,5 +1014,139 @@ mod tests {
                 assert!(ctl_util < new_util - 0.2, "control, {what}: util {ctl_util:.3}");
             }
         }
+    }
+
+    fn filtering(on: bool) -> Cake<Pkt> {
+        Cake::new(CakeParams {
+            codel: big(),
+            ack_filter: on,
+            ..CakeParams::default()
+        })
+    }
+
+    /// Ten ACKs of one connection queued back to back: the filter keeps
+    /// the newest two (one older ACK stays next to the new one), in order;
+    /// without it all ten wait.
+    #[test]
+    fn ack_filter_keeps_the_two_newest_acks() {
+        for on in [true, false] {
+            reset_drops();
+            let mut q = filtering(on);
+            for k in 1..=10u32 {
+                q.enqueue(ack_pkt(1, 5000, k * 1000, k as u64), 0).unwrap();
+            }
+            let s = q.stats();
+            let acks: Vec<u32> = core::iter::from_fn(|| take(&mut q, 0))
+                .map(|p| u32::from_be_bytes(p.ack.as_ref().unwrap()[28..32].try_into().unwrap()))
+                .collect();
+            if on {
+                assert_eq!((s.backlog_packets, q.ack_drops, s.dropped), (2, 8, 8));
+                assert_eq!(acks, [9000, 10_000]);
+            } else {
+                assert_eq!((s.backlog_packets, q.ack_drops), (10, 0));
+                assert_eq!(acks.len(), 10);
+            }
+            assert_eq!(s.aqm_actions, 0, "filtered ACKs are not AQM actions");
+        }
+    }
+
+    /// Only redundant ACKs of the same connection go: duplicate ACKs (the
+    /// sender's loss signal), other connections sharing the queue and
+    /// data packets stay.
+    #[test]
+    fn ack_filter_keeps_dupacks_other_connections_and_data() {
+        reset_drops();
+        let mut q = filtering(true);
+        for k in 0..6 {
+            q.enqueue(ack_pkt(1, 5000, 1000, k), 0).unwrap();
+        }
+        assert_eq!(q.ack_drops, 0, "duplicate ACKs");
+        reset_drops();
+        let mut q = filtering(true);
+        let mut seq = 0;
+        for k in 1..=5u32 {
+            seq += 1;
+            // Same flow queue (a hash collision), another connection.
+            q.enqueue(ack_pkt(1, 6000, k * 1000, seq), 0).unwrap();
+            seq += 1;
+            q.enqueue(pkt(1, 1500, seq), 0).unwrap();
+        }
+        assert_eq!(q.ack_drops, 3, "connection 6000 thinned to two ACKs");
+        q.enqueue(ack_pkt(1, 5000, 99_000, 99), 0).unwrap();
+        assert_eq!(q.ack_drops, 3, "connection 5000 has no older ACK queued");
+        assert_eq!(q.stats().backlog_packets, 2 + 5 + 1, "data packets stay");
+    }
+
+    /// An asymmetric upload (3 Mbit/s) carries a bulk upload and the ACKs
+    /// of a fast download (4 ACKs/ms, more than the ACK flow's fair share,
+    /// so they queue). The filter keeps the ACK queue at two packets, so
+    /// the newest acknowledgement leaves sooner, and the bytes it saves go
+    /// to the upload; the last ACK still gets through.
+    #[test]
+    fn ack_filter_on_an_asymmetric_upload() {
+        let run = |on: bool| {
+            reset_drops();
+            let mut q = Cake::new(CakeParams {
+                codel: params(false),
+                ack_filter: on,
+                ..CakeParams::default()
+            });
+            let (mut credit, mut seq, mut ack_no) = (0.0f64, 0u64, 0u32);
+            let (mut bulk_out, mut bulk_in) = (0u64, 0u64);
+            let mut ack_soj = Vec::new();
+            let mut last_ack = 0u32;
+            for t in 0..100_000u64 {
+                let now = t * MS / 10;
+                // The download's ACKs: 4 per ms.
+                if t % 10 < 4 {
+                    seq += 1;
+                    ack_no = ack_no.wrapping_add(2896);
+                    let mut p = ack_pkt(2, 5000, ack_no, seq);
+                    p.sent = now;
+                    let _ = q.enqueue(p, now);
+                }
+                // A greedy upload: keeps up to 40 packets queued (at most
+                // 4 new ones per step, so a full queue can't spin here).
+                for _ in 0..4 {
+                    if bulk_in.saturating_sub(bulk_out + drops(1)) >= 40 {
+                        break;
+                    }
+                    seq += 1;
+                    bulk_in += 1;
+                    let mut p = pkt(1, 1500, seq);
+                    p.sent = now;
+                    let _ = q.enqueue(p, now);
+                }
+                credit += 375.0 / 10.0; // 3 Mbit/s in bytes per 0.1 ms
+                while credit > 0.0 {
+                    let Some(p) = take(&mut q, now) else {
+                        credit = 0.0;
+                        break;
+                    };
+                    credit -= p.len as f64;
+                    if p.flow == 1 {
+                        bulk_out += 1;
+                    } else {
+                        ack_soj.push(now - p.sent);
+                        last_ack = u32::from_be_bytes(p.ack.as_ref().unwrap()[28..32].try_into().unwrap());
+                    }
+                }
+            }
+            ack_soj.sort_unstable();
+            (pct(&ack_soj, 50), bulk_out, last_ack, ack_no, q.ack_drops, drops(2))
+        };
+        let (soj_on, bulk_on, last_on, sent_on, filtered, _) = run(true);
+        let (soj_off, bulk_off, _, _, _, aqm_off) = run(false);
+        std::eprintln!(
+            "asymmetric upload: ACK sojourn p50 {:.2} ms with the filter ({filtered} filtered) vs {:.2} ms without ({aqm_off} ACKs dropped by CoDel/overflow); upload {bulk_on} vs {bulk_off} packets",
+            soj_on as f64 / 1e6,
+            soj_off as f64 / 1e6,
+        );
+        assert!(filtered > 10_000, "filter active: {filtered}");
+        assert!(soj_on * 2 < soj_off, "ACK sojourn {soj_on} vs {soj_off}");
+        assert!(bulk_on > bulk_off * 11 / 10, "upload {bulk_on} vs {bulk_off}");
+        // The newest acknowledgement is never lost: the last one sent
+        // within the final few milliseconds got through.
+        assert!(sent_on.wrapping_sub(last_on) <= 2896 * 40, "last ACK {last_on} of {sent_on}");
     }
 }

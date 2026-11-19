@@ -16,6 +16,7 @@
 
 extern crate alloc;
 
+pub mod ack_filter;
 pub mod cake;
 pub mod codel;
 pub mod fifo;
@@ -44,6 +45,11 @@ pub trait Packet {
     /// the **internal** (pre-NAT) addresses. Default: one host.
     fn host_hashes(&self) -> (u32, u32) {
         (0, 0)
+    }
+    /// For CAKE's ACK filter ([`ack_filter`]): the packet's bytes from the
+    /// IPv4 header on, if it is a pure TCP ACK. Default: not one.
+    fn pure_ack(&self) -> Option<&[u8]> {
+        None
     }
 }
 

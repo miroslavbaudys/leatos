@@ -178,6 +178,7 @@ pub fn bring_up(
         let aqm = Aqm::new(
             qos,
             ecn,
+            i == 0 && qos.ack_filter,
             QDISC_PACKETS,
             limit,
             timer::ticks() ^ mac_seed(&mac),
@@ -294,6 +295,7 @@ fn ingress_qdisc(qos: &crate::config::Qos) -> PortQdisc {
     let aqm = Aqm::new(
         qos,
         qos.ecn_down,
+        false,
         QDISC_PACKETS,
         queue_bytes(qos, qos.ingress_rate()),
         timer::ticks() ^ 0x1a9e_55c0_de0f_0001,
@@ -437,6 +439,7 @@ pub fn apply_qos(sh: &Shared, old: &crate::config::Qos, new: &crate::config::Qos
             let aqm = Aqm::new(
                 new,
                 ecn_new,
+                up && new.ack_filter,
                 QDISC_PACKETS,
                 limit,
                 timer::ticks() ^ mac_seed(&port.mac),
@@ -449,7 +452,12 @@ pub fn apply_qos(sh: &Shared, old: &crate::config::Qos, new: &crate::config::Qos
             let mut q = port.qdisc.lock();
             q.set_rate(rate);
             q.inner_mut().set_limit_bytes(limit);
-            alloc::string::String::from("queue kept")
+            q.inner_mut().set_ack_filter(up && new.ack_filter);
+            alloc::string::String::from(if up && new.ack_filter {
+                "queue kept, ACK filter on"
+            } else {
+                "queue kept"
+            })
         };
         let lim = describe_limit(limit, rate);
         match rate {

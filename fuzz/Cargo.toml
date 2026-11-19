@@ -94,3 +94,10 @@ path = "fuzz_targets/boot_image.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ack_filter"
+path = "fuzz_targets/ack_filter.rs"
+test = false
+doc = false
+bench = false

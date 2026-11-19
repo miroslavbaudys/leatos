@@ -269,6 +269,7 @@ pub fn overrides() -> Vec<(String, &'static str)> {
         ("qdisc", "shaping.qdisc"),
         ("isolation", "shaping.isolation"),
         ("queue_ms", "shaping.queue_ms"),
+        ("ack_filter", "shaping.ack_filter"),
         ("ntp", "time.ntp_servers"),
         ("dns", "dns.upstreams"),
         ("dns_tls", "dns.tls"),
@@ -392,6 +393,9 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
     }
     if let Some(ms) = arg_u64(args, "queue_ms") {
         s.queue_ms = ms.min(u32::MAX as u64) as u32;
+    }
+    if let Some(v) = arg_u64(args, "ack_filter") {
+        s.ack_filter = v != 0;
     }
     if let Some(v) = arg_u64(args, "ecn_up").or(arg_u64(args, "ecn")) {
         s.ecn_up = v != 0;
@@ -1067,7 +1071,8 @@ fn arg_u64(bootargs: &str, key: &str) -> Option<u64> {
 /// queue, for A/B tests) and
 /// `isolation=triple-isolate|dual-srchost|dual-dsthost|flows` (CAKE's
 /// fairness, default `triple-isolate`) and `queue_ms=` (a shaped queue's
-/// limit as time at its rate, default 100; `0` = the fixed limit).
+/// limit as time at its rate, default 100; `0` = the fixed limit) and
+/// `ack_filter=0|1` (CAKE's ACK filter on the upload, default off).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AqmKind {
     Cake,
@@ -1104,6 +1109,8 @@ pub struct Qos {
     pub ingress: bool,
     /// A shaped queue's limit as time at its rate (ms); 0 = fixed.
     pub queue_ms: u32,
+    /// CAKE's ACK filter on WAN egress (the upload) only.
+    pub ack_filter: bool,
 }
 
 pub fn qos() -> Qos {
@@ -1130,6 +1137,7 @@ pub fn qos() -> Qos {
         wan_pppoe: c.wan.mode == schema::WanMode::Pppoe,
         ingress: arg_u64(bootargs(), "shape_ingress") != Some(0),
         queue_ms: s.queue_ms,
+        ack_filter: s.ack_filter,
     }
 }
 

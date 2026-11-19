@@ -342,10 +342,10 @@ and slab, and adds three CAKE features:
   signal reaches its sender, and counting that made BLUE drop its packets
   for seconds after it had backed off (see "Queue limit follows the rate").
 
-Not yet implemented: DiffServ tins, the ACK filter, a rate-aware CoDel
-target, and COBALT's own CoDel variant (RFC 8289 CoDel is used). Ingress
-mode came later (§3.4), and so did a queue limit that follows the rate
-(below).
+Not yet implemented: DiffServ tins, a rate-aware CoDel target, and
+COBALT's own CoDel variant (RFC 8289 CoDel is used). Ingress mode came
+later (§3.4), and so did a queue limit that follows the rate and the ACK
+filter (below).
 
 **Kernel:** CAKE is the default egress AQM on both ports.
 - Boot args `qdisc=cake|fq_codel|codel` for A/B tests, and
@@ -500,10 +500,47 @@ Mbit/s, latency under load avg 2 ms, ECN per direction).
 Not yet measured on the apu4: the upload start-up spike at 90/18 with the
 new limit (expected ≤ ~100 ms instead of 355 ms).
 
+### ACK filter (2026-11-19)
+On an asymmetric line the download's ACKs take a real share of the
+upload: at 90 Mbit/s with delayed ACKs about 3,900 ACKs/s, ~3 Mbit/s with
+the PPPoE/VLAN overhead, ~17 % of an 18 Mbit/s upload. While the upload
+is idle they pass as a sparse flow; once it is busy (an upload next to the
+download, a video call) they queue, and only the newest ACK of a
+connection carries information the sender still needs.
+
+`crates/qdisc/src/ack_filter.rs` decides on the packets' bytes whether a
+new pure ACK makes a queued one redundant (same connection, both pure
+ACKs with the same flags and IP ECN bits, not CE; the new one
+acknowledges strictly more, so **duplicate ACKs are never filtered**;
+only NOP/EOL/SACK/timestamp options, timestamps not going backwards; the
+old one's SACK blocks above the new ACK number covered by the new one's;
+IPv4 without IP options). CAKE (`CakeParams::ack_filter`) checks at
+enqueue, within the first 64 packets of the ACK's flow queue: if at
+least two queued ACKs are redundant, it drops the oldest, like CAKE's
+conservative mode, so one older ACK always stays next to the new one.
+Dropped ACKs count in `dropped` and `ack_drops`, not as AQM actions (no
+CoDel or BLUE state). The forwarder marks pure ACKs (`is_pure_ack`); ACKs
+with ECE/CWR/AE are not pure and stay.
+
+Config `shaping.ack_filter` (boot argument `ack_filter=0|1`), **off by
+default** (as in CAKE), WAN egress only, switched live. The `qos wan0`
+boot line says `ACK filter`, the `qdisc wan0` stats line counts `ack
+drops`, `/api/status` `ack_drops`, the web queue table "redundant ACKs".
+
+| Evidence | without | with the filter |
+|---|---|---|
+| host sim: 3 Mbit/s upload, a greedy upload + a download's ACKs at 4/ms (above their fair share) | ACK sojourn p50 **13.8 ms** (5,218 ACKs dropped by CoDel), upload 1,251 packets | ACK sojourn p50 **0.30 ms** (31,887 filtered), upload **2,208** packets (+76 %), the newest ACK delivered |
+| host tests | | ten ACKs back to back → the newest two; duplicate ACKs, other connections in the same queue and data packets kept |
+| lab `LAB_ACK=1` (10 Mbit/s down, 150 kbit/s up: the download's ACKs exceed the upload), HVF, one run each | `LAB_ACK_FILTER=0`: 0 ACK drops, check **fails**; download **7.8 Mbit/s** (fails its 8–10.5 range: the queued ACKs hold the sender back) | **748** of ~2,200 ACKs filtered; download **9.1 Mbit/s**, file whole; all checks pass |
+
+Fuzz targets: `ack_filter` (the decision on arbitrary bytes: no panic,
+never supersedes itself, never mutual) and `qdisc` (with ACK packets,
+well-formed and garbage, and the filter on: conservation and limits).
+
 ## 5. Configuration UX
 **Implemented** (`[shaping]`, docs/config-and-storage.md §5; boot
 arguments `shape_up=`, `shape_down=`, `shape_overhead=`, `qdisc=`,
-`isolation=`, `ecn_up=`, `ecn_down=`, `queue_ms=`):
+`isolation=`, `ecn_up=`, `ecn_down=`, `queue_ms=`, `ack_filter=`):
 ```toml
 [shaping]
 up_kbit = 18000              # unset = not shaped
@@ -514,6 +551,7 @@ ecn_down = true
 qdisc = "cake"               # cake | fq_codel | codel
 isolation = "triple-isolate" # dual-srchost | dual-dsthost | flows
 queue_ms = 100               # shaped queue limit as time at its rate (§4); 0 = fixed
+ack_filter = false           # CAKE's ACK filter on the upload (§4)
 ```
 **Target** (not implemented: framing/MPU, DiffServ, ACK filter, a true
 ingress stage):

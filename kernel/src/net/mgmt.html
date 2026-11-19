@@ -403,6 +403,7 @@
         <div>
           <label class="check"><input data-path="shaping.ecn_up" type="checkbox">ECN marking on upload</label>
           <label class="check"><input data-path="shaping.ecn_down" type="checkbox">ECN marking on download</label>
+          <label class="check"><input data-path="shaping.ack_filter" type="checkbox">ACK filter on upload (drops TCP ACKs a newer one makes redundant; for asymmetric lines)</label>
         </div>
       </div>
       <p class="hint">Another queue discipline, fairness or ECN setting rebuilds the queue (packets in it are dropped once).</p>
@@ -891,7 +892,7 @@ async function refresh() {
   // The download is shaped where it arrives (WAN ingress stage); lan0's
   // egress is then unshaped, so traffic between networks is not capped.
   const qrow = (name, what, q) => `<tr><td>${esc(name)} <span class="muted">(${what})</span></td><td>${q.shaped_kbit === null ? "unshaped" : n(q.shaped_kbit) + " kbit/s"}${q.limit_bytes === undefined ? "" : `<br><span class="muted">limit ${bytes(q.limit_bytes)}${q.shaped_kbit ? `, ${Math.round(q.limit_bytes * 8 / q.shaped_kbit)} ms` : ""}</span>`}</td>` +
-    `<td class=num>${n(q.sent)}</td><td class=num>${n(q.dropped)}</td><td class=num>${n(q.ecn_marked)}</td><td class=num>${n(q.backlog_packets)} pkts</td></tr>`;
+    `<td class=num>${n(q.sent)}</td><td class=num>${n(q.dropped)}${q.ack_drops ? `<br><span class="muted">${n(q.ack_drops)} redundant ACKs</span>` : ""}</td><td class=num>${n(q.ecn_marked)}</td><td class=num>${n(q.backlog_packets)} pkts</td></tr>`;
   const qrows = "<tr><th>Queue</th><th>Shaper</th><th class=num>Sent</th><th class=num>Dropped</th><th class=num>ECN marked</th><th class=num>Queued now</th></tr>" +
     st.interfaces.map((i) => qrow(i.name + " egress", i === st.interfaces[0] ? "upload" : st.ingress ? "to the LAN, unshaped" : "download", i.qdisc)).join("") +
     (st.ingress ? qrow("wan0 ingress", "download", st.ingress) : "");

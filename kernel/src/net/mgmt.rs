@@ -1213,9 +1213,9 @@ fn status_json(
     for (n, nif) in sh.ports.iter().enumerate() {
         let snap = *nif.snap.lock();
         let st = snap.stats;
-        let (q, rate, limit) = {
+        let (q, rate, limit, ack_drops) = {
             let q = nif.qdisc.lock();
-            (q.stats(), q.rate(), q.inner().limit_bytes())
+            (q.stats(), q.rate(), q.inner().limit_bytes(), q.inner().ack_drops())
         };
         let link = match snap.link {
             Some((up, mbps, full)) => {
@@ -1241,7 +1241,7 @@ fn status_json(
             s,
             "{}{{\"name\":{},\"model\":{},\"mac\":{},\"vlan\":{vlan},\"link\":{link},\"addrs\":[{}],\
              \"rx_packets\":{},\"rx_bytes\":{},\"rx_no_buf\":{},\"tx_packets\":{},\"tx_bytes\":{},\
-             \"qdisc\":{{\"shaped_kbit\":{rate},\"limit_bytes\":{limit},\"sent\":{},\"dropped\":{},\"ecn_marked\":{},\"backlog_packets\":{}}}}}",
+             \"qdisc\":{{\"shaped_kbit\":{rate},\"limit_bytes\":{limit},\"ack_drops\":{ack_drops},\"sent\":{},\"dropped\":{},\"ecn_marked\":{},\"backlog_packets\":{}}}}}",
             if n > 0 { "," } else { "" },
             json_str(nif.name),
             json_str(nif.model),

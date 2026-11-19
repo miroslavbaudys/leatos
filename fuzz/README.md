@@ -28,7 +28,8 @@ reveals a bug gets a host regression test in its crate before the fix.
 | `http` | `crates/proto-http` parser | LAN, before authentication | body ≤ limits and Content-Length; whole and split feeds agree |
 | `dhcp` | `crates/proto-dhcp` server, packet, persist | LAN | no shared addresses; pool bounds; persist round trip; emit/parse |
 | `mdns` | `crates/proto-mdns` wire + reflector | LAN multicast | rebuild = parse; reflects only along rules, never back |
-| `qdisc` | `crates/qdisc` CAKE / FQ-CoDel / CoDel + shaper | every forwarded packet | backlog limits; packet conservation; no duplicates; drains |
+| `qdisc` | `crates/qdisc` CAKE / FQ-CoDel / CoDel + shaper, ACK filter on and off | every forwarded packet | backlog limits; packet conservation; no duplicates; drains |
+| `ack_filter` | `crates/qdisc` ACK filter decision on arbitrary bytes | pure TCP ACKs from the LAN | no panic; never supersedes itself; never mutual |
 | `boot_image` | `crates/boot-image` ELF / Multiboot2 | uploaded kernels (authenticated) | plan inside the allowed range; flatten fits |
 
 The stateful targets generate operations rather than bytes: packets built from

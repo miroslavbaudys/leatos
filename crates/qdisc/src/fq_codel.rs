@@ -84,6 +84,12 @@ pub(crate) struct Slab<P> {
 }
 
 impl<P> Slab<P> {
+    /// The packet in slot `i` and the next slot of its queue.
+    pub(crate) fn get(&self, i: u32) -> Option<(&P, u32)> {
+        let s = self.slots.get(i as usize)?;
+        Some((&s.pkt.as_ref()?.0, s.next))
+    }
+
     pub(crate) fn new(cap: usize) -> Self {
         let slots = (0..cap)
             .map(|i| Slot {
@@ -123,6 +129,35 @@ impl FlowQueue {
         }
         self.tail = i;
         self.bytes += len;
+    }
+
+    /// Slot of the head packet (`NIL` if empty).
+    pub(crate) fn head(&self) -> u32 {
+        self.head
+    }
+
+    /// Slot of the tail packet (`NIL` if empty).
+    pub(crate) fn tail(&self) -> u32 {
+        self.tail
+    }
+
+    /// Unlink slot `i`, whose predecessor in this queue is `prev` (`NIL`
+    /// if `i` is the head), and free it.
+    pub(crate) fn unlink<P: Packet>(&mut self, slab: &mut Slab<P>, prev: u32, i: u32) -> Option<P> {
+        let next = slab.slots.get(i as usize)?.next;
+        match slab.slots.get_mut(prev as usize) {
+            Some(p) => p.next = next,
+            None => self.head = next,
+        }
+        if self.tail == i {
+            self.tail = prev;
+        }
+        let slot = &mut slab.slots[i as usize];
+        let (p, _) = slot.pkt.take()?;
+        slot.next = slab.free;
+        slab.free = i;
+        self.bytes -= p.len_bytes();
+        Some(p)
     }
 
     pub(crate) fn pop<P: Packet>(&mut self, slab: &mut Slab<P>) -> Option<(P, u64)> {

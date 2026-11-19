@@ -219,6 +219,27 @@ impl qdisc::Packet for PacketBuf {
         )
     }
 
+    /// The IPv4 packet of a pure TCP ACK (`PacketMeta::is_pure_ack`, set
+    /// by the forwarder), for CAKE's ACK filter. Queued frames are plain
+    /// Ethernet (the WAN's VLAN tag and PPPoE header are added after the
+    /// qdisc); a LAN network's tag is skipped.
+    fn pure_ack(&self) -> Option<&[u8]> {
+        use fwd::wire;
+        if !self.meta.is_pure_ack {
+            return None;
+        }
+        let f = self.data();
+        if f.len() < wire::ETH_HDR + 40 {
+            return None; // shorter than Ethernet + IPv4 + TCP headers
+        }
+        let l3 = if wire::get16(f, 12) == wire::ETHERTYPE_VLAN {
+            wire::ETH_HDR + wire::VLAN_HDR
+        } else {
+            wire::ETH_HDR
+        };
+        (f.len() >= l3 + 40 && wire::get16(f, l3 - 2) == wire::ETHERTYPE_IPV4).then(|| &f[l3..])
+    }
+
     fn mark_ce(&mut self) -> bool {
         use fwd::wire;
         let f = self.data_mut();
