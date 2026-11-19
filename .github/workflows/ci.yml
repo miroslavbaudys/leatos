@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Never set RUSTFLAGS here: it would replace the x86_64 kernel's
+  # target rustflags from .cargo/config.toml. Warnings are denied per
+  # clippy call instead (`-- -D warnings`).
+
+jobs:
+  host:
+    name: Host crates (tests + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the channel, both kernel targets and clippy.
+      - run: rustup toolchain install # installs what rust-toolchain.toml names
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: host
+      - name: cargo test
+        run: cargo test --workspace --exclude leatos-kernel
+      - name: cargo clippy
+        run: cargo clippy --workspace --exclude leatos-kernel --all-targets -- -D warnings
+
+  kernel:
+    name: Kernel ${{ matrix.arch }} (clippy per feature + build)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            clippy: kclippy
+            build: kbuild
+          - arch: x86_64
+            clippy: kclippy-x86
+            build: kbuild-x86
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install # installs what rust-toolchain.toml names
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: kernel-${{ matrix.arch }}
+      - name: clippy (default and every test feature, as CLAUDE.md asks)
+        run: |
+          for f in "" smoke-test idle-poll fault-wx fault-stack fault-hang fault-panic; do
+            echo "::group::cargo ${{ matrix.clippy }} ${f:+--features $f}"
+            cargo ${{ matrix.clippy }} ${f:+--features $f} -- -D warnings
+            echo "::endgroup::"
+          done
+      - name: build (links with the kernel's linker script)
+        run: cargo ${{ matrix.build }} --release

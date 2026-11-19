@@ -3,6 +3,7 @@ name = "leatos-kernel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "leatos bare-metal aarch64 unikernel (QEMU virt)"
 
 [[bin]]
