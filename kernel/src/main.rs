@@ -117,8 +117,9 @@ pub fn kmain(boot_arg: usize) -> ! {
     executor::run()
 }
 
-/// Place the network tasks (docs/smp.md): with two ports, one datapath task
-/// per direction (download = WAN RX → LAN TX, upload = LAN RX → WAN TX);
+/// Place the network tasks (docs/smp.md): with two or more ports, one
+/// datapath task per direction (download = WAN RX → every LAN port's TX,
+/// upload = every LAN port's RX → WAN TX);
 /// with 3+ cores each on its own core and the services on a third, with 2
 /// cores both directions on core 0 and the services on core 1.
 fn spawn_net(
@@ -127,12 +128,13 @@ fn spawn_net(
     shared: &'static net::shared::Shared,
     store: Option<store::Store>,
 ) {
-    use net::stack::{Dir, run_dir};
+    use net::stack::{Dir, PortSet, run_dir};
     let lay = net::stack::layout(ports.len(), smp::online());
     let dp = net::stack::new_datapath(shared);
     if ports.len() >= 2 {
-        let down = Dir { rx: 0, tx: 1, primary: true };
-        let up = Dir { rx: 1, tx: 0, primary: false };
+        let lan = PortSet::range(1, ports.len());
+        let down = Dir { rx: PortSet::one(0), tx: lan, primary: true };
+        let up = Dir { rx: lan, tx: PortSet::one(0), primary: false };
         executor::spawn_on(lay.down, Priority::Datapath, "dp_down", run_dir(down, ports, shared, dp));
         executor::spawn_on(lay.up, Priority::Datapath, "dp_up", run_dir(up, ports, shared, dp));
         println!(
@@ -140,7 +142,7 @@ fn spawn_net(
             lay.down, lay.up, lay.svc
         );
     } else {
-        let one = Dir { rx: 0, tx: 0, primary: true };
+        let one = Dir { rx: PortSet::one(0), tx: PortSet::one(0), primary: true };
         executor::spawn_on(lay.down, Priority::Datapath, "dp", run_dir(one, ports, shared, dp));
     }
     executor::spawn_on(lay.svc, Priority::Service, "svc", net::svc::run(hosts, shared, store));

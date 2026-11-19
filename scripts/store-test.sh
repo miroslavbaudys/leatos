@@ -150,13 +150,13 @@ check "invalid TOML -> 422" 422 "$(save_toml "$WORK/bad.toml")"
 printf 'version = 2\n\n[[network]]\nname = "lan"\nipv4 = "10.30.0.1/24"\n\n[network.dhcp]\nrange = ["10.40.0.100", "10.40.0.199"]\n' >"$WORK/incons.toml"
 check "inconsistent config -> 422" 422 "$(save_toml "$WORK/incons.toml")"
 check "422 names the field" "network.lan.dhcp.range" "$(json "$WORK/resp" issues.0.path | cut -d'[' -f1)"
-# Valid, but beyond what this kernel implements (a network on another
-# port, lan1: no bridge yet): refused.
+# Valid, but beyond what this kernel implements (a network on two ports,
+# a bridge: routed ports only): refused.
 python3 -I -c 'import json,sys
 c=json.load(open(sys.argv[1]))
-c["network"][0]["ports"]=["lan1"]
+c["network"][0]["ports"]=["lan0","lan1"]
 open(sys.argv[2],"w").write(json.dumps(c))' "$WORK/cfg.json" "$WORK/v2.json"
-check "unsupported setting (network on lan1) -> 422" 422 "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/v2.json" "$URL/api/config")"
+check "unsupported setting (network on lan0 + lan1: bridge) -> 422" 422 "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/v2.json" "$URL/api/config")"
 check "  ... names it" "network.lan.ports" "$(json "$WORK/resp" issues.0.path)"
 check "refused saves left the store unchanged" "A 1 0" "$(slot)"
 

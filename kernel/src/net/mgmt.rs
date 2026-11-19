@@ -1224,7 +1224,7 @@ fn status_json(
         let addrs: Vec<String> = ifs
             .iter()
             .zip(&sh.links)
-            .filter(|(_, l)| l.port == n)
+            .filter(|(_, l)| l.port() == n)
             .flat_map(|(h, _)| h.iface.ip_addrs().iter().map(|a| json_str(&format!("{a}"))).collect::<Vec<_>>())
             .collect();
         let vlan = nif
@@ -1297,7 +1297,7 @@ fn status_json(
         }
     }
     s.push(']');
-    // The networks: router interfaces on lan0 (docs/config-v2.md).
+    // The networks: router interfaces on the LAN ports (docs/config-v2.md).
     s.push_str(",\"networks\":[");
     for (n, net) in config::networks().iter().enumerate() {
         let leases = services.map_or(0, |svc| {
@@ -1307,9 +1307,10 @@ fn status_json(
         });
         let _ = write!(
             s,
-            "{}{{\"name\":{},\"vlan\":{},\"ipv4\":{},\"zone\":{},\"dhcp\":{},\"mgmt\":{},\"leases\":{leases}}}",
+            "{}{{\"name\":{},\"port\":{},\"vlan\":{},\"ipv4\":{},\"zone\":{},\"dhcp\":{},\"mgmt\":{},\"leases\":{leases}}}",
             if n > 0 { "," } else { "" },
             json_str(&net.name),
+            json_str(config::PORTS[net.port]),
             net.vid,
             json_str(&format!("{}/{}", net.addr, net.prefix)),
             json_str(&net.zone_name),

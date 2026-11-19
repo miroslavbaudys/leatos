@@ -57,7 +57,7 @@ use crate::drivers::Nic;
 use crate::net::packet::{PacketBuf, PacketMeta};
 use crate::net::shared::{Networks, PortShared};
 use crate::net::device::PortQdisc;
-use crate::net::shared::{CTRL_RX_MAX, LOCAL_RX_MAX, Shared};
+use crate::net::shared::{CTRL_RX_MAX, LOCAL_RX_MAX, MAX_PORTS, Shared};
 use crate::timer;
 use alloc::vec::Vec;
 use core::net::Ipv4Addr;
@@ -84,6 +84,9 @@ const HOUSEKEEPING_MS: u64 = 1_000;
 pub const WAN: IfIndex = 0;
 /// The WAN's port.
 pub const WAN_PORT: usize = 0;
+
+/// Per port: its qdisc got packets (its TX task must be woken).
+pub type Touched = [bool; MAX_PORTS];
 
 /// Counters for diagnostics (read by the self-test / stats output).
 pub static FORWARDED: AtomicU64 = AtomicU64::new(0);
@@ -180,9 +183,10 @@ pub fn padt(port: &PortShared) -> Option<PacketBuf> {
 struct Hk {
     next_housekeeping: u64,
     next_stats: u64,
-    /// wan0, lan0, the ingress stage.
-    last_dequeued: [u64; 3],
-    ecn_reported: [u64; 2],
+    /// Per port, then the ingress stage.
+    last_dequeued: Vec<u64>,
+    /// Per port.
+    ecn_reported: Vec<u64>,
     vlan_reported: u64,
 }
 
@@ -224,15 +228,15 @@ pub struct Datapath {
     /// Per ingress port: datagrams whose first fragment came through
     /// ([`fwd::frag`]); each port's RX runs in one direction task, so the
     /// lock is never contended.
-    frags: [Mutex<FragTable<PacketBuf>>; 2],
+    frags: Vec<Mutex<FragTable<PacketBuf>>>,
     /// Forward IP fragments (boot argument `fw_frag=0`: dropped).
     fragments: bool,
     local_rx_drops: AtomicU64,
     /// Per ingress port: forwarded IPv4 packets by ECN codepoint
     /// [Not-ECT, ECT(1), ECT(0), CE], and TCP packets with ECE / CWR set.
-    ecn_seen: [[AtomicU64; 4]; 2],
-    tcp_ece: [AtomicU64; 2],
-    tcp_cwr: [AtomicU64; 2],
+    ecn_seen: Vec<[AtomicU64; 4]>,
+    tcp_ece: Vec<AtomicU64>,
+    tcp_cwr: Vec<AtomicU64>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -278,7 +282,7 @@ fn relaxed(a: &AtomicU64) -> u64 {
 /// One received batch's bookkeeping, passed down the receive path.
 struct Batch<'a> {
     /// Egress ports whose qdisc got packets.
-    touched: &'a mut [bool; 2],
+    touched: &'a mut Touched,
     /// Frames went to a `local_rx` / `ctrl_rx` (wake svc).
     local: bool,
     /// The batch is from the WAN and the ingress stage is on: forwarded
@@ -311,7 +315,7 @@ impl Datapath {
             .iter()
             .enumerate()
             .map(|(i, link)| Interface {
-                mac: sh.ports[link.port].mac,
+                mac: sh.ports[link.port()].mac,
                 addr: None,
                 role: if i == WAN as usize { Role::Wan } else { Role::Lan },
                 zone: if i == WAN as usize { 0 } else { 1 },
@@ -334,6 +338,7 @@ impl Datapath {
                 Mutex::new(f)
             })
             .collect();
+        let n = sh.ports.len();
         let dp = Self {
             sh,
             hash_key,
@@ -347,16 +352,16 @@ impl Datapath {
             hk: Mutex::new(Hk {
                 next_housekeeping: 0,
                 next_stats: STATS_MS,
-                last_dequeued: [0; 3],
-                ecn_reported: [0; 2],
+                last_dequeued: alloc::vec![0; n + 1],
+                ecn_reported: alloc::vec![0; n],
                 vlan_reported: 0,
             }),
-            frags: [Mutex::new(FragTable::new()), Mutex::new(FragTable::new())],
+            frags: (0..n).map(|_| Mutex::new(FragTable::new())).collect(),
             fragments: crate::config::fw_fragments(),
             local_rx_drops: AtomicU64::new(0),
-            ecn_seen: [const { [const { AtomicU64::new(0) }; 4] }; 2],
-            tcp_ece: [const { AtomicU64::new(0) }; 2],
-            tcp_cwr: [const { AtomicU64::new(0) }; 2],
+            ecn_seen: (0..n).map(|_| [const { AtomicU64::new(0) }; 4]).collect(),
+            tcp_ece: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            tcp_cwr: (0..n).map(|_| AtomicU64::new(0)).collect(),
         };
         dp.apply(initial);
         dp
@@ -383,7 +388,7 @@ impl Datapath {
     }
 
     /// Put networks and the firewall into effect (boot, or a saved config,
-    /// live): each network slot gets its VID, address and zone, or is
+    /// live): each network slot gets its port, VID, address and zone, or is
     /// switched off; a slot that changed forgets its neighbors. Tracked
     /// connections the new firewall would not start are removed
     /// (`Forwarder::recheck`); ones through a slot that went away find no
@@ -393,14 +398,19 @@ impl Datapath {
             let want = n.nets.iter().find(|x| x.link == i);
             let addr = want.map(|x| x.addr);
             let vid = want.map_or(0, |x| x.vid);
-            let changed = *self.addrs[i].lock() != addr || link.vid() != vid || link.is_active() != want.is_some();
+            let port = want.map_or(link.port(), |x| x.port);
+            let changed = *self.addrs[i].lock() != addr
+                || link.vid() != vid
+                || link.port() != port
+                || link.is_active() != want.is_some();
             for s in &self.shards {
                 let mut f = s.lock();
                 f.set_addr(i as IfIndex, addr);
                 f.set_zone(i as IfIndex, want.map_or(1, |x| x.zone));
+                f.set_mac(i as IfIndex, self.sh.ports[port].mac);
             }
             *self.addrs[i].lock() = addr;
-            link.set(want.is_some(), vid);
+            link.set(want.is_some(), port, vid);
             if changed {
                 *self.neigh[i].lock() = NeighTable::new();
             }
@@ -422,7 +432,7 @@ impl Datapath {
         let mut port_links = alloc::vec![Vec::new(); self.sh.ports.len()];
         for (i, link) in self.sh.links.iter().enumerate() {
             if link.is_active() {
-                port_links[link.port].push((link.vid(), i as IfIndex));
+                port_links[link.port()].push((link.vid(), i as IfIndex));
             }
         }
         *self.topo.lock() = alloc::sync::Arc::new(Topo {
@@ -440,17 +450,18 @@ impl Datapath {
     }
 
     /// Into the qdisc of the link's port, with the link's VLAN tag.
-    fn enqueue(&self, egress: IfIndex, mut pkt: PacketBuf, touched: &mut [bool; 2]) {
+    fn enqueue(&self, egress: IfIndex, mut pkt: PacketBuf, touched: &mut Touched) {
         let now = now_ns();
         let link = &self.sh.links[egress as usize];
         if let Some(tci) = link.tci() {
             pkt.push_vlan(tci);
             pkt.meta.wire_len += wire::VLAN_HDR as u32;
         }
-        if let Some(t) = touched.get_mut(link.port) {
+        let port = link.port();
+        if let Some(t) = touched.get_mut(port) {
             *t = true;
         }
-        if self.sh.ports[link.port]
+        if self.sh.ports[port]
             .qdisc
             .lock()
             .enqueue(pkt, now)
@@ -466,14 +477,14 @@ impl Datapath {
         egress: IfIndex,
         mac: wire::Mac,
         mut pkt: PacketBuf,
-        touched: &mut [bool; 2],
+        touched: &mut Touched,
     ) {
-        let src = self.sh.ports[self.sh.links[egress as usize].port].mac;
+        let src = self.sh.ports[self.sh.links[egress as usize].port()].mac;
         wire::set_macs(pkt.data_mut(), mac, src);
         self.enqueue(egress, pkt, touched);
     }
 
-    fn send_arp_request(&self, ifx: IfIndex, target: Ipv4Addr, touched: &mut [bool; 2]) {
+    fn send_arp_request(&self, ifx: IfIndex, target: Ipv4Addr, touched: &mut Touched) {
         let addr = *self.addrs[ifx as usize].lock();
         let (Some((my_ip, _)), Some(mut pkt)) = (addr, PacketBuf::alloc()) else {
             return;
@@ -483,7 +494,7 @@ impl Datapath {
         pkt.meta.wire_len = 60;
         wire::build_arp_request(
             pkt.data_mut(),
-            self.sh.ports[self.sh.links[ifx as usize].port].mac,
+            self.sh.ports[self.sh.links[ifx as usize].port()].mac,
             my_ip,
             target,
         );
@@ -495,7 +506,7 @@ impl Datapath {
     /// CWR (sender reacted) flags.
     fn observe_ecn(&self, port: usize, frame: &[u8]) {
         let i = port;
-        if i >= 2 {
+        if i >= self.ecn_seen.len() {
             return;
         }
         let Some(v) = wire::Ipv4View::parse(frame, wire::ETH_HDR) else {
@@ -514,7 +525,7 @@ impl Datapath {
     }
 
     /// Learn neighbors from ARP and release packets waiting for them.
-    fn snoop_arp(&self, ifx: IfIndex, frame: &[u8], now: u64, touched: &mut [bool; 2]) {
+    fn snoop_arp(&self, ifx: IfIndex, frame: &[u8], now: u64, touched: &mut Touched) {
         let Some(arp) = wire::parse_arp(frame) else {
             return;
         };
@@ -558,7 +569,7 @@ impl Datapath {
     /// Run one port's received frames (taken from its NIC by the caller,
     /// at most [`RX_BUDGET`]) through the forwarder. Drains `batch`; marks
     /// in `touched` the egress ports whose qdisc got packets.
-    pub fn rx_batch(&self, port_ix: usize, batch: &mut Vec<PacketBuf>, touched: &mut [bool; 2]) {
+    pub fn rx_batch(&self, port_ix: usize, batch: &mut Vec<PacketBuf>, touched: &mut Touched) {
         let now = now_ms();
         let port = &self.sh.ports[port_ix];
         let pppoe = port.is_pppoe();
@@ -622,7 +633,7 @@ impl Datapath {
                 self.snoop_arp(ifx, pkt.data(), now, b.touched);
             }
             let len = pkt.len();
-            let kind = if self.fragments && port_ix < 2 {
+            let kind = if self.fragments && port_ix < self.frags.len() {
                 frag::classify(pkt.data())
             } else {
                 FragKind::Whole
@@ -807,8 +818,8 @@ impl Datapath {
 
     /// To the next hop: the PPPoE AC, or through the neighbor table, into
     /// the egress qdisc.
-    fn to_next_hop(&self, egress: IfIndex, next_hop: Ipv4Addr, pkt: PacketBuf, now: u64, touched: &mut [bool; 2]) {
-        let out = &self.sh.ports[self.sh.links[egress as usize].port];
+    fn to_next_hop(&self, egress: IfIndex, next_hop: Ipv4Addr, pkt: PacketBuf, now: u64, touched: &mut Touched) {
+        let out = &self.sh.ports[self.sh.links[egress as usize].port()];
         if out.is_pppoe() {
             // Point to point: the access concentrator is the only neighbor.
             match out.pppoe_session() {
@@ -833,7 +844,7 @@ impl Datapath {
     /// neighbor table and egress qdiscs (the task receiving on the WAN, each
     /// pass). Returns when the shaper releases the next packet, if it holds
     /// some back.
-    pub fn drain_ingress(&self, touched: &mut [bool; 2]) -> Option<u64> {
+    pub fn drain_ingress(&self, touched: &mut Touched) -> Option<u64> {
         let now = now_ns();
         let ms = now / 1_000_000;
         loop {
@@ -853,7 +864,7 @@ impl Datapath {
 
     /// Once a second (primary task): expire connections, retry ARP, print
     /// statistics. No NIC access.
-    pub fn housekeeping(&self, touched: &mut [bool; 2]) {
+    pub fn housekeeping(&self, touched: &mut Touched) {
         let now = now_ms();
         let print = {
             let mut hk = self.hk.lock();
@@ -925,7 +936,7 @@ impl Datapath {
         if new_vlan_drops {
             crate::println!("  vlan            : {vlan_drops} frames dropped (wrong or missing tag)");
         }
-        for (i, nif) in self.sh.ports.iter().enumerate().take(2) {
+        for (i, nif) in self.sh.ports.iter().enumerate() {
             let e: [u64; 4] = core::array::from_fn(|c| relaxed(&self.ecn_seen[i][c]));
             let total: u64 = e.iter().sum();
             {
@@ -946,7 +957,7 @@ impl Datapath {
                 relaxed(&self.tcp_cwr[i])
             );
         }
-        let ports = self.sh.ports.iter().take(2).map(|p| (p.name, &p.qdisc));
+        let ports = self.sh.ports.iter().map(|p| (p.name, &p.qdisc));
         for (i, (name, q)) in ports.chain([("ingress", &self.sh.ingress)]).enumerate() {
             printed |= self.print_qdisc(i, name, q);
         }

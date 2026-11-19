@@ -11,7 +11,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use core::task::{Context, Poll, Waker};
 use spin::{Mutex, Once};
 
@@ -96,12 +96,30 @@ impl IrqEvent {
     }
 }
 
+/// Devices one interrupt line can serve: PCI INTx is shared (four lines
+/// for every slot, e.g. QEMU's aarch64 `virt` puts slots 4 and 8 on one).
+const MAX_SHARERS: usize = 4;
+
 struct Entry {
-    action: fn(u32),
-    event: &'static IrqEvent,
+    /// Acknowledge or mask the line (the same for every sharer).
+    action: Once<fn(u32)>,
+    /// One event per device on the line; all are signalled, and each
+    /// device's task finds out whether it was the one.
+    events: [Once<&'static IrqEvent>; MAX_SHARERS],
+    /// Sharers (bit per `events` slot) that have not drained their device
+    /// since the line fired: the line is unmasked only when all have
+    /// ([`line_done`]), so a sharer that was not the source cannot unmask
+    /// a line the source still asserts (an interrupt storm).
+    outstanding: AtomicU8,
 }
 
-static HANDLERS: [Once<Entry>; MAX_INTID] = [const { Once::new() }; MAX_INTID];
+static HANDLERS: [Entry; MAX_INTID] = [const {
+    Entry {
+        action: Once::new(),
+        events: [const { Once::new() }; MAX_SHARERS],
+        outstanding: AtomicU8::new(0),
+    }
+}; MAX_INTID];
 /// Every registered event, for the executor's wake-up scan.
 static EVENTS: Mutex<Vec<&'static IrqEvent>> = Mutex::new(Vec::new());
 static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -112,15 +130,28 @@ static DEV_IRQS: [AtomicU64; crate::smp::MAX_CORES] =
 static SPURIOUS: AtomicU64 = AtomicU64::new(0);
 
 /// Register an interrupt: in IRQ context `action` runs (to ack/mask the
-/// source) and then `event` is signalled. Each INTID can be registered once.
-/// Does not enable the interrupt in the controller.
+/// source) and then `event` is signalled. A line may be shared by up to
+/// [`MAX_SHARERS`] devices with the same `action` (each with its own
+/// event; the first action registered is the line's). Registered at bring-up, before the line is enabled. Does not
+/// enable the interrupt in the controller.
 pub fn register(intid: u32, action: fn(u32), event: &'static IrqEvent) {
-    let mut first = false;
-    HANDLERS[intid as usize].call_once(|| {
-        first = true;
-        Entry { action, event }
-    });
-    assert!(first, "irq: intid {intid} registered twice");
+    let e = &HANDLERS[intid as usize];
+    // The first registration's action serves the line (sharers pass the
+    // same one: the NICs' `mask_intx`).
+    e.action.call_once(|| action);
+    let mut placed = false;
+    for slot in &e.events {
+        let mut mine = false;
+        slot.call_once(|| {
+            mine = true;
+            event
+        });
+        if mine {
+            placed = true;
+            break;
+        }
+    }
+    assert!(placed, "irq: intid {intid} has more than {MAX_SHARERS} sharers");
 }
 
 /// Allocate an event that lives forever: one per device/IRQ source
@@ -138,14 +169,34 @@ pub fn dispatch(intid: u32) {
     if intid != arch::irqchip::IPI_INTID && intid != crate::timer::intid() {
         DEV_IRQS[crate::smp::current()].fetch_add(1, Ordering::Relaxed);
     }
-    match HANDLERS.get(intid as usize).and_then(Once::get) {
-        Some(e) => {
-            (e.action)(intid);
-            e.event.signal();
+    let e = HANDLERS.get(intid as usize);
+    match e.and_then(|e| Some((e.action.get()?, &e.events))) {
+        Some((action, events)) => {
+            let all = events.iter().enumerate().filter(|(_, e)| e.get().is_some()).fold(0u8, |m, (i, _)| m | 1 << i);
+            if let Some(e) = e {
+                e.outstanding.fetch_or(all, Ordering::AcqRel);
+            }
+            action(intid);
+            for ev in events.iter().filter_map(Once::get) {
+                ev.signal();
+            }
         }
         // Unexpected interrupt: disable it so it cannot storm.
         None => arch::irqchip::disable(intid),
     }
+}
+
+/// Thread context, NAPI's last step: the task of the device behind `event`
+/// has drained it. `true` = every sharer of the line has, so the caller
+/// unmasks it now.
+pub fn line_done(intid: u32, event: &'static IrqEvent) -> bool {
+    let Some(e) = HANDLERS.get(intid as usize) else {
+        return true;
+    };
+    let Some(i) = e.events.iter().position(|x| x.get().is_some_and(|x| core::ptr::eq(*x, event))) else {
+        return true;
+    };
+    e.outstanding.fetch_and(!(1 << i), Ordering::AcqRel) & !(1 << i) == 0
 }
 
 pub fn note_spurious() {

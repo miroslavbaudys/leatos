@@ -747,6 +747,66 @@ if [ -n "$guest" ]; then
   fi
 fi
 
+# --- a second LAN port (scripts/lab-test.sh LAB_PORTS): routed ports, M10 -----------
+# The router's third NIC is lan1, with network "wired" (10.40.0.1/24,
+# untagged, zone lan); this VM's eth1 is on that wire and moves into its
+# own network namespace, a separate host there. lab_ports=lan0 is the
+# negative control: the network is on lan0 (VLAN 40), so nothing answers
+# on the lan1 wire: no lease (the other checks need one).
+pnet=$($bb sed -n 's/.*lab_ports=\([a-z0-9]*\).*/\1/p' /proc/cmdline)
+if [ -n "$pnet" ]; then
+  $bb unshare -n $bb sleep 600 &
+  pns=$!
+  $bb sleep 0.3
+  pn() { $bb nsenter -n -t "$pns" "$@"; }
+  $bb rm -f /tmp/plese
+  if ! { $bb ip link set eth1 netns "$pns" && pn $bb ip link set lo up && pn $bb ip link set eth1 up; }; then
+    fail "ports: cannot move eth1 into a network namespace"
+  elif ! pn $bb udhcpc -i eth1 -n -q -t 6 -T 1 -x hostname:labwired -s /udhcpc-port.sh >/dev/null 2>&1; then
+    fail "ports: no DHCP lease on the lan1 wire (network on $pnet)"
+  else
+    . /tmp/plese
+    case "$pip" in
+      10.40.0.*) pass "ports: dhcp lease $pip on the lan1 wire (router $prouter)" ;;
+      *) fail "ports: lease '$pip' not in 10.40.0.0/24" ;;
+    esac
+    if pn $bb ping -c 2 -W 2 10.40.0.1 >/dev/null 2>&1; then pass "ports: ping router 10.40.0.1 from lan1"; else fail "ports: ping 10.40.0.1 from lan1"; fi
+    if pn $bb ping -c 2 -W 2 "$ISP" >/tmp/pping 2>&1; then
+      pass "ports: lan1 reaches the ISP through NAT ($($bb grep -o 'min/avg/max = [^ ]*' /tmp/pping))"
+    else
+      fail "ports: ping $ISP from lan1"; $bb tail -2 /tmp/pping | $bb sed 's/^/    | /'
+    fi
+    st=$($bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null)
+    if echo "$st" | $bb grep -q '"name":"wired","port":"lan1"'; then
+      pass "ports: /api/status lists network wired on lan1"
+    else
+      fail "ports: /api/status: $(echo "$st" | $bb grep -o '"name":"wired","port":"[a-z0-9]*"' || echo 'no network wired')"
+    fi
+    # Routed between ports: main LAN (lan0, received by dp_up) -> wired
+    # (lan1, sent by dp_down), not held to the download rate.
+    if [ -n "$want" ] && [ "$want" != 0 ]; then
+      $bb mkdir -p /tmp/www-p
+      $bb dd if=/dev/zero of=/tmp/www-p/5mb bs=1024 count=5120 2>/dev/null
+      $bb nsenter -n -t "$pns" $bx httpd -f -p 8082 -h /tmp/www-p &
+      php=$!
+      $bb sleep 0.5
+      t0=$(now_ms)
+      $bb wget -q -T 30 -O /tmp/pdl "http://$pip:8082/5mb"
+      t1=$(now_ms)
+      got=$($bb wc -c </tmp/pdl 2>/dev/null || echo 0); $bb rm -f /tmp/pdl
+      kbit=$(( 5242880 * 8 / (t1 - t0 + 1) ))
+      if [ "$got" = 5242880 ] && [ "$kbit" -gt $((want * 2)) ]; then
+        pass "ports: lan0 -> lan1: $kbit kbit/s (download shaped at $want)"
+      else
+        fail "ports: lan0 -> lan1: got $got of 5242880 bytes, $kbit kbit/s"
+      fi
+      kill "$php" 2>/dev/null
+      $bb rm -rf /tmp/www-p
+    fi
+  fi
+  kill "$pns" 2>/dev/null
+fi
+
 # --- PPPoE (M5): the session ends on the ISP side, the router reconnects --------------
 kick=$($bb sed -n 's/.*lab_pppoe_kick=\([a-z]*\).*/\1/p' /proc/cmdline)
 if [ -n "$kick" ]; then

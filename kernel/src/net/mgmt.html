@@ -957,8 +957,8 @@ async function refresh() {
   lastUptime = st.uptime_s;
   showLeases();
   const nets = st.networks ?? [];
-  $("ifnets").innerHTML = nets.length ? "<tr><th>Network</th><th>VLAN</th><th>Address</th><th>Zone</th><th class=num>Clients</th></tr>" +
-    nets.map((n) => `<tr><td>${esc(n.name)}</td><td>${n.vlan || "untagged"}</td><td>${esc(n.ipv4)}</td><td>${esc(n.zone)}</td><td class=num>${n.dhcp ? n.leases : "no DHCP"}</td></tr>`).join("")
+  $("ifnets").innerHTML = nets.length ? "<tr><th>Network</th><th>Port</th><th>VLAN</th><th>Address</th><th>Zone</th><th class=num>Clients</th></tr>" +
+    nets.map((n) => `<tr><td>${esc(n.name)}</td><td>${esc(n.port ?? "lan0")}</td><td>${n.vlan || "untagged"}</td><td>${esc(n.ipv4)}</td><td>${esc(n.zone)}</td><td class=num>${n.dhcp ? n.leases : "no DHCP"}</td></tr>`).join("")
     : rows([["Networks", "none"]]);
   renderNetStatus();
   renderRuleHits();
@@ -1167,12 +1167,20 @@ function zoneNames(zones = readZones()) {
   const v = ["lan", ...zones.map((z) => z.name).filter((n) => n && n !== "lan")];
   return v;
 }
+// The LAN ports a network may use: those this router has (status), plus
+// any a network names (the same config boots on machines with fewer).
+function lanPorts(extra) {
+  const v = (st?.interfaces ?? []).map((i) => i.name).filter((n) => n.startsWith("lan"));
+  if (!v.length) v.push("lan0");
+  if (extra && !v.includes(extra)) v.push(extra);
+  return v;
+}
 function renderNets(list) {
   const t = $("nets");
-  t.replaceChildren(el("tr", {}, ["Name", "VLAN", "Router address / prefix", "Zone", "DHCP", "Clients", ""].map((h) => el("th", { textContent: h }))));
+  t.replaceChildren(el("tr", {}, ["Name", "Port", "VLAN", "Router address / prefix", "Zone", "DHCP", "Clients", ""].map((h) => el("th", { textContent: h }))));
   const first = list[0];
   if (first) {
-    t.append(el("tr", {}, [el("td", { textContent: first.name }), el("td", { textContent: first.vlan ? first.vlan : "untagged" }),
+    t.append(el("tr", {}, [el("td", { textContent: first.name }), el("td", { textContent: (first.ports ?? ["lan0"]).join(", ") }), el("td", { textContent: first.vlan ? first.vlan : "untagged" }),
       el("td", { textContent: first.ipv4 }), el("td", { textContent: first.zone ?? "lan" }), el("td", { textContent: first.dhcp?.enabled === false ? "off" : "on" }),
       el("td", { className: "num", dataset: { leases: first.name } }), el("td", {}, [el("a", { href: "#/lan", textContent: "Edit" })])]));
   }
@@ -1188,12 +1196,17 @@ function netRow(n = {}, i = netOrig.length) {
   for (const z of zoneNames()) zone.append(el("option", { value: z, textContent: z }));
   if (n.zone && !zoneNames().includes(n.zone)) zone.append(el("option", { value: n.zone, textContent: n.zone }));
   zone.value = n.zone ?? "lan";
+  // Routed ports: a network is on one LAN port (untagged or tagged there).
+  const cur = (n.ports ?? ["lan0"])[0];
+  const port = el("select", { dataset: { key: "ports" }, title: "The LAN port this network is on (tagged with its VLAN, or untagged)" });
+  for (const p of lanPorts(cur)) port.append(el("option", { value: p, textContent: p }));
+  port.value = cur;
   const dhcp = el("input", { type: "checkbox", checked: n.dhcp?.enabled !== false, dataset: { key: "dhcp" } });
   const detail = netDetail(n);
   const more = el("button", { type: "button", className: "plain", textContent: "DHCP…", title: "Pool, lease time, reservations, DNS domain",
     onclick: () => { detail.hidden = !detail.hidden; } });
   const rm = el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); detail.remove(); netPaths(); updatePending(); showLeases(); } });
-  tr.append(inp("name", { placeholder: "guest", size: 10 }), inp("vlan", { type: "number", min: 1, max: 4094, placeholder: "20", size: 5 }),
+  tr.append(inp("name", { placeholder: "guest", size: 10 }), el("td", {}, [port]), inp("vlan", { type: "number", min: 1, max: 4094, placeholder: "20", size: 5 }),
     inp("ipv4", { placeholder: "10.20.0.1/24", size: 15 }), el("td", {}, [zone]), el("td", {}, [dhcp]),
     el("td", { className: "num", dataset: { leases: n.name ?? "" } }), el("td", {}, [more, rm]));
   $("nets").append(tr, detail);
@@ -1207,7 +1220,7 @@ function netDetail(n) {
   const statics = el("table", { className: "netstatics" });
   const head = el("tr", {}, ["MAC", "IP address", "Name", ""].map((h) => el("th", { textContent: h })));
   statics.append(head);
-  const box = el("td", { colSpan: 7 }, [
+  const box = el("td", { colSpan: 8 }, [
     el("div", { className: "form" }, [
       field("lo", "Pool, first address (empty = automatic)", d.range?.[0], { placeholder: "automatic" }),
       field("hi", "Pool, last address", d.range?.[1], { placeholder: "automatic" }),
@@ -1251,6 +1264,9 @@ function readNets() {
     if (vlan === "" || Number(vlan) === 0) delete o.vlan; else o.vlan = Number(vlan);
     o.ipv4 = v("ipv4").value.trim();
     o.zone = v("zone").value;
+    // lan0 is the default: left out unless the network named it.
+    const port = v("ports").value;
+    if (port === "lan0" && !(o.ports ?? []).length) delete o.ports; else o.ports = [port];
     o.dhcp = { ...(o.dhcp ?? {}) };
     if (v("dhcp").checked) delete o.dhcp.enabled; else o.dhcp.enabled = false;
     const det = tr.nextElementSibling;

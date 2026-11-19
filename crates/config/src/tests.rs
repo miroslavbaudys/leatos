@@ -1254,10 +1254,17 @@ fn what_the_kernel_supports() {
     // Networks on lan0, VLANs, zones, DHCP off: supported.
     let c = parse(FULL_V2).unwrap();
     assert_eq!(c.unsupported(), vec![]);
-    // Not yet: other ports (rules, forwards, DNS hosts, a static WAN are in).
+    // Routed LAN ports are in; a bridge and unknown port names are not.
     let mut d = c.clone();
     d.networks[1].ports = vec!["lan1".into()];
+    assert_eq!(d.unsupported(), vec![]);
+    d.networks[1].ports = vec!["lan2".into()];
+    assert_eq!(d.unsupported(), vec![]);
+    d.networks[1].ports = vec!["lan3".into()];
     assert_eq!(d.unsupported()[0].path, "network.guest.ports");
+    d.networks[1].ports = vec!["lan1".into(), "lan2".into()];
+    assert_eq!(d.unsupported()[0].path, "network.guest.ports");
+    assert!(d.unsupported()[0].msg.contains("bridge"), "{:?}", d.unsupported());
     let mut s = c.clone();
     s.wan.mode = WanMode::Static;
     s.wan.static_ip = Some(WanStatic { ipv4: Cidr::new(ip(203, 0, 113, 50), 24), gateway: ip(203, 0, 113, 1), dns: vec![] });
@@ -1266,7 +1273,7 @@ fn what_the_kernel_supports() {
 }
 
 #[test]
-fn only_port_changes_reboot() {
+fn only_bridges_reboot() {
     let old = parse(FULL_V2).unwrap();
     let r = |f: fn(&mut Config)| {
         let mut c = old.clone();
@@ -1284,8 +1291,10 @@ fn only_port_changes_reboot() {
     assert!(!r(|c| c.networks[1].zone = "lan".into()));
     assert!(!r(|c| { c.networks.pop(); }));
     assert!(!r(|c| c.zones.push(Zone { name: "lab".into(), ..Zone::builtin_lan() })));
-    // Other physical ports: built at boot.
-    assert!(r(|c| c.networks[1].ports = vec!["lan1".into()]));
+    // Another port: live too (every NIC is up from boot); a bridge would
+    // be built at boot.
+    assert!(!r(|c| c.networks[1].ports = vec!["lan1".into()]));
+    assert!(r(|c| c.networks[1].ports = vec!["lan1".into(), "lan2".into()]));
 }
 
 #[test]

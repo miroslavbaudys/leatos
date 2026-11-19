@@ -194,6 +194,17 @@
 #                        route, the ISP forging 10.30.0.5 is dropped as
 #                        spoofed. Negative control: LAB_ROUTES=0 (the route
 #                        disabled: every check fails).
+#   LAB_PORTS=1          (implies LAB_GUEST=1) a second LAN port: the router
+#                        gets a third NIC (lan1), network "wired"
+#                        10.40.0.1/24 untagged on it (zone lan); the client
+#                        gets a second NIC on that wire and moves it into a
+#                        network namespace. Checks: a lease from 10.40.0.0/24
+#                        on it, ping router and ISP from there, /api/status
+#                        shows wired on lan1, main LAN -> wired runs above
+#                        twice the download rate. Negative control:
+#                        LAB_PORTS_NET=lan0 (the network on lan0, VLAN 40:
+#                        the lan1 wire gets no lease, so the checks fail).
+#                        With LAB_GUEST_LIVE=1 the network is added live.
 #   LAB_GUEST_LIVE=1     the same, but added live: the router boots with the
 #                        main LAN only (and mgmt_pass=lab-pass); the client
 #                        POSTs the guest config (in its initrd) to
@@ -242,6 +253,9 @@ WAN_OPEN="${LAB_WAN_OPEN:-}"
 DNS_VIEWS="${LAB_DNS_VIEWS:-}"
 ROUTES="${LAB_ROUTES:-}"
 [[ -n "$ROUTES" ]] && GUEST=1
+PORTS="${LAB_PORTS:-}"
+PORTS_NET="${LAB_PORTS_NET:-lan1}"
+[[ -n "$PORTS" ]] && GUEST=1
 DNS_HOSTS="${LAB_DNS_HOSTS:-1}"
 [[ -n "$DNS_VIEWS" ]] && GUEST=1
 [[ -n "$WAN_OPEN" ]] && GUEST=1
@@ -257,6 +271,7 @@ DOT_NAME="${LAB_DOT_NAME:-dns.isp.example}"
 DOT_CA="${LAB_DOT_CA:-1}"
 LAN_PORT="${LAB_LAN_PORT:-10003}"
 WAN_PORT="${LAB_WAN_PORT:-10005}"
+LAN1_PORT="${LAB_LAN1_PORT:-10007}"
 WORK=$(mktemp -d -t rrouter-lab)
 PCAP_DIR="${LAB_PCAP_DIR:-}"
 [[ -n "$MDNS" && -z "$PCAP_DIR" ]] && PCAP_DIR="$WORK/pcap"
@@ -345,6 +360,8 @@ name = "guest"
 input = "drop"
 allow = ["dhcp", "dns", "ping"$([[ -n "$MDNS" ]] && echo ', "mdns"')]
 forward_to = ["wan"]
+
+$([[ -n "$PORTS" ]] && printf '\n# The second LAN port (LAB_PORTS): untagged on lan1, or the negative\n# control on lan0 as VLAN 40.\n[[network]]\nname = "wired"\nports = ["%s"]\n%s\nipv4 = "10.40.0.1/24"\n' "$PORTS_NET" "$([[ "$PORTS_NET" == lan0 ]] && echo 'vlan = 40')")
 
 # The client's "lan to guest" throughput check (WAN ingress shaping).
 [[firewall.rule]]
@@ -462,7 +479,7 @@ fi
 [[ -n "$DOT" ]] && echo "== router config: DNS over TLS to 203.0.113.1#$DOT_NAME$([[ "$DOT_CA" == 1 ]] && echo ", lab CA trusted" || echo ", Mozilla's roots only")"
 
 echo "== start rrouter${ROUTER_ARGS:+ ($(echo "$ROUTER_ARGS" | sed 's/pppoe_pass=[^ ]*/pppoe_pass=***/'))}"
-QEMU_STORE="$ROUTER_STORE" QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" QEMU_PCAP_DIR="$PCAP_DIR" QEMU_ACCEL="$QEMU_ACCEL" QEMU_APPEND="$ROUTER_ARGS" \
+QEMU_STORE="$ROUTER_STORE" QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" LAB_LAN1_PORT="${PORTS:+$LAN1_PORT}" QEMU_PCAP_DIR="$PCAP_DIR" QEMU_ACCEL="$QEMU_ACCEL" QEMU_APPEND="$ROUTER_ARGS" \
   scripts/qemu-run.sh "target/$ARCH-unknown-none/debug/rrouter" >"$WORK/router.log" 2>&1 &
 PIDS+=($!)
 wait_for "$WORK/router.log" "rrouter: boot ok" 40 || { echo "router did not boot:"; cat "$WORK/router.log"; exit 1; }
@@ -473,7 +490,8 @@ PIDS+=($!)
 
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}"
+  VM_NIC2="${PORTS:+52:54:00:00:00:11 $((LAN1_PORT + 1)) $LAN1_PORT}" \
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so

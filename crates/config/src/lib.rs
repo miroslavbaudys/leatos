@@ -54,6 +54,10 @@ pub const ZONE_LAN: &str = "lan";
 /// The default LAN port and WAN port names.
 pub const PORT_LAN: &str = "lan0";
 pub const PORT_WAN: &str = "wan0";
+/// The ports the kernel knows, in NIC (PCI) order: the WAN, then up to
+/// three LAN ports (the apu4's four i211s). A port missing on a machine
+/// is not an error: its networks are left out there.
+pub const PORTS: [&str; 4] = [PORT_WAN, PORT_LAN, "lan1", "lan2"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -990,10 +994,11 @@ impl Config {
 
     /// Settings this kernel does not implement yet (docs/config-v2.md §9):
     /// a save or a stored config with them is refused. Implemented:
-    /// networks on `lan0` (untagged or VLANs), zones, DHCP per network,
-    /// rules, port forwards, redirects, mDNS reflection, DNS hosts and
-    /// views, a static WAN. Not yet: other ports (bridging), another WAN
-    /// port.
+    /// networks on one LAN port each (`lan0`–`lan2`: routed ports,
+    /// untagged or VLANs), zones, DHCP per network, rules, port forwards,
+    /// redirects, mDNS reflection, DNS hosts and views, a static WAN. Not
+    /// yet: a network on several ports (a bridge), other port names,
+    /// another WAN port.
     pub fn unsupported(&self) -> Vec<Issue> {
         let mut out = Vec::new();
         let mut add = |path: String, what: &str| {
@@ -1003,8 +1008,10 @@ impl Config {
             })
         };
         for n in &self.networks {
-            if n.ports.len() != 1 || n.ports[0] != PORT_LAN {
-                add(alloc::format!("network.{}.ports", n.name), "ports other than lan0");
+            if n.ports.len() > 1 {
+                add(alloc::format!("network.{}.ports", n.name), "a network on several ports (bridge)");
+            } else if n.ports.iter().any(|p| p == PORT_WAN || !PORTS.contains(&p.as_str())) {
+                add(alloc::format!("network.{}.ports", n.name), "ports other than lan0, lan1, lan2");
             }
         }
         if self.wan.port != PORT_WAN {
@@ -1013,20 +1020,20 @@ impl Config {
         out
     }
 
-    /// Applied by rebooting into the saved config: which physical ports
-    /// the networks use (the port layout is built at boot). Networks
-    /// themselves (added, removed, VLAN, address, zone), zones, DHCP and
-    /// everything else apply live (docs/config-v2.md §7).
+    /// Applied by rebooting into the saved config: a bridge (a network
+    /// on several ports, built at boot; not supported yet). Networks
+    /// themselves (added, removed, moved to another port, VLAN, address,
+    /// zone), zones, DHCP and everything else apply live
+    /// (docs/config-v2.md §7): every NIC is up from boot.
     pub fn needs_reboot(&self, old: &Config) -> bool {
-        let ports = |c: &Config| -> Vec<(String, Vec<String>)> {
-            c.networks.iter().map(|n| (n.name.clone(), n.ports.clone())).collect()
+        let bridges = |c: &Config| -> Vec<(String, Vec<String>)> {
+            c.networks
+                .iter()
+                .filter(|n| n.ports.len() > 1)
+                .map(|n| (n.name.clone(), n.ports.clone()))
+                .collect()
         };
-        let mut a = ports(self);
-        let mut b = ports(old);
-        // A network added or removed on lan0 changes nothing at boot.
-        a.retain(|(_, p)| p.len() != 1 || p[0] != PORT_LAN);
-        b.retain(|(_, p)| p.len() != 1 || p[0] != PORT_LAN);
-        a != b
+        bridges(self) != bridges(old)
     }
 
     /// The first network ("the LAN"), where boot argument `lan=`

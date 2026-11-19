@@ -417,12 +417,12 @@ fn apply_saved(
         let (placed, links, msg) = stack::place_networks(slots);
         *slots = placed;
         let nets = crate::config::networks();
-        stack::set_host_addrs(hosts, &nets, &links);
-        let shape = |v: &[crate::config::Lan]| -> Vec<(String, u16, core::net::Ipv4Addr, u8, u8)> {
-            v.iter().map(|n| (n.name.clone(), n.vid, n.addr, n.prefix, n.zone)).collect()
+        stack::set_host_addrs(hosts, &nets, &links, &stack::port_macs(&sh.ports));
+        let shape = |v: &[crate::config::Lan]| -> Vec<(String, usize, u16, core::net::Ipv4Addr, u8, u8)> {
+            v.iter().map(|n| (n.name.clone(), n.port, n.vid, n.addr, n.prefix, n.zone)).collect()
         };
         if shape(&old_nets) != shape(&nets) {
-            stack::log_networks(sh.ports[1].name, &nets);
+            stack::log_networks(&nets);
         }
         sh.post_networks(msg);
         if let Some(svc) = services {
@@ -462,7 +462,7 @@ fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
     let t = stack::now();
     let now_ns = datapath::now_ns();
     for (host, link) in hosts.iter_mut().zip(&sh.links) {
-        let i = link.port;
+        let i = link.port();
         let port = &sh.ports[i];
         let mut queued = 0;
         let mut dev = PortDevice {

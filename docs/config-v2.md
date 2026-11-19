@@ -2,15 +2,16 @@
 
 Status (2026-11-17): **the schema is implemented** in `crates/config`
 (types, validation, CLI editing by name; version 1 is no longer read
-since 2026-11-18, §5). The kernel implements networks on `lan0` (untagged or VLANs, a
+since 2026-11-18, §5). The kernel implements networks on the LAN ports
+`lan0`–`lan2` (routed ports, one port per network, since 2026-11-19; untagged or VLANs, a
 DHCP server and DNS domain each, changed live), zones (forwarding between
 them, input policy), rules (incl. `reject`), port forwards with hairpin,
 redirects, WAN anti-spoofing, mDNS reflect rules (docs/mdns.md), and the
 web interface's Networks and Firewall pages (§9), DNS hosts and
 split-horizon DNS views (docs/dns-views.md; in QEMU, 2026-11-18). All of
 it but the DNS views runs on the apu4 as the developer's home router.
-Ports other than `wan0`/`lan0` are refused as unsupported
-(`Config::unsupported`). Schema v1 is
+A network on several ports (a bridge) and port names other than
+`lan0`–`lan2` are refused as unsupported (`Config::unsupported`). Schema v1 is
 in `docs/config-and-storage.md` §5. v2 is the data model the multipage
 web interface is built against (Networks and Firewall pages). It also covers
 the kernel work listed for M10 in `docs/roadmap.md`: one router interface
@@ -145,7 +146,7 @@ negative controls `LAB_ROUTER_ARGS=mgmt=wan`, `LAB_WAN_OPEN=1`).
 | Field | Default | Notes |
 |---|---|---|
 | `name` | required | key; unique; not `wan`, `router` or `any` |
-| `ports` | `["lan0"]` | ports must exist at runtime; unknown ones are an apply-time warning, not a parse error (the same file boots on QEMU and on the apu4) |
+| `ports` | `["lan0"]` | one of `lan0`, `lan1`, `lan2` (the LAN NICs in PCI order after `wan0`; more than one = a bridge, not supported yet). A network on a port the machine lacks is left out there with a boot-log line, not refused (the same file boots on QEMU and on the apu4) |
 | `vlan` | `0` | 0 = untagged, 1–4094 = tagged |
 | `ipv4` | required | router address/prefix, prefix 8–29 as in v1 |
 | `zone` | `"lan"` | an existing `[[zone]]` or a built-in one |
@@ -382,7 +383,8 @@ control `LAB_GUEST_DOMAIN=0`).
   unsupported (`Config::unsupported`, separate from validation so the
   crate accepts the whole schema): by a save (web, CLI), by `rrstore
   put`, and a stored config with them is not used (defaults, as for any
-  rejected record). Today that is ports other than `wan0`/`lan0`.
+  rejected record). Today that is a network on several ports (a bridge),
+  port names other than `lan0`–`lan2`, and a WAN port other than `wan0`.
 
 ## 5. Migration and rollback
 - **Version 1 is no longer read** (dropped 2026-11-18). It had one
@@ -412,9 +414,11 @@ control `LAB_GUEST_DOMAIN=0`).
 ## 6. Datapath and services mapping (kernel work)
 - **Interfaces** ✅. A *port* is a NIC with its egress qdisc; a *link*
   (`net::shared::LinkShared`) is a router interface on a port: link 0 is
-  the WAN on `wan0`, links 1.. the networks on `lan0`. Forwarder
-  interfaces, ARP tables, smoltcp interfaces and `local_rx` queues are per
-  link. On RX the datapath maps the frame's VID on `lan0` to a link (none:
+  the WAN on `wan0`, links 1.. the networks, each on its LAN port
+  (`LinkShared::port`, set live with the VID: routed ports, 2026-11-19).
+  Forwarder interfaces (with the port's MAC), ARP tables, smoltcp
+  interfaces (likewise) and `local_rx` queues are per link. On RX the
+  datapath maps the frame's (port, VID) to a link (none:
   dropped, `vlan_drops`); a frame for a network on a VLAN gets its tag
   when it is queued (forwarded, ARP, smoltcp), so the qdisc holds tagged
   frames and shapes the 4 bytes too. `fwd::Interface` gained `zone: u8`;
@@ -524,8 +528,10 @@ control `LAB_GUEST_DOMAIN=0`).
   interface on networks that newly reach it (`Mgmt::add_sockets`; sockets
   are never taken away, the input policy guards them). Connections
   through a removed network find no route and expire.
-- **Reboot** (`Config::needs_reboot`): only a change to the physical
-  ports of networks (other than `lan0`; not supported yet anyway).
+- **Reboot** (`Config::needs_reboot`): only a bridge (a network on
+  several ports; not supported yet). Moving a network to another LAN
+  port is live: every NIC is up from boot, the slot changes port, forgets
+  its neighbors and takes the port's MAC.
 - **Trial** (`Config::needs_trial`): any change to the network or zone
   that serves management, i.e. its address, VLAN, ports or zone. Also
   `input`/`allow` of a zone that can reach management, rules with
@@ -633,9 +639,19 @@ In rough order of value:
    in one boot; `LAB_GUEST_LIVE=1 scripts/lab-test.sh`: the router boots
    with the main LAN only, the client adds the guest network, zone, rules
    and forward live, then every guest, rule and forward check runs.
-11. **Multi-port LAN (M10).** The apu4's other two i211 ports: a software
-   bridge with MAC learning, `network.ports` with per-port tagged or
-   untagged membership. **WAN ingress shaping** (CAKE ingress mode), which
+11. **Multi-port LAN (M10).** The apu4's other two i211 ports.
+   **Step A, routed ports ✅ (QEMU, 2026-11-19):** `lan1`, `lan2` (NICs
+   3 and 4 in PCI order), each network on one port (untagged or tagged
+   there), moved live; `dp_up` receives on every LAN port, `dp_down`
+   sends on them; `/api/status` `networks[].port`, a Port column on the
+   Networks page. `LAB_PORTS=1 scripts/lab-test.sh` (third NIC, network
+   wired on lan1; negative control `LAB_PORTS_NET=lan0`). Open: which
+   physical socket is which name on the apu4.
+   **Step B, bridge (not started):** a network on several ports, MAC
+   learning, flooding, loop protection, igb unicast promiscuous mode,
+   per-port tagged/untagged membership (one `vlan` per network can't say
+   "tagged on lan0, untagged on lan2" yet); software switching on the
+   Jaguar stays well below a hardware switch. **WAN ingress shaping** (CAKE ingress mode), which
    this needs because LAN egress no longer equals the download once
    traffic can stay between LAN ports, is done ✅ (2026-11-19,
    docs/bufferbloat-cake.md §3.4): it already lifted the download cap off
@@ -651,5 +667,5 @@ In rough order of value:
 
 Outside this document (`docs/roadmap.md`): PPPoE long-run stability and a
 bufferbloat run on the PPPoE line with the right shaper overhead (M5),
-CAKE tuning on hardware (M6: DiffServ tins, ACK filter, ingress mode),
+CAKE tuning on hardware (M6: DiffServ tins, ACK filter, rate-aware target),
 per-packet cost on the apu4 and a 72 h soak (M10).

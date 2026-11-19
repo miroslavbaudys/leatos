@@ -21,14 +21,20 @@ lab_cpu_flags() {
 
 # Start an Alpine lab VM with one NIC on a UDP socket link (background; PID appended to PIDS).
 # VM_DISK: optional read-only raw disk for the VM (/dev/vda).
+# VM_NIC2="mac local_port remote_port": a second NIC (eth1).
 linux_vm() { # initrd mac local_port remote_port log [extra kernel args]
-  local disk=()
+  local disk=() nic2=()
   [[ -n "${VM_DISK:-}" ]] && disk=(-drive "file=$VM_DISK,if=virtio,format=raw,readonly=on")
+  if [[ -n "${VM_NIC2:-}" ]]; then
+    set -- "$1" "$2" "$3" "$4" "$5" "${6:-}" $VM_NIC2
+    nic2=(-netdev "dgram,id=n1,local.type=inet,local.host=127.0.0.1,local.port=${8},remote.type=inet,remote.host=127.0.0.1,remote.port=${9}"
+      -device "virtio-net-pci,netdev=n1,mac=${7}")
+  fi
   qemu-system-aarch64 -machine virt "${CPU[@]}" -m 512M -nographic ${disk[@]+"${disk[@]}"} \
     -kernel "$ALPINE_DIR/vmlinuz-virt" -initrd "$1" \
     -append "console=ttyAMA0 rdinit=/init quiet loglevel=3 ${6:-}" \
     -netdev "dgram,id=n0,local.type=inet,local.host=127.0.0.1,local.port=$3,remote.type=inet,remote.host=127.0.0.1,remote.port=$4" \
-    -device "virtio-net-pci,netdev=n0,mac=$2" >"$5" 2>&1 &
+    -device "virtio-net-pci,netdev=n0,mac=$2" ${nic2[@]+"${nic2[@]}"} >"$5" 2>&1 &
   PIDS+=($!)
 }
 

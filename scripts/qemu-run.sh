@@ -16,6 +16,8 @@
 #                        networking; lab = WAN and LAN on UDP socket links to
 #                        the ISP and client VMs (scripts/lab-test.sh)
 #   LAB_LAN_PORT=10003   lab mode: router's LAN link port (client uses +1)
+#   LAB_LAN1_PORT=10007  lab mode: a third NIC, the LAN port lan1 (client's
+#                        second NIC uses +1); unset = no lan1
 #   LAB_WAN_PORT=10005   lab mode: router's WAN link port (ISP uses +1)
 #                        mac = WAN to the ISP VM like lab, LAN on macOS
 #                        vmnet-host (the Mac itself joins the LAN; needs root,
@@ -97,9 +99,10 @@ fi
 # devfn + 0x80, which collide when QEMU places two igbs next to each other.
 WAN_ADDR=
 LAN_ADDR=
+LAN1_ADDR=
 case "${QEMU_NIC:-virtio}" in
   virtio) NIC=virtio-net-pci ;;
-  igb) NIC=igb WAN_ADDR=,addr=0x4 LAN_ADDR=,addr=0x6 ;;
+  igb) NIC=igb WAN_ADDR=,addr=0x4 LAN_ADDR=,addr=0x6 LAN1_ADDR=,addr=0x8 ;;
   *) echo "QEMU_NIC must be virtio or igb" >&2; exit 2 ;;
 esac
 
@@ -119,6 +122,13 @@ if [[ "${QEMU_NET:-none}" == "lab" ]]; then
     -netdev "dgram,id=lan,local.type=inet,local.host=127.0.0.1,local.port=$lp,remote.type=inet,remote.host=127.0.0.1,remote.port=$((lp + 1))"
     -device "$NIC,netdev=lan,mac=52:54:00:00:00:02$LAN_ADDR"
   )
+  if [[ -n "${LAB_LAN1_PORT:-}" ]]; then
+    l1="$LAB_LAN1_PORT"
+    NET+=(
+      -netdev "dgram,id=lan1,local.type=inet,local.host=127.0.0.1,local.port=$l1,remote.type=inet,remote.host=127.0.0.1,remote.port=$((l1 + 1))"
+      -device "$NIC,netdev=lan1,mac=52:54:00:00:00:03$LAN1_ADDR"
+    )
+  fi
 fi
 if [[ "${QEMU_NET:-none}" == "mac" || "${QEMU_NET:-none}" == "mac-internet" ]]; then
   wp="${LAB_WAN_PORT:-10005}"

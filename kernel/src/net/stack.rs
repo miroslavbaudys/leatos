@@ -111,13 +111,15 @@ pub fn layout(ports: usize, cores: usize) -> Layout {
     }
 }
 
-/// Bring up the first two supported NICs: first = WAN, second = LAN.
+/// Bring up the supported NICs in PCI order, at most
+/// [`shared::MAX_PORTS`]: first = WAN (`wan0`), then the LAN ports
+/// (`lan0`, `lan1`, ..: `config::PORTS`).
 /// WAN egress is shaped at the upload rate; the download in the WAN
 /// ingress stage (`Shared::ingress`), so LAN egress is unshaped and
 /// traffic between networks runs at the line rate (`shape_ingress=0`:
 /// LAN egress at the download rate instead).
-/// Links: the WAN on the first, one per network (`config::networks`) on
-/// the second. Returns the datapath's ports, the services' router-stack
+/// Links: the WAN on the first, one per network (`config::networks`),
+/// each on its LAN port. Returns the datapath's ports, the services' router-stack
 /// interfaces (one per link) and the shared state (`None` without NICs).
 pub fn bring_up(
     pci: &mut Pci,
@@ -133,12 +135,13 @@ pub fn bring_up(
     let mut shared_ports = Vec::new();
     let mut links = Vec::new();
     let mut hosts = Vec::new();
-    let nets = crate::config::networks();
-    let lay = layout(devs.len().min(2), crate::smp::online());
-    for (i, d) in devs.iter().enumerate().take(2) {
+    let lay = layout(devs.len().min(shared::MAX_PORTS), crate::smp::online());
+    for d in devs.iter().take(shared::MAX_PORTS) {
+        // Ports are numbered by the NICs that came up.
+        let i = shared_ports.len();
         // Interrupts go to the core of the task that receives on this port.
         let rx_core = if i == 0 { lay.down } else { lay.up };
-        let name = if i == 0 { "wan0" } else { "lan0" };
+        let name = crate::config::PORTS[i];
         let mut dev = match Nic::new(pci, d) {
             Ok(dev) => dev,
             Err(e) => {
@@ -182,7 +185,7 @@ pub fn bring_up(
             ctrl_rx: Mutex::new(VecDeque::with_capacity(CTRL_RX_MAX)),
         };
         // The port's links, each with its router-stack interface.
-        let port_ix = shared_ports.len();
+        let port_ix = i;
         if i == 0 {
             let link = LinkShared::new(port_ix, true);
             let iface = new_iface(&port);
@@ -192,9 +195,10 @@ pub fn bring_up(
             }
             hosts.push(HostIf { iface, sockets });
             links.push(link);
-        } else {
-            // Every network slot, with an interface without addresses;
-            // `set_host_addrs` gives the config's networks theirs.
+        } else if i == shared::FIRST_LAN_PORT {
+            // Every network slot, with an interface without addresses (on
+            // lan0 until a network places it); `set_host_addrs` gives the
+            // config's networks their addresses and port MACs.
             for _ in 1..shared::MAX_LINKS {
                 links.push(LinkShared::new(port_ix, false));
                 hosts.push(HostIf {
@@ -202,8 +206,6 @@ pub fn bring_up(
                     sockets: SocketSet::new(Vec::new()),
                 });
             }
-            let (_, placed, _) = place_networks(&[]);
-            set_host_addrs(&mut hosts, &nets, &placed);
         }
         // Legacy INTx where the platform routes it (aarch64 DTB), otherwise
         // MSI-X (x86_64: INTx routing would need ACPI AML).
@@ -230,9 +232,6 @@ pub fn bring_up(
                 None => alloc::string::String::from("(no irq: polling)"),
             }
         );
-        if i == 1 {
-            log_networks(name, &nets);
-        }
         if let Some(tci) = port.vlan() {
             println!("  net {name}       : {}", vlan_text(tci));
         }
@@ -250,6 +249,12 @@ pub fn bring_up(
     if ports.is_empty() {
         return None;
     }
+    // Networks on ports this machine lacks are left out from here on.
+    crate::config::set_ports(shared_ports.len());
+    let nets = crate::config::networks();
+    let (_, placed, _) = place_networks(&[]);
+    set_host_addrs(&mut hosts, &nets, &placed, &port_macs(&shared_ports));
+    log_networks(&nets);
     let ingress = ingress_qdisc(qos);
     log_ingress(qos, ingress.rate(), None);
     Some((
@@ -334,14 +339,38 @@ impl Future for WaitAny<'_> {
     }
 }
 
-/// One direction of the datapath: receive on port `rx`, forward, transmit
-/// the queue of port `tx` (download = WAN → LAN, upload = LAN → WAN; one
-/// task for both when there is a single port). The `primary` direction
-/// also handles control messages, housekeeping and the status snapshot.
+/// A set of ports (bit `i` = port `i`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortSet(pub u8);
+
+impl PortSet {
+    pub fn one(i: usize) -> Self {
+        Self(1 << i)
+    }
+
+    /// Ports `from..to`.
+    pub fn range(from: usize, to: usize) -> Self {
+        Self((from..to).fold(0, |m, i| m | 1 << i))
+    }
+
+    pub fn has(self, i: usize) -> bool {
+        i < 8 && self.0 & (1 << i) != 0
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = usize> {
+        (0..8).filter(move |&i| self.has(i))
+    }
+}
+
+/// One direction of the datapath: receive on the ports `rx`, forward,
+/// transmit the queues of the ports `tx` (download = WAN → the LAN ports,
+/// upload = the LAN ports → WAN; one task for both when there is a single
+/// port). The `primary` direction also handles control messages,
+/// housekeeping and the status snapshot.
 #[derive(Clone, Copy)]
 pub struct Dir {
-    pub rx: usize,
-    pub tx: usize,
+    pub rx: PortSet,
+    pub tx: PortSet,
     pub primary: bool,
 }
 
@@ -428,6 +457,7 @@ pub fn place_networks(
             .zip(&links)
             .map(|(n, &link)| shared::NetSlot {
                 link,
+                port: n.port,
                 vid: n.vid,
                 addr: (n.addr, n.prefix),
                 zone: n.zone,
@@ -439,15 +469,27 @@ pub fn place_networks(
     (slots, links, msg)
 }
 
+/// The ports' MACs by index (for [`set_host_addrs`]).
+pub fn port_macs(ports: &[PortShared]) -> Vec<[u8; 6]> {
+    ports.iter().map(|p| p.mac).collect()
+}
+
 /// The router stack's addresses: each network's on its slot's interface,
-/// none on the others; and its `[[route]]`s (the WAN's: those through a
-/// router on the WAN's subnet), so the router answers hosts behind them.
-pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: &[usize]) {
+/// none on the others; the MAC of the network's port; and its
+/// `[[route]]`s (the WAN's: those through a router on the WAN's subnet),
+/// so the router answers hosts behind them.
+pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: &[usize], macs: &[[u8; 6]]) {
     if let Some(wan) = hosts.first_mut() {
         set_host_routes(&mut wan.iface, &crate::config::wan_routes());
     }
     for (i, host) in hosts.iter_mut().enumerate().skip(1) {
         let k = links.iter().position(|&l| l == i);
+        if let Some(&mac) = k.and_then(|k| macs.get(nets[k].port)) {
+            let hw = HardwareAddress::Ethernet(EthernetAddress(mac));
+            if host.iface.hardware_addr() != hw {
+                host.iface.set_hardware_addr(hw);
+            }
+        }
         set_host_routes(&mut host.iface, k.map_or(&[][..], |k| &nets[k].routes));
         let want = k.map(|k| cidr(&nets[k]));
         let have = host.iface.ip_addrs().first().copied();
@@ -485,10 +527,14 @@ pub fn set_host_routes(iface: &mut Interface, routes: &[(core::net::Ipv4Addr, u8
 }
 
 /// One line per network (boot, and after a change).
-pub fn log_networks(port: &str, nets: &[crate::config::Lan]) {
+pub fn log_networks(nets: &[crate::config::Lan]) {
+    for (name, port) in crate::config::missing_networks() {
+        println!("  net             : network {name} left out: no port {port} on this machine");
+    }
     for n in nets {
         println!(
-            "  net {port}       : {} {} ({}, zone {})",
+            "  net {}       : {} {} ({}, zone {})",
+            crate::config::PORTS[n.port],
             n.name,
             cidr(n),
             if n.vid == 0 {
@@ -536,55 +582,64 @@ fn poll_links(ports: &[Port], sh: &Shared) {
 /// A datapath direction task: never returns (except into a reboot or a
 /// new kernel, from the primary task).
 pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: SharedDatapath) {
-    let rx = &ports[d.rx];
-    let mut events: Vec<&'static IrqEvent> = rx.irq.map(|(_, e)| e).into_iter().collect();
-    events.push(sh.tx_kick[d.tx]);
+    let rx_ports: Vec<usize> = d.rx.iter().filter(|&p| p < ports.len()).collect();
+    let tx_ports: Vec<usize> = d.tx.iter().filter(|&p| p < ports.len()).collect();
+    let mut events: Vec<&'static IrqEvent> = rx_ports.iter().filter_map(|&p| ports[p].irq.map(|(_, e)| e)).collect();
+    events.extend(tx_ports.iter().map(|&p| sh.tx_kick[p]));
     if d.primary {
         events.push(sh.dp_kick);
     }
     let mut batch = Vec::with_capacity(datapath::RX_BUDGET);
-    let mut masked = false;
+    // Per receive port: its interrupt is masked until it is drained.
+    let mut masked = alloc::vec![false; rx_ports.len()];
     let mut next_links = 0u64;
     loop {
-        sh.tx_kick[d.tx].take();
+        for &p in &tx_ports {
+            sh.tx_kick[p].take();
+        }
         if d.primary {
             sh.dp_kick.take();
         }
-        // NAPI step 1: IRQ fired → clear device interrupt status. The TX
-        // side of this NIC (the other direction) may have completions.
-        if let Some((_, ev)) = rx.irq
-            && ev.take()
-        {
-            masked = true;
-            if d.rx != d.tx {
-                sh.tx_kick[d.rx].signal();
-            }
-        }
-        // Step 2: take a batch off the NIC (short lock), then forward it.
-        let more = {
-            let mut g = rx.dev.lock();
-            let Some(dev) = g.as_mut() else {
-                drop(g);
-                park().await
-            };
-            if masked {
-                dev.ack_interrupt();
-            }
-            while batch.len() < datapath::RX_BUDGET {
-                match dev.receive() {
-                    Some(p) => batch.push(p),
-                    None => break,
+        let mut touched: datapath::Touched = Default::default();
+        let mut more = false;
+        for (k, &p) in rx_ports.iter().enumerate() {
+            let rx = &ports[p];
+            // NAPI step 1: IRQ fired → clear device interrupt status. The
+            // TX side of this NIC (the other direction) may have completions.
+            if let Some((_, ev)) = rx.irq
+                && ev.take()
+            {
+                masked[k] = true;
+                if !d.tx.has(p) {
+                    sh.tx_kick[p].signal();
                 }
             }
-            batch.len() == datapath::RX_BUDGET
-        };
-        let mut touched = [false; 2];
-        if !batch.is_empty() {
-            dp.rx_batch(d.rx, &mut batch, &mut touched);
+            // Step 2: take a batch off the NIC (short lock), then forward it.
+            let full = {
+                let mut g = rx.dev.lock();
+                let Some(dev) = g.as_mut() else {
+                    drop(g);
+                    park().await
+                };
+                if masked[k] {
+                    dev.ack_interrupt();
+                }
+                while batch.len() < datapath::RX_BUDGET {
+                    match dev.receive() {
+                        Some(pkt) => batch.push(pkt),
+                        None => break,
+                    }
+                }
+                batch.len() == datapath::RX_BUDGET
+            };
+            more |= full;
+            if !batch.is_empty() {
+                dp.rx_batch(p, &mut batch, &mut touched);
+            }
         }
         // Step 2b (receiving on the WAN): the ingress stage's shaper
         // releases the download to the egress qdiscs.
-        let ingress_wake = if d.rx == datapath::WAN_PORT {
+        let ingress_wake = if d.rx.has(datapath::WAN_PORT) {
             dp.drain_ingress(&mut touched)
         } else {
             None
@@ -638,26 +693,41 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
             }
         }
         for (p, &t) in touched.iter().enumerate() {
-            if t && p != d.tx && p < sh.tx_kick.len() {
+            if t && !d.tx.has(p) && p < sh.tx_kick.len() {
                 sh.tx_kick[p].signal();
             }
         }
 
-        // Step 4: this direction's qdisc → NIC.
-        let tx = {
-            let mut g = ports[d.tx].dev.lock();
-            let Some(dev) = g.as_mut() else {
-                drop(g);
-                park().await
+        // Step 4: this direction's qdiscs → NICs.
+        let mut shaper_wake: Option<u64> = None;
+        let mut ring_full_backlog = false;
+        for &p in &tx_ports {
+            let tx = {
+                let mut g = ports[p].dev.lock();
+                let Some(dev) = g.as_mut() else {
+                    drop(g);
+                    park().await
+                };
+                datapath::flush_port(&sh.ports[p], dev)
             };
-            datapath::flush_port(&sh.ports[d.tx], dev)
-        };
+            shaper_wake = match (shaper_wake, tx.shaper_wake_ns) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            ring_full_backlog |= tx.ring_full_backlog;
+        }
 
         // Step 5: unmask (a still-pending device re-fires). On aarch64 this
         // also routes the line to this core.
-        if masked && let Some((intid, _)) = rx.irq {
-            masked = false;
-            arch::irqchip::enable(intid, Trigger::Level);
+        // A shared INTx line (several NICs) only once every sharer has
+        // drained its device (`irq::line_done`).
+        for (k, &p) in rx_ports.iter().enumerate() {
+            if masked[k] && let Some((intid, ev)) = ports[p].irq {
+                masked[k] = false;
+                if irq::line_done(intid, ev) {
+                    arch::irqchip::enable(intid, Trigger::Level);
+                }
+            }
         }
 
         // Step 6: sleep until an IRQ, a kick or the next deadline.
@@ -673,13 +743,13 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
             u64::MAX
         };
         let mut delay = Duration::from_millis(due.saturating_sub(now_ms).min(1000));
-        for at in [tx.shaper_wake_ns, ingress_wake].into_iter().flatten() {
+        for at in [shaper_wake, ingress_wake].into_iter().flatten() {
             delay = delay.min(Duration::from_nanos(at.saturating_sub(datapath::now_ns())));
         }
         // TX completion normally raises an interrupt (handled by the other
-        // direction, which kicks us); poll as a fallback while the ring is
+        // direction, which kicks us); poll as a fallback while a ring is
         // full with a backlog, and for devices without an IRQ.
-        if tx.ring_full_backlog || ports.iter().any(|n| n.irq.is_none()) {
+        if ring_full_backlog || ports.iter().any(|n| n.irq.is_none()) {
             delay = delay.min(Duration::from_millis(1));
         }
         WaitAny {

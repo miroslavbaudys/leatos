@@ -11,10 +11,12 @@
 //!  dp_down: WAN RX ► forwarder ► Shared::ingress (download shaper) ► neighbor ► lan0 qdisc
 //! ```
 //!
-//! A **port** is a NIC with its egress qdisc; a **link** is a router
-//! interface on a port: the WAN on `wan0`, and one per network on `lan0`
-//! (untagged, or a VLAN). The forwarder, ARP, smoltcp and the services
-//! work per link; tags exist only between the link and its port.
+//! A **port** is a NIC with its egress qdisc (`wan0`, then the LAN ports
+//! `lan0`.., `config::PORTS`); a **link** is a router interface on a
+//! port: the WAN on `wan0`, and one per network on its LAN port
+//! (untagged, or a VLAN; routed ports, no bridge: a network is on one
+//! port). The forwarder, ARP, smoltcp and the services work per link;
+//! tags exist only between the link and its port.
 //!
 //! Forwarded packets never leave the datapath; the qdisc stays the only
 //! place they wait. Everything here is `spin::Mutex` or atomics, so the two
@@ -110,15 +112,19 @@ impl PortShared {
 
 /// Router interfaces: the WAN, and one slot per possible network.
 pub const MAX_LINKS: usize = 1 + crate::config::schema::MAX_NETWORKS;
+/// NICs used: the WAN and up to three LAN ports (the apu4's four).
+pub const MAX_PORTS: usize = crate::config::PORTS.len();
+/// The LAN port network slots start on (`lan0`).
+pub const FIRST_LAN_PORT: usize = 1;
 
-/// A router interface: the WAN (link 0), or a slot for a network on the
+/// A router interface: the WAN (link 0), or a slot for a network on a
 /// LAN port (docs/config-v2.md). Its index is the forwarder's `IfIndex`
 /// and the services' `HostIf` index. Network slots exist from boot and
-/// are switched on, retagged and readdressed when the config changes
-/// (live), so nothing indexed by link ever moves.
+/// are switched on, moved to another port, retagged and readdressed when
+/// the config changes (live), so nothing indexed by link ever moves.
 pub struct LinkShared {
-    /// Index into [`Shared::ports`].
-    pub port: usize,
+    /// Index into [`Shared::ports`] (set by the datapath with the VID).
+    port: AtomicUsize,
     /// 802.1Q VLAN ID on the port (networks), 0 = untagged. The WAN's tag
     /// is the port's own ([`PortShared::vlan`]).
     vid: AtomicU16,
@@ -131,7 +137,7 @@ pub struct LinkShared {
 impl LinkShared {
     pub fn new(port: usize, active: bool) -> Self {
         LinkShared {
-            port,
+            port: AtomicUsize::new(port),
             vid: AtomicU16::new(0),
             active: AtomicBool::new(active),
             local_rx: Mutex::new(VecDeque::with_capacity(LOCAL_RX_MAX)),
@@ -142,11 +148,15 @@ impl LinkShared {
     /// interface is made).
     pub fn detached() -> Self {
         LinkShared {
-            port: 0,
+            port: AtomicUsize::new(0),
             vid: AtomicU16::new(0),
             active: AtomicBool::new(false),
             local_rx: Mutex::new(VecDeque::new()),
         }
+    }
+
+    pub fn port(&self) -> usize {
+        self.port.load(Ordering::Relaxed)
     }
 
     pub fn vid(&self) -> u16 {
@@ -158,7 +168,8 @@ impl LinkShared {
     }
 
     /// The datapath (re)configures a network slot.
-    pub fn set(&self, active: bool, vid: u16) {
+    pub fn set(&self, active: bool, port: usize, vid: u16) {
+        self.port.store(port, Ordering::Relaxed);
         self.vid.store(vid, Ordering::Relaxed);
         self.active.store(active, Ordering::Relaxed);
     }
@@ -175,6 +186,8 @@ impl LinkShared {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetSlot {
     pub link: usize,
+    /// Its port (index into [`Shared::ports`]).
+    pub port: usize,
     pub vid: u16,
     pub addr: (Ipv4Addr, u8),
     pub zone: u8,
@@ -232,10 +245,10 @@ pub struct Control {
 }
 
 pub struct Shared {
-    /// `ports[0]` = WAN, `ports[1]` = LAN.
+    /// `ports[0]` = WAN, then the LAN ports (`config::PORTS`).
     pub ports: Vec<PortShared>,
     /// `links[0]` = the WAN (port 0), then [`MAX_LINKS`]` - 1` network
-    /// slots on port 1 (none without a LAN port).
+    /// slots, each on its network's LAN port (none without a LAN port).
     pub links: Vec<LinkShared>,
     /// Services → the primary datapath task: a control message.
     pub dp_kick: &'static IrqEvent,

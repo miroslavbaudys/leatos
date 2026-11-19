@@ -422,7 +422,7 @@ fn status(ctx: &Ctx, wan: &str) {
             .hosts
             .iter()
             .zip(&ctx.sh.links)
-            .filter(|(_, l)| l.port == pi)
+            .filter(|(_, l)| l.port() == pi)
             .flat_map(|(h, l)| {
                 h.iface
                     .ip_addrs()

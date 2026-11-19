@@ -24,6 +24,27 @@ pub use ::config as schema;
 
 /// The kernel command line, stored once at boot ([`init`]).
 static BOOTARGS: spin::Once<&'static str> = spin::Once::new();
+/// The NICs found at bring-up (`set_ports`): networks on a port this
+/// machine lacks are left out of [`networks`].
+static PORTS_PRESENT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Port names by index, in PCI order: the first NIC is the WAN, the
+/// others the LAN ports (docs/config-v2.md, `network.ports`).
+pub use schema::PORTS;
+
+/// A port's index in [`PORTS`] (= `net::shared::Shared::ports`).
+pub fn port_index(name: &str) -> Option<usize> {
+    PORTS.iter().position(|p| *p == name)
+}
+
+/// Bring-up found `n` NICs (ports `PORTS[..n]`).
+pub fn set_ports(n: usize) {
+    PORTS_PRESENT.store(n, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn port_present(i: usize) -> bool {
+    i < PORTS_PRESENT.load(core::sync::atomic::Ordering::Relaxed)
+}
 // Replaced as a whole when a saved config is applied live ([`apply`]).
 // Readers take a snapshot (`Arc`), never hold the lock.
 static CONFIG: spin::Mutex<Option<Arc<schema::Config>>> = spin::Mutex::new(None);
@@ -465,7 +486,9 @@ impl core::fmt::Display for Redacted<'_> {
 #[derive(Clone)]
 pub struct Lan {
     pub name: String,
-    /// 802.1Q VLAN ID on `lan0`, 0 = untagged.
+    /// Its port: the index in [`PORTS`] (1 = `lan0`).
+    pub port: usize,
+    /// 802.1Q VLAN ID on its port, 0 = untagged.
     pub vid: u16,
     pub addr: Ipv4Addr,
     pub prefix: u8,
@@ -517,14 +540,22 @@ fn zone_index(names: &[String], name: &str) -> u8 {
     names.iter().position(|n| n == name).unwrap_or(1) as u8
 }
 
-/// The networks, in config order (the first is the LAN).
+/// A network's port index: its (only) port, if this machine has it.
+fn network_port(n: &schema::Network) -> Option<usize> {
+    n.ports.first().and_then(|p| port_index(p)).filter(|&i| i > 0 && port_present(i))
+}
+
+/// The networks, in config order (the first is the LAN), without those
+/// on a port this machine lacks ([`missing_networks`]).
 pub fn networks() -> Vec<Lan> {
     let c = get();
     let names = zone_names(&c);
     c.networks
         .iter()
-        .map(|n| Lan {
+        .filter_map(|n| Some((n, network_port(n)?)))
+        .map(|(n, port)| Lan {
             name: n.name.clone(),
+            port,
             vid: n.vlan,
             addr: n.ipv4.addr,
             prefix: n.ipv4.prefix,
@@ -547,6 +578,16 @@ pub fn networks() -> Vec<Lan> {
             mgmt: c.zone(&n.zone).is_some_and(|z| z.reaches_mgmt()),
             routes: c.network_routes(&n.name),
         })
+        .collect()
+}
+
+/// Networks left out because their port is missing here: (name, port).
+pub fn missing_networks() -> Vec<(String, String)> {
+    get()
+        .networks
+        .iter()
+        .filter(|n| network_port(n).is_none())
+        .map(|n| (n.name.clone(), n.ports.join(",")))
         .collect()
 }
 

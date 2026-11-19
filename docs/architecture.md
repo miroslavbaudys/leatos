@@ -86,7 +86,8 @@ snooping, neighbor tables, smoltcp and the qdiscs therefore only see
 untagged frames, and `crates/fwd` stays tag-free. Because the qdisc counts
 untagged lengths, the WAN shaper adds the tag's 4 bytes to its overhead
 (`config::Qos::port_rate`). LAN VLANs use the RX hook the same way (the
-VID selects the link, one router interface per network on `lan0`), but a
+port and VID select the link, one router interface per network on its
+LAN port), but a
 frame for a VLAN network gets its tag when it is queued, so the LAN qdisc
 holds tagged frames and shapes the 4 bytes too (docs/config-v2.md §6).
 

@@ -780,6 +780,11 @@ impl Forwarder {
         &self.ifs[ifx as usize]
     }
 
+    /// The interface's own MAC (a network moved to another port).
+    pub fn set_mac(&mut self, ifx: IfIndex, mac: wire::Mac) {
+        self.ifs[ifx as usize].mac = mac;
+    }
+
     /// Set or clear an interface address; maintains its connected route. A
     /// changed WAN address invalidates all NAT state.
     pub fn set_addr(&mut self, ifx: IfIndex, addr: Option<(Ipv4Addr, u8)>) {
