@@ -1,0 +1,96 @@
+# Fuzz targets (M9) for the sans-IO crates: `cargo +nightly fuzz run <target>`
+# (list: `cargo fuzz list`). A workspace of its own, so the main workspace
+# (stable, `cargo test`) never builds libFuzzer. See fuzz/README.md.
+[package]
+name = "rrouter-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+fwd = { path = "../crates/fwd" }
+proto-pppoe = { path = "../crates/proto-pppoe" }
+proto-dns = { path = "../crates/proto-dns" }
+proto-sntp = { path = "../crates/proto-sntp" }
+proto-http = { path = "../crates/proto-http" }
+proto-dhcp = { path = "../crates/proto-dhcp" }
+proto-mdns = { path = "../crates/proto-mdns" }
+qdisc = { path = "../crates/qdisc" }
+boot-image = { path = "../crates/boot-image" }
+
+[lib]
+path = "src/lib.rs"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fwd"
+path = "fuzz_targets/fwd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pppoe"
+path = "fuzz_targets/pppoe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sntp"
+path = "fuzz_targets/sntp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http"
+path = "fuzz_targets/http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dhcp"
+path = "fuzz_targets/dhcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mdns"
+path = "fuzz_targets/mdns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qdisc"
+path = "fuzz_targets/qdisc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "boot_image"
+path = "fuzz_targets/boot_image.rs"
+test = false
+doc = false
+bench = false
