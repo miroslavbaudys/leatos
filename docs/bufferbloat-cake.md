@@ -121,7 +121,7 @@ the NIC pulls from it (`Datapath::flush_tx`). `PacketMeta` is filled from
 conntrack: a keyed flow hash of the **pre-NAT** original tuple (identical
 in both directions), pre-NAT host hashes, DSCP, ECN and pure-ACK. The
 only other buffering is the neighbor table's ≤ 3 packets per unresolved
-next hop. Not done yet: the ingress hook (download shaping) and the DSCP→tin mapping.
+next hop. Not done yet: the DSCP→tin mapping.
 
 ```
 WAN RX ─► decap (VLAN/PPPoE) ─► conntrack/NAT ─► classify ─► [CAKE ingress] ─► forward ─► LAN TX
@@ -134,6 +134,41 @@ LAN RX ─► conntrack/NAT ─► classify ─► forward ─► [CAKE egress o
   trick and also covers traffic to the router itself and multiple LAN ports.
 - Classification happens **after conntrack**, so the flow and host hashes
   use the internal (pre-NAT) addresses in both directions.
+
+**Status: WAN ingress stage ✅ (2026-11-19).** Before it, the download was
+shaped on `lan0` egress, so everything leaving `lan0` was held to the
+download rate: traffic routed *between* the networks (main → guest/IoT,
+all on `lan0`) and the router's own replies too, and it competed with the
+internet download. Now (`net::datapath`, `Shared::ingress`):
+- `dp_down` runs forwarded packets from the WAN through the forwarder
+  (conntrack, NAT, classification as before), then into the ingress
+  qdisc: CAKE (`ecn_down`, `isolation`, `qdisc=` as for the ports) behind
+  `Shaper::ingress` at `shaping.down_kbit`. The egress link and next hop
+  ride in `PacketMeta`; `Datapath::drain_ingress` (each `dp_down` pass,
+  which also sleeps until the shaper's next release) hands what the
+  shaper releases to the neighbor table and the egress qdisc.
+- **Ingress mode** (`qdisc::shaper`): every byte that arrived used the
+  downlink, so AQM drops at dequeue and overflow drops at enqueue are
+  charged to the rate, and so is WAN traffic that never enters the queue
+  (frames for the router, firewall drops, PPPoE control: `Shaper::charge`,
+  once per RX batch). The shaper sees frames with the WAN's VLAN tag and
+  PPPoE header removed, so their 4 + 8 bytes are added to the overhead as
+  on the upload.
+- `lan0` egress is CAKE **without a rate**: the NIC's pull-based TX is the
+  limit, so between-network traffic runs at what the router can forward
+  (lab, HVF: ~230 Mbit/s main → guest with a 10 Mbit/s download shaper;
+  9.3 Mbit/s with the old placement).
+- Lab (`LAB_GUEST=1`): `lan to guest` (the client's VLAN 20 interface in
+  its own network namespace serves 5 MB to the main LAN; must exceed twice
+  the download rate; negative control `LAB_ROUTER_ARGS=shape_ingress=0`,
+  the old placement); download ECN read from `qdisc ingress`; latency
+  under load pings the ISP, so the replies cross the ingress queue
+  (negative control `qdisc=codel`: ~7 ms).
+- `/api/status` `ingress` (`null` with `shape_ingress=0`), CLI `status`
+  line `ingress`, a row in the web page's queue table.
+- Packet pool 1536 buffers (three qdiscs of 384 + RX rings).
+- Not yet: the second LAN port (the software bridge) puts more than one
+  port behind this stage, which needs no change here.
 
 ### 3.5 Sans-IO implementation (crates/qdisc)
 CAKE is pure logic, so it lives in `crates/qdisc` (`no_std`, no I/O). Time is
@@ -153,7 +188,7 @@ behaviour without any VM.
 2. **FQ-CoDel** (RFC 8290): useful on its own and the base of CAKE.
 3. **CAKE shaper + overhead compensation**: shape egress at a fixed rate.
 4. **COBALT, set-associative hashing, host isolation (via conntrack)**.
-5. **Ingress mode** for download shaping.
+5. **Ingress mode** for download shaping ✅ (2026-11-19, §3.4).
 6. **DiffServ tins, ACK filter**.
 7. **Autorate** (later): adjust the shaper rate for variable links (LTE,
    cable) from latency probes, like `cake-autorate`. This is easy to integrate natively.
@@ -189,8 +224,9 @@ rate-based `next_tx` instead of a token bucket; 1 ms release window so the
 datapath wakes ~1×/ms; no credit after idle). In the kernel, each port is
 `Shaper<Codel>` (now `Shaper<FqCodel>`, see below): the **WAN egress** is shaped at the upload rate and the
 **LAN egress** at the download rate. With one LAN port, shaping LAN egress
-is equivalent to an ingress hook for download traffic. A true ingress stage
-(for several LAN ports, counting drops) comes with CAKE. The network task
+is equivalent to an ingress hook for download traffic, except that it also
+caps traffic between networks on that port; the WAN ingress stage (§3.4,
+2026-11-19) replaced it (`shape_ingress=0` brings it back). The network task
 sleeps until the shaper's next release (`FlushResult::shaper_wake_ns`), and
 hybrid idle makes that wake-up µs-precise.
 

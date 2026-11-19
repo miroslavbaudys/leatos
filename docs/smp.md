@@ -91,7 +91,8 @@ does one 64-bit access. TCG answered either way.
   after step 3 (the per-task CPU line shows `svc@2`; `svc@1` with 2 cores).
 
 ## Step 3: one datapath core per direction ✅
-- **Tasks:** `dp_down` (WAN RX → forwarder → LAN qdisc → LAN TX) and
+- **Tasks:** `dp_down` (WAN RX → forwarder → WAN ingress stage → LAN
+  qdisc → LAN TX; it owns the ingress stage's queue) and
   `dp_up` (LAN RX → forwarder → WAN qdisc → WAN TX), `net::stack::run_dir`.
   With 3+ cores they run on cores 0 and 1 and the services on core 2;
   with 2 cores both directions are on core 0 and the services on core 1.

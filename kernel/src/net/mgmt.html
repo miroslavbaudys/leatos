@@ -206,7 +206,7 @@
     <h2>Interfaces</h2>
     <p class="lead">Physical ports and the router's addresses on them.</p>
     <div class="card"><h3>Ports</h3><div class="tw"><table id="ifs"></table></div></div>
-    <div class="card"><h3>Egress queues</h3><div class="tw"><table id="qdiscs"></table></div>
+    <div class="card"><h3>Queues</h3><div class="tw"><table id="qdiscs"></table></div>
       <p class="hint">Each port's transmit side has its own queue (CAKE by default); settings under <a href="#/shaping">Traffic shaping</a>.</p></div>
     <div class="card"><h3>Networks on the LAN port</h3><div class="tw"><table id="ifnets"></table></div>
       <p class="hint">Router interfaces on lan0, untagged or on a VLAN: configured under <a href="#/networks">Networks</a>.</p></div>
@@ -871,7 +871,8 @@ async function refresh() {
   $("t-down").textContent = wr ? bits(wr.rx) : "–";
   $("t-upl").textContent = wr ? bits(wr.tx) : "–";
   const sh = st.interfaces.map((i) => i.qdisc.shaped_kbit);
-  $("t-down2").textContent = "WAN receive" + (st.interfaces[1]?.qdisc.shaped_kbit ? ` · shaped ${bits(st.interfaces[1].qdisc.shaped_kbit * 1000)}` : "");
+  const down = st.ingress ? st.ingress.shaped_kbit : st.interfaces[1]?.qdisc.shaped_kbit;
+  $("t-down2").textContent = "WAN receive" + (down ? ` · shaped ${bits(down * 1000)}` : "");
   $("t-upl2").textContent = "WAN send" + (sh[0] ? ` · shaped ${bits(sh[0] * 1000)}` : "");
   $("t-clients").textContent = n(st.dhcp_leases.filter((d) => d.bound).length);
   $("t-conns").textContent = n(st.conntrack);
@@ -885,9 +886,13 @@ async function refresh() {
       `<td>${i.link === null ? "–" : i.link.up ? `<span class="up">up ${i.link.mbps} Mbit/s${i.link.full_duplex ? "" : " half"}</span>` : '<span class="down">down</span>'}</td>` +
       `<td>${i.addrs.map(esc).join("<br>") || "–"}</td><td class=num>${n(i.rx_packets)} pkts<br><span class="muted">${bytes(i.rx_bytes)}</span>${i.rx_no_buf ? `<br><span class="warn">${n(i.rx_no_buf)} no buffer</span>` : ""}</td>` +
       `<td class=num>${n(i.tx_packets)} pkts<br><span class="muted">${bytes(i.tx_bytes)}</span></td><td class=num>${r ? bits(r.rx) + "<br>" + bits(r.tx) : "–"}</td></tr>`; }).join("");
-  const qrows = "<tr><th>Port (egress)</th><th>Shaper</th><th class=num>Sent</th><th class=num>Dropped</th><th class=num>ECN marked</th><th class=num>Queued now</th></tr>" +
-    st.interfaces.map((i) => `<tr><td>${esc(i.name)} <span class="muted">${i === st.interfaces[0] ? "(upload)" : "(download)"}</span></td><td>${i.qdisc.shaped_kbit === null ? "unshaped" : n(i.qdisc.shaped_kbit) + " kbit/s"}</td>` +
-      `<td class=num>${n(i.qdisc.sent)}</td><td class=num>${n(i.qdisc.dropped)}</td><td class=num>${n(i.qdisc.ecn_marked)}</td><td class=num>${n(i.qdisc.backlog_packets)} pkts</td></tr>`).join("");
+  // The download is shaped where it arrives (WAN ingress stage); lan0's
+  // egress is then unshaped, so traffic between networks is not capped.
+  const qrow = (name, what, q) => `<tr><td>${esc(name)} <span class="muted">(${what})</span></td><td>${q.shaped_kbit === null ? "unshaped" : n(q.shaped_kbit) + " kbit/s"}</td>` +
+    `<td class=num>${n(q.sent)}</td><td class=num>${n(q.dropped)}</td><td class=num>${n(q.ecn_marked)}</td><td class=num>${n(q.backlog_packets)} pkts</td></tr>`;
+  const qrows = "<tr><th>Queue</th><th>Shaper</th><th class=num>Sent</th><th class=num>Dropped</th><th class=num>ECN marked</th><th class=num>Queued now</th></tr>" +
+    st.interfaces.map((i) => qrow(i.name + " egress", i === st.interfaces[0] ? "upload" : st.ingress ? "to the LAN, unshaped" : "download", i.qdisc)).join("") +
+    (st.ingress ? qrow("wan0 ingress", "download", st.ingress) : "");
   $("qdiscs").innerHTML = qrows; $("qdiscs2").innerHTML = qrows;
 
   // WAN + DNS status

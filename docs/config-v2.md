@@ -423,9 +423,11 @@ control `LAB_GUEST_DOMAIN=0`).
   between two networks by the endpoint pair, so both directions meet in
   one conntrack shard.
   - The two-port, two-direction core layout stays: all LAN networks share
-    `lan0`, so they share one LAN qdisc. CAKE's host isolation then spans
-    every network, and the download shaper covers them all (the roadmap
-    requires this).
+    `lan0`, so they share one LAN qdisc. The download shaper is the WAN
+    ingress stage (2026-11-19, docs/bufferbloat-cake.md §3.4): one CAKE
+    for everything from the WAN, so its host isolation spans every
+    network, while traffic between the networks only passes `lan0`'s
+    unshaped CAKE and is not held to the download rate.
 - **Firewall** (zones ✅, rules ✅).
   - `fwd::forwarder::Policy`: per zone a bitmask of zones it may forward
     to, and its input (`None` = all, or a mask of `svc::*` services),
@@ -633,9 +635,11 @@ In rough order of value:
    and forward live, then every guest, rule and forward check runs.
 11. **Multi-port LAN (M10).** The apu4's other two i211 ports: a software
    bridge with MAC learning, `network.ports` with per-port tagged or
-   untagged membership, and **WAN ingress shaping** (CAKE ingress mode),
-   because LAN egress no longer equals the download once traffic can stay
-   between LAN ports.
+   untagged membership. **WAN ingress shaping** (CAKE ingress mode), which
+   this needs because LAN egress no longer equals the download once
+   traffic can stay between LAN ports, is done ✅ (2026-11-19,
+   docs/bufferbloat-cake.md §3.4): it already lifted the download cap off
+   traffic between the networks on `lan0`.
 12. **IPv6 (M7).** DHCPv6-PD over DHCP and PPPoE (IPv6CP), a /64 per
    network with RA/RDNSS, the zone firewall for IPv6 (inbound blocked by
    default), `[wan.ipv6]`.

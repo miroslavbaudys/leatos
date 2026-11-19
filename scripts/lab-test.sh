@@ -345,6 +345,15 @@ name = "guest"
 input = "drop"
 allow = ["dhcp", "dns", "ping"$([[ -n "$MDNS" ]] && echo ', "mdns"')]
 forward_to = ["wan"]
+
+# The client's "lan to guest" throughput check (WAN ingress shaping).
+[[firewall.rule]]
+name = "lab-lan-to-guest"
+from = "lan"
+to = "guest"
+proto = "tcp"
+dst_port = 8081
+action = "accept"
 CFG
   [[ -n "$MDNS" ]] && cat >>"$WORK/config.toml" <<CFG
 
@@ -490,7 +499,8 @@ tr -d '\r' <"$WORK/client.log" | grep -E "^LAB (PASS|FAIL|INFO|WARN)|^    \|" | 
 
 # Per-direction ECN (router side): with ECN on, the AQM marks the client's
 # ECN-capable traffic; with it off, it drops and never marks. Upload = WAN
-# egress, download = LAN egress.
+# egress, download = the WAN ingress stage (LAN egress with
+# shape_ingress=0).
 router_fails=0
 if [[ "$SHAPE_KBIT" != 0 ]]; then
   bootarg() { echo " $ROUTER_ARGS " | sed -n "s/.* $1=\([0-9]*\) .*/\1/p"; }
@@ -498,7 +508,9 @@ if [[ "$SHAPE_KBIT" != 0 ]]; then
   up=$(bootarg ecn_up); up=${up:-${all:-0}}
   down=$(bootarg ecn_down); down=${down:-${all:-1}}
   if [[ -n "${LAB_EXPECT_ECN:-}" ]]; then up=${LAB_EXPECT_ECN%%:*}; down=${LAB_EXPECT_ECN##*:}; fi
-  for pair in "wan0 upload $up" "lan0 download $down"; do
+  downq=ingress
+  [[ " $ROUTER_ARGS " == *" shape_ingress=0 "* ]] && downq=lan0
+  for pair in "wan0 upload $up" "$downq download $down"; do
     set -- $pair
     line=$(tr -d '\r' <"$WORK/router.log" | grep "qdisc $1 " | tail -1)
     drops=$(echo "$line" | sed -n 's/.*aqm drops \([0-9]*\).*/\1/p')

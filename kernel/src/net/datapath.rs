@@ -3,10 +3,23 @@
 //! ```text
 //!  NIC RX ─► VLAN ─► shard_of ─► Forwarder shard ─┬─ Local ───► port.local_rx ─► smoltcp (router stack)
 //!                                         ├─ Forward ─► neigh[egress] ─► egress qdisc
+//!                                         │  (from the WAN: ─► ingress qdisc ─► (shaper) ─► neigh[egress] ─► …)
 //!                                         └─ Drop
 //!  smoltcp TX ──────────────────────────────────────────────────────────► port qdisc
 //!  port qdisc ─► (pull, while the NIC has room) ─► VLAN ─► NIC TX
 //! ```
+//!
+//! **WAN ingress stage** (docs/bufferbloat-cake.md §3.4): the download is
+//! shaped where it arrives, not on LAN egress. Forwarded packets from the
+//! WAN wait in [`Shared::ingress`] (CAKE behind an ingress-mode shaper at
+//! the download rate) with their egress and next hop in `PacketMeta`;
+//! [`Datapath::drain_ingress`] (the task receiving on the WAN) releases
+//! them to the neighbor table and the egress port's qdisc. Every other WAN
+//! frame (for the router, dropped, PPPoE control) is charged to the
+//! shaper, since it used the downlink too. LAN egress is then unshaped
+//! CAKE, so traffic between networks is not held to the download rate.
+//! Without a download rate (or with `shape_ingress=0`) the stage is
+//! skipped.
 //!
 //! Links (`net::shared::LinkShared`) are the forwarder's interfaces: link
 //! 0 is the WAN on port 0, links 1.. the networks on port 1 (`lan0`),
@@ -43,6 +56,7 @@
 use crate::drivers::Nic;
 use crate::net::packet::{PacketBuf, PacketMeta};
 use crate::net::shared::{Networks, PortShared};
+use crate::net::device::PortQdisc;
 use crate::net::shared::{CTRL_RX_MAX, LOCAL_RX_MAX, Shared};
 use crate::timer;
 use alloc::vec::Vec;
@@ -68,6 +82,8 @@ const HOUSEKEEPING_MS: u64 = 1_000;
 
 /// The WAN link (on port 0); the networks are links 1.. on port 1.
 pub const WAN: IfIndex = 0;
+/// The WAN's port.
+pub const WAN_PORT: usize = 0;
 
 /// Counters for diagnostics (read by the self-test / stats output).
 pub static FORWARDED: AtomicU64 = AtomicU64::new(0);
@@ -164,7 +180,8 @@ pub fn padt(port: &PortShared) -> Option<PacketBuf> {
 struct Hk {
     next_housekeeping: u64,
     next_stats: u64,
-    last_dequeued: [u64; 2],
+    /// wan0, lan0, the ingress stage.
+    last_dequeued: [u64; 3],
     ecn_reported: [u64; 2],
     vlan_reported: u64,
 }
@@ -239,6 +256,8 @@ pub fn now_ns() -> u64 {
 
 fn meta_from(class: &Classification, ingress: IfIndex, len: usize, now: u64) -> PacketMeta {
     PacketMeta {
+        egress_if: 0,
+        next_hop: 0,
         enqueue_ts: now,
         flow_hash: class.flow_hash,
         src_host_hash: class.src_host_hash,
@@ -254,6 +273,30 @@ fn meta_from(class: &Classification, ingress: IfIndex, len: usize, now: u64) -> 
 
 fn relaxed(a: &AtomicU64) -> u64 {
     a.load(Ordering::Relaxed)
+}
+
+/// One received batch's bookkeeping, passed down the receive path.
+struct Batch<'a> {
+    /// Egress ports whose qdisc got packets.
+    touched: &'a mut [bool; 2],
+    /// Frames went to a `local_rx` / `ctrl_rx` (wake svc).
+    local: bool,
+    /// The batch is from the WAN and the ingress stage is on: forwarded
+    /// packets go into it, everything else is charged to its shaper.
+    ingress: bool,
+    /// WAN frames that used the downlink without entering the ingress
+    /// queue: (bytes, frames).
+    charge: (usize, usize),
+}
+
+impl Batch<'_> {
+    /// A WAN frame that bypasses the ingress queue.
+    fn bypass(&mut self, len: usize) {
+        if self.ingress {
+            self.charge.0 += len;
+            self.charge.1 += 1;
+        }
+    }
 }
 
 impl Datapath {
@@ -304,7 +347,7 @@ impl Datapath {
             hk: Mutex::new(Hk {
                 next_housekeeping: 0,
                 next_stats: STATS_MS,
-                last_dequeued: [0; 2],
+                last_dequeued: [0; 3],
                 ecn_reported: [0; 2],
                 vlan_reported: 0,
             }),
@@ -520,7 +563,12 @@ impl Datapath {
         let port = &self.sh.ports[port_ix];
         let pppoe = port.is_pppoe();
         let session = port.pppoe_session();
-        let mut local = false;
+        let mut b = Batch {
+            touched,
+            local: false,
+            ingress: port_ix == WAN_PORT && self.sh.ingress.lock().rate().is_some(),
+            charge: (0, 0),
+        };
         let topo = self.topo.lock().clone();
         let hints = ShardHints {
             internal: &topo.internal,
@@ -536,6 +584,7 @@ impl Datapath {
         for mut pkt in batch.drain(..) {
             let Some((ifx, want_vid)) = self.link_of(&topo, port_ix, pkt.data()) else {
                 VLAN_DROPS.fetch_add(1, Ordering::Relaxed);
+                b.bypass(pkt.len());
                 continue;
             };
             let role = if ifx == WAN { Role::Wan } else { Role::Lan };
@@ -544,6 +593,7 @@ impl Datapath {
                 wire::VlanRx::Accept { strip: true } => pkt.pop_vlan(),
                 wire::VlanRx::Drop => {
                     VLAN_DROPS.fetch_add(1, Ordering::Relaxed);
+                    b.bypass(pkt.len());
                     continue;
                 }
             }
@@ -551,10 +601,11 @@ impl Datapath {
                 match pppoe_rx(&mut pkt, session) {
                     PppoeRx::Ipv4 => {}
                     PppoeRx::Control => {
+                        b.bypass(pkt.len());
                         let mut q = port.ctrl_rx.lock();
                         if q.len() < CTRL_RX_MAX {
                             q.push_back(pkt);
-                            local = true;
+                            b.local = true;
                         } else {
                             PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
                         }
@@ -562,12 +613,13 @@ impl Datapath {
                     }
                     PppoeRx::Drop => {
                         PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
+                        b.bypass(pkt.len());
                         continue;
                     }
                 }
             }
             if wire::ethertype(pkt.data()) == Some(wire::ETHERTYPE_ARP) {
-                self.snoop_arp(ifx, pkt.data(), now, touched);
+                self.snoop_arp(ifx, pkt.data(), now, b.touched);
             }
             let len = pkt.len();
             let kind = if self.fragments && port_ix < 2 {
@@ -632,7 +684,7 @@ impl Datapath {
                     v
                 }
             };
-            self.deliver(verdict, pkt, ifx, port_ix, now, touched, &mut local);
+            self.deliver(verdict, pkt, ifx, port_ix, now, &mut b);
             if let Some(key) = released_key.take() {
                 let hit = self.frags[port_ix].lock().lookup(&key, now);
                 for mut p in released.drain(..) {
@@ -646,34 +698,30 @@ impl Datapath {
                     if matches!(v, Verdict::Forward { .. }) {
                         FRAGS_FORWARDED.fetch_add(1, Ordering::Relaxed);
                     }
-                    self.deliver(v, p, ifx, port_ix, now, touched, &mut local);
+                    self.deliver(v, p, ifx, port_ix, now, &mut b);
                 }
             }
         }
-        if local {
+        if b.charge.1 > 0 {
+            self.sh.ingress.lock().charge(b.charge.0, b.charge.1, now_ns());
+        }
+        if b.local {
             self.sh.svc_kick.signal();
         }
     }
 
     /// Act on the forwarder's verdict for a received frame: to the router
     /// stack, out through the neighbor table into the qdisc, or dropped.
-    #[allow(clippy::too_many_arguments)]
-    fn deliver(
-        &self,
-        verdict: Verdict,
-        mut pkt: PacketBuf,
-        ifx: IfIndex,
-        port_ix: usize,
-        now: u64,
-        touched: &mut [bool; 2],
-        local: &mut bool,
-    ) {
+    fn deliver(&self, verdict: Verdict, mut pkt: PacketBuf, ifx: IfIndex, port_ix: usize, now: u64, b: &mut Batch) {
+        if !matches!(verdict, Verdict::Forward { .. }) {
+            b.bypass(pkt.len());
+        }
         match verdict {
             Verdict::Local => {
                 let mut q = self.sh.links[ifx as usize].local_rx.lock();
                 if q.len() < LOCAL_RX_MAX {
                     q.push_back(pkt);
-                    *local = true;
+                    b.local = true;
                 } else {
                     self.local_rx_drops.fetch_add(1, Ordering::Relaxed);
                 }
@@ -689,7 +737,7 @@ impl Datapath {
                 self.observe_ecn(port_ix, pkt.data());
                 FORWARDED.fetch_add(1, Ordering::Relaxed);
                 if split == 0 {
-                    self.send_out(egress, next_hop, &class, ifx, pkt, now, touched);
+                    self.send_out(egress, next_hop, &class, ifx, pkt, now, b);
                     return;
                 }
                 // Larger than the egress MTU, no DF: split (RFC 791).
@@ -697,6 +745,7 @@ impl Datapath {
                 else {
                     DROPPED.fetch_add(1, Ordering::Relaxed);
                     DROP_REASONS[DropReason::TooBig.index()].fetch_add(1, Ordering::Relaxed);
+                    b.bypass(pkt.len());
                     return;
                 };
                 // Every piece or none: a datagram missing one is useless.
@@ -705,6 +754,7 @@ impl Datapath {
                     let Some(mut p) = PacketBuf::alloc() else {
                         DROPPED.fetch_add(1, Ordering::Relaxed);
                         SPLIT_DROPS.fetch_add(1, Ordering::Relaxed);
+                        b.bypass(pkt.len());
                         return;
                     };
                     p.set_len(plan.piece_len(i));
@@ -716,9 +766,9 @@ impl Datapath {
                 pkt.set_len(n);
                 SPLIT.fetch_add(1, Ordering::Relaxed);
                 // In order, one after the other, into the same CAKE flow.
-                self.send_out(egress, next_hop, &class, ifx, pkt, now, touched);
+                self.send_out(egress, next_hop, &class, ifx, pkt, now, b);
                 for p in rest.into_iter().flatten() {
-                    self.send_out(egress, next_hop, &class, ifx, p, now, touched);
+                    self.send_out(egress, next_hop, &class, ifx, p, now, b);
                 }
             }
             Verdict::Drop(r) => {
@@ -728,8 +778,8 @@ impl Datapath {
         }
     }
 
-    /// A forwarded frame (or piece of one) to its next hop: the PPPoE AC,
-    /// or through the neighbor table, into the egress qdisc.
+    /// A forwarded frame (or piece of one) into the WAN ingress stage (if
+    /// it came from the WAN and the stage is on), else to its next hop.
     #[allow(clippy::too_many_arguments)]
     fn send_out(
         &self,
@@ -739,9 +789,25 @@ impl Datapath {
         ifx: IfIndex,
         mut pkt: PacketBuf,
         now: u64,
-        touched: &mut [bool; 2],
+        b: &mut Batch,
     ) {
-        pkt.meta = meta_from(class, ifx, pkt.len(), now_ns());
+        let t = now_ns();
+        pkt.meta = meta_from(class, ifx, pkt.len(), t);
+        if b.ingress {
+            pkt.meta.egress_if = egress;
+            pkt.meta.next_hop = u32::from(next_hop);
+            // An overflow drop is charged by the shaper itself.
+            if self.sh.ingress.lock().enqueue(pkt, t).is_err() {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        self.to_next_hop(egress, next_hop, pkt, now, b.touched);
+    }
+
+    /// To the next hop: the PPPoE AC, or through the neighbor table, into
+    /// the egress qdisc.
+    fn to_next_hop(&self, egress: IfIndex, next_hop: Ipv4Addr, pkt: PacketBuf, now: u64, touched: &mut [bool; 2]) {
         let out = &self.sh.ports[self.sh.links[egress as usize].port];
         if out.is_pppoe() {
             // Point to point: the access concentrator is the only neighbor.
@@ -760,6 +826,28 @@ impl Datapath {
             Resolve::Ready(mac, pkt) => self.send_resolved(egress, mac, pkt, touched),
             Resolve::Queued { send_arp: true } => self.send_arp_request(egress, next_hop, touched),
             Resolve::Queued { send_arp: false } => {}
+        }
+    }
+
+    /// Release what the WAN ingress stage's shaper allows now to the
+    /// neighbor table and egress qdiscs (the task receiving on the WAN, each
+    /// pass). Returns when the shaper releases the next packet, if it holds
+    /// some back.
+    pub fn drain_ingress(&self, touched: &mut [bool; 2]) -> Option<u64> {
+        let now = now_ns();
+        let ms = now / 1_000_000;
+        loop {
+            // One packet per lock: the neighbor and qdisc locks come after.
+            let d = self.sh.ingress.lock().dequeue(now);
+            match d {
+                Dequeue::Packet(p) => {
+                    let egress = p.meta.egress_if;
+                    let next_hop = Ipv4Addr::from(p.meta.next_hop);
+                    self.to_next_hop(egress, next_hop, p, ms, touched);
+                }
+                Dequeue::WaitUntil(t) => return Some(t),
+                Dequeue::Empty => return None,
+            }
         }
     }
 
@@ -858,43 +946,9 @@ impl Datapath {
                 relaxed(&self.tcp_cwr[i])
             );
         }
-        for i in 0..self.sh.ports.len().min(2) {
-            let nif = &self.sh.ports[i];
-            let mut qdisc = nif.qdisc.lock();
-            let s = qdisc.stats();
-            {
-                let mut hk = self.hk.lock();
-                if s.dequeued == hk.last_dequeued[i] {
-                    continue;
-                }
-                hk.last_dequeued[i] = s.dequeued;
-            }
-            printed = true;
-            let throttled = qdisc.throttled;
-            let rate = qdisc.rate();
-            let aqm = qdisc.inner_mut();
-            let max_sojourn = aqm.take_max_sojourn_ns();
-            let flows = aqm.diag();
-            drop(qdisc); // the console is slow: print without holding the lock
-            let shaped = match rate {
-                Some(r) => alloc::format!(
-                    "shaped {} kbit/s, throttled {}, ",
-                    r.bits_per_sec / 1000,
-                    throttled
-                ),
-                None => alloc::string::String::new(),
-            };
-            crate::println!(
-                "  qdisc {}       : {shaped}{flows}sent {}, aqm drops {}, ecn marks {}, overflow drops {}, backlog {} pkts, max sojourn {}.{:03} ms",
-                nif.name,
-                s.dequeued,
-                s.aqm_actions - s.marked,
-                s.marked,
-                s.dropped - (s.aqm_actions - s.marked),
-                s.backlog_packets,
-                max_sojourn / 1_000_000,
-                (max_sojourn / 1_000) % 1_000
-            );
+        let ports = self.sh.ports.iter().take(2).map(|p| (p.name, &p.qdisc));
+        for (i, (name, q)) in ports.chain([("ingress", &self.sh.ingress)]).enumerate() {
+            printed |= self.print_qdisc(i, name, q);
         }
         // Cumulative CPU time by task, and where device interrupts land
         // (scripts/lab-test.sh checks both).
@@ -915,6 +969,47 @@ impl Datapath {
                 timer::uptime().as_millis()
             );
         }
+    }
+
+    /// One qdisc's stats line (`scripts/lab-test.sh` reads it), if it sent
+    /// packets since the last one; `slot` indexes `Hk::last_dequeued`.
+    fn print_qdisc(&self, slot: usize, name: &str, q: &Mutex<PortQdisc>) -> bool {
+        let mut qdisc = q.lock();
+        let s = qdisc.stats();
+        {
+            let mut hk = self.hk.lock();
+            if s.dequeued == hk.last_dequeued[slot] {
+                return false;
+            }
+            hk.last_dequeued[slot] = s.dequeued;
+        }
+        let throttled = qdisc.throttled;
+        let charged = qdisc.is_ingress().then_some(qdisc.charged_bytes);
+        let rate = qdisc.rate();
+        let aqm = qdisc.inner_mut();
+        let max_sojourn = aqm.take_max_sojourn_ns();
+        let flows = aqm.diag();
+        drop(qdisc); // the console is slow: print without holding the lock
+        let shaped = match rate {
+            Some(r) => alloc::format!(
+                "shaped {} kbit/s, throttled {}{}, ",
+                r.bits_per_sec / 1000,
+                throttled,
+                charged.map(|c| alloc::format!(", charged {c} B")).unwrap_or_default()
+            ),
+            None => alloc::string::String::new(),
+        };
+        crate::println!(
+            "  qdisc {name:<11}: {shaped}{flows}sent {}, aqm drops {}, ecn marks {}, overflow drops {}, backlog {} pkts, max sojourn {}.{:03} ms",
+            s.dequeued,
+            s.aqm_actions - s.marked,
+            s.marked,
+            s.dropped - (s.aqm_actions - s.marked),
+            s.backlog_packets,
+            max_sojourn / 1_000_000,
+            (max_sojourn / 1_000) % 1_000
+        );
+        true
     }
 
     pub fn next_housekeeping(&self) -> u64 {

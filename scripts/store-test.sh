@@ -173,9 +173,9 @@ check "JSON save: no trial, applied live" "false true" "$(json "$WORK/resp" tria
 sleep 3
 check "no reboot (same boot, uptime went on)" "1 1" "$(count "$CFG_LINE") $([[ "$(status uptime_s)" -ge "$up0" ]] && echo 1 || echo 0)"
 check "status: new config source" "stored (slot B, seq 2)" "$(status config)"
-check "download shaper changed live" 50000 "$(json "$WORK/status" interfaces.1.qdisc.shaped_kbit)"
-check "  ... upload shaper untouched" null "$(json "$WORK/status" interfaces.0.qdisc.shaped_kbit)"
-check "qdisc rebuilt as FQ-CoDel" 1 "$(count 'qos lan0       : now shaped 50000 kbit/s, overhead 0 B, FQ-CoDel')"
+check "download shaper (WAN ingress) changed live" 50000 "$(json "$WORK/status" ingress.shaped_kbit)"
+check "  ... upload shaper untouched, lan0 unshaped" "null null" "$(json "$WORK/status" interfaces.0.qdisc.shaped_kbit) $(json "$WORK/status" interfaces.1.qdisc.shaped_kbit)"
+check "qdisc rebuilt as FQ-CoDel" "1 1" "$(count 'qos ingress    : now shaped 50000 kbit/s (download), overhead 0 B, FQ-CoDel') $(count 'qos lan0       : now unshaped, FQ-CoDel')"
 check "DHCP and DNS reconfigured (1 reservation, cache 1000)" 1 "$(count 'lan services    : reconfigured: .*(1 static, 0 lease(s) dropped).*cache 1000')"
 curl -s -m 10 -u "$AUTH" -o "$WORK/cfg.json" "$URL/api/config.json" || true
 check "saved values read back" "1000 tv" "$(json "$WORK/cfg.json" dns.cache_entries) $(json "$WORK/cfg.json" network.0.dhcp.static.0.hostname)"
@@ -188,7 +188,7 @@ python3 -I -c 'import json,sys
 c=json.load(open(sys.argv[1])); c["shaping"]["down_kbit"]=60000
 open(sys.argv[1],"w").write(json.dumps(c))' "$WORK/cfg.json"
 check "rate-only change -> 200, applied" "200 true" "$(code -u admin:test -X POST -H 'Content-Type: application/json' --data-binary @"$WORK/cfg.json" "$URL/api/config") $(json "$WORK/resp" applied)"
-check "  ... queue kept, new rate" "1 60000" "$(count 'qos lan0       : now shaped 60000 kbit/s, overhead 0 B, queue kept') $(status interfaces.1.qdisc.shaped_kbit)"
+check "  ... queue kept, new rate" "1 60000" "$(count 'qos ingress    : now shaped 60000 kbit/s (download), overhead 0 B, queue kept') $(status ingress.shaped_kbit)"
 
 echo "== trials"
 check "LAN change -> 200" 200 "$(save_toml "$WORK/lan.toml")"

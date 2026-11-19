@@ -994,8 +994,10 @@ fn arg_u64(bootargs: &str, key: &str) -> Option<u64> {
 }
 
 /// Shaping (docs/bufferbloat-cake.md): `[shaping]`, or boot arguments in
-/// kbit/s: `shape_up=42000` (WAN egress), `shape_down=50000` (LAN egress,
-/// i.e. the download direction), `shape_overhead=38` (bytes per packet,
+/// kbit/s: `shape_up=42000` (WAN egress), `shape_down=50000` (the WAN
+/// ingress stage: what arrives from the WAN, before it is forwarded; with
+/// `shape_ingress=0`, a boot argument for A/B tests, LAN egress as before
+/// M10, which caps traffic between networks too), `shape_overhead=38` (bytes per packet,
 /// default 0), `ecn_up=0|1` / `ecn_down=0|1` (ECN marking instead of
 /// dropping, per direction; default up off, down on; `ecn=` sets both),
 /// `qdisc=cake|fq_codel|codel` (egress AQM, default `cake`; `codel` = one
@@ -1033,6 +1035,9 @@ pub struct Qos {
     /// The WAN runs PPPoE: 8 more bytes per frame (PPPoE header and PPP
     /// protocol, added in `datapath::flush_port`), likewise added.
     pub wan_pppoe: bool,
+    /// The download is shaped in the WAN ingress stage (default), not on
+    /// LAN egress (boot argument `shape_ingress=0`; fixed at boot).
+    pub ingress: bool,
 }
 
 pub fn qos() -> Qos {
@@ -1057,23 +1062,51 @@ pub fn qos() -> Qos {
         },
         wan_vlan: c.wan.vlan.is_some(),
         wan_pppoe: c.wan.mode == schema::WanMode::Pppoe,
+        ingress: arg_u64(bootargs(), "shape_ingress") != Some(0),
     }
 }
 
 impl Qos {
-    /// The shaper of a port: WAN egress (`up`) at the upload rate, LAN
-    /// egress at the download rate; unset = not shaped.
+    /// The shaper of a port's egress: the WAN (`up`) at the upload rate;
+    /// the LAN only with `shape_ingress=0`, at the download rate. Unset =
+    /// not shaped.
     pub fn port_rate(&self, up: bool) -> Option<qdisc::shaper::Rate> {
-        let kbit = if up { self.up_kbit } else { self.down_kbit };
+        if up {
+            self.rate(self.up_kbit, self.wan_encap())
+        } else if self.ingress {
+            None
+        } else {
+            self.rate(self.down_kbit, 0)
+        }
+    }
+
+    /// The WAN ingress stage's shaper: the download rate. It sees frames
+    /// with the WAN's VLAN tag and PPPoE header already removed, so their
+    /// bytes are added like on the upload. `None` = no ingress stage
+    /// (unshaped, or `shape_ingress=0`).
+    pub fn ingress_rate(&self) -> Option<qdisc::shaper::Rate> {
+        if self.ingress {
+            self.rate(self.down_kbit, self.wan_encap())
+        } else {
+            None
+        }
+    }
+
+    /// Bytes per frame on the WAN that the qdiscs do not see.
+    fn wan_encap(&self) -> u32 {
         let mut tag = 0;
-        if up && self.wan_vlan {
+        if self.wan_vlan {
             tag += fwd::wire::VLAN_HDR as u32;
         }
-        if up && self.wan_pppoe {
+        if self.wan_pppoe {
             tag += proto_pppoe::wire::SESSION_OVERHEAD as u32;
         }
+        tag
+    }
+
+    fn rate(&self, kbit: Option<u64>, encap: u32) -> Option<qdisc::shaper::Rate> {
         kbit.map(|k| qdisc::shaper::Rate {
-            overhead: self.overhead + tag,
+            overhead: self.overhead + encap,
             ..qdisc::shaper::Rate::kbit(k)
         })
     }

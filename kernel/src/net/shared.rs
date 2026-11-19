@@ -8,6 +8,7 @@
 //!  datapath ── PPPoE discovery/LCP/auth/IPCP ► PortShared::ctrl_rx ► svc + svc_kick
 //!  svc ── PPPoE session (id, peer MAC) ► PortShared::pppoe_session ► datapath
 //!  datapath ── PortSnap, conntrack count ────────────────────► svc (status page)
+//!  dp_down: WAN RX ► forwarder ► Shared::ingress (download shaper) ► neighbor ► lan0 qdisc
 //! ```
 //!
 //! A **port** is a NIC with its egress qdisc; a **link** is a router
@@ -255,6 +256,12 @@ pub struct Shared {
     pub redirect_hits: Mutex<Vec<u64>>,
     /// The forwarder's routing table (published by the datapath).
     pub routes: Mutex<Vec<fwd::route::Route>>,
+    /// The WAN ingress stage (docs/bufferbloat-cake.md §3.4): forwarded
+    /// packets that came from the WAN wait here, shaped at the download
+    /// rate, before their neighbor lookup and egress qdisc. Owned by the
+    /// task receiving on the WAN (`dp_down`); svc only reconfigures and
+    /// reads it. A shaper without a rate = no ingress stage.
+    pub ingress: Mutex<PortQdisc>,
 }
 
 /// One line of the routing table as shown (`/api/status` `routes`, CLI
@@ -277,7 +284,7 @@ pub struct RouteRow {
 static SHARED: Once<&'static Shared> = Once::new();
 
 /// Create the shared state once (at bring-up).
-pub fn init(ports: Vec<PortShared>, links: Vec<LinkShared>) -> &'static Shared {
+pub fn init(ports: Vec<PortShared>, links: Vec<LinkShared>, ingress: PortQdisc) -> &'static Shared {
     SHARED.call_once(|| {
         let tx_kick = ports.iter().map(|_| irq::new_event()).collect();
         Box::leak(Box::new(Shared {
@@ -292,6 +299,7 @@ pub fn init(ports: Vec<PortShared>, links: Vec<LinkShared>) -> &'static Shared {
             forward_hits: Mutex::new(Vec::new()),
             redirect_hits: Mutex::new(Vec::new()),
             routes: Mutex::new(Vec::new()),
+            ingress: Mutex::new(ingress),
         }))
     })
 }

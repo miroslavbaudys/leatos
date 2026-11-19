@@ -147,9 +147,10 @@ fn spawn_net(
 }
 
 /// Packet buffers to preallocate: 2 NICs × (RX ring + TX ring) plus room
-/// for queues. 1024 × 2.125 KiB ≈ 2.1 MiB.
+/// for queues (three qdiscs: wan0, lan0, the WAN ingress stage). 1536 ×
+/// 2.125 KiB ≈ 3.2 MiB.
 fn net_pool_size() -> usize {
-    1024
+    1536
 }
 
 #[panic_handler]

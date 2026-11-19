@@ -449,6 +449,21 @@ fn status(ctx: &Ctx, wan: &str) {
             q.backlog_packets
         );
     }
+    if config::qos().ingress {
+        let (q, rate) = {
+            let q = ctx.sh.ingress.lock();
+            (q.stats(), q.rate())
+        };
+        println!(
+            "ingress  : download {}, qdisc sent {} drops {} ecn {} backlog {}",
+            rate.map(|r| alloc::format!("shaped {} kbit/s", r.bits_per_sec / 1000))
+                .unwrap_or_else(|| String::from("unshaped")),
+            q.dequeued,
+            q.dropped,
+            q.marked,
+            q.backlog_packets
+        );
+    }
     for (name, m) in ctx.services.map(LanServices::mdns_status).unwrap_or_default() {
         println!(
             "mdns     : {name}: {} in, {} out, {} filtered, {} dup, {} rate-limited, {} bad, {} foreign",

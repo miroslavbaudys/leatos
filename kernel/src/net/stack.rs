@@ -36,9 +36,10 @@ use smoltcp::time::Instant as NetInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Cidr};
 use spin::Mutex;
 
-/// Egress qdisc hard limits per port (shared by all flows). The AQM keeps
-/// standing queues near 5 ms; the limits only bound bursts. Two full queues plus both RX rings
-/// (2 × 384 + 128 = 896) stay within the 1024-buffer packet pool.
+/// Qdisc hard limits, per port egress and for the WAN ingress stage
+/// (shared by all flows). The AQM keeps standing queues near 5 ms; the
+/// limits only bound bursts. Three full queues plus both RX rings
+/// (3 × 384 + 128 = 1280) stay within the packet pool (`net_pool_size`).
 const QDISC_PACKETS: usize = 384;
 const QDISC_BYTES: usize = 384 * 1514;
 
@@ -111,7 +112,10 @@ pub fn layout(ports: usize, cores: usize) -> Layout {
 }
 
 /// Bring up the first two supported NICs: first = WAN, second = LAN.
-/// WAN egress is shaped at the upload rate, LAN egress at the download rate.
+/// WAN egress is shaped at the upload rate; the download in the WAN
+/// ingress stage (`Shared::ingress`), so LAN egress is unshaped and
+/// traffic between networks runs at the line rate (`shape_ingress=0`:
+/// LAN egress at the download rate instead).
 /// Links: the WAN on the first, one per network (`config::networks`) on
 /// the second. Returns the datapath's ports, the services' router-stack
 /// interfaces (one per link) and the shared state (`None` without NICs).
@@ -246,11 +250,43 @@ pub fn bring_up(
     if ports.is_empty() {
         return None;
     }
+    let ingress = ingress_qdisc(qos);
+    log_ingress(qos, ingress.rate(), None);
     Some((
         alloc::boxed::Box::leak(ports.into_boxed_slice()),
         hosts,
-        shared::init(shared_ports, links),
+        shared::init(shared_ports, links, ingress),
     ))
+}
+
+/// The WAN ingress stage: the download's CAKE (ECN as on the download),
+/// shaped in ingress mode (drops and bypassing traffic count against the
+/// rate: `qdisc::shaper`).
+fn ingress_qdisc(qos: &crate::config::Qos) -> PortQdisc {
+    let aqm = Aqm::new(
+        qos,
+        qos.ecn_down,
+        QDISC_PACKETS,
+        QDISC_BYTES,
+        timer::ticks() ^ 0x1a9e_55c0_de0f_0001,
+    );
+    PortQdisc::ingress(aqm, qos.ingress_rate())
+}
+
+/// The boot log line for the ingress stage; `what` = "queue kept" or the
+/// new AQM after a live change.
+fn log_ingress(qos: &crate::config::Qos, rate: Option<qdisc::shaper::Rate>, what: Option<&str>) {
+    let now = if what.is_some() { "now " } else { "" };
+    match rate {
+        Some(r) => println!(
+            "  qos ingress    : {now}shaped {} kbit/s (download), overhead {} B, {}",
+            r.bits_per_sec / 1000,
+            r.overhead,
+            what.unwrap_or("CAKE in ingress mode")
+        ),
+        None if !qos.ingress => println!("  qos ingress    : off (shape_ingress=0: download shaped on lan0)"),
+        None => println!("  qos ingress    : {now}unshaped (no download rate)"),
+    }
 }
 
 /// The router stack's interface for a link on `port`: Ethernet, or
@@ -315,9 +351,23 @@ pub type SharedDatapath = &'static Datapath;
 
 /// Apply new shaping settings without a restart. Rate and overhead change
 /// in place (the queue is kept); another AQM, fairness mode or ECN setting
-/// rebuilds the port's qdisc, dropping the packets queued in it (a few
-/// milliseconds' worth when it is shaped).
+/// rebuilds the port's qdisc (and the ingress stage's), dropping the
+/// packets queued in it (a few milliseconds' worth when it is shaped).
 pub fn apply_qos(sh: &Shared, old: &crate::config::Qos, new: &crate::config::Qos) {
+    {
+        let rebuild = old.aqm != new.aqm || old.isolation != new.isolation || old.ecn_down != new.ecn_down;
+        let what = if rebuild {
+            let fresh = ingress_qdisc(new);
+            let desc = fresh.inner().describe(new.ecn_down);
+            // The old queue and its packets drop here, under the lock.
+            *sh.ingress.lock() = fresh;
+            desc
+        } else {
+            sh.ingress.lock().set_rate(new.ingress_rate());
+            alloc::string::String::from("queue kept")
+        };
+        log_ingress(new, new.ingress_rate(), Some(&what));
+    }
     for (i, port) in sh.ports.iter().enumerate() {
         let up = i == 0;
         let rate = new.port_rate(up);
@@ -532,6 +582,13 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
         if !batch.is_empty() {
             dp.rx_batch(d.rx, &mut batch, &mut touched);
         }
+        // Step 2b (receiving on the WAN): the ingress stage's shaper
+        // releases the download to the egress qdiscs.
+        let ingress_wake = if d.rx == datapath::WAN_PORT {
+            dp.drain_ingress(&mut touched)
+        } else {
+            None
+        };
 
         // Step 3 (primary): control messages, housekeeping, status.
         let mut next_hk = u64::MAX;
@@ -616,7 +673,7 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
             u64::MAX
         };
         let mut delay = Duration::from_millis(due.saturating_sub(now_ms).min(1000));
-        if let Some(at) = tx.shaper_wake_ns {
+        for at in [tx.shaper_wake_ns, ingress_wake].into_iter().flatten() {
             delay = delay.min(Duration::from_nanos(at.saturating_sub(datapath::now_ns())));
         }
         // TX completion normally raises an interrupt (handled by the other

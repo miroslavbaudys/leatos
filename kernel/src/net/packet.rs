@@ -54,6 +54,10 @@ pub struct PacketMeta {
     pub is_pure_ack: bool,
     /// Interface the packet arrived on.
     pub ingress_if: u8,
+    /// In the WAN ingress stage: the forwarder's egress link and next hop
+    /// (IPv4 as `u32`), for the neighbor lookup once the shaper releases it.
+    pub egress_if: u8,
+    pub next_hop: u32,
 }
 
 /// Preallocate `count` buffers. Call once at boot.

@@ -1255,7 +1255,28 @@ fn status_json(
             q.backlog_packets,
         );
     }
-    s.push_str("],\"dhcp_leases\":[");
+    // The WAN ingress stage (the download's shaper; `null` with
+    // `shape_ingress=0`, where lan0 egress shapes it).
+    s.push_str("],\"ingress\":");
+    {
+        let (on, q, rate, charged) = {
+            let q = sh.ingress.lock();
+            (crate::config::qos().ingress, q.stats(), q.rate(), q.charged_bytes)
+        };
+        if on {
+            let rate = rate
+                .map(|r| format!("{}", r.bits_per_sec / 1000))
+                .unwrap_or_else(|| String::from("null"));
+            let _ = write!(
+                s,
+                "{{\"shaped_kbit\":{rate},\"sent\":{},\"dropped\":{},\"ecn_marked\":{},\"backlog_packets\":{},\"charged_bytes\":{charged}}}",
+                q.dequeued, q.dropped, q.marked, q.backlog_packets
+            );
+        } else {
+            s.push_str("null");
+        }
+    }
+    s.push_str(",\"dhcp_leases\":[");
     if let Some(svc) = services {
         let now = timer::uptime().as_secs();
         for (n, (net, l)) in svc.leases_by_network().enumerate() {

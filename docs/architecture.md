@@ -59,8 +59,11 @@ watchdog backed by a hardware timer resets a stuck one (M8,
    firewall verdict, NAT rewrite, **classify** (fill `PacketMeta`: pre-NAT
    flow and host hashes, wire length), route lookup (LPM), neighbor
    resolution (at most 3 packets held per unresolved next hop), TTL
-   decrement and incremental checksum update. Download shaping happens on
-   LAN egress (a WAN-ingress CAKE stage is planned for the multi-port LAN).
+   decrement and incremental checksum update. Packets from the WAN then
+   wait in the **WAN ingress stage** (CAKE shaped at the download rate,
+   `Shared::ingress`) before the neighbor lookup, so LAN egress stays
+   unshaped and traffic between networks is not held to the download
+   rate (docs/bufferbloat-cake.md §3.4).
    Packets *for* the router go into a small bounded per-link queue
    (`local_rx`, 64 packets) and from there into smoltcp, which runs in the
    services task. The router's own transmissions go straight into the port's qdisc,

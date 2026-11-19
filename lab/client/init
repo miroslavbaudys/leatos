@@ -426,8 +426,9 @@ if [ -n "$want" ] && [ "$want" != 0 ]; then
   # difference, so the rest of the run (svc's idle work) does not count.
   task_ms() { echo "$1" | $bb grep -o "\"name\":\"$2\",\"core\":[0-9]*,\"ms\":[0-9]*" | $bb sed 's/.*"ms"://'; }
   cpu0=$($bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null)
-  # Download 5 MB while pinging the router (latency under load).
-  $bb ping -c 25 -i 0.2 192.168.1.1 >/tmp/ping-load 2>&1 &
+  # Download 5 MB while pinging the ISP (latency under load: the replies
+  # share the WAN ingress stage with the download).
+  $bb ping -c 25 -i 0.2 "$ISP" >/tmp/ping-load 2>&1 &
   t0=$(now_ms)
   $bb wget -q -T 30 -O /tmp/5mb "http://$ISP/5mb"
   t1=$(now_ms)
@@ -465,9 +466,10 @@ if [ -n "$want" ] && [ "$want" != 0 ]; then
     [ -n "$a" ] && [ -n "$b" ] && load="$load $t=$((b - a))"
   done
   echo "LAB CPU load:$load"
-  # Ping replies leave through the LAN egress shaper behind the download. With
-  # flow isolation (CAKE, FQ-CoDel) they skip the download's queue: avg ~1 ms. One
-  # CoDel queue (router arg qdisc=codel, the negative control) gives ~8 ms.
+  # The ISP's ping replies wait in the WAN ingress stage (download shaper)
+  # with the download. With flow isolation (CAKE, FQ-CoDel) they skip the
+  # download's queue: avg ~1 ms. One CoDel queue (router arg qdisc=codel,
+  # the negative control) gives ~8 ms.
   avg=$($bb awk -F'/' '/min\/avg\/max/{print int($4)}' /tmp/ping-load)
   if [ -n "$avg" ] && [ "$avg" -lt 3 ]; then pass "latency under shaped load: avg ${avg} ms ($($bb grep -o 'min/avg/max = [^ ]*' /tmp/ping-load))"; else fail "latency under shaped load: avg '${avg}' ms"; $bb tail -2 /tmp/ping-load | $bb sed 's/^/    | /'; fi
 fi
@@ -701,6 +703,46 @@ if [ -n "$guest" ]; then
           *) fail "recheck: config not applied: $r / $r2" ;;
         esac
       fi
+    fi
+    # Traffic between networks is not the download (docs/bufferbloat-cake.md
+    # §3.4): the router shapes the download where it arrives from the WAN,
+    # so main LAN -> guest runs well above the download rate. eth0.20 moves
+    # into its own network namespace (a second host on VLAN 20), so the
+    # 5 MB really crosses the router; rule lab-lan-to-guest lets the main
+    # LAN open TCP 8081 there. Last guest check: the VLAN interface goes
+    # away with the namespace. Negative control:
+    # LAB_ROUTER_ARGS=shape_ingress=0 (download shaped on lan0 egress, which
+    # caps this too).
+    if [ -n "$want" ] && [ "$want" != 0 ]; then
+      $bb mkdir -p /tmp/www-ll
+      $bb dd if=/dev/zero of=/tmp/www-ll/5mb bs=1024 count=5120 2>/dev/null
+      $bb unshare -n $bb sleep 300 &
+      nsp=$!
+      $bb sleep 0.3
+      ns() { $bb nsenter -n -t "$nsp" "$@"; }
+      if $bb ip link set eth0.20 netns "$nsp" && ns $bb ip link set lo up && ns $bb ip link set eth0.20 up \
+         && ns $bb ip addr add "$gip/24" dev eth0.20 && ns $bb ip route add default via 10.20.0.1; then
+        $bb nsenter -n -t "$nsp" $bx httpd -f -p 8081 -h /tmp/www-ll &
+        hp=$!
+        $bb sleep 0.5
+        t0=$(now_ms)
+        $bb wget -q -T 30 -O /tmp/ll "http://$gip:8081/5mb"
+        t1=$(now_ms)
+        got=$($bb wc -c </tmp/ll 2>/dev/null || echo 0); $bb rm -f /tmp/ll
+        kbit=$(( 5242880 * 8 / (t1 - t0 + 1) ))
+        if [ "$got" != 5242880 ]; then
+          fail "lan to guest: got $got of 5242880 bytes from $gip"
+        elif [ "$kbit" -gt $((want * 2)) ]; then
+          pass "lan to guest: $kbit kbit/s, not held to the download rate ($want)"
+        else
+          fail "lan to guest: $kbit kbit/s, expected more than twice the download rate ($want)"
+        fi
+        kill "$hp" 2>/dev/null
+      else
+        fail "lan to guest: cannot move eth0.20 into a network namespace"
+      fi
+      kill "$nsp" 2>/dev/null
+      $bb rm -rf /tmp/www-ll
     fi
   fi
 fi
