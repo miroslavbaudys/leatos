@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 leatos is a SOHO router OS in Rust: a **bare-metal unikernel** for aarch64 (QEMU `virt`, HVF on Apple Silicon) and x86_64 (QEMU q35 via PVH, TCG; target hardware: PC Engines apu4, M10).
-Formerly **rrouter** (renamed 2026-11-19). The old name stays where changing it would break something deployed: the store magics `RRSTORE1`/`RREC` (crates/config-store), `/boot/rrouter` on apu4 SD cards flashed before the rename (new images use `/boot/leatos`), the `mac-lab.sh` resolver marker (old one still recognised) and the measurement labels in docs/bufferbloat-cake.md.
+Formerly **rrouter** (renamed 2026-11-19). The old name stays where changing it would break something deployed: the store magics `RRSTORE1`/`RREC` (crates/config-store), `/boot/rrouter` on apu4 SD cards flashed before the rename (new images use `/boot/leatos`) and the `mac-lab.sh` resolver marker (old one still recognised).
 Goals: PPPoE, DHCP (v4 server/client, DHCPv6-PD, RA), a DNS forwarder, NAT, a firewall, IPv4 + IPv6, and
 **bufferbloat mitigation with CAKE**, which is a core design driver (`docs/bufferbloat-cake.md`).
 

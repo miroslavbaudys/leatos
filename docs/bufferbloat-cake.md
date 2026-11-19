@@ -555,11 +555,9 @@ loaded p90 minus idle p50. Only valid runs are shown (2026-11-08/09):
 | Path | Runs | Download added (p90) | Upload added (p90) | Upload max | ↓ / ↑ Mbit/s |
 |---|---|---|---|---|---|
 | direct | 2 | 66.9, 47.5 ms (≈ 57) | **243.5, 241.7 ms** | 369–403 ms | 54–56 / 46 |
-| rrouter-release | 3 | 50.7, 58.6, 45.0 ms (≈ 51) | **52.0, 69.2, 100.1 ms (≈ 74)** | 172–206 ms | 54–55 / 38–48 |
-| rrouter-debug | 1 | 55.7 ms | 58.0 ms | 129 ms | 55 / 45 |
-| rrouter-release + hybrid idle + CoDel | 1 | 47.8 ms | **199.2 ms** | 323 ms | 53 / 47 |
-
-(Path labels from before the project was renamed from rrouter to leatos.)
+| leatos-release | 3 | 50.7, 58.6, 45.0 ms (≈ 51) | **52.0, 69.2, 100.1 ms (≈ 74)** | 172–206 ms | 54–55 / 38–48 |
+| leatos-debug | 1 | 55.7 ms | 58.0 ms | 129 ms | 55 / 45 |
+| leatos-release + hybrid idle + CoDel | 1 | 47.8 ms | **199.2 ms** | 323 ms | 53 / 47 |
 
 **Findings:**
 1. **Download is the same with or without leatos** (≈ +50–57 ms at the
