@@ -1,4 +1,4 @@
-// rrouter early boot — aarch64, QEMU `virt`.
+// leatos early boot — aarch64, QEMU `virt`.
 //
 // Entered by QEMU at _start (ELF entry) on every powered-on core, with the
 // MMU off. Under HVF the core starts at EL1; under TCG with

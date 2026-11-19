@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end lab: three QEMU VMs joined by UDP socket links (no root needed).
 #
-#   [client]  ──LAN 10004<->10003──  [rrouter]  ──WAN 10005<->10006──  [ISP]
+#   [client]  ──LAN 10004<->10003──  [leatos]  ──WAN 10005<->10006──  [ISP]
 #   Alpine, DHCP client              192.168.1.1 / DHCP from ISP        203.0.113.1
 #   runs all checks                  DHCP srv, DNS, NAT, firewall       udhcpd, httpd, dnsd
 #
@@ -16,7 +16,7 @@
 #   LAB_KEEP_LOGS=1      keep console logs (path printed)
 #   LAB_TIMEOUT=150      seconds before giving up
 #   QEMU_ACCEL=tcg       run without hardware acceleration
-#   RROUTER_ARCH=x86_64  run the x86_64 router kernel (QEMU q35, TCG); the
+#   LEATOS_ARCH=x86_64  run the x86_64 router kernel (QEMU q35, TCG); the
 #                        client and ISP VMs stay aarch64
 #   LAB_SHAPE_KBIT=10000 router shapes both directions at this rate and the
 #                        client checks throughput + latency under load
@@ -55,7 +55,7 @@
 #   LAB_PPPOE=pap|chap|none  the ISP is a PPPoE access concentrator only (no
 #                        DHCP; pppoe-server from the pinned packages, needs
 #                        modloop) requiring PAP or CHAP; the router gets
-#                        wan_mode=pppoe pppoe_user=rrouter pppoe_pass=lab-secret
+#                        wan_mode=pppoe pppoe_user=leatos pppoe_pass=lab-secret
 #                        (LAB_ROUTER_ARGS win). Checks: session up (router
 #                        log), all client checks through it, and a reconnect
 #                        after the ISP ends the session. Negative controls:
@@ -177,7 +177,7 @@
 #                        certificate's issue time on aarch64 (no RTC); the
 #                        check reads which from the router's log
 #                        (LAB_EXPECT_DATES=rtc|issue|expired overrides).
-#                        Control: RROUTER_ARCH=x86_64
+#                        Control: LEATOS_ARCH=x86_64
 #                        QEMU_EXTRA="-rtc base=2040-01-01" with
 #                        LAB_EXPECT_DATES=expired: an RTC far ahead must not
 #                        break DNS (accepted until SNTP), and SNTP then
@@ -237,7 +237,7 @@ if [[ -n "$ISP_PPPOE" ]]; then
   if [[ "$ISP_PPPOE" == none || -n "${LAB_PPPOE_ANON:-}" ]]; then
     ROUTER_ARGS="$ROUTER_ARGS wan_mode=pppoe"
   else
-    ROUTER_ARGS="$ROUTER_ARGS wan_mode=pppoe pppoe_user=rrouter pppoe_pass=lab-secret"
+    ROUTER_ARGS="$ROUTER_ARGS wan_mode=pppoe pppoe_user=leatos pppoe_pass=lab-secret"
   fi
   BIG_PING="${LAB_BIG_PING:-1464}"
 fi
@@ -272,7 +272,7 @@ DOT_CA="${LAB_DOT_CA:-1}"
 LAN_PORT="${LAB_LAN_PORT:-10003}"
 WAN_PORT="${LAB_WAN_PORT:-10005}"
 LAN1_PORT="${LAB_LAN1_PORT:-10007}"
-WORK=$(mktemp -d -t rrouter-lab)
+WORK=$(mktemp -d -t leatos-lab)
 PCAP_DIR="${LAB_PCAP_DIR:-}"
 [[ -n "$MDNS" && -z "$PCAP_DIR" ]] && PCAP_DIR="$WORK/pcap"
 PIDS=()
@@ -287,7 +287,7 @@ source scripts/lab/common.sh
 lab_cpu_flags
 
 echo "== build"
-ARCH="${RROUTER_ARCH:-aarch64}"
+ARCH="${LEATOS_ARCH:-aarch64}"
 cargo build -q -p leatos-kernel --target "$ARCH-unknown-none"
 MODLOOP=""
 [[ -n "$ISP_VLAN$ISP_PPPOE$GUEST" ]] && MODLOOP=modloop
@@ -300,7 +300,7 @@ if [[ -n "$DOT" ]]; then
   # and valid from now; the server's half goes into the ISP's initrd.
   mkdir -p "$WORK/dot/etc/dot"; d="$WORK/dot"
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$d/ca.key" -out "$d/ca.pem" -days 30 \
-    -subj "/CN=rrouter lab CA" -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
+    -subj "/CN=leatos lab CA" -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
   openssl req -newkey rsa:2048 -nodes -keyout "$d/etc/dot/server.key" -out "$d/server.csr" -subj "/CN=dns.isp.example" 2>/dev/null
   printf 'subjectAltName=DNS:dns.isp.example\nbasicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' >"$d/ext.cnf"
   openssl x509 -req -in "$d/server.csr" -CA "$d/ca.pem" -CAkey "$d/ca.key" -CAcreateserial -days 30 -extfile "$d/ext.cnf" -out "$d/etc/dot/server.pem" 2>/dev/null
@@ -478,11 +478,11 @@ CFG
 fi
 [[ -n "$DOT" ]] && echo "== router config: DNS over TLS to 203.0.113.1#$DOT_NAME$([[ "$DOT_CA" == 1 ]] && echo ", lab CA trusted" || echo ", Mozilla's roots only")"
 
-echo "== start rrouter${ROUTER_ARGS:+ ($(echo "$ROUTER_ARGS" | sed 's/pppoe_pass=[^ ]*/pppoe_pass=***/'))}"
+echo "== start leatos${ROUTER_ARGS:+ ($(echo "$ROUTER_ARGS" | sed 's/pppoe_pass=[^ ]*/pppoe_pass=***/'))}"
 QEMU_STORE="$ROUTER_STORE" QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" LAB_LAN1_PORT="${PORTS:+$LAN1_PORT}" QEMU_PCAP_DIR="$PCAP_DIR" QEMU_ACCEL="$QEMU_ACCEL" QEMU_APPEND="$ROUTER_ARGS" \
   scripts/qemu-run.sh "target/$ARCH-unknown-none/debug/leatos" >"$WORK/router.log" 2>&1 &
 PIDS+=($!)
-wait_for "$WORK/router.log" "rrouter: boot ok" 40 || { echo "router did not boot:"; cat "$WORK/router.log"; exit 1; }
+wait_for "$WORK/router.log" "leatos: boot ok" 40 || { echo "router did not boot:"; cat "$WORK/router.log"; exit 1; }
 # When the host sees the router's first SNTP sync (compared with the time
 # the router then reports).
 ( wait_for "$WORK/router.log" "ntp  .*synced to" 90 && date -u +%s >"$WORK/ntp-seen" ) &

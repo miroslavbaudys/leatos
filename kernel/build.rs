@@ -20,7 +20,7 @@ fn main() {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".into());
-    println!("cargo:rustc-env=RROUTER_BUILD={id}");
+    println!("cargo:rustc-env=LEATOS_BUILD={id}");
     // When the built commit was made (Unix seconds): DNS over TLS refuses
     // certificates that expired before it, even before SNTP has set the
     // clock (`net::dot`). `SOURCE_DATE_EPOCH` wins (reproducible builds).
@@ -38,7 +38,7 @@ fn main() {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
         .unwrap_or_else(|| "0".into());
-    println!("cargo:rustc-env=RROUTER_BUILD_TIME={time}");
+    println!("cargo:rustc-env=LEATOS_BUILD_TIME={time}");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=../crates");

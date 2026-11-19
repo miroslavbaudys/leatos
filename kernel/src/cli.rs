@@ -40,7 +40,7 @@ use qdisc::Qdisc as _;
 use core::fmt::Write as _;
 use core::time::Duration;
 
-const PROMPT: &str = "rrouter> ";
+const PROMPT: &str = "leatos> ";
 const POLL_IDLE: Duration = Duration::from_millis(50);
 const POLL_ACTIVE: Duration = Duration::from_millis(2);
 const ACTIVE_FOR: Duration = Duration::from_secs(2);
@@ -392,7 +392,7 @@ fn dur(s: u64) -> String {
 
 fn status(ctx: &Ctx, wan: &str) {
     println!(
-        "rrouter {} ({}), up {}",
+        "leatos {} ({}), up {}",
         env!("CARGO_PKG_VERSION"),
         if cfg!(target_arch = "x86_64") { "x86_64" } else { "aarch64" },
         dur(timer::uptime().as_secs())

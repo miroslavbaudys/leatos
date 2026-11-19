@@ -3,7 +3,7 @@
 //! AQM), [`fq_codel::FqCodel`] (RFC 8290 flow queueing), [`shaper::Shaper`],
 //! and later CAKE (docs/bufferbloat-cake.md).
 //!
-//! The qdisc is the **only** place packets wait in rrouter. Egress is
+//! The qdisc is the **only** place packets wait in leatos. Egress is
 //! pull-based: the datapath dequeues only when the driver has room, so a
 //! full NIC ring makes packets wait here (where AQM can act), never in a
 //! hidden driver queue.

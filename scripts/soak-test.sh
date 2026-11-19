@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Soak test (M9): watch a running rrouter for days and judge whether it
+# Soak test (M9): watch a running leatos for days and judge whether it
 # leaks or resets. It only observes: the load must come from real use (the
 # apu4 as the home router) or from something else driving the lab router.
 #
@@ -24,15 +24,15 @@
 #   scripts/soak-test.sh [--host H] [--hours 72] [--interval 60] [--label NAME]
 #                        [--warmup-hours 1] [--window-hours 6] [--min-forwarded N]
 #   scripts/soak-test.sh --report lab/cache/soak-NAME.csv [--hours H] ...
-# Defaults: host from $RROUTER_HOST, password from $RROUTER_PASS or
+# Defaults: host from $LEATOS_HOST, password from $LEATOS_PASS or
 # target/apu4/mgmt-pass (none: the router has no password, reads are public).
 # Exit: 0 pass, 1 fail, 2 usage, 3 invalid.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export LC_ALL=C
 
-HOST="${RROUTER_HOST:-}"
-PASS="${RROUTER_PASS:-}"
+HOST="${LEATOS_HOST:-}"
+PASS="${LEATOS_PASS:-}"
 HOURS=72
 INTERVAL=60
 LABEL=""
@@ -136,7 +136,7 @@ if [[ -n "$REPORT" ]]; then
   exit $?
 fi
 
-[[ -n "$HOST" ]] || { echo "no router: --host ADDR or RROUTER_HOST" >&2; exit 2; }
+[[ -n "$HOST" ]] || { echo "no router: --host ADDR or LEATOS_HOST" >&2; exit 2; }
 if [[ -z "$PASS" && -f target/apu4/mgmt-pass ]]; then PASS="$(cat target/apu4/mgmt-pass)"; fi
 AUTH=()
 [[ -n "$PASS" ]] && AUTH=(-u "admin:$PASS")

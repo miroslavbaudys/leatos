@@ -1,4 +1,4 @@
-//! rrouter — bare-metal unikernel for SOHO routing (aarch64 today, x86_64 later).
+//! leatos — bare-metal unikernel for SOHO routing (aarch64 today, x86_64 later).
 //!
 //! Single address space; everything runs in kernel mode. Boot order is
 //! arch-neutral (this file); the arch backend supplies entry, CPU, irqchip,
@@ -51,9 +51,9 @@ pub fn kmain(boot_arg: usize) -> ! {
     timer::init_clock();
     println!();
     println!(
-        "rrouter {} — bare metal (build {})",
+        "leatos {} — bare metal (build {})",
         env!("CARGO_PKG_VERSION"),
-        env!("RROUTER_BUILD")
+        env!("LEATOS_BUILD")
     );
     println!("  privilege level : {}", arch::cpu::privilege_level());
 

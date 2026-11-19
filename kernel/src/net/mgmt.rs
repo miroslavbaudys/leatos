@@ -44,7 +44,7 @@
 //! - `POST /api/login` (Basic auth, the page's login screen): a session
 //!   token (`{ok, token}`), sent as `Authorization: Bearer <token>`; it
 //!   lasts while used at least every 12 h. `POST /api/logout` ends it.
-//! - Requests with `X-Rrouter-UI: 1` (the page's own) get a 401 without
+//! - Requests with `X-Leatos-UI: 1` (the page's own) get a 401 without
 //!   `WWW-Authenticate`, so the browser shows the page's login screen
 //!   instead of its own password dialog.
 //!
@@ -211,7 +211,7 @@ struct Conn {
     /// Connection start (for the timeouts).
     since: Option<timer::Instant>,
     responded_at: Option<timer::Instant>,
-    /// `X-Rrouter-UI`: answer 401 without `WWW-Authenticate`.
+    /// `X-Leatos-UI`: answer 401 without `WWW-Authenticate`.
     no_prompt: bool,
 }
 
@@ -257,7 +257,7 @@ impl Conn {
             self.respond(
                 status,
                 "application/json",
-                &[("WWW-Authenticate", "Basic realm=\"rrouter\"")],
+                &[("WWW-Authenticate", "Basic realm=\"leatos\"")],
                 body.as_bytes(),
             );
         } else {
@@ -581,7 +581,7 @@ impl Mgmt {
     /// A request head arrived: route it, check auth, claim the staging area.
     fn on_head(&mut self, i: usize, head: Head) {
         crate::entropy::mix(head.path.as_bytes());
-        self.conns[i].no_prompt = head.header("x-rrouter-ui").is_some();
+        self.conns[i].no_prompt = head.header("x-leatos-ui").is_some();
         let route = match (head.method, head.path.as_str()) {
             (Method::Get, "/" | "/index.html") => Ok(Route::Index),
             (Method::Get, "/api/info") => Ok(Route::Info),
@@ -1155,7 +1155,7 @@ fn status_json(
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"temp\":{temp},\"memory\":{memory},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
          \"fragments\":{{\"forwarded\":{},\"parked\":{},\"park_drops\":{},\"split\":{},\"split_drops\":{}}},\"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
         json_str(env!("CARGO_PKG_VERSION")),
-        json_str(env!("RROUTER_BUILD")),
+        json_str(env!("LEATOS_BUILD")),
         json_str(if cfg!(target_arch = "x86_64") {
             "x86_64"
         } else {

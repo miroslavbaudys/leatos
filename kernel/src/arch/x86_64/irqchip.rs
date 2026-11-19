@@ -3,7 +3,7 @@
 //! Interrupt IDs are **vectors**: 32 = local APIC timer, 34 = COM1 (the
 //! serial console's RX), 48-63 = device MSI-X (`crate::pci`), 255 =
 //! spurious. PCI INTx via the IOAPIC is not used: on PCs its routing needs
-//! the ACPI `_PRT` (AML), while MSI-X works on every device rrouter targets
+//! the ACPI `_PRT` (AML), while MSI-X works on every device leatos targets
 //! (virtio-net, Intel i211). The one IOAPIC entry in use is COM1's ISA IRQ
 //! 4, which the MADT alone describes (interrupt source overrides).
 //!

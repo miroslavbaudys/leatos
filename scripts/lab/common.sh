@@ -61,7 +61,7 @@ sudo_keepalive() {
   KEEPALIVE_PID=$!
 }
 
-# Find the interface vmnet created for rrouter's LAN: a new interface (not in
+# Find the interface vmnet created for leatos's LAN: a new interface (not in
 # $1, the `ifconfig -l` output from before QEMU started) with an address in
 # $2 (e.g. "192.168.1"). Sets MAC_IF and MAC_IP; returns 1 after ~15 s.
 find_new_lan_if() { # before-list net-prefix

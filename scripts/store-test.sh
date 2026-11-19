@@ -5,7 +5,7 @@
 # reboot.
 #
 #   scripts/store-test.sh                       # aarch64 (HVF on Apple Silicon)
-#   RROUTER_ARCH=x86_64 scripts/store-test.sh   # x86_64 (TCG)
+#   LEATOS_ARCH=x86_64 scripts/store-test.sh   # x86_64 (TCG)
 #   LAB_VERBOSE=1 ...                           # print the router consoles
 #   QEMU_STORE_BUS=sd ...                       # store on an SD card (sdhci-pci)
 #   STORE_MIB=2048 ...                          # image size; QEMU's SD card is
@@ -31,12 +31,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ARCH="${RROUTER_ARCH:-aarch64}"
-case "$ARCH" in aarch64 | x86_64) ;; *) echo "RROUTER_ARCH must be aarch64 or x86_64" >&2; exit 2 ;; esac
+ARCH="${LEATOS_ARCH:-aarch64}"
+case "$ARCH" in aarch64 | x86_64) ;; *) echo "LEATOS_ARCH must be aarch64 or x86_64" >&2; exit 2 ;; esac
 TARGET="$ARCH-unknown-none"
 PORT="${STORE_TEST_PORT:-18081}"
 URL="http://127.0.0.1:$PORT"
-WORK="$(mktemp -d -t rrouter-store.XXXXXX)"
+WORK="$(mktemp -d -t leatos-store.XXXXXX)"
 IMG="$WORK/store.img"
 # Power of two: QEMU's SD card needs it.
 STORE_MIB="${STORE_MIB:-32}"

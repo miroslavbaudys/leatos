@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boot an rrouter kernel ELF in QEMU: aarch64 `virt`, or x86_64 `q35` when
+# Boot a leatos kernel ELF in QEMU: aarch64 `virt`, or x86_64 `q35` when
 # the ELF is an x86-64 build (PVH entry via -kernel; SeaBIOS assigns BARs).
 # Used as the cargo runner for both targets (`cargo krun`, `cargo krun-x86`).
 #

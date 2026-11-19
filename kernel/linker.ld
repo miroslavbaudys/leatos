@@ -1,5 +1,5 @@
 /*
- * rrouter kernel linker script — QEMU aarch64 `virt` machine.
+ * leatos kernel linker script — QEMU aarch64 `virt` machine.
  *
  * RAM starts at 0x4000_0000. For bare-metal ELF images QEMU places the
  * device tree blob at the very start of RAM and reserves up to 1 MiB for it,

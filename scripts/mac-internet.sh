@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# "Level 3": route this Mac's IPv4 internet traffic and DNS through rrouter.
+# "Level 3": route this Mac's IPv4 internet traffic and DNS through leatos.
 #
-#   MacBook ──bridgeN (vmnet-host, 192.168.1.2)── [rrouter LAN 192.168.1.1]
-#                                                 [rrouter WAN] ══ vmnet-bridged on <wan-if> ══ home router → internet
+#   MacBook ──bridgeN (vmnet-host, 192.168.1.2)── [leatos LAN 192.168.1.1]
+#                                                 [leatos WAN] ══ vmnet-bridged on <wan-if> ══ home router → internet
 #
-# rrouter's WAN is bridged at layer 2 onto a physical interface and gets its
+# leatos's WAN is bridged at layer 2 onto a physical interface and gets its
 # own lease from your home router (double NAT). The Mac then sends all IPv4
-# traffic to rrouter via 8 prefix routes (1/8 … 64/2 + 128/1: more specific
+# traffic to leatos via 8 prefix routes (1/8 … 64/2 + 128/1: more specific
 # than the default route, so macOS's own default route stays untouched;
 # verified after adding) and uses
 # 192.168.1.1 as DNS server.
@@ -19,25 +19,25 @@
 #                    interface of the current default route). Ethernet is
 #                    strongly preferred: many Wi-Fi access points drop frames
 #                    from the extra MAC address of a bridged VM.
-#     --ipv4-only    turn IPv6 off on that service while running (rrouter has
+#     --ipv4-only    turn IPv6 off on that service while running (leatos has
 #                    no IPv6 yet, so IPv6 traffic would bypass it); restored on exit
-#     --release      run an optimised (release) build of rrouter instead of
+#     --release      run an optimised (release) build of leatos instead of
 #                    the debug build: much faster datapath (see bufferbloat.sh)
-#     --shape U:D    shape rrouter's upload to U and download to D Mbit/s
+#     --shape U:D    shape leatos's upload to U and download to D Mbit/s
 #                    (e.g. 42:50: slightly below the real line rate, so the
-#                    queue forms in rrouter where CoDel controls it)
-#     --kernel-args "a=b c=d"   extra rrouter boot arguments (e.g. "ecn_up=1")
+#                    queue forms in leatos where CoDel controls it)
+#     --kernel-args "a=b c=d"   extra leatos boot arguments (e.g. "ecn_up=1")
 #     --yes          don't ask for confirmation
 #     --check        run the checks, then restore and exit (exit 1 on failure)
 #
 # Safety: the original DNS/IPv6 settings are saved to lab/cache/mac-internet.state
 # *before* anything changes; Ctrl-C, errors and --restore put them back. A
-# watchdog restores the network if rrouter stops answering.
+# watchdog restores the network if leatos stops answering.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 STATE=lab/cache/mac-internet.state
-# IPv4 space via rrouter, as "network netmask" pairs. The lower half is split
+# IPv4 space via leatos, as "network netmask" pairs. The lower half is split
 # into 1/8 … 64/2 because a route keyed 0.0.0.0 (like 0.0.0.0/1) shares its
 # radix key with vmnet-host's interface-scoped default route on the LAN
 # bridge, and macOS then resolves lookups to that gateway-less route
@@ -48,7 +48,7 @@ SPLIT_ROUTES=(
 )
 ROUTER_LAN=192.168.1.1
 LAN_NET=192.168.1
-WORK=$(mktemp -d -t rrouter-macinet)
+WORK=$(mktemp -d -t leatos-macinet)
 PIDS=()
 ROUTER_PID=""
 KEEPALIVE_PID=""
@@ -146,7 +146,7 @@ cleanup() {
   for p in "${PIDS[@]:-}"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null; done
   [[ -n "$KEEPALIVE_PID" ]] && kill "$KEEPALIVE_PID" 2>/dev/null
   wait 2>/dev/null
-  echo "  rrouter stopped; logs: $WORK"
+  echo "  leatos stopped; logs: $WORK"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
@@ -164,13 +164,13 @@ PORT=$(networksetup -listallhardwareports | awk -v dev="$WAN_IF" '/^Hardware Por
 check_no_subnet_conflict "192\\.168\\.1" || exit 1
 HOME_GW=$(route -n get default 2>/dev/null | awk '/gateway/{print $2}')
 
-echo "rrouter ($PROFILE build${SHAPE:+, shaped ${SHAPE%%:*} up / ${SHAPE##*:} down Mbit/s}) will become this Mac's IPv4 router:"
+echo "leatos ($PROFILE build${SHAPE:+, shaped ${SHAPE%%:*} up / ${SHAPE##*:} down Mbit/s}) will become this Mac's IPv4 router:"
 echo "  WAN bridged onto : $WAN_IF ($PORT, service '$SERVICE'); home gateway $HOME_GW"
 echo "  Mac changes      : routes for 1.0.0.0-255.255.255.255 (8 prefixes) via $ROUTER_LAN, DNS for '$SERVICE' -> $ROUTER_LAN$([[ $IPV4_ONLY == 1 ]] && echo ", IPv6 off")"
 echo "  undo             : automatic on exit/Ctrl-C/watchdog; manual: scripts/mac-internet.sh --restore"
 if [[ "$PORT" == Wi-Fi* ]]; then
   echo "  WARNING: bridging over Wi-Fi often fails (the access point drops the VM's MAC)."
-  echo "           If rrouter gets no WAN lease, use an Ethernet adapter: --wan-if enX"
+  echo "           If leatos gets no WAN lease, use an Ethernet adapter: --wan-if enX"
 fi
 if [[ "$ASSUME_YES" != 1 ]]; then
   read -r -p "Continue? [y/N] " answer
@@ -188,24 +188,24 @@ fi
 KERNEL=target/aarch64-unknown-none/$PROFILE/leatos
 BEFORE=$(ifconfig -l)
 
-echo "== start rrouter (WAN bridged on $WAN_IF, LAN on vmnet-host)"
+echo "== start leatos (WAN bridged on $WAN_IF, LAN on vmnet-host)"
 sudo -n env QEMU_BIN="$QEMU_BIN" QEMU_NET=mac-internet MAC_WAN_IF="$WAN_IF" QEMU_ACCEL="${QEMU_ACCEL:-hvf}" \
   QEMU_APPEND="$KERNEL_ARGS${EXTRA_ARGS:+ $EXTRA_ARGS}" scripts/qemu-run.sh "$KERNEL" >"$WORK/router.log" 2>&1 &
 ROUTER_PID=$!
 if ! wait_for "$WORK/router.log" "net wan0 .*dhcp lease" 30; then
-  echo "rrouter got no WAN lease on $WAN_IF within 30 s."
+  echo "leatos got no WAN lease on $WAN_IF within 30 s."
   [[ "$PORT" == Wi-Fi* ]] && echo "This is the known Wi-Fi bridging limitation: try an Ethernet adapter (--wan-if enX)."
   tr -d '\r' <"$WORK/router.log" | tail -15
   exit 1
 fi
 LEASE=$(tr -d '\r' <"$WORK/router.log" | grep -m1 "net wan0 .*dhcp lease" | sed 's/^ *//')
 echo "  $LEASE"
-wait_for "$WORK/router.log" "rrouter: boot ok" 20 || true
+wait_for "$WORK/router.log" "leatos: boot ok" 20 || true
 
 find_new_lan_if "$BEFORE" "$LAN_NET" || { echo "no vmnet LAN interface with a $LAN_NET.x address appeared" >&2; exit 1; }
 [[ "$MAC_IP" != "$ROUTER_LAN" ]] || { echo "vmnet gave the Mac $ROUTER_LAN (clash)" >&2; exit 1; }
-echo "== Mac joined rrouter's LAN: $MAC_IF = $MAC_IP"
-ping -c 1 -t 3 "$ROUTER_LAN" >/dev/null 2>&1 || { echo "rrouter does not answer on $ROUTER_LAN; not switching" >&2; exit 1; }
+echo "== Mac joined leatos's LAN: $MAC_IF = $MAC_IP"
+ping -c 1 -t 3 "$ROUTER_LAN" >/dev/null 2>&1 || { echo "leatos does not answer on $ROUTER_LAN; not switching" >&2; exit 1; }
 
 # ---- switch: save state first, then change ------------------------------------------------
 orig_dns=$(networksetup -getdnsservers "$SERVICE" | tr '\n' ' ' | sed 's/ *$//')
@@ -216,14 +216,14 @@ mkdir -p "$(dirname "$STATE")"
 # BUILD= is informational (read by scripts/bufferbloat.sh to label results).
 printf 'SERVICE=%s\nDNS=%s\nIPV6=%s\nROUTES=split\nBUILD=%s\nSHAPE=%s\nARGS=%s\n' "$SERVICE" "$orig_dns" "$v6_state" "$PROFILE" "$SHAPE" "$EXTRA_ARGS" >"$STATE"
 
-echo "== switching this Mac to rrouter"
+echo "== switching this Mac to leatos"
 for r in "${SPLIT_ROUTES[@]}"; do
   # shellcheck disable=SC2086 # "net mask" pair
   set -- $r
   sudo -n route -n add -net "$1" -netmask "$2" "$ROUTER_LAN" >/dev/null
 done
 # Verify addresses across the whole space before going further; restore at
-# once if any of them does not route via rrouter.
+# once if any of them does not route via leatos.
 for probe in 1.1.1.1 3.3.3.3 8.8.8.8 23.0.0.1 45.0.0.1 100.64.0.1 172.66.0.1 208.67.222.222; do
   got_gw=$(route -n get "$probe" 2>/dev/null | awk '/gateway:/{print $2}')
   got_if=$(route -n get "$probe" 2>/dev/null | awk '/interface:/{print $2}')
@@ -250,9 +250,9 @@ done
 tr_out=$(traceroute -n -m 2 -q 1 -w 2 1.1.1.1 2>/dev/null || true)
 h1=$(echo "$tr_out" | awk '$1=="1"{print $2}')
 h2=$(echo "$tr_out" | awk '$1=="2"{print $2}')
-[[ "$h1" == "$ROUTER_LAN" ]] && pass "traceroute: hop1 $h1 (rrouter), hop2 ${h2:-?} (home router: $HOME_GW)" || fail "traceroute hop1='$h1' hop2='$h2'"
+[[ "$h1" == "$ROUTER_LAN" ]] && pass "traceroute: hop1 $h1 (leatos), hop2 ${h2:-?} (home router: $HOME_GW)" || fail "traceroute hop1='$h1' hop2='$h2'"
 a=$(dig +short +time=3 +tries=1 example.com A 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
-[[ -n "$a" ]] && pass "dns: system resolver example.com -> $a (via rrouter)" || fail "dns: example.com"
+[[ -n "$a" ]] && pass "dns: system resolver example.com -> $a (via leatos)" || fail "dns: example.com"
 a=$(dig +short +time=2 +tries=1 @"$ROUTER_LAN" router.lan A 2>/dev/null | head -1)
 [[ "$a" == "$ROUTER_LAN" ]] && pass "dns: router.lan -> $a" || fail "dns: router.lan -> '$a'"
 code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 https://example.com/ || true)
@@ -265,9 +265,9 @@ for probe in 1.1.1.1 9.9.9.9; do
   fi
 done
 if networksetup -getinfo "$SERVICE" | grep -q "^IPv6 IP address: [0-9a-f]"; then
-  info "IPv6 is active on '$SERVICE': IPv6 traffic bypasses rrouter (use --ipv4-only)"
+  info "IPv6 is active on '$SERVICE': IPv6 traffic bypasses leatos (use --ipv4-only)"
 fi
-info "rebind protection: local names on your home LAN resolving to private addresses are refused by rrouter's DNS"
+info "rebind protection: local names on your home LAN resolving to private addresses are refused by leatos's DNS"
 if [[ "$fails" == 0 ]]; then echo "MAC INTERNET: PASS"; else echo "MAC INTERNET: FAIL ($fails)"; fi
 if [[ "$MODE" == check ]]; then
   [[ "$fails" == 0 ]]; exit $?
@@ -275,7 +275,7 @@ fi
 
 cat <<EOT
 
-== This Mac now uses rrouter for IPv4 internet and DNS. Browse normally.
+== This Mac now uses leatos for IPv4 internet and DNS. Browse normally.
   WAN: $LEASE
   watch traffic : sudo tcpdump -ni $MAC_IF      (Wireshark on $MAC_IF)
   router console: tail -f $WORK/router.log   (qdisc lines every 10 s under load)
@@ -283,13 +283,13 @@ cat <<EOT
 Ctrl-C restores your network. If anything goes wrong: scripts/mac-internet.sh --restore
 EOT
 
-# Watchdog: restore if rrouter dies or stops answering for ~15 s.
+# Watchdog: restore if leatos dies or stops answering for ~15 s.
 misses=0
 while true; do
   sleep 5
   if ! sudo -n kill -0 "$ROUTER_PID" 2>/dev/null; then
-    echo "!! rrouter exited: restoring network"; exit 1
+    echo "!! leatos exited: restoring network"; exit 1
   fi
   if ping -c 1 -t 2 "$ROUTER_LAN" >/dev/null 2>&1; then misses=0; else misses=$((misses + 1)); fi
-  if [[ "$misses" -ge 3 ]]; then echo "!! rrouter not answering: restoring network"; exit 1; fi
+  if [[ "$misses" -ge 3 ]]; then echo "!! leatos not answering: restoring network"; exit 1; fi
 done

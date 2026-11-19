@@ -1,5 +1,5 @@
 /*
- * rrouter x86_64 entry: PVH (QEMU `-kernel`) or Multiboot2 (Limine on the
+ * leatos x86_64 entry: PVH (QEMU `-kernel`) or Multiboot2 (Limine on the
  * apu4, booted by SeaBIOS from USB/SD).
  *
  * PVH loaders find the 32-bit entry point in the XEN_ELFNOTE_PHYS32_ENTRY

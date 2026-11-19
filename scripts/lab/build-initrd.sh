@@ -12,7 +12,7 @@ ROLE="${1:?usage: build-initrd.sh client|isp}"
 [[ -d "lab/$ROLE" ]] || { echo "no lab/$ROLE" >&2; exit 1; }
 ALPINE_DIR=$(scripts/lab/fetch-alpine.sh | tail -1)
 OUT="lab/cache/$ROLE-initrd.img"
-STAGE=$(mktemp -d -t rrouter-initrd)
+STAGE=$(mktemp -d -t leatos-initrd)
 trap 'rm -rf "$STAGE"' EXIT
 
 # Packages first, so lab/<role>/ (e.g. /etc/ppp) overrides their files.

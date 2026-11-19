@@ -11,7 +11,7 @@
 # (A+ <5 ms, A <30, B <60, C <200, D <400, F otherwise).
 #
 # Results are appended to lab/cache/bufferbloat.csv (gitignored), labelled
-# by path: "direct", "rrouter-debug", "rrouter-release" (from the
+# by path: "direct", "leatos-debug", "leatos-release" (from the
 # mac-internet state file), or --label NAME.
 #
 # Usage: scripts/bufferbloat.sh [--label NAME] [--streams N] [--no-upload] [--duration S]
@@ -51,7 +51,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-WORK=$(mktemp -d -t rrouter-bloat)
+WORK=$(mktemp -d -t leatos-bloat)
 trap 'rm -rf "$WORK"; jobs -p | xargs kill 2>/dev/null || true' EXIT
 
 # ---- which path are we measuring? ---------------------------------------------------------
@@ -61,7 +61,7 @@ if [[ -z "$LABEL" ]]; then
     build=$(sed -n 's/^BUILD=//p' lab/cache/mac-internet.state 2>/dev/null || true)
     shape=$(sed -n 's/^SHAPE=//p' lab/cache/mac-internet.state 2>/dev/null || true)
     xargs_=$(sed -n 's/^ARGS=//p' lab/cache/mac-internet.state 2>/dev/null | tr ' =' '_-' || true)
-    LABEL="rrouter-${build:-unknown}${shape:+-shaped-${shape/:/-}}${xargs_:+-$xargs_}"
+    LABEL="leatos-${build:-unknown}${shape:+-shaped-${shape/:/-}}${xargs_:+-$xargs_}"
   else
     LABEL=direct
   fi

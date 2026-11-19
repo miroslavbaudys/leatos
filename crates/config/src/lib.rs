@@ -887,9 +887,9 @@ pub enum Error {
     /// Not TOML, a wrong type or an unknown field: the parser's message,
     /// with line and column.
     Syntax(String),
-    /// Written by a newer rrouter.
+    /// Written by a newer leatos.
     NewerVersion(u32),
-    /// An older schema this rrouter no longer reads (version 1: `[lan]`).
+    /// An older schema this leatos no longer reads (version 1: `[lan]`).
     OldVersion(u32),
     /// Parsed, but the settings are inconsistent (or, from
     /// [`Config::unsupported`], not implemented yet).
@@ -906,7 +906,7 @@ impl fmt::Display for Error {
             Error::NewerVersion(v) => {
                 write!(
                     f,
-                    "config version {v} is newer than this rrouter supports ({VERSION})"
+                    "config version {v} is newer than this leatos supports ({VERSION})"
                 )
             }
             Error::OldVersion(v) => {

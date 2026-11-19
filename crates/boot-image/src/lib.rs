@@ -1,5 +1,5 @@
 //! Kernel images for the in-RAM upgrade (`kernel/src/upgrade.rs`): a new
-//! rrouter kernel arrives as an ELF file, is checked and laid out flat
+//! leatos kernel arrives as an ELF file, is checked and laid out flat
 //! here, and the arch backend copies it into place and enters it the way
 //! a Multiboot2 loader would.
 //!

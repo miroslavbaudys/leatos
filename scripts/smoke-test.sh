@@ -6,8 +6,8 @@
 #   scripts/smoke-test.sh                 # all cases
 #   SMOKE_CASES="boot" scripts/smoke-test.sh
 #   QEMU_ACCEL=tcg scripts/smoke-test.sh  # without hardware acceleration
-#   RROUTER_ARCH=x86_64 scripts/smoke-test.sh   # x86_64 kernel on QEMU q35 (TCG)
-#   RROUTER_BOOT=limine scripts/smoke-test.sh   # x86_64 via the apu4 disk image:
+#   LEATOS_ARCH=x86_64 scripts/smoke-test.sh   # x86_64 kernel on QEMU q35 (TCG)
+#   LEATOS_BOOT=limine scripts/smoke-test.sh   # x86_64 via the apu4 disk image:
 #                                               # SeaBIOS -> Limine -> Multiboot2
 #   SMOKE_VERBOSE=1 ...                   # print full console output
 #
@@ -27,15 +27,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CASES="${SMOKE_CASES:-boot fault-wx fault-stack panic wdt-task wdt-hw}"
-BOOT_MODE="${RROUTER_BOOT:-kernel}"
-case "$BOOT_MODE" in kernel) ;; limine) RROUTER_ARCH=x86_64 ;; *) echo "RROUTER_BOOT must be kernel or limine" >&2; exit 2 ;; esac
-ARCH="${RROUTER_ARCH:-aarch64}"
-case "$ARCH" in aarch64 | x86_64) ;; *) echo "RROUTER_ARCH must be aarch64 or x86_64" >&2; exit 2 ;; esac
+BOOT_MODE="${LEATOS_BOOT:-kernel}"
+case "$BOOT_MODE" in kernel) ;; limine) LEATOS_ARCH=x86_64 ;; *) echo "LEATOS_BOOT must be kernel or limine" >&2; exit 2 ;; esac
+ARCH="${LEATOS_ARCH:-aarch64}"
+case "$ARCH" in aarch64 | x86_64) ;; *) echo "LEATOS_ARCH must be aarch64 or x86_64" >&2; exit 2 ;; esac
 TARGET="$ARCH-unknown-none"
 KERNEL="target/$TARGET/debug/leatos"
 # x86_64 runs under TCG on Apple Silicon: allow more time.
 [[ "$ARCH" == x86_64 ]] && SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-40}"
-LOG="$(mktemp -t rrouter-smoke.XXXXXX)"
+LOG="$(mktemp -t leatos-smoke.XXXXXX)"
 IMG="$LOG.img"
 trap 'rm -f "$LOG" "$IMG"' EXIT
 FAILED=0
@@ -90,7 +90,7 @@ for c in $CASES; do
     boot)
       boot smoke-test
       ok=0
-      if has "rrouter: boot ok" && has "net self-test   : ok" && has "temp self-test  : ok" && ! has "PANIC" && ! has "UNHANDLED"; then ok=1; fi
+      if has "leatos: boot ok" && has "net self-test   : ok" && has "temp self-test  : ok" && ! has "PANIC" && ! has "UNHANDLED"; then ok=1; fi
       # With QEMU_SMP=N (N > 1, up to 4): every core online and the
       # cross-core wake works. Negative control: QEMU_APPEND=cores=1 with
       # QEMU_SMP=4 must fail this case.

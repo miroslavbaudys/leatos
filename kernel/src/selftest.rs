@@ -368,7 +368,7 @@ pub fn spawn(has_net: bool) {
             free >> 20
         );
         println!("  uptime          : {} us", timer::uptime().as_micros());
-        println!("rrouter: boot ok");
+        println!("leatos: boot ok");
 
         #[cfg(any(feature = "fault-hang", feature = "fault-panic"))]
         late_fault().await;

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Put this Mac on rrouter's LAN (macOS vmnet-host), with the lab ISP VM as
-# rrouter's upstream. The Mac's normal internet (Wi-Fi/Ethernet) is NOT
-# touched: only lab traffic is routed through rrouter.
+# Put this Mac on leatos's LAN (macOS vmnet-host), with the lab ISP VM as
+# leatos's upstream. The Mac's normal internet (Wi-Fi/Ethernet) is NOT
+# touched: only lab traffic is routed through leatos.
 #
-#   MacBook ──bridgeN (vmnet-host, 192.168.1.2)── [rrouter LAN 192.168.1.1]
-#                                                 [rrouter WAN] ──udp── [ISP VM 203.0.113.1]
+#   MacBook ──bridgeN (vmnet-host, 192.168.1.2)── [leatos LAN 192.168.1.1]
+#                                                 [leatos WAN] ──udp── [ISP VM 203.0.113.1]
 #   Mac route:     203.0.113.0/24 via 192.168.1.1   (removed on exit)
 #   Mac resolvers: /etc/resolver/{lan,example} -> 192.168.1.1   (removed on exit)
 #
@@ -25,8 +25,9 @@ LAN_NET=192.168.1
 ROUTER_LAN=192.168.1.1
 ISP=203.0.113.1
 WAN_PORT="${LAB_WAN_PORT:-10005}"
-MARKER="# created by rrouter scripts/mac-lab.sh"
-WORK=$(mktemp -d -t rrouter-maclab)
+MARKER="# created by leatos scripts/mac-lab.sh"
+OLD_MARKER="# created by rrouter scripts/mac-lab.sh" # files from before the rename: still ours
+WORK=$(mktemp -d -t leatos-maclab)
 PIDS=()
 ROUTER_PID=""
 KEEPALIVE_PID=""
@@ -48,7 +49,7 @@ cleanup() {
   fi
   for f in "${RESOLVERS[@]:-}"; do
     [[ -n "$f" ]] || continue
-    if head -1 "$f" 2>/dev/null | grep -qF "$MARKER"; then sudo -n rm -f "$f" && echo "  removed $f"; fi
+    if head -1 "$f" 2>/dev/null | grep -qF -e "$MARKER" -e "$OLD_MARKER"; then sudo -n rm -f "$f" && echo "  removed $f"; fi
   done
   [[ -n "$ROUTER_PID" ]] && sudo -n kill "$ROUTER_PID" 2>/dev/null
   for p in "${PIDS[@]:-}"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null; done
@@ -82,12 +83,12 @@ BEFORE=$(ifconfig -l)
 echo "== start ISP VM ($ISP)"
 start_isp "$WAN_PORT" "$WORK/isp.log"
 
-echo "== start rrouter (LAN on vmnet-host, as root)"
+echo "== start leatos (LAN on vmnet-host, as root)"
 sudo -n env QEMU_BIN="$QEMU_BIN" QEMU_NET=mac LAB_WAN_PORT="$WAN_PORT" QEMU_ACCEL="$QEMU_ACCEL" \
   scripts/qemu-run.sh target/aarch64-unknown-none/debug/leatos >"$WORK/router.log" 2>&1 &
 ROUTER_PID=$!
-if ! wait_for "$WORK/router.log" "rrouter: boot ok" 40; then
-  echo "rrouter did not boot:"; tr -d '\r' <"$WORK/router.log" | tail -30; exit 1
+if ! wait_for "$WORK/router.log" "leatos: boot ok" 40; then
+  echo "leatos did not boot:"; tr -d '\r' <"$WORK/router.log" | tail -30; exit 1
 fi
 tr -d '\r' <"$WORK/router.log" | grep -E "net wan0 .*lease" | sed 's/^/  /'
 
@@ -99,9 +100,9 @@ if [[ -z "$MAC_IF" ]]; then
   exit 1
 fi
 if [[ "$MAC_IP" == "$ROUTER_LAN" ]]; then
-  echo "mac-lab: vmnet gave the Mac $ROUTER_LAN, which clashes with rrouter" >&2; exit 1
+  echo "mac-lab: vmnet gave the Mac $ROUTER_LAN, which clashes with leatos" >&2; exit 1
 fi
-echo "== Mac joined rrouter's LAN: $MAC_IF = $MAC_IP"
+echo "== Mac joined leatos's LAN: $MAC_IF = $MAC_IP"
 
 # ---- route + scoped DNS for the lab only -------------------------------------------------
 sudo -n route -n add -net "$ISP/24" "$ROUTER_LAN" >/dev/null
@@ -110,8 +111,8 @@ echo "  route 203.0.113.0/24 via $ROUTER_LAN"
 sudo -n mkdir -p /etc/resolver
 for domain in lan example; do
   f="/etc/resolver/$domain"
-  if [[ -e "$f" ]] && ! head -1 "$f" | grep -qF "$MARKER"; then
-    info "$f exists and is not ours: left untouched (*.$domain won't use rrouter)"
+  if [[ -e "$f" ]] && ! head -1 "$f" | grep -qF -e "$MARKER" -e "$OLD_MARKER"; then
+    info "$f exists and is not ours: left untouched (*.$domain won't use leatos)"
     continue
   fi
   printf '%s\nnameserver %s\n' "$MARKER" "$ROUTER_LAN" | sudo -n tee "$f" >/dev/null
@@ -121,17 +122,17 @@ done
 
 # ---- checks from the Mac ---------------------------------------------------------------------
 echo "== checks (from this Mac)"
-if ping -c 2 -t 3 "$ROUTER_LAN" >/dev/null 2>&1; then pass "ping rrouter $ROUTER_LAN"; else fail "ping rrouter"; fi
+if ping -c 2 -t 3 "$ROUTER_LAN" >/dev/null 2>&1; then pass "ping leatos $ROUTER_LAN"; else fail "ping leatos"; fi
 
 a=$(dig +short +time=2 +tries=1 @"$ROUTER_LAN" nas.lan A 2>/dev/null | head -1)
-[[ "$a" == "192.168.1.10" ]] && pass "dns: dig @rrouter nas.lan -> $a" || fail "dns: nas.lan -> '$a'"
+[[ "$a" == "192.168.1.10" ]] && pass "dns: dig @leatos nas.lan -> $a" || fail "dns: nas.lan -> '$a'"
 a=$(dig +short +time=2 +tries=1 @"$ROUTER_LAN" isp.example A 2>/dev/null | head -1)
 [[ "$a" == "203.0.113.80" ]] && pass "dns: upstream isp.example -> $a (forwarded to the ISP)" || fail "dns: isp.example -> '$a'"
 a=$(dscacheutil -q host -a name router.lan 2>/dev/null | awk '/ip_address/{print $2; exit}')
 [[ "$a" == "$ROUTER_LAN" ]] && pass "dns: macOS resolver (/etc/resolver/lan) router.lan -> $a" || info "macOS resolver router.lan -> '$a' (cache? try: sudo killall -HUP mDNSResponder)"
 
 body=$(curl -s -m 5 "http://$ISP/" || true)
-[[ "$body" == "rrouter-lab-isp" ]] && pass "tcp: curl http://$ISP/ through NAT" || fail "tcp: curl http://$ISP/ ('$body')"
+[[ "$body" == "leatos-lab-isp" ]] && pass "tcp: curl http://$ISP/ through NAT" || fail "tcp: curl http://$ISP/ ('$body')"
 seen=$(curl -s -m 5 "http://$ISP/cgi-bin/ip" || true)
 [[ "$seen" == 203.0.113.* ]] && pass "nat: ISP sees source $seen (not $MAC_IP)" || fail "nat: ISP sees '$seen'"
 if ping -c 2 -t 3 "$ISP" >"$WORK/ping" 2>&1; then
@@ -162,14 +163,14 @@ fi
 
 cat <<EOT
 
-== rrouter is up. This Mac is on its LAN as $MAC_IP ($MAC_IF).
+== leatos is up. This Mac is on its LAN as $MAC_IP ($MAC_IF).
 Try:
-  curl http://$ISP/                    # web server behind rrouter's NAT
-  curl http://$ISP/cgi-bin/ip          # what the ISP sees (rrouter's WAN address)
+  curl http://$ISP/                    # web server behind leatos's NAT
+  curl http://$ISP/cgi-bin/ip          # what the ISP sees (leatos's WAN address)
   ping $ISP ; traceroute -n $ISP
   dig @$ROUTER_LAN nas.lan ; ping router.lan
-  sudo tcpdump -ni $MAC_IF             # watch rrouter's LAN traffic (or Wireshark on $MAC_IF)
-  tail -f $WORK/router.log      # rrouter console
+  sudo tcpdump -ni $MAC_IF             # watch leatos's LAN traffic (or Wireshark on $MAC_IF)
+  tail -f $WORK/router.log      # leatos console
 Your normal internet still uses your usual interface. Ctrl-C to stop and clean up.
 EOT
 while true; do sleep 3600; done

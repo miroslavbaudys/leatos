@@ -3,7 +3,7 @@ name = "leatos-kernel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "rrouter bare-metal aarch64 unikernel (QEMU virt)"
+description = "leatos bare-metal aarch64 unikernel (QEMU virt)"
 
 [[bin]]
 name = "leatos"

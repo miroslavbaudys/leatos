@@ -3,7 +3,7 @@
 # its UART (QEMU's stdin, fed from a FIFO) and check the console.
 #
 #   scripts/cli-test.sh
-#   RROUTER_ARCH=x86_64 scripts/cli-test.sh
+#   LEATOS_ARCH=x86_64 scripts/cli-test.sh
 #   QEMU_STORE_BUS=sd scripts/cli-test.sh      # store on the SD card
 #   CLI_TEST_SKIP_SAVE=1 scripts/cli-test.sh   # negative control: the
 #                                              # persistence checks must fail
@@ -14,12 +14,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ARCH="${RROUTER_ARCH:-aarch64}"
-case "$ARCH" in aarch64 | x86_64) ;; *) echo "RROUTER_ARCH must be aarch64 or x86_64" >&2; exit 2 ;; esac
+ARCH="${LEATOS_ARCH:-aarch64}"
+case "$ARCH" in aarch64 | x86_64) ;; *) echo "LEATOS_ARCH must be aarch64 or x86_64" >&2; exit 2 ;; esac
 TARGET="$ARCH-unknown-none"
 # x86_64 runs under TCG on Apple Silicon: allow more time.
 T=20; [[ "$ARCH" == x86_64 ]] && T=60
-WORK="$(mktemp -d -t rrouter-cli.XXXXXX)"
+WORK="$(mktemp -d -t leatos-cli.XXXXXX)"
 IMG="$WORK/store.img"
 LOG="$WORK/console.log"
 FIFO="$WORK/stdin"
@@ -50,9 +50,9 @@ OUT=
 send() {
   local before n
   before=$(wc -c <"$LOG" | tr -d ' ')
-  n=$(count "rrouter> ")
+  n=$(count "leatos> ")
   printf '%s\r' "$1" >&3
-  wait_count $((n + 1)) "rrouter> " "$T" || true
+  wait_count $((n + 1)) "leatos> " "$T" || true
   sleep 0.2
   OUT=$(tail -c +$((before + 1)) "$LOG" | tr -d '\r')
 }
@@ -98,9 +98,9 @@ send $'statsx\x7f\x7fus'; expect "backspace edits the line" ", up "
 send "bogus"; expect "unknown command" "unknown command: bogus"
 send "status"; expect "console input through the interrupt" "^console  : rx interrupt"
 # A paste: several lines at once run one by one, output in order.
-n=$(count "rrouter> "); before=$(wc -c <"$LOG" | tr -d ' ')
+n=$(count "leatos> "); before=$(wc -c <"$LOG" | tr -d ' ')
 printf 'leases\rhelp\rbogus2\r' >&3
-wait_count $((n + 3)) "rrouter> " "$T" || true; sleep 0.2
+wait_count $((n + 3)) "leatos> " "$T" || true; sleep 0.2
 OUT=$(tail -c +$((before + 1)) "$LOG" | tr -d '\r')
 if echo "$OUT" | grep -a -e "no leases" -e "config set <setting>" -e "unknown command: bogus2" | tr '\n' '|' \
   | grep -aq "no leases|.*config set <setting>.*|.*unknown command: bogus2"; then pass "pasted lines run in order"

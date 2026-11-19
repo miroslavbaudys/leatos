@@ -1,4 +1,4 @@
-//! `leatstore`: host tool for rrouter store partitions
+//! `leatstore`: host tool for leatos store partitions
 //! (docs/config-and-storage.md). The kernel never formats a store; this
 //! tool (called by the QEMU and image scripts) does.
 //!

@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 
 PORT="${UPGRADE_TEST_PORT:-18080}"
 URL="http://127.0.0.1:$PORT"
-WORK="$(mktemp -d -t rrouter-upgrade.XXXXXX)"
+WORK="$(mktemp -d -t leatos-upgrade.XXXXXX)"
 LOG="$WORK/router.log"
 QPID=
 cleanup() {
@@ -56,7 +56,7 @@ wait_for 1 "dhcp lease" 90 || { echo "  [FAIL] router did not boot"; exit 1; }
 code() { curl -s -m 20 -o /dev/null -w '%{http_code}' "$@" || true; }
 check "status without password -> 401, /api/info public" '401 {"auth":true}' "$(code "$URL/api/status") $(curl -s -m 5 "$URL/api/info" || true)"
 check "status JSON" "x86_64" "$(curl -s -m 5 -u admin:test "$URL/api/status" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["arch"])' 2>/dev/null || true)"
-check "status page" "1" "$(curl -s -m 5 "$URL/" | grep -c '<title>rrouter</title>' || true)"
+check "status page" "1" "$(curl -s -m 5 "$URL/" | grep -c '<title>leatos</title>' || true)"
 check "unknown path -> 404" 404 "$(code "$URL/nope")"
 check "upload without password -> 401" 401 "$(code -X POST --data-binary @"$WORK/new.elf" "$URL/api/upgrade")"
 check "upload with wrong password -> 401" 401 "$(code -u admin:wrong -X POST --data-binary @"$WORK/new.elf" "$URL/api/upgrade")"
@@ -65,7 +65,7 @@ head -c 100000 /dev/urandom >"$WORK/garbage"
 check "garbage upload -> 422" 422 "$(code -u admin:test -X POST --data-binary @"$WORK/garbage" "$URL/api/upgrade")"
 # A whole kernel: as long as a real upload (the CRC is checked at the end).
 check "wrong CRC -> 422" 422 "$(code -m 120 -u admin:test -H 'X-Image-CRC32: deadbeef' -X POST --data-binary @"$WORK/new.elf" "$URL/api/upgrade")"
-check "refused uploads did not restart the kernel" 1 "$(grep -ac 'rrouter 0.1.0' "$LOG")"
+check "refused uploads did not restart the kernel" 1 "$(grep -ac 'leatos 0.1.0' "$LOG")"
 
 for gen in 2 3; do
   check "upgrade $((gen - 1)) accepted" 200 "$(code -m 120 -u admin:test -H "X-Image-CRC32: $CRC" -H "X-Cmdline: $ARGS gen=$gen" -X POST --data-binary @"$WORK/new.elf" "$URL/api/upgrade")"
@@ -78,7 +78,7 @@ check "password masked in the log" 0 "$(grep -ac 'mgmt_pass=test' "$LOG" || true
 
 check "reboot accepted" 200 "$(code -u admin:test -X POST "$URL/api/reboot")"
 ok=0
-wait_for 4 "rrouter 0.1.0" 60 && [[ "$(grep -a 'bootargs' "$LOG" | tail -1)" != *gen=* ]] && ok=1
+wait_for 4 "leatos 0.1.0" 60 && [[ "$(grep -a 'bootargs' "$LOG" | tail -1)" != *gen=* ]] && ok=1
 check "reboot: firmware boots the original kernel" 1 "$ok"
 
 if [[ "$FAILED" == 0 ]]; then echo "UPGRADE TEST: PASS"; else echo "UPGRADE TEST: FAIL"; exit 1; fi

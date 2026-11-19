@@ -28,7 +28,7 @@ cd "$(dirname "$0")/.."
 
 PORT="${PERSIST_TEST_PORT:-18082}"
 URL="http://127.0.0.1:$PORT"
-WORK="$(mktemp -d -t rrouter-persist.XXXXXX)"
+WORK="$(mktemp -d -t leatos-persist.XXXXXX)"
 IMG="$WORK/store.img"
 LOG="$WORK/router.log"
 QPID=

@@ -1,5 +1,5 @@
 /*
- * rrouter kernel linker script — x86_64 (QEMU q35 via PVH; later the apu4).
+ * leatos kernel linker script — x86_64 (QEMU q35 via PVH; later the apu4).
  *
  * Loaded at 1 MiB (physical = virtual, identity map). Low memory below
  * 1 MiB holds firmware data (BIOS, ACPI pointers, the PVH start info) and is

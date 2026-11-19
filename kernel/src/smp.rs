@@ -17,7 +17,7 @@ use crate::{arch, executor, irq, mm, println, timer};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::time::Duration;
 
-/// Most cores rrouter uses (the apu4 has 4).
+/// Most cores leatos uses (the apu4 has 4).
 pub const MAX_CORES: usize = 4;
 /// The wake/stop IPI: SGI 0 on aarch64, a fixed vector on x86_64.
 static ONLINE: AtomicUsize = AtomicUsize::new(1);

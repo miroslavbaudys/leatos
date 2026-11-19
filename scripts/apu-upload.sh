@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the x86_64 kernel and upgrade a running rrouter over HTTP
+# Build the x86_64 kernel and upgrade a running leatos over HTTP
 # (kernel/src/net/mgmt.rs, docs/upgrades.md). By default in RAM (POST
 # /api/upgrade): nothing is written to the SD card, a power cycle boots its
 # kernel again. With --persist the kernel is stored on the SD card (POST
@@ -8,7 +8,7 @@
 # 30, without a reboot in between), this script confirms it. A kernel that
 # panics, hangs or is not confirmed within the trial window is rolled back.
 #
-#   scripts/apu-upload.sh                      # release kernel -> $RROUTER_HOST, in RAM
+#   scripts/apu-upload.sh                      # release kernel -> $LEATOS_HOST, in RAM
 #   scripts/apu-upload.sh --persist            # store it on the SD card, reboot, confirm
 #   scripts/apu-upload.sh --persist --no-confirm   # leave the trial unconfirmed (rolls back)
 #   scripts/apu-upload.sh --persist --stable-secs 60   # longer stability window before confirming
@@ -22,22 +22,22 @@
 #     --tunnel "ssh -o ServerAliveInterval=5 -o ServerAliveCountMax=60 -f -N -L 18080:192.168.1.1:80 user@jump"
 #                                              # through an SSH tunnel that may drop
 #
-# --tunnel CMD (or $RROUTER_TUNNEL) re-runs CMD whenever nothing listens at
+# --tunnel CMD (or $LEATOS_TUNNEL) re-runs CMD whenever nothing listens at
 # the host any more (connection refused: the tunnel's ssh has exited, e.g.
 # because the jump host's own path goes through the rebooting router), so a
 # persistent upgrade can still be confirmed in its trial window. An upload
 # cut off mid-way is checked: if the router reboots anyway, the trial is
 # confirmed only if it runs the build that was uploaded.
 #
-# Defaults: host from $RROUTER_HOST, password from $RROUTER_PASS or the
+# Defaults: host from $LEATOS_HOST, password from $LEATOS_PASS or the
 # file target/apu4/mgmt-pass (written by scripts/apu-image.sh --mgmt-wan).
 # The command line stays the running kernel's unless --cmdline is given.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-HOST="${RROUTER_HOST:-}"
-PASS="${RROUTER_PASS:-}"
-TUNNEL="${RROUTER_TUNNEL:-}"
+HOST="${LEATOS_HOST:-}"
+PASS="${LEATOS_PASS:-}"
+TUNNEL="${LEATOS_TUNNEL:-}"
 PROFILE=release
 CMDLINE=
 FEATURES=
@@ -66,15 +66,15 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 [[ "$PERSIST" == 1 && -n "$CMDLINE" ]] && { echo "--persist: a stored kernel boots with the SD card's command line (no --cmdline)" >&2; exit 2; }
-[[ -n "$HOST" ]] || { echo "no router: --host ADDR or RROUTER_HOST" >&2; exit 2; }
+[[ -n "$HOST" ]] || { echo "no router: --host ADDR or LEATOS_HOST" >&2; exit 2; }
 if [[ -z "$PASS" && -f target/apu4/mgmt-pass ]]; then PASS="$(cat target/apu4/mgmt-pass)"; fi
-[[ -n "$PASS" ]] || { echo "no password: --pass, RROUTER_PASS or target/apu4/mgmt-pass" >&2; exit 2; }
+[[ -n "$PASS" ]] || { echo "no password: --pass, LEATOS_PASS or target/apu4/mgmt-pass" >&2; exit 2; }
 URL="http://$HOST"
 
 # /api/status, re-opening the tunnel first when nothing listens at the host
 # (curl exit 7) any more. Prints the body or nothing. Callers run it in
 # $(...), so its state ("last re-open time, warned") lives in a file.
-TUNSTATE="$(mktemp -t rrouter-tunnel.XXXXXX)"
+TUNSTATE="$(mktemp -t leatos-tunnel.XXXXXX)"
 trap 'rm -f "$TUNSTATE"' EXIT
 fetch_status() {
   local out rc=0 last=0 warned=0
@@ -136,7 +136,7 @@ cargo "${args[@]}"
 ELF="target/x86_64-unknown-none/$PROFILE/leatos"
 # Strip debug info (12 MiB -> < 1 MiB) when llvm-objcopy is available.
 OBJCOPY="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objcopy"
-UPLOAD="$(mktemp -t rrouter-upload.XXXXXX)"
+UPLOAD="$(mktemp -t leatos-upload.XXXXXX)"
 trap 'rm -f "$UPLOAD" "$TUNSTATE"' EXIT
 if [[ -x "$OBJCOPY" ]]; then "$OBJCOPY" --strip-debug "$ELF" "$UPLOAD"; else cp "$ELF" "$UPLOAD"; fi
 CRC="$(python3 -I -c 'import sys,zlib; print("%08x" % zlib.crc32(open(sys.argv[1],"rb").read()))' "$UPLOAD")"

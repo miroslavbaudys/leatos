@@ -55,7 +55,7 @@ struct Pki {
 }
 
 fn pki(alg: &'static SignatureAlgorithm) -> Pki {
-    pki_named(alg, "rrouter test CA")
+    pki_named(alg, "leatos test CA")
 }
 
 fn pki_named(alg: &'static SignatureAlgorithm, cn: &str) -> Pki {

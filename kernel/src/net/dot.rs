@@ -79,7 +79,7 @@ impl Clock for WallClock {
 
 /// Unix time of the commit this kernel was built from (`build.rs`).
 const BUILD_TIME: u64 = {
-    let s = env!("RROUTER_BUILD_TIME").as_bytes();
+    let s = env!("LEATOS_BUILD_TIME").as_bytes();
     let mut v = 0u64;
     let mut i = 0;
     while i < s.len() {

@@ -60,7 +60,7 @@ fn stir(pool: &mut auth::Pool, data: &[u8]) {
 /// Mix `data` (and the current time) into the pool.
 pub fn mix(data: &[u8]) {
     let mut g = POOL.lock();
-    let p = g.get_or_insert_with(|| auth::Pool::new(b"rrouter entropy"));
+    let p = g.get_or_insert_with(|| auth::Pool::new(b"leatos entropy"));
     stir(p, data);
 }
 
@@ -81,7 +81,7 @@ pub fn with<R>(f: impl FnOnce(&mut auth::Pool) -> R) -> R {
         }
     }
     let mut g = POOL.lock();
-    let p = g.get_or_insert_with(|| auth::Pool::new(b"rrouter entropy"));
+    let p = g.get_or_insert_with(|| auth::Pool::new(b"leatos entropy"));
     stir(p, b"use");
     p.mix(&fresh[..n]);
     f(p)

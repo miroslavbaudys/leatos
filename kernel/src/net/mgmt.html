@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>rrouter</title>
+<title>leatos</title>
 <style>
   :root { --bg:#f4f5f7; --card:#fff; --fg:#1d2330; --muted:#6b7280; --line:#e3e6eb; --ok:#15803d; --bad:#b91c1c; --warn:#b45309; --accent:#2563eb;
           --nav:#fff; --navsel:#e8effd; --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#8a5cd6; --shadow:0 1px 2px rgba(0,0,0,.05); }
@@ -122,7 +122,7 @@
 <body class="locked">
 <div class="gate" id="gate">
   <div class="card">
-    <h1>rrouter</h1>
+    <h1>leatos</h1>
     <p class="hint" id="gatemsg">Connecting to the router…</p>
     <form id="loginform" hidden>
       <input type="text" name="username" autocomplete="username" value="admin" hidden>
@@ -133,7 +133,7 @@
   </div>
 </div>
 <div class="top">
-  <h1>rrouter</h1>
+  <h1>leatos</h1>
   <div class="meta"><span id="wanstate"><i class="dot"></i>WAN …</span><span id="up"></span><span id="ver" class="opt">…</span><span id="wanwarn" class="warn"></span></div>
   <button id="loginbtn" class="plain">Log in</button>
 </div>
@@ -499,7 +499,7 @@ function route() {
     if (target === page) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
   }
   const sec = document.querySelector(`.page[data-page="${page}"]`);
-  document.title = (page ? sec.dataset.title + " · " : "") + "rrouter";
+  document.title = (page ? sec.dataset.title + " · " : "") + "leatos";
   if (page === "") { cpuCores.forEach((_, c) => drawCpu(c)); drawRate(); drawLine("temp"); drawLine("mem"); }
   if (page === "logs") loadLog();
 }
@@ -530,11 +530,11 @@ function ask(title, text, ok = "OK", danger = false) {
 // the browser (localStorage); the router forgets it after 12 h unused, at
 // a logout, a reboot or a password change, and the page then asks again.
 // Without a password the page is read-only and needs no login.
-let token = store.get("rrouter-token");
+let token = store.get("leatos-token");
 let authAvailable = false;
 const b64 = (s) => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
-const authHeaders = () => ({ "X-Rrouter-UI": "1", ...(token ? { Authorization: "Bearer " + token } : {}) });
-function setToken(t) { token = t; store.set("rrouter-token", t); showLogin(); }
+const authHeaders = () => ({ "X-Leatos-UI": "1", ...(token ? { Authorization: "Bearer " + token } : {}) });
+function setToken(t) { token = t; store.set("leatos-token", t); showLogin(); }
 function showLogin() {
   $("loginbtn").textContent = authAvailable ? "Log out" : "Read-only";
   $("loginbtn").disabled = !authAvailable;
@@ -561,7 +561,7 @@ $("loginform").onsubmit = async (ev) => {
   const p = $("loginpass").value;
   $("loginmsg").textContent = "…";
   try {
-    const r = await fetch("/api/login", { method: "POST", headers: { "X-Rrouter-UI": "1", Authorization: "Basic " + b64("admin:" + p) } });
+    const r = await fetch("/api/login", { method: "POST", headers: { "X-Leatos-UI": "1", Authorization: "Basic " + b64("admin:" + p) } });
     const j = await r.json().catch(() => ({}));
     if (r.ok && j.token) { setToken(j.token); unlock(); return; }
     $("loginmsg").textContent = r.status === 401 ? "Wrong password." : r.status === 429 ? "Too fast: wait a second and try again." : (j.error ?? `Refused (${r.status})`);

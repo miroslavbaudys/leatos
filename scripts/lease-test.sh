@@ -9,15 +9,15 @@
 #   B, reboot: the client takes a second lease (another MAC) and asks for
 #     a reboot right away (POST /api/reboot): saved on the way down.
 # Negative control: LEASE_TEST_NO_STORE=1 (no store: every lease check fails).
-#   scripts/lease-test.sh            (RROUTER_ARCH=x86_64 for the x86 kernel)
+#   scripts/lease-test.sh            (LEATOS_ARCH=x86_64 for the x86 kernel)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 NO_STORE="${LEASE_TEST_NO_STORE:-0}"
 LAN_PORT="${LAB_LAN_PORT:-10023}"
 WAN_PORT="${LAB_WAN_PORT:-10025}"
-ARCH="${RROUTER_ARCH:-aarch64}"
-WORK=$(mktemp -d -t rrouter-leases)
+ARCH="${LEATOS_ARCH:-aarch64}"
+WORK=$(mktemp -d -t leatos-leases)
 PIDS=()
 ROUTER_PID=""
 cleanup() {
@@ -48,10 +48,10 @@ router() { # log
   QEMU_STORE="$STORE" QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" QEMU_ACCEL="$QEMU_ACCEL" \
     QEMU_APPEND="mgmt_pass=lab-pass" scripts/qemu-run.sh "target/$ARCH-unknown-none/debug/leatos" >"$1" 2>&1 &
   ROUTER_PID=$!
-  wait_for "$1" "rrouter: boot ok" 60 || { echo "router did not boot:"; cat "$1"; exit 1; }
+  wait_for "$1" "leatos: boot ok" 60 || { echo "router did not boot:"; cat "$1"; exit 1; }
 }
 
-echo "== start rrouter ($WHAT)"
+echo "== start leatos ($WHAT)"
 router "$WORK/router1.log"
 echo "== start client"
 linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_leases=1"

@@ -2,7 +2,7 @@
 
 use crate::SECTOR;
 
-/// MBR partition type of the rrouter store ("non-FS data").
+/// MBR partition type of the leatos store ("non-FS data").
 pub const STORE_PARTITION_TYPE: u8 = 0xda;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

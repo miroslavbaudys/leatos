@@ -19,7 +19,7 @@
 //! to the queues, and a device with MSI-X enabled but no vector raises no
 //! interrupts at all. [`VirtioNet::route_msix`] therefore writes the two
 //! vector registers of the virtio common configuration itself, once, after
-//! `VirtIONetRaw::new` finished. That is the one place where rrouter
+//! `VirtIONetRaw::new` finished. That is the one place where leatos
 //! touches registers that `virtio-drivers` also maps: its transport uses
 //! the common configuration only during init (and when queues are set up),
 //! never afterwards, so the accesses never interleave. Remove this when

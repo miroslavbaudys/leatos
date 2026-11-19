@@ -95,7 +95,7 @@ impl Pinger {
             let repr = Icmpv4Repr::EchoRequest {
                 ident: PING_IDENT,
                 seq_no: self.seq,
-                data: b"rrouter",
+                data: b"leatos",
             };
             if let Ok(buf) = sock.send(repr.buffer_len(), IpAddress::Ipv4(target)) {
                 repr.emit(&mut Icmpv4Packet::new_unchecked(buf), &caps);

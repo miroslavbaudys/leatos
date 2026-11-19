@@ -10,18 +10,18 @@
 # (static datapath: `LAB_WAN_STATIC=1 scripts/lab-test.sh`).
 #
 #   scripts/vlan-test.sh
-#   RROUTER_ARCH=x86_64 scripts/vlan-test.sh
+#   LEATOS_ARCH=x86_64 scripts/vlan-test.sh
 #   VLAN_TEST_SKIP_SAVE=1 scripts/vlan-test.sh   # negative control: edits
 #                                                # never saved, the apply
 #                                                # checks must fail
 #   VLAN_TEST_VERBOSE=1 ...                      # print the relevant console lines
 set -euo pipefail
 cd "$(dirname "$0")/.."
-ARCH="${RROUTER_ARCH:-aarch64}"
-case "$ARCH" in aarch64 | x86_64) ;; *) echo "RROUTER_ARCH must be aarch64 or x86_64" >&2; exit 2 ;; esac
+ARCH="${LEATOS_ARCH:-aarch64}"
+case "$ARCH" in aarch64 | x86_64) ;; *) echo "LEATOS_ARCH must be aarch64 or x86_64" >&2; exit 2 ;; esac
 TARGET="$ARCH-unknown-none"
 T=20; [[ "$ARCH" == x86_64 ]] && T=60
-WORK="$(mktemp -d -t rrouter-vlan.XXXXXX)"
+WORK="$(mktemp -d -t leatos-vlan.XXXXXX)"
 IMG="$WORK/store.img"; LOG="$WORK/console.log"; FIFO="$WORK/stdin"; QPID=
 cleanup() {
   exec 3>&- 2>/dev/null || true
@@ -35,7 +35,7 @@ pass() { echo "  [PASS] $1"; }
 fail() { echo "  [FAIL] $1"; FAILED=1; }
 count() { tr -d '\r' <"$LOG" | grep -ac -- "$1" || true; }
 wait_count() { local i; for i in $(seq 1 $(($3 * 5))); do [[ "$(count "$2")" -ge "$1" ]] && return 0; sleep 0.2; done; return 1; }
-send() { local n; n=$(count "rrouter> "); printf '%s\r' "$1" >&3; wait_count $((n + 1)) "rrouter> " "$T" || true; sleep 0.2; }
+send() { local n; n=$(count "leatos> "); printf '%s\r' "$1" >&3; wait_count $((n + 1)) "leatos> " "$T" || true; sleep 0.2; }
 check() { # name n pattern seconds
   if wait_count "$2" "$3" "$4"; then pass "$1"; else fail "$1 (want $2 x '$3', have $(count "$3"))"; fi
 }

@@ -12,7 +12,7 @@
 #   4. back to DHCP: the session is ended (PADT), overhead back to 0 B
 #
 #   scripts/pppoe-test.sh
-#   RROUTER_ARCH=x86_64 scripts/pppoe-test.sh
+#   LEATOS_ARCH=x86_64 scripts/pppoe-test.sh
 #   PPPOE_TEST_SKIP_SAVE=1 scripts/pppoe-test.sh   # negative control: edits
 #                                                  # never saved, the apply
 #                                                  # checks must fail
@@ -21,13 +21,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export LC_ALL=C   # the console log has binary bytes: tr/grep must not choke
-ARCH="${RROUTER_ARCH:-aarch64}"
-case "$ARCH" in aarch64 | x86_64) ;; *) echo "RROUTER_ARCH must be aarch64 or x86_64" >&2; exit 2 ;; esac
+ARCH="${LEATOS_ARCH:-aarch64}"
+case "$ARCH" in aarch64 | x86_64) ;; *) echo "LEATOS_ARCH must be aarch64 or x86_64" >&2; exit 2 ;; esac
 TARGET="$ARCH-unknown-none"
 T=20; [[ "$ARCH" == x86_64 ]] && T=60
 LAN_PORT="${LAB_LAN_PORT:-12003}"
 WAN_PORT="${LAB_WAN_PORT:-12005}"
-WORK="$(mktemp -d -t rrouter-pppoe.XXXXXX)"
+WORK="$(mktemp -d -t leatos-pppoe.XXXXXX)"
 IMG="$WORK/store.img"; LOG="$WORK/console.log"; ISPLOG="$WORK/isp.log"; FIFO="$WORK/stdin"; QPID=
 PIDS=()
 cleanup() {
@@ -49,7 +49,7 @@ count_in() { tr -d '\r' <"$1" | grep -ac -- "$2" || true; }
 count() { count_in "$LOG" "$1"; }
 wait_count_in() { local i; for i in $(seq 1 $(($4 * 5))); do [[ "$(count_in "$1" "$3")" -ge "$2" ]] && return 0; sleep 0.2; done; return 1; }
 wait_count() { wait_count_in "$LOG" "$@"; }
-send() { local n; n=$(count "rrouter> "); printf '%s\r' "$1" >&3; wait_count $((n + 1)) "rrouter> " "$T" || true; sleep 0.2; }
+send() { local n; n=$(count "leatos> "); printf '%s\r' "$1" >&3; wait_count $((n + 1)) "leatos> " "$T" || true; sleep 0.2; }
 check() { # name n pattern seconds
   if wait_count "$2" "$3" "$4"; then pass "$1"; else fail "$1 (want $2 x '$3', have $(count "$3"))"; fi
 }
@@ -82,7 +82,7 @@ if [[ "$(count "dhcp lease [0-9]")" == 0 ]]; then pass "no DHCP lease (the ISP o
 save() { [[ "${PPPOE_TEST_SKIP_SAVE:-0}" == 1 ]] || send "config save"; }
 
 echo "== 2. switch to PPPoE live"
-send 'config set wan.pppoe.username = "rrouter"'
+send 'config set wan.pppoe.username = "leatos"'
 send 'config set wan.pppoe.password = "lab-secret"'
 send 'config set wan.mode = "pppoe"'
 send "config diff"
