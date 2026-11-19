@@ -3,6 +3,8 @@
 //! for every block device.
 
 pub mod cputemp;
+#[allow(unsafe_code)] // the register window's constructor (read-only TRNG registers)
+pub mod ccp;
 #[allow(unsafe_code)] // the register window's constructor
 pub mod i6300esb;
 #[allow(unsafe_code)] // register window + DMA buffer hand-off (slot ownership)

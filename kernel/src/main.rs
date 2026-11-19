@@ -102,6 +102,10 @@ pub fn kmain(boot_arg: usize) -> ! {
     upgrade::boot(store.as_mut(), &mut hw_watchdog);
     config::load(store.as_mut(), info.virtual_machine);
     entropy::mix(config::bootargs().as_bytes());
+    match pci.as_mut().and_then(drivers::ccp::probe) {
+        Some(t) => entropy::add_hardware(t),
+        None => println!("  entropy         : {}", entropy::status()),
+    }
     wallclock::init_rtc();
     let qos = config::qos();
     let net = pci.as_mut().and_then(|p| net::stack::bring_up(p, &qos));

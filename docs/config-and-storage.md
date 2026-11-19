@@ -256,13 +256,15 @@ rollbacks.
   random key), so PBKDF2 runs once. A wrong password blocks password
   checks for a second. Salts and tokens come from `kernel/src/entropy.rs`:
   a SHA-256 pool fed with boot time, boot arguments, MAC addresses and
-  request arrival times. No hardware RNG is used: the apu4's AMD CCP
-  (PCI 1022:1537) has a TRNG, but its queues are assigned by the AMD
-  PSP, and no PC Engines coreboot release (up to the last, v4.19.0.1)
-  includes the PSP firmware, so it stays disabled (queue mask 0); a
-  driver that checked this was removed (2026-11-15, see git history).
-  Jaguar's RDRAND is not used either (AMD family 15h/16h hardware RNGs
-  have returned constants). `/api/status` `entropy` says so.
+  request arrival times, and on the apu4 the TRNG of the AMD CCP (PCI
+  1022:1537, `kernel/src/drivers/ccp.rs`): as in Linux's ccpv3 the
+  registers sit 0x20000 into BAR 2 (`TRNG_OUT` at +0x0c; an earlier
+  driver read BAR 2 + 0x0c, saw only zeros and was wrongly blamed on
+  missing PSP firmware). 64 words at boot after a startup test, 4 more
+  per use; 0, 0xffffffff, repeats or no value switch it off for the
+  boot, and it is only ever mixed in with the timing sources. Jaguar's
+  RDRAND is not used (AMD family 15h/16h hardware RNGs have returned
+  constants). `/api/status` `entropy` names the sources.
 - Secrets that must be usable in clear (PPPoE password) are stored as
   is, like on other SOHO routers.
 - `GET /api/config` and the TOML export omit secret fields; an upload

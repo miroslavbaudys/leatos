@@ -1201,7 +1201,7 @@ fn status_json(
             ))
             .collect::<Vec<_>>()
             .join(","),
-        json_str(crate::entropy::status()),
+        json_str(&crate::entropy::status()),
         mgmt.on_wan,
         mgmt.auth_configured(),
         json_str(mgmt.auth_source()),

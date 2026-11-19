@@ -123,9 +123,10 @@ checked (webpki). aarch64 has no RTC driver (QEMU's PL031 is not mapped).
 
 TLS key shares and randoms come from the kernel's entropy pool
 (`kernel/src/entropy.rs`): timing jitter, boot data, management request
-and DoT arrival times through SHA-256. No hardware RNG is trusted on the
-apu4 (CCP TRNG disabled by firmware, Jaguar RDRAND unreliable), so this is
-best effort, as for password salts.
+and DoT arrival times through SHA-256, plus on the apu4 the AMD CCP's
+TRNG (health-checked, one input among the others; Jaguar RDRAND is not
+used). In QEMU there is no hardware source, so it is best effort there,
+as for password salts.
 
 ## Observability
 
