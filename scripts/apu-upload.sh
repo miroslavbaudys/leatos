@@ -18,6 +18,16 @@
 #   scripts/apu-upload.sh --reboot             # only reboot the router
 #   scripts/apu-upload.sh --features fault-hang --cmdline "... cores=1"
 #                                              # test kernel (here: the FCH watchdog)
+#   scripts/apu-upload.sh --host 127.0.0.1:18080 --persist \
+#     --tunnel "ssh -o ServerAliveInterval=5 -o ServerAliveCountMax=60 -f -N -L 18080:192.168.1.1:80 user@jump"
+#                                              # through an SSH tunnel that may drop
+#
+# --tunnel CMD (or $RROUTER_TUNNEL) re-runs CMD whenever nothing listens at
+# the host any more (connection refused: the tunnel's ssh has exited, e.g.
+# because the jump host's own path goes through the rebooting router), so a
+# persistent upgrade can still be confirmed in its trial window. An upload
+# cut off mid-way is checked: if the router reboots anyway, the trial is
+# confirmed only if it runs the build that was uploaded.
 #
 # Defaults: host from $RROUTER_HOST, password from $RROUTER_PASS or the
 # file target/apu4/mgmt-pass (written by scripts/apu-image.sh --mgmt-wan).
@@ -27,6 +37,7 @@ cd "$(dirname "$0")/.."
 
 HOST="${RROUTER_HOST:-}"
 PASS="${RROUTER_PASS:-}"
+TUNNEL="${RROUTER_TUNNEL:-}"
 PROFILE=release
 CMDLINE=
 FEATURES=
@@ -39,6 +50,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --host) HOST="$2"; shift ;;
     --pass) PASS="$2"; shift ;;
+    --tunnel) TUNNEL="$2"; shift ;;
     --cmdline) CMDLINE="$2"; shift ;;
     --debug) PROFILE=debug ;;
     --features) FEATURES="$2"; shift ;;
@@ -48,7 +60,7 @@ while [[ $# -gt 0 ]]; do
     --stable-secs) STABLE="$2"; shift ;;
     --confirm) TRIAL_OP=confirm ;;
     --revert) TRIAL_OP=revert ;;
-    -h | --help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -59,16 +71,40 @@ if [[ -z "$PASS" && -f target/apu4/mgmt-pass ]]; then PASS="$(cat target/apu4/mg
 [[ -n "$PASS" ]] || { echo "no password: --pass, RROUTER_PASS or target/apu4/mgmt-pass" >&2; exit 2; }
 URL="http://$HOST"
 
+# /api/status, re-opening the tunnel first when nothing listens at the host
+# (curl exit 7) any more. Prints the body or nothing. Callers run it in
+# $(...), so its state ("last re-open time, warned") lives in a file.
+TUNSTATE="$(mktemp -t rrouter-tunnel.XXXXXX)"
+trap 'rm -f "$TUNSTATE"' EXIT
+fetch_status() {
+  local out rc=0 last=0 warned=0
+  out="$(curl -s -m 3 -u "admin:$PASS" "$URL/api/status" 2>/dev/null)" || rc=$?
+  if [[ "$rc" == 7 ]]; then
+    read -r last warned <"$TUNSTATE" || true
+    if [[ -n "$TUNNEL" ]]; then
+      if [[ $(($(date +%s) - ${last:-0})) -ge 5 ]]; then
+        echo "$(date +%s) 0" >"$TUNSTATE"
+        echo "  (nothing listens at $HOST: re-opening the tunnel)" >&2
+        eval "$TUNNEL" >/dev/null 2>&1 || true
+        out="$(curl -s -m 3 -u "admin:$PASS" "$URL/api/status" 2>/dev/null)" || true
+      fi
+    elif [[ "${warned:-0}" == 0 ]]; then
+      echo "0 1" >"$TUNSTATE"
+      echo "  (nothing listens at $HOST: if it is an SSH tunnel, it has closed; --tunnel CMD re-opens it)" >&2
+    fi
+  fi
+  printf '%s' "$out"
+}
 status_line() { # prints "version uptime_s" or nothing
-  curl -s -m 3 -u "admin:$PASS" "$URL/api/status" 2>/dev/null |
+  fetch_status |
     python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(d["version"], d["uptime_s"])' 2>/dev/null || true
 }
 image_line() { # prints "build|trial seq or -|source" or nothing
-  curl -s -m 3 -u "admin:$PASS" "$URL/api/status" 2>/dev/null |
+  fetch_status |
     python3 -I -c 'import json,sys; d=json.load(sys.stdin); i=d.get("image") or {}; t=i.get("trial"); print("%s|%s|%s" % (d.get("build","?"), t["seq"] if t else "-", i.get("source","?")))' 2>/dev/null || true
 }
 trial_state() { # prints "uptime_s trial_seq remaining_s" ("-" for no trial), or nothing
-  curl -s -m 3 -u "admin:$PASS" "$URL/api/status" 2>/dev/null |
+  fetch_status |
     python3 -I -c 'import json,sys; d=json.load(sys.stdin); t=(d.get("image") or {}).get("trial"); print(d["uptime_s"], t["seq"] if t else "-", t["remaining_s"] if t else "-")' 2>/dev/null || true
 }
 trial_op() { # confirm | revert
@@ -101,7 +137,7 @@ ELF="target/x86_64-unknown-none/$PROFILE/rrouter"
 # Strip debug info (12 MiB -> < 1 MiB) when llvm-objcopy is available.
 OBJCOPY="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objcopy"
 UPLOAD="$(mktemp -t rrouter-upload.XXXXXX)"
-trap 'rm -f "$UPLOAD"' EXIT
+trap 'rm -f "$UPLOAD" "$TUNSTATE"' EXIT
 if [[ -x "$OBJCOPY" ]]; then "$OBJCOPY" --strip-debug "$ELF" "$UPLOAD"; else cp "$ELF" "$UPLOAD"; fi
 CRC="$(python3 -I -c 'import sys,zlib; print("%08x" % zlib.crc32(open(sys.argv[1],"rb").read()))' "$UPLOAD")"
 SIZE="$(wc -c <"$UPLOAD" | tr -d ' ')"
@@ -116,13 +152,37 @@ SHOWN="$(echo "$CMDLINE" | sed 's/mgmt_pass=[^ ]*/mgmt_pass=***/')"
 ENDPOINT=/api/upgrade
 [[ "$PERSIST" == 1 ]] && ENDPOINT=/api/upgrade/persist
 echo "upload: $PROFILE kernel${FEATURES:+ ($FEATURES)} build $BUILD, $SIZE bytes, crc32 $CRC${CMDLINE:+, cmdline \"$SHOWN\"}$([[ "$PERSIST" == 1 ]] && echo ', stored on the SD card')"
-out="$(curl -s -m 180 -u "admin:$PASS" "${hdr[@]}" -X POST --data-binary @"$UPLOAD" "$URL$ENDPOINT" -w '\n%{http_code}')"
-code="${out##*$'\n'}"
-echo "router: ${out%$'\n'*} (HTTP $code)"
-[[ "$code" == 200 ]] || exit 1
-# The record the router stored ("... (slot A, seq 3, ...)"): the trial that
-# boots must be exactly this one.
-STORED_SEQ="$(printf '%s' "$out" | sed -n 's/.*, seq \([0-9]*\),.*/\1/p' | head -1)"
+rc=0
+out="$(curl -s -m 180 -u "admin:$PASS" "${hdr[@]}" -X POST --data-binary @"$UPLOAD" "$URL$ENDPOINT" -w '\n%{http_code}')" || rc=$?
+STORED_SEQ=
+INTERRUPTED=0
+if [[ "$rc" != 0 ]]; then
+  # Cut off (a tunnel dropping): the router may have stored it and be
+  # rebooting, or have nothing. Its uptime and image tell.
+  # Stored, it restarts within a second or two; still answering 10 s later
+  # without its uptime going back means it took nothing.
+  echo "upload interrupted (curl exit $rc): checking what the router has" >&2
+  INTERRUPTED=1
+  kept=0
+  for _ in 1 2 3 4 5; do
+    sleep 2
+    now="$(status_line)"
+    if [[ -n "$now" && "${now##* }" -ge "${before##* }" ]]; then kept=$((kept + 1)); else break; fi
+  done
+  if [[ "$kept" == 5 ]]; then
+    img="$(image_line)"
+    echo "the router kept running ${img%%|*} (up ${now##* } s, $(echo "$img" | cut -d'|' -f3)): nothing was stored, upload again" >&2
+    exit 1
+  fi
+  echo "the router is restarting: following it" >&2
+else
+  code="${out##*$'\n'}"
+  echo "router: ${out%$'\n'*} (HTTP $code)"
+  [[ "$code" == 200 ]] || exit 1
+  # The record the router stored ("... (slot A, seq 3, ...)"): the trial that
+  # boots must be exactly this one.
+  STORED_SEQ="$(printf '%s' "$out" | sed -n 's/.*, seq \([0-9]*\),.*/\1/p' | head -1)"
+fi
 
 # The new kernel needs a few seconds (NIC reset, link, DHCP), a persistent
 # upgrade a whole firmware boot too. It is back once the router was
@@ -152,8 +212,16 @@ img="$(image_line)"
 echo "kernel: build ${img%%|*}, ${img##*|}"
 rest="${img#*|}"
 if [[ "${rest%%|*}" == - ]]; then
+  if [[ "${img%%|*}" == "$BUILD" ]]; then
+    echo "the router runs $BUILD with no trial pending: already confirmed (from elsewhere, or while this script could not reach it)"
+    exit 0
+  fi
   echo "the router does not run a trial kernel: the stored kernel was rolled back (see the serial console)" >&2
   exit 1
+fi
+if [[ "$INTERRUPTED" == 1 && "${img%%|*}" == "$BUILD" ]]; then
+  STORED_SEQ="${rest%%|*}"
+  echo "the interrupted upload was stored: trial seq $STORED_SEQ runs $BUILD"
 fi
 if [[ -z "$STORED_SEQ" || "${rest%%|*}" != "$STORED_SEQ" ]]; then
   echo "the trial is seq ${rest%%|*}, the upload was stored as seq ${STORED_SEQ:-?}: not confirming" >&2
@@ -182,9 +250,10 @@ miss=0
 while :; do
   read -r up seq left <<<"$(trial_state)"
   if [[ -z "${up:-}" ]]; then
-    # One lost poll (Wi-Fi) is not a crash; three in a row are.
+    # Lost polls (Wi-Fi, a tunnel being re-opened) are not a crash; 20 s
+    # of silence is.
     miss=$((miss + 1))
-    if [[ "$miss" -ge 3 ]]; then
+    if [[ "$miss" -ge 20 ]]; then
       echo "the trial kernel stopped answering at uptime ~$last s: not confirming (it is rolled back)" >&2
       exit 1
     fi
