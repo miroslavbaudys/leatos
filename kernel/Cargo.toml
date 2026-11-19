@@ -1,12 +1,12 @@
 [package]
-name = "rrouter-kernel"
+name = "leatos-kernel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "rrouter bare-metal aarch64 unikernel (QEMU virt)"
 
 [[bin]]
-name = "rrouter"
+name = "leatos"
 path = "src/main.rs"
 test = false
 bench = false

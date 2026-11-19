@@ -381,7 +381,7 @@ control `LAB_GUEST_DOMAIN=0`).
   ≤ 256 DNS hosts.
 - Settings the running kernel does not implement yet are rejected as
   unsupported (`Config::unsupported`, separate from validation so the
-  crate accepts the whole schema): by a save (web, CLI), by `rrstore
+  crate accepts the whole schema): by a save (web, CLI), by `leatstore
   put`, and a stored config with them is not used (defaults, as for any
   rejected record). Today that is a network on several ports (a bridge),
   port names other than `lan0`–`lan2`, and a WAN port other than `wan0`.
@@ -561,7 +561,7 @@ pointing at the right row while the user edits.
    with a diff, login, logs, per-reason drop counters).
 2. ✅ (2026-11-15) `crates/config` v2 types + validation + migration +
    v1-compatible writer + CLI editing by name (33 host tests); the kernel,
-   web form, `rrstore` and the test scripts on it; unsupported settings
+   web form, `leatstore` and the test scripts on it; unsupported settings
    refused.
 3. ✅ (2026-11-15) Networks on `lan0` (untagged + VLANs), zones with
    forwarding and input policy, per-network DHCP, Networks and Firewall

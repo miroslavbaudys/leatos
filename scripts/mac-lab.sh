@@ -72,7 +72,7 @@ echo "== sudo (for vmnet, one route and two resolver files)"
 sudo_keepalive
 
 echo "== build"
-cargo build -q -p rrouter-kernel --target aarch64-unknown-none
+cargo build -q -p leatos-kernel --target aarch64-unknown-none
 ALPINE_DIR=$(scripts/lab/fetch-alpine.sh | tail -1)
 ISP_INITRD=$(scripts/lab/build-initrd.sh isp | tail -1)
 
@@ -84,7 +84,7 @@ start_isp "$WAN_PORT" "$WORK/isp.log"
 
 echo "== start rrouter (LAN on vmnet-host, as root)"
 sudo -n env QEMU_BIN="$QEMU_BIN" QEMU_NET=mac LAB_WAN_PORT="$WAN_PORT" QEMU_ACCEL="$QEMU_ACCEL" \
-  scripts/qemu-run.sh target/aarch64-unknown-none/debug/rrouter >"$WORK/router.log" 2>&1 &
+  scripts/qemu-run.sh target/aarch64-unknown-none/debug/leatos >"$WORK/router.log" 2>&1 &
 ROUTER_PID=$!
 if ! wait_for "$WORK/router.log" "rrouter: boot ok" 40; then
   echo "rrouter did not boot:"; tr -d '\r' <"$WORK/router.log" | tail -30; exit 1

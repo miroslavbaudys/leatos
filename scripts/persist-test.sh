@@ -64,7 +64,7 @@ code() { curl -s -m 60 -o /dev/null -w '%{http_code}' "$@" || true; }
 upload() { # file [endpoint] -> HTTP code
   code -m 180 -u admin:test -X POST --data-binary @"$1" "$URL${2:-/api/upgrade/persist}"
 }
-images() { "$RRSTORE" show "$IMG" | sed -n 's/^  images .*A: \(.*\)   B: \(.*\)$/A: \1 | B: \2/p'; }
+images() { "$LEATSTORE" show "$IMG" | sed -n 's/^  images .*A: \(.*\)   B: \(.*\)$/A: \1 | B: \2/p'; }
 source_now() { status 'd["image"]["source"]'; }
 trial_now() { status '"-" if d["image"]["trial"] is None else d["image"]["trial"]["seq"]'; }
 
@@ -74,19 +74,19 @@ strip() { # elf out
   if [[ -x "$objcopy" ]]; then "$objcopy" --strip-debug "$1" "$2"; else cp "$1" "$2"; fi
 }
 build() { # features out
-  local args=(build -p rrouter-kernel --target "$TARGET" --release --quiet)
+  local args=(build -p leatos-kernel --target "$TARGET" --release --quiet)
   [[ -n "$1" ]] && args+=(--features "$1")
   cargo "${args[@]}"
-  strip "target/$TARGET/release/rrouter" "$2"
+  strip "target/$TARGET/release/leatos" "$2"
 }
 # Test kernels first; the plain build last, so the tree keeps it.
 build fault-panic "$WORK/panic.elf"
 build fault-hang "$WORK/hang.elf"
 build "" "$WORK/new.elf"
-cp "target/$TARGET/release/rrouter" "$WORK/boot.elf" # the loader (boot partition)
-cargo build -p rrstore --release --quiet
-RRSTORE=target/release/rrstore
-"$RRSTORE" create "$IMG" --mib 32 >/dev/null
+cp "target/$TARGET/release/leatos" "$WORK/boot.elf" # the loader (boot partition)
+cargo build -p leatstore --release --quiet
+LEATSTORE=target/release/leatstore
+"$LEATSTORE" create "$IMG" --mib 32 >/dev/null
 
 ARGS="mgmt=wan mgmt_pass=test lan=10.10.0.1/24 trial_secs=20"
 start() { # extra boot arguments
@@ -221,7 +221,7 @@ start "image=golden"
 for _ in $(seq 1 180); do [[ -n "$(source_now)" ]] && break; sleep 1; done
 check "image=golden: stored kernels not used" "boot partition (image=golden: stored kernels not used)" "$(source_now)"
 stop
-"$RRSTORE" corrupt "$IMG" images >/dev/null
+"$LEATSTORE" corrupt "$IMG" images >/dev/null
 start
 for _ in $(seq 1 180); do [[ -n "$(source_now)" ]] && break; sleep 1; done
 check "corrupt record: the loader boots itself" "boot partition (no kernel in the store)" "$(source_now)"

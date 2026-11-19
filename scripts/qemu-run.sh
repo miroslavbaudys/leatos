@@ -35,11 +35,11 @@
 #   QEMU_DISK=img        boot a disk image via SeaBIOS + Limine instead of -kernel
 #                        (x86_64; scripts/apu-image.sh); QEMU_APPEND is ignored
 #   QEMU_STORE=img       attach img as a virtio-blk disk (the router's store; create
-#                        one with `cargo run -q -p rrstore -- create img`). Written
+#                        one with `cargo run -q -p leatstore -- create img`). Written
 #                        in place: pass a copy to keep the original
 #   QEMU_STORE_BUS=virtio|sd   how QEMU_STORE is attached: virtio-blk (default) or an
 #                        SD card behind QEMU's sdhci-pci (the apu4's SD driver).
-#                        SD images must be a power of two in size (rrstore create --mib 32)
+#                        SD images must be a power of two in size (leatstore create --mib 32)
 #   QEMU_NIC=virtio|igb  NIC model for WAN and LAN (default virtio): igb = QEMU's
 #                        Intel 82576, driven by the same igb driver as the apu4's i211
 #   QEMU_WDT=1|0         attach QEMU's i6300esb PCI watchdog (default 1; the

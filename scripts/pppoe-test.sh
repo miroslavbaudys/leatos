@@ -59,17 +59,17 @@ check_isp() { # name n pattern seconds
 
 source scripts/lab/common.sh
 lab_cpu_flags
-cargo build -p rrouter-kernel --target "$TARGET" --quiet
-cargo build -p rrstore --release --quiet
-cp "target/$TARGET/debug/rrouter" "$WORK/rrouter.elf"
-target/release/rrstore create "$IMG" --mib 32 >/dev/null
+cargo build -p leatos-kernel --target "$TARGET" --quiet
+cargo build -p leatstore --release --quiet
+cp "target/$TARGET/debug/leatos" "$WORK/leatos.elf"
+target/release/leatstore create "$IMG" --mib 32 >/dev/null
 ALPINE_DIR=$(scripts/lab/fetch-alpine.sh modloop | tail -1)
 ISP_INITRD=$(scripts/lab/build-initrd.sh isp | tail -1)
 ISP_PPPOE=pap start_isp "$WAN_PORT" "$ISPLOG" || exit 1
 
 mkfifo "$FIFO"
 QEMU_APPEND="shape_up=10000 ntp=" QEMU_STORE="$IMG" QEMU_NET=lab QEMU_PCAP_DIR="${PPPOE_TEST_PCAP_DIR:-}" LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" \
-  QEMU_ACCEL="$QEMU_ACCEL" scripts/qemu-run.sh "$WORK/rrouter.elf" <"$FIFO" >"$LOG" 2>&1 &
+  QEMU_ACCEL="$QEMU_ACCEL" scripts/qemu-run.sh "$WORK/leatos.elf" <"$FIFO" >"$LOG" 2>&1 &
 QPID=$!
 exec 3>"$FIFO"
 wait_count 1 "serial console ready" $((T * 2)) || { fail "cli started"; exit 1; }

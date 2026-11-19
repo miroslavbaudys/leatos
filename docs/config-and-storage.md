@@ -24,7 +24,7 @@ partition next to the boot partition:
 
 ```
 p1  FAT32, 1–64 MiB    Limine + kernel (read-only for the kernel)
-p2  type 0xda, 16 MiB  rrouter store (64–80 MiB; formatted by tools/rrstore)
+p2  type 0xda, 16 MiB  rrouter store (64–80 MiB; formatted by tools/leatstore)
 ```
 
 The store starts with a **store header** (sector 0) that lists the
@@ -244,7 +244,7 @@ rollbacks.
   as `mgmt.password` in clear (web form: System page; serial CLI: `config
   set mgmt.password = "…"`; at least 8 characters); the kernel hashes it
   with a fresh salt before the config is stored or used, and ends every
-  login session. `rrstore put` refuses a clear `mgmt.password`; `rrstore
+  login session. `leatstore put` refuses a clear `mgmt.password`; `leatstore
   hash <password>` prints a hash for a config file. The boot argument
   `mgmt_pass=` wins over the stored hash (development, recovery). Without
   either, nothing can be changed through the web interface; the first
@@ -395,7 +395,7 @@ For when the network is not an option: the console prompt `rrouter> `.
   Requests are at most 64 KiB (`crate::store` splits). Known limit:
   `virtio-drivers` has only a blocking flush, so each flush (two per
   record) spins until QEMU answers.
-- Host tool `tools/rrstore` (`cargo run -p rrstore -- create|format|show|put|get|corrupt|hash`):
+- Host tool `tools/leatstore` (`cargo run -p leatstore -- create|format|show|put|get|corrupt|hash`):
   creates and formats store images, writes and reads records through the
   same `config-store` code, and flips payload bytes for negative controls.
   `QEMU_STORE=img scripts/qemu-run.sh` attaches an image as virtio-blk.
@@ -452,7 +452,7 @@ For when the network is not an option: the console prompt `rrouter> `.
 | `crates/config-store`: layout, records, MBR lookup, write plans | ✅ host-tested |
 | `crates/config`: schema v1 (LAN, DHCP + reservations, DNS, shaping, mgmt), defaults, validation, TOML; schema v2 (networks, zones, rules, forwards; `docs/config-v2.md`) (version 1 no longer read since 2026-11-18) | ✅ host-tested |
 | Kernel: one `Config` loaded at boot (refactor, no behaviour change) | ✅ `config::load()`; boot arguments overlay it |
-| virtio-blk + store partition in QEMU, lab check | ✅ `drivers::virtio_blk`, `store`, `tools/rrstore`, `GET`/`POST /api/config`, `scripts/store-test.sh` (aarch64 + x86_64) |
+| virtio-blk + store partition in QEMU, lab check | ✅ `drivers::virtio_blk`, `store`, `tools/leatstore`, `GET`/`POST /api/config`, `scripts/store-test.sh` (aarch64 + x86_64) |
 | DHCP leases in the `leases` area | ✅ (2026-11-15) `proto_dhcp::v4::persist` + `Server::restore` (host-tested), `net/svc.rs` `LeaseStore`, `scripts/lease-test.sh` (both arches, virtio + SD) |
 | Web interface: config pages, save + reboot, confirm/revert | ✅ form + import/export on the status page, JSON API, trial records (flags), `scripts/store-test.sh` covers confirm, timeout, revert and a kill during the trial (aarch64 + x86_64) |
 | apu4: SD driver, store partition in `apu-image.sh` | ✅ in QEMU (`sdhci-pci`, SDSC + SDHC, both arches, full `store-test.sh`) and SeaBIOS → Limine with the apu4 image as the SD card; on the apu4 ✅ (2026-11-14): image with the store and `--config`, boots from the stored config with only `mgmt_pass=` on the command line; saves write both slots (~0.1 s each including HTTP, applied live) and survive a reboot |

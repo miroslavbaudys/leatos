@@ -16,7 +16,7 @@ use fwd::forwarder::{
 };
 use fwd::wire::{self, ETH_HDR, PROTO_ICMP, PROTO_TCP, PROTO_UDP, SplitPlan};
 use libfuzzer_sys::fuzz_target;
-use rrouter_fuzz::{Addr, Ipv4Pkt, checksums_ok, damage};
+use leatos_fuzz::{Addr, Ipv4Pkt, checksums_ok, damage};
 
 const WAN: u8 = 0;
 const MACS: [[u8; 6]; 3] = [[2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 2], [2, 0, 0, 0, 0, 3]];
@@ -221,9 +221,9 @@ fuzz_target!(|ops: Vec<Op>| {
                 let pkt = Ipv4Pkt {
                     src: from,
                     dst: Addr::Any(u32::from(v.src(&l.frame))),
-                    sport: rrouter_fuzz::Port::Any(0),
-                    dport: rrouter_fuzz::Port::Any(0),
-                    l4: rrouter_fuzz::L4Kind::Other(PROTO_ICMP),
+                    sport: leatos_fuzz::Port::Any(0),
+                    dport: leatos_fuzz::Port::Any(0),
+                    l4: leatos_fuzz::L4Kind::Other(PROTO_ICMP),
                     ttl: 64,
                     tos: 0,
                     id: 1,

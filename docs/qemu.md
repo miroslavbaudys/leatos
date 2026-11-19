@@ -35,8 +35,8 @@ environment variables:
 | `QEMU_SMP` | `1` | number of CPUs |
 | `QEMU_GDB` | `0` | `1` = start paused, with a gdb stub on `:1234` |
 | `QEMU_NET` | `none` | `user` = two NICs on user-mode networking (WAN `52:54:00:00:00:01`, LAN `…:02`); `lab` = WAN and LAN on UDP socket links to the lab ISP and client VMs; `mac` / `mac-internet` = LAN on macOS vmnet-host (`scripts/mac-lab.sh`, `scripts/mac-internet.sh`) |
-| `QEMU_DISK` | unset | x86_64: boot this disk image through SeaBIOS (e.g. `target/apu4/rrouter-apu4.img` from `scripts/apu-image.sh`: Limine → Multiboot2, the apu4 boot path) instead of `-kernel`; `QEMU_APPEND` is ignored (the command line is in `limine.conf`) |
-| `QEMU_STORE` | unset | attach a store image (`cargo run -p rrstore -- create img`), written in place |
+| `QEMU_DISK` | unset | x86_64: boot this disk image through SeaBIOS (e.g. `target/apu4/leatos-apu4.img` from `scripts/apu-image.sh`: Limine → Multiboot2, the apu4 boot path) instead of `-kernel`; `QEMU_APPEND` is ignored (the command line is in `limine.conf`) |
+| `QEMU_STORE` | unset | attach a store image (`cargo run -p leatstore -- create img`), written in place |
 | `QEMU_STORE_BUS` | `virtio` | `sd` = attach `QEMU_STORE` as an SD card behind `sdhci-pci` (the apu4's driver; size a power of two) |
 | `QEMU_WDT` | `1` | `0` = no i6300esb watchdog device |
 | `QEMU_APPEND` | unset | kernel command line (boot arguments); `log=console` is added unless it sets `log=` |
@@ -84,7 +84,7 @@ docs/bufferbloat-cake.md §3.2).
 ```sh
 QEMU_GDB=1 cargo krun
 # in another terminal (lldb works too: `gdb-remote 1234`)
-gdb target/aarch64-unknown-none/debug/rrouter -ex 'target remote :1234'
+gdb target/aarch64-unknown-none/debug/leatos -ex 'target remote :1234'
 ```
 Useful QEMU options: `QEMU_EXTRA="-d int,guest_errors -D qemu.log"` logs
 exceptions and invalid guest accesses (TCG only).

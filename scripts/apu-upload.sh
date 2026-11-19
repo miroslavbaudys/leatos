@@ -129,11 +129,11 @@ if [[ -n "$TRIAL_OP" ]]; then
   exit $?
 fi
 
-args=(build -p rrouter-kernel --target x86_64-unknown-none --quiet)
+args=(build -p leatos-kernel --target x86_64-unknown-none --quiet)
 [[ "$PROFILE" == release ]] && args+=(--release)
 [[ -n "$FEATURES" ]] && args+=(--features "$FEATURES")
 cargo "${args[@]}"
-ELF="target/x86_64-unknown-none/$PROFILE/rrouter"
+ELF="target/x86_64-unknown-none/$PROFILE/leatos"
 # Strip debug info (12 MiB -> < 1 MiB) when llvm-objcopy is available.
 OBJCOPY="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objcopy"
 UPLOAD="$(mktemp -t rrouter-upload.XXXXXX)"

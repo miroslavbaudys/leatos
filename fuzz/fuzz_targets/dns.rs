@@ -13,7 +13,7 @@ use libfuzzer_sys::fuzz_target;
 use proto_dns::resolver::{Action, Config, Resolver};
 use proto_dns::wire::{self, Rdata};
 use proto_dns::zone::{Source, View, Zone};
-use rrouter_fuzz::{Addr, damage};
+use leatos_fuzz::{Addr, damage};
 
 const UP: [Ipv4Addr; 2] = [Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(1, 1, 1, 1)];
 const NAMES: &[&str] = &[

@@ -2,7 +2,7 @@
 # Build a bootable disk image for the PC Engines apu4 (coreboot + SeaBIOS):
 # MBR + a FAT32 partition holding Limine (BIOS) and the x86_64 kernel,
 # which Limine starts via Multiboot2, and the rrouter store (p2, type 0xda,
-# 16 MiB, formatted by tools/rrstore: the config saved from the web
+# 16 MiB, formatted by tools/leatstore: the config saved from the web
 # interface and kernels from persistent upgrades live there;
 # docs/config-and-storage.md, docs/upgrades.md). Write it to the SD card
 # (the kernel reads and writes the store through the SD slot).
@@ -10,7 +10,7 @@
 # enters the kernel stored by `scripts/apu-upload.sh --persist` if there is
 # one. The second Limine entry ("boot partition kernel") skips that.
 #
-#   scripts/apu-image.sh                       # release kernel -> target/apu4/rrouter-apu4.img
+#   scripts/apu-image.sh                       # release kernel -> target/apu4/leatos-apu4.img
 #   scripts/apu-image.sh --debug               # debug kernel (slower, more checks)
 #   scripts/apu-image.sh --cmdline "shape_up=20000 shape_down=100000"
 #   scripts/apu-image.sh --mgmt-pass           # command line gets mgmt_pass= (upgrades, saves);
@@ -24,7 +24,7 @@
 #   scripts/apu-image.sh --features smoke-test --out FILE   # used by smoke-test.sh
 #
 # Test the image in QEMU exactly as SeaBIOS boots it on the apu4:
-#   QEMU_DISK=target/apu4/rrouter-apu4.img QEMU_NET=user QEMU_NIC=igb scripts/qemu-run.sh
+#   QEMU_DISK=target/apu4/leatos-apu4.img QEMU_NET=user QEMU_NIC=igb scripts/qemu-run.sh
 #
 # Needs: limine and mtools (brew install limine mtools).
 # Serial console: 115200 8N1 (SeaBIOS, Limine and rrouter).
@@ -34,7 +34,7 @@ cd "$(dirname "$0")/.."
 PROFILE=release
 FEATURES=
 CMDLINE=
-OUT=target/apu4/rrouter-apu4.img
+OUT=target/apu4/leatos-apu4.img
 MGMT_WAN=0
 MGMT_PASS=0
 CONFIG=
@@ -73,11 +73,11 @@ done
 LIMINE_SHARE="$(cd "$(dirname "$(command -v limine)")/../share/limine" && pwd)"
 [[ -f "$LIMINE_SHARE/limine-bios.sys" ]] || { echo "no limine-bios.sys in $LIMINE_SHARE" >&2; exit 1; }
 
-args=(build -p rrouter-kernel --target x86_64-unknown-none --quiet)
+args=(build -p leatos-kernel --target x86_64-unknown-none --quiet)
 [[ "$PROFILE" == release ]] && args+=(--release)
 [[ -n "$FEATURES" ]] && args+=(--features "$FEATURES")
 cargo "${args[@]}"
-KERNEL="target/x86_64-unknown-none/$PROFILE/rrouter"
+KERNEL="target/x86_64-unknown-none/$PROFILE/leatos"
 
 IMG_MIB=80
 PART_LBA=2048 # boot partition at 1 MiB, up to 64 MiB
@@ -107,31 +107,31 @@ timeout: 3
 serial: yes
 serial_baudrate: 115200
 
-/rrouter
+/leatos
     protocol: multiboot2
-    path: boot():/boot/rrouter
+    path: boot():/boot/leatos
     cmdline: $CMDLINE
 
-/rrouter (boot partition kernel, ignore stored kernels)
+/leatos (boot partition kernel, ignore stored kernels)
     protocol: multiboot2
-    path: boot():/boot/rrouter
+    path: boot():/boot/leatos
     cmdline: ${CMDLINE:+$CMDLINE }image=golden
 EOF
 
 P="$IMG@@$((PART_LBA * 512))"
-mformat -i "$P" -F -v RROUTER -T "$PART_SECTORS" -h 64 -s 32 -H "$PART_LBA" ::
+mformat -i "$P" -F -v LEATOS -T "$PART_SECTORS" -h 64 -s 32 -H "$PART_LBA" ::
 mmd -i "$P" ::/boot ::/boot/limine
 mcopy -i "$P" "$LIMINE_SHARE/limine-bios.sys" "$WORK/limine.conf" ::/boot/limine/
 # Without debug info (gdb uses the ELF in target/): the boot partition
 # holds at most 63 MiB, and a debug kernel with DNS over TLS is ~80 MB.
 OBJCOPY="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objcopy"
-if [[ -x "$OBJCOPY" ]]; then "$OBJCOPY" --strip-debug "$KERNEL" "$WORK/rrouter"; else cp "$KERNEL" "$WORK/rrouter"; fi
-mcopy -i "$P" "$WORK/rrouter" ::/boot/rrouter
-cargo build -p rrstore --release --quiet
-target/release/rrstore format "$IMG" >/dev/null
-# Validated by rrstore (the same checks as the kernel's): a config the
+if [[ -x "$OBJCOPY" ]]; then "$OBJCOPY" --strip-debug "$KERNEL" "$WORK/leatos"; else cp "$KERNEL" "$WORK/leatos"; fi
+mcopy -i "$P" "$WORK/leatos" ::/boot/leatos
+cargo build -p leatstore --release --quiet
+target/release/leatstore format "$IMG" >/dev/null
+# Validated by leatstore (the same checks as the kernel's): a config the
 # router would reject never reaches the card.
-[[ -n "$CONFIG" ]] && target/release/rrstore put "$IMG" config "$CONFIG" >/dev/null
+[[ -n "$CONFIG" ]] && target/release/leatstore put "$IMG" config "$CONFIG" >/dev/null
 out="$(limine bios-install "$IMG" 2>&1)" || { echo "$out" >&2; exit 1; }
 
 mv "$IMG" "$OUT"

@@ -31,8 +31,8 @@ source scripts/lab/common.sh
 lab_cpu_flags
 
 echo "== build"
-cargo build -q -p rrouter-kernel --target "$ARCH-unknown-none"
-cargo build -q -p rrstore --release
+cargo build -q -p leatos-kernel --target "$ARCH-unknown-none"
+cargo build -q -p leatstore --release
 ALPINE_DIR=$(scripts/lab/fetch-alpine.sh | tail -1)
 CLIENT_INITRD=$(scripts/lab/build-initrd.sh client | tail -1)
 
@@ -40,13 +40,13 @@ STORE=""
 WHAT="no store: negative control"
 if [[ "$NO_STORE" != 1 ]]; then
   WHAT="store"
-  target/release/rrstore create "$WORK/store.img" --mib 32 >/dev/null
+  target/release/leatstore create "$WORK/store.img" --mib 32 >/dev/null
   STORE="$WORK/store.img"
 fi
 
 router() { # log
   QEMU_STORE="$STORE" QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" QEMU_ACCEL="$QEMU_ACCEL" \
-    QEMU_APPEND="mgmt_pass=lab-pass" scripts/qemu-run.sh "target/$ARCH-unknown-none/debug/rrouter" >"$1" 2>&1 &
+    QEMU_APPEND="mgmt_pass=lab-pass" scripts/qemu-run.sh "target/$ARCH-unknown-none/debug/leatos" >"$1" 2>&1 &
   ROUTER_PID=$!
   wait_for "$1" "rrouter: boot ok" 60 || { echo "router did not boot:"; cat "$1"; exit 1; }
 }

@@ -40,12 +40,12 @@ check() { # name n pattern seconds
   if wait_count "$2" "$3" "$4"; then pass "$1"; else fail "$1 (want $2 x '$3', have $(count "$3"))"; fi
 }
 
-cargo build -p rrouter-kernel --target "$TARGET" --quiet
-cargo build -p rrstore --release --quiet
-cp "target/$TARGET/debug/rrouter" "$WORK/rrouter.elf"
-target/release/rrstore create "$IMG" --mib 32 >/dev/null
+cargo build -p leatos-kernel --target "$TARGET" --quiet
+cargo build -p leatstore --release --quiet
+cp "target/$TARGET/debug/leatos" "$WORK/leatos.elf"
+target/release/leatstore create "$IMG" --mib 32 >/dev/null
 mkfifo "$FIFO"
-QEMU_APPEND="shape_up=10000" QEMU_STORE="$IMG" QEMU_NET=user scripts/qemu-run.sh "$WORK/rrouter.elf" <"$FIFO" >"$LOG" 2>&1 &
+QEMU_APPEND="shape_up=10000" QEMU_STORE="$IMG" QEMU_NET=user scripts/qemu-run.sh "$WORK/leatos.elf" <"$FIFO" >"$LOG" 2>&1 &
 QPID=$!
 exec 3>"$FIFO"
 wait_count 1 "serial console ready" $((T * 2)) || { fail "cli started"; exit 1; }

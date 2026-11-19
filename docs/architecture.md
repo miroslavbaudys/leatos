@@ -218,7 +218,7 @@ kernel/              bare-metal platform that drives the crates
   platform/          neutral BootInfo + firmware backends (DTB; PVH/Multiboot2 + ACPI)
   mm/ mmio.rs        memory, page tables, DMA, stacks; the safe MMIO abstraction
   drivers/ net/      NICs, block devices, watchdogs; packet pool, datapath, services
-tools/rrstore        host tool for store images (std)
+tools/leatstore        host tool for store images (std)
 ```
 
 The benefits: fast iteration and unit tests on the host, fuzzing with

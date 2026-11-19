@@ -234,7 +234,7 @@ datapath cores (arch work, out of scope here).
 ## 10. Order of work
 1. `crates/proto-wg` with host tests and fuzzing; the apu4 benchmark
    (§8) decides whether to continue.
-2. Config schema, validation, secrets, key generation (`rrstore` and the
+2. Config schema, validation, secrets, key generation (`leatstore` and the
    CLI see it; `unsupported()` until step 4).
 3. Per-packet shaper overhead in `crates/qdisc` + `PacketMeta`.
 4. Kernel: `wg0` link, receive path in `dp_down`, encrypt-on-dequeue in

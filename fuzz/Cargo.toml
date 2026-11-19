@@ -2,7 +2,7 @@
 # (list: `cargo fuzz list`). A workspace of its own, so the main workspace
 # (stable, `cargo test`) never builds libFuzzer. See fuzz/README.md.
 [package]
-name = "rrouter-fuzz"
+name = "leatos-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"

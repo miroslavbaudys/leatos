@@ -11,7 +11,7 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use proto_pppoe::wire::{self, *};
 use proto_pppoe::{Client, Config};
-use rrouter_fuzz::damage;
+use leatos_fuzz::damage;
 
 const CLIENT: [u8; 6] = [2, 0, 0, 0, 0, 1];
 const AC: [u8; 6] = [2, 0xac, 0, 0, 0, 1];

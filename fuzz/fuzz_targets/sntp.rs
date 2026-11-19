@@ -7,7 +7,7 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use proto_sntp::{Client, packet};
-use rrouter_fuzz::damage;
+use leatos_fuzz::damage;
 
 #[derive(Arbitrary, Debug)]
 enum Op {

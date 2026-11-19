@@ -1,15 +1,15 @@
-//! `rrstore`: host tool for rrouter store partitions
+//! `leatstore`: host tool for rrouter store partitions
 //! (docs/config-and-storage.md). The kernel never formats a store; this
 //! tool (called by the QEMU and image scripts) does.
 //!
 //! ```text
-//! rrstore create <img> [--mib N]        new disk image: MBR + one store partition, formatted
-//! rrstore format <img> [--force]        format the image's 0xda partition (standard layout)
-//! rrstore show <img>                    layout and slot states
-//! rrstore put <img> <area> <file> [--raw] [--version N]
+//! leatstore create <img> [--mib N]        new disk image: MBR + one store partition, formatted
+//! leatstore format <img> [--force]        format the image's 0xda partition (standard layout)
+//! leatstore show <img>                    layout and slot states
+//! leatstore put <img> <area> <file> [--raw] [--version N]
 //!                                       write a record (config: validated unless --raw)
-//! rrstore get <img> <area>              current record's payload to stdout
-//! rrstore corrupt <img> <area> [--slot A|B]
+//! leatstore get <img> <area>              current record's payload to stdout
+//! leatstore corrupt <img> <area> [--slot A|B]
 //!                                       flip a payload byte (default: of the current record)
 //! ```
 //!
@@ -319,7 +319,7 @@ fn hash(password: &str) -> Result<()> {
 }
 
 fn usage() -> String {
-    "usage: rrstore create <img> [--mib N] | format <img> [--force] | show <img> | \
+    "usage: leatstore create <img> [--mib N] | format <img> [--force] | show <img> | \
      put <img> <area> <file> [--raw] [--version N] | get <img> <area> | \
      corrupt <img> <area> [--slot A|B] | hash <password>"
         .into()
@@ -384,7 +384,7 @@ fn main() -> ExitCode {
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("rrstore: {e}");
+            eprintln!("leatstore: {e}");
             ExitCode::FAILURE
         }
     }
@@ -395,7 +395,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> String {
-        let d = std::env::temp_dir().join(format!("rrstore-test-{}-{name}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("leatstore-test-{}-{name}", std::process::id()));
         d.to_string_lossy().into_owned()
     }
 

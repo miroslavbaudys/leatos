@@ -32,7 +32,7 @@ case "$BOOT_MODE" in kernel) ;; limine) RROUTER_ARCH=x86_64 ;; *) echo "RROUTER_
 ARCH="${RROUTER_ARCH:-aarch64}"
 case "$ARCH" in aarch64 | x86_64) ;; *) echo "RROUTER_ARCH must be aarch64 or x86_64" >&2; exit 2 ;; esac
 TARGET="$ARCH-unknown-none"
-KERNEL="target/$TARGET/debug/rrouter"
+KERNEL="target/$TARGET/debug/leatos"
 # x86_64 runs under TCG on Apple Silicon: allow more time.
 [[ "$ARCH" == x86_64 ]] && SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-40}"
 LOG="$(mktemp -t rrouter-smoke.XXXXXX)"
@@ -46,7 +46,7 @@ boot() { # features [extra kernel arguments] [boots to wait for]
   if [[ "$BOOT_MODE" == limine ]]; then
     scripts/apu-image.sh --debug --features "$1" --cmdline "log=console${args:+ $args}" --out "$IMG" >/dev/null
   else
-    cargo build -p rrouter-kernel --target "$TARGET" --features "$1" --quiet
+    cargo build -p leatos-kernel --target "$TARGET" --features "$1" --quiet
   fi
   # macOS has no `timeout`: a background watchdog kills QEMU if the kernel hangs.
   if [[ "$BOOT_MODE" == limine ]]; then

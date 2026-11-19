@@ -12,7 +12,7 @@ use libfuzzer_sys::fuzz_target;
 use proto_dhcp::v4::packet::{Message, Options};
 use proto_dhcp::v4::persist;
 use proto_dhcp::v4::server::{Config, Server, StaticLease};
-use rrouter_fuzz::{Addr, damage};
+use leatos_fuzz::{Addr, damage};
 
 #[derive(Arbitrary, Debug)]
 enum Op {

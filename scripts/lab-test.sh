@@ -76,7 +76,7 @@
 #                        checks run through it. Negative control:
 #                        LAB_ROUTER_ARGS=wan_mode=dhcp (no address, everything
 #                        fails).
-#   LAB_GUEST=1          the router boots from a store (tools/rrstore) with a
+#   LAB_GUEST=1          the router boots from a store (tools/leatstore) with a
 #                        second network: VLAN 20 on lan0, 10.20.0.1/24, zone
 #                        "guest" (input: DHCP, DNS, ping; forwards to the
 #                        WAN only). The client adds eth0.20 (8021q from
@@ -288,7 +288,7 @@ lab_cpu_flags
 
 echo "== build"
 ARCH="${RROUTER_ARCH:-aarch64}"
-cargo build -q -p rrouter-kernel --target "$ARCH-unknown-none"
+cargo build -q -p leatos-kernel --target "$ARCH-unknown-none"
 MODLOOP=""
 [[ -n "$ISP_VLAN$ISP_PPPOE$GUEST" ]] && MODLOOP=modloop
 ALPINE_DIR=$(scripts/lab/fetch-alpine.sh $MODLOOP | tail -1)
@@ -436,15 +436,15 @@ dst = "10.30.0.0/24"
 via = "192.168.1.100"
 CFG
   dns_toml >>"$WORK/config.toml"
-  cargo build -q -p rrstore --release
-  target/release/rrstore create "$WORK/store.img" --mib 32 >/dev/null
-  target/release/rrstore put "$WORK/store.img" config "$WORK/config.toml" >/dev/null
+  cargo build -q -p leatstore --release
+  target/release/leatstore create "$WORK/store.img" --mib 32 >/dev/null
+  target/release/leatstore put "$WORK/store.img" config "$WORK/config.toml" >/dev/null
   if [[ -n "$GUEST_LIVE" ]]; then
     # Boot with the main LAN only (everything before the second network);
     # the client adds the rest live.
     awk '/^\[\[network\]\]$/ { n++ } n < 2' "$WORK/config.toml" >"$WORK/boot.toml"
-    target/release/rrstore create "$WORK/store.img" --mib 32 >/dev/null
-    target/release/rrstore put "$WORK/store.img" config "$WORK/boot.toml" >/dev/null
+    target/release/leatstore create "$WORK/store.img" --mib 32 >/dev/null
+    target/release/leatstore put "$WORK/store.img" config "$WORK/boot.toml" >/dev/null
     # The full config goes into the client's initrd (an extra cpio archive).
     mkdir -p "$WORK/extra"; cp "$WORK/config.toml" "$WORK/extra/guest.toml"
     ( cd "$WORK/extra" && echo guest.toml | cpio -o -H newc 2>/dev/null | gzip -9 ) >"$WORK/extra.cpio.gz"
@@ -471,16 +471,16 @@ ip = "192.168.1.10"
 hostname = "nas"
 CFG
   dns_toml >>"$WORK/config.toml"
-  cargo build -q -p rrstore --release
-  target/release/rrstore create "$WORK/store.img" --mib 32 >/dev/null
-  target/release/rrstore put "$WORK/store.img" config "$WORK/config.toml" >/dev/null
+  cargo build -q -p leatstore --release
+  target/release/leatstore create "$WORK/store.img" --mib 32 >/dev/null
+  target/release/leatstore put "$WORK/store.img" config "$WORK/config.toml" >/dev/null
   ROUTER_STORE="$WORK/store.img"
 fi
 [[ -n "$DOT" ]] && echo "== router config: DNS over TLS to 203.0.113.1#$DOT_NAME$([[ "$DOT_CA" == 1 ]] && echo ", lab CA trusted" || echo ", Mozilla's roots only")"
 
 echo "== start rrouter${ROUTER_ARGS:+ ($(echo "$ROUTER_ARGS" | sed 's/pppoe_pass=[^ ]*/pppoe_pass=***/'))}"
 QEMU_STORE="$ROUTER_STORE" QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" LAB_LAN1_PORT="${PORTS:+$LAN1_PORT}" QEMU_PCAP_DIR="$PCAP_DIR" QEMU_ACCEL="$QEMU_ACCEL" QEMU_APPEND="$ROUTER_ARGS" \
-  scripts/qemu-run.sh "target/$ARCH-unknown-none/debug/rrouter" >"$WORK/router.log" 2>&1 &
+  scripts/qemu-run.sh "target/$ARCH-unknown-none/debug/leatos" >"$WORK/router.log" 2>&1 &
 PIDS+=($!)
 wait_for "$WORK/router.log" "rrouter: boot ok" 40 || { echo "router did not boot:"; cat "$WORK/router.log"; exit 1; }
 # When the host sees the router's first SNTP sync (compared with the time

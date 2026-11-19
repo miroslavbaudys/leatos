@@ -16,7 +16,7 @@ The in-RAM upgrade is the development loop. The persistent upgrade replaces
 reflashing the SD card for every new kernel.
 
 ## 1. Pieces
-- **Boot partition kernel** (`/boot/rrouter` on the FAT partition, started
+- **Boot partition kernel** (`/boot/leatos` on the FAT partition, started
   by Limine): the **loader** and the last fallback. The kernel never
   writes the FAT partition, so this kernel changes only when the card is
   reflashed (`scripts/apu-image.sh`). It must already contain the loader

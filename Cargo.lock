@@ -639,6 +639,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
+name = "leatos-kernel"
+version = "0.1.0"
+dependencies = [
+ "aarch64-cpu",
+ "auth",
+ "boot-image",
+ "cli",
+ "config",
+ "config-store",
+ "fdt",
+ "fwd",
+ "linked_list_allocator",
+ "proto-dhcp",
+ "proto-dns",
+ "proto-dot",
+ "proto-http",
+ "proto-mdns",
+ "proto-pppoe",
+ "proto-sntp",
+ "qdisc",
+ "safe-mmio 0.4.0",
+ "smoltcp",
+ "spin",
+ "virtio-drivers",
+]
+
+[[package]]
+name = "leatstore"
+version = "0.1.0"
+dependencies = [
+ "auth",
+ "config",
+ "config-store",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -997,42 +1033,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys",
-]
-
-[[package]]
-name = "rrouter-kernel"
-version = "0.1.0"
-dependencies = [
- "aarch64-cpu",
- "auth",
- "boot-image",
- "cli",
- "config",
- "config-store",
- "fdt",
- "fwd",
- "linked_list_allocator",
- "proto-dhcp",
- "proto-dns",
- "proto-dot",
- "proto-http",
- "proto-mdns",
- "proto-pppoe",
- "proto-sntp",
- "qdisc",
- "safe-mmio 0.4.0",
- "smoltcp",
- "spin",
- "virtio-drivers",
-]
-
-[[package]]
-name = "rrstore"
-version = "0.1.0"
-dependencies = [
- "auth",
- "config",
- "config-store",
 ]
 
 [[package]]

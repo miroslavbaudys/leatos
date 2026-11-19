@@ -9,7 +9,7 @@
 //!
 //! **Safety rules:** a disk is used only if its MBR has a 0xda partition
 //! **and** that partition starts with a valid store header. The kernel
-//! never formats (only `rrstore`, the host tool, does), and every access is
+//! never formats (only `leatstore`, the host tool, does), and every access is
 //! checked to lie inside the partition.
 
 use crate::drivers::{DISK_MAX_SECTORS as MAX_REQUEST_SECTORS, Disk, DiskError};

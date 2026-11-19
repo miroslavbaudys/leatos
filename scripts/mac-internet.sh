@@ -181,11 +181,11 @@ sudo_keepalive
 
 echo "== build ($PROFILE)"
 if [[ "$PROFILE" == release ]]; then
-  cargo build -q -p rrouter-kernel --target aarch64-unknown-none --release
+  cargo build -q -p leatos-kernel --target aarch64-unknown-none --release
 else
-  cargo build -q -p rrouter-kernel --target aarch64-unknown-none
+  cargo build -q -p leatos-kernel --target aarch64-unknown-none
 fi
-KERNEL=target/aarch64-unknown-none/$PROFILE/rrouter
+KERNEL=target/aarch64-unknown-none/$PROFILE/leatos
 BEFORE=$(ifconfig -l)
 
 echo "== start rrouter (WAN bridged on $WAN_IF, LAN on vmnet-host)"

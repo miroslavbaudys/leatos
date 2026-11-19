@@ -38,8 +38,8 @@ wait_for() { # count pattern seconds
   return 1
 }
 
-cargo build -p rrouter-kernel --target x86_64-unknown-none --release --quiet
-ELF=target/x86_64-unknown-none/release/rrouter
+cargo build -p leatos-kernel --target x86_64-unknown-none --release --quiet
+ELF=target/x86_64-unknown-none/release/leatos
 OBJCOPY="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objcopy"
 if [[ -x "$OBJCOPY" ]]; then "$OBJCOPY" --strip-debug "$ELF" "$WORK/new.elf"; else cp "$ELF" "$WORK/new.elf"; fi
 cp "$ELF" "$WORK/boot.elf" # boot a copy: the build may change under us
