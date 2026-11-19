@@ -832,6 +832,7 @@ const DROP_TEXT = {
   "too-big": "larger than the outgoing MTU and not split (IP options, or splitting off with fw_split=0)",
   "input": "to the router, refused by the zone's input policy",
   "spoofed": "from the WAN with a source in one of our networks or loopback (forged)",
+  "host-limit": "new connection from a host already holding its limit of answered connections (conn_per_host)",
   "clash": "new connection whose addresses and ports a tracked one already uses (or a fragmented datagram whose IP ID another one already uses through NAT)",
 };
 let savedReboot = false;
@@ -876,7 +877,7 @@ async function refresh() {
   $("t-upl2").textContent = "WAN send" + (sh[0] ? ` · shaped ${bits(sh[0] * 1000)}` : "");
   $("t-clients").textContent = n(st.dhcp_leases.filter((d) => d.bound).length);
   $("t-conns").textContent = n(st.conntrack);
-  $("t-fwd").textContent = `${n(st.forwarded)} forwarded, ${n(st.dropped)} dropped`;
+  $("t-fwd").textContent = `${n(st.forwarded)} forwarded, ${n(st.dropped)} dropped` + (st.early_drops ? `, ${n(st.early_drops)} early-dropped` : "");
   $("t-time").textContent = st.time?.utc ? st.time.utc.slice(11, 19) : "not synced";
   $("t-time2").textContent = st.time?.utc ? st.time.utc.slice(0, 10) + ` · NTP stratum ${st.time.stratum}` : (st.time?.servers?.length ? "NTP: " + st.time.servers.join(", ") : "no NTP servers");
 

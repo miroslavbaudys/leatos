@@ -77,8 +77,13 @@ pub const RX_BUDGET: usize = 64;
 /// Forwarder (conntrack) shards.
 pub const SHARDS: usize = 16;
 /// Tracked connections, all shards together (`fwd::conntrack::Budget`).
-const MAX_CONNS: usize = 16_384;
+pub const MAX_CONNS: usize = 16_384;
 const HOUSEKEEPING_MS: u64 = 1_000;
+/// Expired connections removed per housekeeping pass, all shards together
+/// (M9: removing 16k at once held a shard's lock, and this task, for
+/// milliseconds). More wait for the next pass: they are early-droppable
+/// and invisible to packets meanwhile (`Conntrack::lookup_live`).
+pub const EXPIRE_PER_PASS: usize = 256;
 
 /// The WAN link (on port 0); the networks are links 1.. on port 1.
 pub const WAN: IfIndex = 0;
@@ -103,6 +108,15 @@ pub static REVOKED: AtomicU64 = AtomicU64::new(0);
 /// Refused packets answered with a RST / port unreachable (`reject`),
 /// summed over the shards once a second (not in `DROP_REASONS`).
 pub static REJECTED: AtomicU64 = AtomicU64::new(0);
+/// Connections that were not assured, removed to make room for new ones
+/// (full table or a shard's NAT ports taken), summed over the shards once
+/// a second.
+pub static EARLY_DROPS: AtomicU64 = AtomicU64::new(0);
+/// The once-a-second conntrack pass (expire + counters) per shard, while
+/// its lock is held: the longest in the last pass and since boot (µs).
+/// Packets of that shard wait meanwhile (M9: measured on the apu4).
+pub static EXPIRE_LAST_US: AtomicU64 = AtomicU64::new(0);
+pub static EXPIRE_MAX_US: AtomicU64 = AtomicU64::new(0);
 /// On a PPPoE port: received frames that are not PPPoE, control frames
 /// that found the client's queue full, and IPv4 to send while there is no
 /// session.
@@ -324,7 +338,12 @@ impl Datapath {
         // One budget for all shards: every connection of one endpoint (a
         // torrent client's forwarded port: inbound peers, uTP, DHT) lives in
         // one shard, which may therefore take the whole table.
-        let budget = fwd::conntrack::Budget::new(MAX_CONNS);
+        // One host (initiator) at most `conn_per_host=` of them.
+        let budget = fwd::conntrack::Budget::with_host_limit(
+            MAX_CONNS,
+            crate::config::conn_per_host(MAX_CONNS),
+            hash_key,
+        );
         let shards = (0..SHARDS)
             .map(|k| {
                 let mut f = Forwarder::new_shard(MAX_CONNS, hash_key, SHARDS as u16, k as u16);
@@ -883,22 +902,34 @@ impl Datapath {
         let mut fhits: Vec<u64> = Vec::new();
         let mut rhits: Vec<u64> = Vec::new();
         let mut rejected = 0;
+        let mut early_drops = 0;
         let add = |into: &mut Vec<u64>, from: &[u64]| {
             into.resize(into.len().max(from.len()), 0);
             for (h, n) in into.iter_mut().zip(from) {
                 *h += n;
             }
         };
-        for s in &self.shards {
+        let mut longest = 0;
+        let mut removals = EXPIRE_PER_PASS;
+        let first = (now / HOUSEKEEPING_MS) as usize % self.shards.len();
+        for k in 0..self.shards.len() {
+            let s = &self.shards[(first + k) % self.shards.len()];
             let mut f = s.lock();
-            f.expire(now);
+            let held = timer::Instant::now();
+            removals -= f.expire_some(now, removals);
             conns += f.ct.len();
             add(&mut hits, &f.rule_hits);
             add(&mut fhits, &f.forward_hits);
             add(&mut rhits, &f.redirect_hits);
             rejected += f.stats.rejected;
+            early_drops += f.ct.stats.early_drops;
+            drop(f);
+            longest = longest.max(held.elapsed().as_micros() as u64);
         }
+        EXPIRE_LAST_US.store(longest, Ordering::Relaxed);
+        EXPIRE_MAX_US.fetch_max(longest, Ordering::Relaxed);
         REJECTED.store(rejected, Ordering::Relaxed);
+        EARLY_DROPS.store(early_drops, Ordering::Relaxed);
         self.sh.conntrack.store(conns, Ordering::Relaxed);
         *self.sh.rule_hits.lock() = hits;
         *self.sh.forward_hits.lock() = fhits;

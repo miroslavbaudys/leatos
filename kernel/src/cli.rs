@@ -546,11 +546,12 @@ fn status(ctx: &Ctx, wan: &str) {
     }
     let (used, free) = crate::mm::heap::usage();
     println!(
-        "memory   : heap {} KiB used, {} MiB free; forwarded {}, connections {}",
+        "memory   : heap {} KiB used, {} MiB free; forwarded {}, connections {} ({} early-dropped)",
         used >> 10,
         free >> 20,
         crate::net::datapath::FORWARDED.load(core::sync::atomic::Ordering::Relaxed),
-        ctx.sh.conntrack()
+        ctx.sh.conntrack(),
+        crate::net::datapath::EARLY_DROPS.load(core::sync::atomic::Ordering::Relaxed)
     );
 }
 

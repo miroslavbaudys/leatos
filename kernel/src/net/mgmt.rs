@@ -1150,7 +1150,7 @@ fn status_json(
     };
     let _ = write!(
         s,
-        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"vlan_drops\":{},\"conntrack\":{},\"revoked\":{},\"rejected\":{},\
+        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"vlan_drops\":{},\"conntrack\":{},\"early_drops\":{},\"conntrack_pass_us\":{{\"last\":{},\"max\":{}}},\"revoked\":{},\"rejected\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"temp\":{temp},\"memory\":{memory},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
          \"fragments\":{{\"forwarded\":{},\"parked\":{},\"park_drops\":{},\"split\":{},\"split_drops\":{}}},\"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
@@ -1180,6 +1180,9 @@ fn status_json(
         datapath::DROPPED.load(Ordering::Relaxed),
         datapath::VLAN_DROPS.load(Ordering::Relaxed),
         sh.conntrack(),
+        datapath::EARLY_DROPS.load(Ordering::Relaxed),
+        datapath::EXPIRE_LAST_US.load(Ordering::Relaxed),
+        datapath::EXPIRE_MAX_US.load(Ordering::Relaxed),
         datapath::REVOKED.load(Ordering::Relaxed),
         datapath::REJECTED.load(Ordering::Relaxed),
         mgmt.wan_pppoe.as_deref().unwrap_or("null"),

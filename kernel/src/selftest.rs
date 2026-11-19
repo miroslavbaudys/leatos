@@ -140,7 +140,79 @@ async fn late_fault() {
     }
 }
 
+/// `ct_bench=1` (M9): conntrack costs on this CPU with one shard holding
+/// the whole table (the worst case for the once-a-second pass: a torrent
+/// client's forward puts every connection in one shard). Prints µs per
+/// operation; nothing is asserted.
+pub fn conntrack_bench() {
+    use fwd::conntrack::{Budget, Conntrack, Dir, Tuple};
+    use fwd::wire::{PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_SYN};
+    use net::datapath::{EXPIRE_PER_PASS, MAX_CONNS};
+    use core::net::Ipv4Addr;
+    let wan = Ipv4Addr::new(203, 0, 113, 10);
+    let us = |t0: timer::Instant| t0.elapsed().as_micros() as u64;
+    let tuple = |i: usize, proto: u8| Tuple {
+        proto,
+        // 128 hosts × 8 source ports (1024 NAT mappings, within one of 16
+        // shards' ports) × 16 destinations.
+        src: Ipv4Addr::new(192, 168, 1, (i % 128) as u8 + 1),
+        sport: 40_000 + (i / 2048 % 8) as u16,
+        dst: Ipv4Addr::new(198, 51, 100 + (i / 16_384) as u8, (i / 128 % 16) as u8 + 1),
+        dport: 443,
+    };
+    let fill = |assured: bool| {
+        let mut ct = Conntrack::new_shard(MAX_CONNS, 0x5eed, 16, 0);
+        ct.set_budget(Budget::with_host_limit(MAX_CONNS, MAX_CONNS, 0x5eed));
+        let t0 = timer::Instant::now();
+        for i in 0..MAX_CONNS {
+            let id = ct.create(0, tuple(i, PROTO_TCP), Some(wan), TCP_SYN).expect("bench: room");
+            if assured {
+                ct.update(0, id, Dir::Reply, TCP_SYN | TCP_ACK, 60);
+                ct.update(0, id, Dir::Original, TCP_ACK, 60);
+            }
+        }
+        (ct, us(t0))
+    };
+    let (mut ct, fill_us) = fill(true);
+    assert_eq!(ct.len(), MAX_CONNS);
+    let t0 = timer::Instant::now();
+    let n = ct.expire(1000);
+    let scan_us = us(t0);
+    assert_eq!(n, 0);
+    // Full of assured connections: every new one samples and is refused.
+    const TRIES: usize = 1000;
+    let t0 = timer::Instant::now();
+    for i in 0..TRIES {
+        assert!(ct.create(0, tuple(MAX_CONNS + i, PROTO_UDP), Some(wan), 0).is_none());
+    }
+    let refuse_ns = us(t0) * 1000 / TRIES as u64;
+    let t0 = timer::Instant::now();
+    let n = ct.expire_some(u64::MAX, EXPIRE_PER_PASS);
+    let expire_pass_us = us(t0);
+    assert_eq!(n, EXPIRE_PER_PASS);
+    let t0 = timer::Instant::now();
+    let n = ct.expire(u64::MAX);
+    let expire_all_us = us(t0);
+    assert_eq!(n, MAX_CONNS - EXPIRE_PER_PASS);
+    // Full of unanswered connections: every new one early-drops one.
+    let (mut ct, _) = fill(false);
+    let t0 = timer::Instant::now();
+    for i in 0..TRIES {
+        assert!(ct.create(0, tuple(MAX_CONNS + i, PROTO_UDP), Some(wan), 0).is_some());
+    }
+    let evict_ns = us(t0) * 1000 / TRIES as u64;
+    println!(
+        "  ct bench        : {MAX_CONNS} conns in one shard: fill {} ns/conn, pass {scan_us} us (none expired), \
+         expire {EXPIRE_PER_PASS} (a pass) {expire_pass_us} us, the other {} {expire_all_us} us; when full: refuse {refuse_ns} ns, early drop {evict_ns} ns",
+        fill_us * 1000 / MAX_CONNS as u64,
+        MAX_CONNS - EXPIRE_PER_PASS
+    );
+}
+
 pub fn spawn(has_net: bool) {
+    if crate::config::ct_bench() {
+        executor::spawn(Priority::Service, "ct-bench", async { conntrack_bench() });
+    }
     // Spawned in "wrong" order on purpose: the datapath task must still run first.
     executor::spawn(Priority::Service, "selftest-a", async {
         let _ = FIRST.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);

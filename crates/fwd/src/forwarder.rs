@@ -356,9 +356,12 @@ pub enum DropReason {
     /// A new connection whose tuple a tracked one already has (e.g. two
     /// internal hosts racing for one external port); not a full table.
     Clash,
+    /// A new connection from a host that holds its limit of connections
+    /// (`conntrack::Budget::with_host_limit`), none of them early-droppable.
+    HostLimit,
 }
 
-pub const DROP_REASONS: usize = 14;
+pub const DROP_REASONS: usize = 15;
 
 impl DropReason {
     pub fn index(self) -> usize {
@@ -380,6 +383,7 @@ impl DropReason {
             Self::Input => "input",
             Self::Spoofed => "spoofed",
             Self::Clash => "clash",
+            Self::HostLimit => "host-limit",
         }
     }
     pub fn all() -> [DropReason; DROP_REASONS] {
@@ -399,6 +403,7 @@ impl DropReason {
             Input,
             Spoofed,
             Clash,
+            HostLimit,
         ]
     }
 }
@@ -1206,6 +1211,11 @@ impl Forwarder {
         self.ct.expire(now)
     }
 
+    /// [`Forwarder::expire`], removing at most `max` connections.
+    pub fn expire_some(&mut self, now: u64, max: usize) -> usize {
+        self.ct.expire_some(now, max)
+    }
+
     fn drop(&mut self, r: DropReason) -> Verdict {
         self.stats.drops[r.index()] += 1;
         Verdict::Drop(r)
@@ -1280,8 +1290,8 @@ impl Forwarder {
         }
         let key = extract_key(f, &v);
         let hit = match &key {
-            Key::Flow(t, _) => self.ct.lookup(t),
-            Key::Related { inner, .. } => self.ct.lookup(&inner.inverse()),
+            Key::Flow(t, _) => self.ct.lookup_live(now, t),
+            Key::Related { inner, .. } => self.ct.lookup_live(now, &inner.inverse()),
             Key::Other => None,
         };
 
@@ -1359,7 +1369,7 @@ impl Forwarder {
                 }
                 // Masquerade towards the WAN only; between networks
                 // addresses stay as they are.
-                let clashes = self.ct.stats.clashes;
+                let (clashes, host_limit) = (self.ct.stats.clashes, self.ct.stats.host_limit);
                 let created = match dnat {
                     // Port forward: to the target; hairpin (an internal
                     // client) also from the router's address there.
@@ -1403,6 +1413,7 @@ impl Forwarder {
                 match created {
                     Some(id) => (id, Dir::Original),
                     None if self.ct.stats.clashes != clashes => return self.drop(DropReason::Clash),
+                    None if self.ct.stats.host_limit != host_limit => return self.drop(DropReason::HostLimit),
                     None => return self.drop(DropReason::TableFull),
                 }
             }
@@ -2950,6 +2961,28 @@ mod tests {
         let mut r = tcp_frame(WAN_MAC, SERVER, ROUTER_WAN, 6881, 8443, TCP_SYN);
         assert_eq!(run(&mut fw, 1, WAN, &mut r), Verdict::Drop(DropReason::Clash));
         assert_eq!((fw.ct.stats.clashes, fw.ct.stats.table_full), (1, 0));
+    }
+
+    #[test]
+    fn a_host_at_its_limit_is_not_a_full_table() {
+        let mut fw = router();
+        fw.set_conn_budget(crate::conntrack::Budget::with_host_limit(100, 2, 7));
+        // Two answered UDP connections from the host, then a third.
+        for port in [5000, 5001] {
+            let d = udp_datagram(HOST, SERVER, port, 53, b"q");
+            let mut f = to(LAN_MAC, ipv4_frame(HOST, SERVER, PROTO_UDP, 64, &d));
+            assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward { .. }));
+            let (id, _) = fw.ct.iter_ids().find(|(_, c)| c.orig.sport == port).map(|(id, c)| (id, c.clone())).unwrap();
+            fw.ct.update(0, id, crate::conntrack::Dir::Reply, 0, 10);
+        }
+        let d = udp_datagram(HOST, SERVER, 5002, 53, b"q");
+        let mut f = to(LAN_MAC, ipv4_frame(HOST, SERVER, PROTO_UDP, 64, &d));
+        assert_eq!(run(&mut fw, 0, LAN, &mut f), Verdict::Drop(DropReason::HostLimit));
+        assert_eq!((fw.ct.stats.host_limit, fw.ct.stats.table_full), (1, 0));
+        // Another host still gets in.
+        let d = udp_datagram(NAS, SERVER, 5002, 53, b"q");
+        let mut f = to(LAN_MAC, ipv4_frame(NAS, SERVER, PROTO_UDP, 64, &d));
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward { .. }));
     }
 
     #[test]

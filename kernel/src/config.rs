@@ -1023,6 +1023,18 @@ pub fn fw_fragments() -> bool {
     arg_u64(bootargs(), "fw_frag") != Some(0)
 }
 
+/// `ct_bench=1`: time conntrack operations on a full synthetic table at
+/// boot (`selftest::conntrack_bench`), for the target CPU's numbers.
+pub fn ct_bench() -> bool {
+    arg_u64(bootargs(), "ct_bench") == Some(1)
+}
+
+/// Connections one host may initiate (`conn_per_host=N`, `0` = no limit):
+/// default a quarter of the table, so one host never takes it all.
+pub fn conn_per_host(table: usize) -> usize {
+    arg_u64(bootargs(), "conn_per_host").map_or(table / 4, |n| n as usize)
+}
+
 /// Split packets without DF that exceed the egress MTU (RFC 791); boot
 /// argument `fw_split=0` drops them as `too-big` (the lab's negative
 /// control).
