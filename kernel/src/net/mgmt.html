@@ -911,7 +911,8 @@ async function refresh() {
   const views = cfgOrig?.dns?.views === "firewall" ? "by the firewall" : "all networks see all";
   $("dnsst").innerHTML = rows([["Upstream", ups], ...tls,
     ["Local names", `DHCP host names, reservations and ${n((cfgOrig?.dns?.host ?? []).length)} record(s), as <i>name</i>.${esc(cfgOrig?.dns?.domain ?? "lan")}; ${views}`],
-    ...(d ? [["Answers", `${n(d.local)} local · ${n(d.hidden ?? 0)} hidden from the asking network · ${n(d.cache_hits)} from the cache · ${n(d.forwarded)} forwarded`]] : [])]);
+    ...(d ? [["Answers", `${n(d.local)} local · ${n(d.hidden ?? 0)} hidden from the asking network · ${n(d.cache_hits)} from the cache · ${n(d.forwarded)} forwarded`],
+      ["Over TCP", d.tcp ? `${n(d.tcp.queries)} queries · ${n(d.tcp.accepted)} connections (${n(d.tcp.open)} open)` : "off"]] : [])]);
 
   // Firewall
   const dr = st.drop_reasons ?? {};

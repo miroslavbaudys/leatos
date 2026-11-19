@@ -492,6 +492,8 @@ fn status(ctx: &Ctx, wan: &str) {
             st.prefetch_failed,
             st.stale_answers
         );
+        let (accepted, open) = svc.dns_tcp_status();
+        println!("dns-tcp  : {} queries, {} connections ({} open)", st.tcp_queries, accepted, open);
         for l in svc.dot_status_lines() {
             println!("dns-tls  : {l}");
         }

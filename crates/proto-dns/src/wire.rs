@@ -150,6 +150,57 @@ pub fn add_ede(msg: &mut Vec<u8>, code: u16, text: &str, dnssec_ok: bool) -> boo
     true
 }
 
+/// The OPT record of `msg` if it is the last record and its owner is the
+/// root (one zero byte, as RFC 6891 §6.1.2 requires): (record start,
+/// class offset). Only such a record can be changed in place or cut off
+/// without moving anything a compressed name may point to.
+fn last_opt(msg: &[u8]) -> Option<(usize, usize)> {
+    let recs = records(msg).ok()?;
+    let o = recs.last().filter(|r| r.section == 2 && r.rtype == TYPE_OPT)?;
+    let start = o.ttl_offset.checked_sub(5)?; // root, type, class
+    (o.rdata_offset + o.rdata_len == msg.len() && msg[start] == 0).then_some((start, o.ttl_offset - 2))
+}
+
+/// `query` as the forwarder sends it upstream: announcing EDNS with
+/// [`EDNS_UDP_SIZE`] bytes, in its own OPT record (size changed, options and
+/// DO kept) or a new one (without DO) appended. Unchanged if its OPT record
+/// is not the last record, or it cannot be parsed.
+pub fn with_edns_size(query: &[u8]) -> Vec<u8> {
+    let mut out = query.to_vec();
+    let Ok((h, _, q_end)) = parse_query(query) else {
+        return out;
+    };
+    if let Some((_, class)) = last_opt(query) {
+        out[class..class + 2].copy_from_slice(&EDNS_UDP_SIZE.to_be_bytes());
+        return out;
+    }
+    let Ok(recs) = records(query) else {
+        return out;
+    };
+    let end = recs.last().map_or(q_end, |r| r.rdata_offset + r.rdata_len);
+    if has_edns(query) || end != query.len() || h.arcount == u16::MAX {
+        return out;
+    }
+    out.push(0); // root
+    out.extend_from_slice(&TYPE_OPT.to_be_bytes());
+    out.extend_from_slice(&EDNS_UDP_SIZE.to_be_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // flags, no options
+    out[10..12].copy_from_slice(&(h.arcount + 1).to_be_bytes());
+    out
+}
+
+/// Remove `msg`'s OPT record (an answer for a client that sent no EDNS,
+/// RFC 6891 §7). Only a last record ([`last_opt`]); false if there was
+/// none to remove.
+pub fn strip_opt(msg: &mut Vec<u8>) -> bool {
+    let (Some((start, _)), Ok(h)) = (last_opt(msg), Header::parse(msg)) else {
+        return false;
+    };
+    msg.truncate(start);
+    msg[10..12].copy_from_slice(&(h.arcount - 1).to_be_bytes());
+    true
+}
+
 /// The Extended DNS Error codes in `msg`'s OPT record.
 pub fn ede_codes(msg: &[u8]) -> Vec<u16> {
     let mut out = Vec::new();
@@ -509,6 +560,31 @@ mod tests {
     }
 
     #[test]
+    fn upstream_queries_announce_1232_bytes_and_answers_lose_opt_for_plain_clients() {
+        let q = build_query(5, "x.example", TYPE_A);
+        let up = with_edns_size(&q);
+        assert!(has_edns(&up) && !dnssec_ok(&up));
+        assert_eq!((udp_limit(&up, 4096), Header::parse(&up).unwrap().arcount), (1232, 1));
+        assert_eq!(parse_query(&up).unwrap().1, parse_query(&q).unwrap().1);
+        // The client's own OPT: size raised, DO and options kept.
+        let mut e = q.clone();
+        e[11] = 1;
+        e.extend_from_slice(&[0, 0, 41, 0x02, 0x00, 0, 0, 0x80, 0, 0, 4, 0, 10, 0, 0]); // 512, DO, empty cookie
+        let up = with_edns_size(&e);
+        assert_eq!((up.len(), udp_limit(&up, 4096), dnssec_ok(&up)), (e.len(), 1232, true));
+        assert_eq!(&up[up.len() - 6..], &e[e.len() - 6..]);
+
+        // An answer with an OPT record, for a client that sent none.
+        let (_, _, end) = parse_query(&q).unwrap();
+        let mut a = build_response(&q, end, RCODE_NOERROR, &[(Rdata::A(Ipv4Addr::new(1, 2, 3, 4)), 60)], false);
+        let plain = a.clone();
+        assert!(add_ede(&mut a, EDE_STALE_ANSWER, "", false));
+        assert!(strip_opt(&mut a));
+        assert_eq!(a, plain);
+        assert!(!strip_opt(&mut a), "nothing left to strip");
+    }
+
+    #[test]
     fn pointer_loops_are_rejected() {
         let mut m = build_query(1, "a", TYPE_A);
         // Replace the question name with a pointer to itself.
@@ -553,6 +629,11 @@ mod tests {
             let _ = fit(&b, 20);
             let _ = (dnssec_ok(&b), has_edns(&b), ede_codes(&b));
             let _ = add_ede(&mut b.clone(), EDE_BLOCKED, "fuzz", false);
+            let _ = with_edns_size(&b);
+            let mut s = b.clone();
+            if strip_opt(&mut s) {
+                assert!(!has_edns(&s), "an OPT record left after stripping");
+            }
         }
     }
 

@@ -1030,6 +1030,12 @@ pub fn fw_split() -> bool {
     arg_u64(bootargs(), "fw_split") != Some(0)
 }
 
+/// DNS over TCP from clients (port 53, RFC 7766); boot argument
+/// `dns_tcp=0` serves UDP only (the lab's negative control).
+pub fn dns_tcp() -> bool {
+    arg_u64(bootargs(), "dns_tcp") != Some(0)
+}
+
 fn arg_u64(bootargs: &str, key: &str) -> Option<u64> {
     arg(bootargs, key).and_then(|v| v.parse().ok())
 }

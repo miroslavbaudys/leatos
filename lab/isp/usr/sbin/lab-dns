@@ -1,22 +1,33 @@
 #!/usr/bin/busybox sh
-# The ISP's DNS servers: lab-dns start|stop. dnsd (plain DNS on
-# 203.0.113.1:53) always; with DNS over TLS (/etc/dot/server.pem) also the
-# dnsmasq behind stunnel. TTL 12 s: short enough for the client's DNS
-# prefetch and serve-stale checks to see entries expire.
+# The ISP's DNS servers: lab-dns start|stop. Plain DNS on 203.0.113.1:53
+# always: dnsmasq (no cache) answering big.isp.example itself and passing
+# everything else to dnsd on 127.0.0.1:5301; with DNS over TLS
+# (/etc/dot/server.pem) also the dnsmasq behind stunnel. TTL 12 s: short
+# enough for the client's DNS prefetch and serve-stale checks to see
+# entries expire.
+#
+# big.isp.example: a TXT answer of about 850 bytes (four strings of 200),
+# more than a UDP answer without EDNS may carry (512): the client's DNS
+# over TCP check.
 bb=/usr/bin/busybox
 bx=/usr/bin/busybox-extras
+s=$($bb printf '%0200d' 0)
+big="--txt-record=big.isp.example,$s,$s,$s,$s"
 case "$1" in
   start)
-    $bx dnsd -c /etc/dnsd.conf -i 203.0.113.1 -t 12 >/dev/console 2>&1 </dev/null &
+    $bx dnsd -c /etc/dnsd.conf -i 127.0.0.1 -p 5301 -t 12 >/dev/console 2>&1 </dev/null &
     echo $! >/tmp/dnsd.pid
+    /usr/sbin/dnsmasq --conf-file=/dev/null --no-resolv --no-hosts --cache-size=0 --server=127.0.0.1#5301 \
+      --listen-address=203.0.113.1 --bind-interfaces --port=53 --user=root --local-ttl=12 "$big" \
+      --pid-file=/tmp/dnsmasq-plain.pid --log-facility=/tmp/dnsmasq-plain.log || exit 1
     if [ -f /etc/dot/server.pem ]; then
       /usr/sbin/dnsmasq --conf-file=/dev/null --no-resolv --no-hosts --addn-hosts=/tmp/dot-hosts \
-        --listen-address=127.0.0.1 --bind-interfaces --port=5300 --user=root --local-ttl=12 \
+        --listen-address=127.0.0.1 --bind-interfaces --port=5300 --user=root --local-ttl=12 "$big" \
         --pid-file=/tmp/dnsmasq.pid --log-queries --log-facility=/tmp/dot.log || exit 1
     fi
     ;;
   stop)
-    for f in /tmp/dnsd.pid /tmp/dnsmasq.pid; do
+    for f in /tmp/dnsd.pid /tmp/dnsmasq-plain.pid /tmp/dnsmasq.pid; do
       [ -f "$f" ] && $bb kill "$($bb cat "$f")" 2>/dev/null
       $bb rm -f "$f"
     done

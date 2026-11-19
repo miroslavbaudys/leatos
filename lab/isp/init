@@ -1,7 +1,8 @@
 #!/usr/bin/busybox sh
 # rrouter lab "ISP": PID 1 of the ISP VM, on the router's WAN link.
 #   eth0 203.0.113.1/24 — DHCP server (udhcpd) for the router's WAN,
-#   web server (httpd, with CGI helpers), DNS server (dnsd: isp.example),
+#   web server (httpd, with CGI helpers), DNS server (dnsd: isp.example,
+#   behind a cacheless dnsmasq that adds big.isp.example: lab-dns),
 #   TCP byte sink on port 5001 (tcpsvd + wc), NTP server (busybox ntpd -l:
 #   without peers it serves its own clock, i.e. the host's, as stratum 1).
 # lab_vlan=N on the kernel command line (scripts/lab-test.sh LAB_VLAN=N):

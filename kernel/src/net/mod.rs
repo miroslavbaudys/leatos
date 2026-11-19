@@ -3,6 +3,7 @@
 
 pub mod datapath;
 pub mod device;
+pub mod dns_tcp;
 pub mod dot;
 pub mod mdns;
 pub mod mgmt;

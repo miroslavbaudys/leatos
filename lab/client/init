@@ -171,6 +171,33 @@ case "$ede" in
   *) fail "dns extended error: no EDE 3 in the answer to an EDNS query:${ede:- (none)}" ;;
 esac
 
+# DNS over TCP (RFC 7766): big.isp.example has a TXT answer of about 850
+# bytes (the ISP's dnsmasq, lab-dns). Asked over UDP without EDNS (crafted:
+# ID 0x4321, RD, TXT), the router answers with TC set (it takes 512 bytes);
+# the same query over TCP (two-byte length first) gets the whole answer:
+# ID 43 21, TC clear, one answer, longer than 512, as long as its prefix
+# says. The router asks the ISP with EDNS 1232 although the client sent
+# none (else the ISP's answer would be truncated too). Negative control:
+# LAB_ROUTER_ARGS=dns_tcp=0 (no TCP listener: the TCP check fails).
+bigq='\103\041\001\000\000\001\000\000\000\000\000\000\003big\003isp\007example\000\000\020\000\001'
+udp=$($bb printf "$bigq" | $bb nc -u -w 3 192.168.1.1 53 2>/dev/null | $bb od -An -tx1 | $bb tr -s ' \n' ' ')
+tcp=$( { $bb printf '\000\041'; $bb printf "$bigq"; } | $bb nc -w 3 192.168.1.1 53 2>/dev/null | $bb od -An -v -tx1 | $bb tr -s ' \n' ' ')
+tcpq=$($bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb sed -n 's/.*"tcp":{"queries":\([0-9]*\).*/\1/p')
+set -- $udp
+if [ "$1 $2" = "43 21" ] && [ $((0x$3 & 2)) -ne 0 ] && [ $# -le 512 ]; then
+  pass "dns over udp: big.isp.example truncated (TC, $# bytes): the client must ask over TCP"
+else
+  fail "dns over udp: big.isp.example not truncated:${udp:- (no answer)}"
+fi
+set -- $tcp
+n=$#
+if [ "$n" -ge 4 ] && [ "$3 $4" = "43 21" ] && [ $((0x$5 & 2)) -eq 0 ] && [ "$9 ${10}" = "00 01" ] \
+   && [ $((0x$1$2)) -gt 512 ] && [ $((0x$1$2 + 2)) -eq "$n" ]; then
+  pass "dns over tcp: big.isp.example whole ($((0x$1$2)) bytes, one TXT answer); router counts ${tcpq:-?} TCP queries"
+else
+  fail "dns over tcp: no whole answer to big.isp.example ($n bytes):$(echo "$tcp" | $bb cut -c1-60)"
+fi
+
 # DNS over TLS (scripts/lab-test.sh LAB_DOT=1): dot.isp.example is known
 # only to the ISP's DoT server, plain.isp.example only to its plain dnsd.
 # Strict: the first must resolve, the second never (no plain DNS, also

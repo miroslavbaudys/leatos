@@ -1,6 +1,7 @@
 //! The DNS forwarder: local zone → cache → upstream, sans-IO.
 //!
-//! - **Queries** from LAN clients: [`Resolver::handle_query`].
+//! - **Queries** from LAN clients: [`Resolver::handle_query`] (datagrams),
+//!   [`Resolver::handle_query_tcp`] (one message from a TCP connection).
 //! - **Responses** from upstream servers: [`Resolver::handle_upstream`].
 //! - **Timers**: call [`Resolver::poll`] at [`Resolver::next_deadline`].
 //!
@@ -40,6 +41,19 @@
 //! none, Blocked (15) on rebind-protection refusals. Errors from the
 //! upstream go to the client as they came (with its own EDE, if any).
 //!
+//! Sizes: an answer to a UDP client is cut to what it takes (512 bytes
+//! without EDNS, else its EDNS size up to [`MAX_UDP_REPLY`]) with TC set,
+//! so it asks again over TCP (RFC 7766), where it gets up to
+//! [`MAX_TCP_REPLY`]. Upstream queries always announce EDNS with 1232
+//! bytes (DNS flag day 2020), whatever the client sent, so the cache gets
+//! whole answers up to that size for TCP clients too; a client that sent
+//! no EDNS gets its answers without an OPT record (RFC 6891 §7).
+//!
+//! Known gap: an upstream answer larger than 1232 bytes comes back
+//! truncated over UDP (it is not cached, and TCP clients get it truncated
+//! too): the forwarder does not ask the upstream again over TCP. Over TLS
+//! (`dns.tls`) there is no such limit.
+//!
 //! Known gap: one fixed upstream source port (chosen by the caller), so
 //! spoofing resistance relies on the 16-bit ID only. Per-query source ports
 //! are planned.
@@ -60,6 +74,10 @@ pub const LOCAL_TTL: u32 = 60;
 /// ([`wire::fit`]).
 pub const MAX_UDP_REPLY: usize = 1472;
 
+/// Largest answer to a TCP client: what the two-byte length prefix allows
+/// (RFC 1035 §4.2.2).
+pub const MAX_TCP_REPLY: usize = 65_535;
+
 /// A client whose question has a stale answer to fall back on waits at
 /// most this long for the upstream (RFC 8767 §5, client response timer:
 /// 1.8 s).
@@ -67,8 +85,9 @@ pub const STALE_CLIENT_TIMEOUT_MS: u64 = 1800;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Send `data` to the LAN client `to`.
-    Reply { to: SocketAddr, data: Vec<u8> },
+    /// Send `data` to the LAN client `to`: over its TCP connection (`tcp`,
+    /// framed by the caller) or as a datagram.
+    Reply { to: SocketAddr, data: Vec<u8>, tcp: bool },
     /// Send `data` to upstream server `server`, port 53.
     Upstream { server: Ipv4Addr, data: Vec<u8> },
 }
@@ -124,6 +143,8 @@ pub struct Stats {
     /// Local names withheld from the asking network (answered NXDOMAIN;
     /// also counted in `local_answers`).
     pub hidden: u64,
+    /// Queries that came over TCP (also counted in `queries`).
+    pub tcp_queries: u64,
 }
 
 /// An Extended DNS Error (RFC 8914): INFO-CODE and EXTRA-TEXT.
@@ -141,10 +162,13 @@ fn stale_ede(data: &[u8]) -> Ede {
     }
 }
 
-/// `data` for a client: with `ede` if it sent EDNS (RFC 6891: no OPT
-/// record otherwise), cut to `limit`.
+/// `data` for a client: with `ede` if it sent EDNS, without an OPT record
+/// if it did not (RFC 6891 §7: upstream queries always carry one), cut to
+/// `limit`.
 fn for_client(mut data: Vec<u8>, edns: bool, dnssec_ok: bool, ede: Option<Ede>, limit: usize) -> Vec<u8> {
-    if edns && let Some((code, text)) = ede {
+    if !edns {
+        wire::strip_opt(&mut data);
+    } else if let Some((code, text)) = ede {
         wire::add_ede(&mut data, code, text, dnssec_ok);
     }
     wire::fit(&data, limit)
@@ -153,6 +177,8 @@ fn for_client(mut data: Vec<u8>, edns: bool, dnssec_ok: bool, ede: Option<Ede>, 
 /// A client waiting for an upstream answer.
 struct Waiter {
     to: SocketAddr,
+    /// It asked over TCP.
+    tcp: bool,
     /// Its query ID.
     id: u16,
     /// Its query had EDNS (so the answer may carry an EDE).
@@ -252,24 +278,25 @@ impl Resolver {
         }
     }
 
-    fn reply_error(&mut self, to: SocketAddr, query: &[u8], rcode: u8) -> Vec<Action> {
+    fn reply_error(&mut self, to: SocketAddr, tcp: bool, query: &[u8], rcode: u8) -> Vec<Action> {
         if rcode == wire::RCODE_SERVFAIL {
             self.stats.servfails += 1;
         }
         wire::error_response(query, rcode)
-            .map(|data| Action::Reply { to, data })
+            .map(|data| Action::Reply { to, data, tcp })
             .into_iter()
             .collect()
     }
 
-    /// A stale answer (already with the client's ID) to `to`, marked as
+    /// A stale answer (already with the client's ID) to `w`, marked as
     /// such (EDE 3 or 19) for EDNS clients.
-    fn reply_stale(&mut self, to: SocketAddr, data: Vec<u8>, limit: usize, edns: bool, dnssec_ok: bool) -> Action {
+    fn reply_stale(&mut self, w: &Waiter, data: Vec<u8>, dnssec_ok: bool) -> Action {
         self.stats.stale_answers += 1;
         let ede = stale_ede(&data);
         Action::Reply {
-            to,
-            data: for_client(data, edns, dnssec_ok, Some(ede), limit),
+            to: w.to,
+            data: for_client(data, w.edns, dnssec_ok, Some(ede), w.limit),
+            tcp: w.tcp,
         }
     }
 
@@ -285,6 +312,18 @@ impl Resolver {
     /// it may not see is NXDOMAIN ([`Stats::hidden`]). Cache and upstream
     /// do not depend on the view (local answers are never cached).
     pub fn handle_query_in(&mut self, now_ms: u64, client: SocketAddr, view: View, query: &[u8]) -> Vec<Action> {
+        self.query(now_ms, client, false, view, query)
+    }
+
+    /// [`Self::handle_query_in`] for one query from a TCP connection (the
+    /// message without its length prefix): its answers are not cut to a
+    /// datagram ([`MAX_TCP_REPLY`]) and go back with `tcp` set.
+    pub fn handle_query_tcp(&mut self, now_ms: u64, client: SocketAddr, view: View, query: &[u8]) -> Vec<Action> {
+        self.stats.tcp_queries += 1;
+        self.query(now_ms, client, true, view, query)
+    }
+
+    fn query(&mut self, now_ms: u64, client: SocketAddr, tcp: bool, view: View, query: &[u8]) -> Vec<Action> {
         let Ok(h) = wire::Header::parse(query) else {
             return Vec::new();
         };
@@ -293,14 +332,14 @@ impl Resolver {
         }
         self.stats.queries += 1;
         if h.opcode() != 0 {
-            return self.reply_error(client, query, wire::RCODE_NOTIMP);
+            return self.reply_error(client, tcp, query, wire::RCODE_NOTIMP);
         }
         let (q, q_end) = match wire::parse_query(query) {
             Ok((_, q, end)) => (q, end),
-            Err(_) => return self.reply_error(client, query, wire::RCODE_FORMERR),
+            Err(_) => return self.reply_error(client, tcp, query, wire::RCODE_FORMERR),
         };
         if q.qclass != wire::CLASS_IN {
-            return self.reply_error(client, query, wire::RCODE_REFUSED);
+            return self.reply_error(client, tcp, query, wire::RCODE_REFUSED);
         }
 
         // 1. Local zone (authoritative, never forwarded).
@@ -331,19 +370,29 @@ impl Resolver {
             }
             Lookup::NotLocal => None,
         };
+        let limit = if tcp { MAX_TCP_REPLY } else { wire::udp_limit(query, MAX_UDP_REPLY) };
         if let Some((rcode, answers)) = local {
             self.stats.local_answers += 1;
             let data = wire::build_response(query, q_end, rcode, &answers, true);
-            return alloc::vec![Action::Reply { to: client, data }];
+            let data = wire::fit(&data, limit);
+            return alloc::vec![Action::Reply { to: client, data, tcp }];
         }
 
         // 2. Cache, per question and DNSSEC flags.
         let key = Key::of(query, q);
-        let limit = wire::udp_limit(query, MAX_UDP_REPLY);
+        let edns = wire::has_edns(query);
+        let waiter = Waiter {
+            to: client,
+            tcp,
+            id: h.id,
+            edns,
+            limit,
+            stale_at: None,
+        };
         if let Some(hit) = self.cache.get(now_ms, &key, h.id) {
             self.stats.cache_hits += 1;
-            let data = wire::fit(&hit.data, limit);
-            let mut out = alloc::vec![Action::Reply { to: client, data }];
+            let data = for_client(hit.data, edns, key.dnssec_ok, None, limit);
+            let mut out = alloc::vec![Action::Reply { to: client, data, tcp }];
             if let Some(query) = hit.refresh {
                 out.extend(self.prefetch(now_ms, key, query));
             }
@@ -352,20 +401,16 @@ impl Resolver {
 
         // 3. Stale, at once: the last refresh failed moments ago, or there
         // is nobody to ask.
-        let edns = wire::has_edns(query);
         let stale = self.cache.stale(now_ms, &key, h.id);
         if let Some(data) = &stale
             && (self.cache.failed_recently(now_ms, &key) || self.upstreams.is_empty())
         {
             let dnssec_ok = key.dnssec_ok;
-            return alloc::vec![self.reply_stale(client, data.clone(), limit, edns, dnssec_ok)];
+            return alloc::vec![self.reply_stale(&waiter, data.clone(), dnssec_ok)];
         }
         let waiter = Waiter {
-            to: client,
-            id: h.id,
-            edns,
-            limit,
             stale_at: stale.is_some().then_some(now_ms + STALE_CLIENT_TIMEOUT_MS),
+            ..waiter
         };
 
         // 4. Upstream (merge identical in-flight questions with the same
@@ -380,20 +425,22 @@ impl Resolver {
         if self.upstreams.is_empty() || self.pending.len() >= self.cfg.max_pending {
             let dnssec_ok = key.dnssec_ok;
             if let Some(data) = stale {
-                return alloc::vec![self.reply_stale(client, data, limit, edns, dnssec_ok)];
+                return alloc::vec![self.reply_stale(&waiter, data, dnssec_ok)];
             }
             if !self.upstreams.is_empty() {
-                return self.reply_error(client, query, wire::RCODE_SERVFAIL);
+                return self.reply_error(client, tcp, query, wire::RCODE_SERVFAIL);
             }
             self.stats.servfails += 1;
             let Some(data) = wire::error_response(query, wire::RCODE_SERVFAIL) else {
                 return Vec::new();
             };
             let data = for_client(data, edns, dnssec_ok, Some(EDE_NO_UPSTREAM), limit);
-            return alloc::vec![Action::Reply { to: client, data }];
+            return alloc::vec![Action::Reply { to: client, data, tcp }];
         }
         let id = self.next_id();
-        let mut up = query.to_vec();
+        // Whole answers up to 1232 bytes, whatever the client takes (it
+        // may ask again over TCP).
+        let mut up = wire::with_edns_size(query);
         wire::set_id(&mut up, id);
         let server = self.upstreams[0];
         self.by_question.insert(key.clone(), id);
@@ -506,6 +553,7 @@ impl Resolver {
                 Action::Reply {
                     to: w.to,
                     data: for_client(d, w.edns, dnssec_ok, ede, w.limit),
+                    tcp: w.tcp,
                 }
             })
             .collect()
@@ -520,7 +568,7 @@ impl Resolver {
         let mut out = Vec::new();
         for w in p.waiters {
             if let Some(data) = self.cache.stale(now_ms, &p.key, w.id) {
-                out.push(self.reply_stale(w.to, data, w.limit, w.edns, dnssec_ok));
+                out.push(self.reply_stale(&w, data, dnssec_ok));
             } else {
                 let mut q = p.query.clone();
                 wire::set_id(&mut q, w.id);
@@ -532,6 +580,7 @@ impl Resolver {
                     out.push(Action::Reply {
                         to: w.to,
                         data: for_client(data, w.edns, dnssec_ok, ede, w.limit),
+                        tcp: w.tcp,
                     });
                 }
             }
@@ -560,6 +609,7 @@ impl Resolver {
                 out.push(Action::Reply {
                     to: w.to,
                     data: for_client(data, w.edns, p.key.dnssec_ok, Some(ede), w.limit),
+                    tcp: w.tcp,
                 });
                 false
             });
@@ -651,7 +701,7 @@ mod tests {
 
     fn reply(actions: &[Action]) -> (&SocketAddr, &[u8]) {
         match actions {
-            [Action::Reply { to, data }] => (to, data),
+            [Action::Reply { to, data, .. }] => (to, data),
             other => panic!("expected one reply, got {other:?}"),
         }
     }
@@ -869,6 +919,48 @@ mod tests {
             rcode(reply(&r.handle_query(0, client(1), &bad)).1),
             wire::RCODE_FORMERR
         );
+    }
+
+    #[test]
+    fn big_answers_are_truncated_over_udp_and_whole_over_tcp() {
+        let mut r = resolver();
+        let q = build_query(7, "big.example", TYPE_A);
+        // Upstream with EDNS 1232, although the client sent none.
+        let (_, up) = upstream(&r.handle_query(0, client(1), &q));
+        assert_eq!((wire::has_edns(&up), wire::udp_limit(&up, 4096), wire::dnssec_ok(&up)), (true, 1232, false));
+        let (_, _, end) = wire::parse_query(&up).unwrap();
+        let ips: Vec<_> = (0..40).map(|i| Ipv4Addr::new(93, 184, 216, i)).collect();
+        let recs: Vec<_> = ips.iter().map(|&a| (Rdata::A(a), 300)).collect();
+        let mut big = wire::build_response(&up, end, RCODE_NOERROR, &recs, false);
+        assert!(wire::add_ede(&mut big, 0, "", false)); // the upstream's OPT record
+        assert!(big.len() > 512 && big.len() < 1232);
+
+        // The UDP client without EDNS: truncated (TC), no OPT record.
+        let a = r.handle_upstream(10, UP1, &big);
+        let [Action::Reply { to, data, tcp: false }] = &a[..] else { panic!("{a:?}") };
+        assert_eq!(to, &client(1));
+        assert!(wire::is_truncated(data) && !wire::has_edns(data));
+        assert_eq!(wire::Header::parse(data).unwrap().id, 7);
+
+        // It asks again over TCP: the whole answer, from the cache.
+        let a = r.handle_query_tcp(20, client(1), View::ALL, &q);
+        let [Action::Reply { data, tcp: true, .. }] = &a[..] else { panic!("{a:?}") };
+        assert!(!wire::is_truncated(data) && !wire::has_edns(data));
+        assert_eq!(wire::answer_ipv4s(data, &wire::records(data).unwrap()), ips);
+        assert_eq!((r.stats.tcp_queries, r.stats.queries, r.stats.cache_hits), (1, 2, 1));
+
+        // An EDNS client over UDP gets it whole too, with its OPT record.
+        let a = r.handle_query(30, client(2), &with_edns("big.example"));
+        let (_, d) = reply(&a);
+        assert!(!wire::is_truncated(d) && wire::has_edns(d));
+
+        // A TCP client waiting for the upstream gets the whole answer.
+        let q2 = build_query(8, "big2.example", TYPE_A);
+        let (_, up) = upstream(&r.handle_query_tcp(40, client(3), View::ALL, &q2));
+        let (_, _, end) = wire::parse_query(&up).unwrap();
+        let a = r.handle_upstream(50, UP1, &wire::build_response(&up, end, RCODE_NOERROR, &recs, false));
+        let [Action::Reply { data, tcp: true, .. }] = &a[..] else { panic!("{a:?}") };
+        assert_eq!(wire::Header::parse(data).unwrap().ancount, 40);
     }
 
     /// Query `name` at t = 0 and answer it with TTL `ttl`.

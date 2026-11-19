@@ -1398,9 +1398,16 @@ fn status_json(
     if let Some(svc) = services {
         let ups: Vec<String> = svc.upstreams().iter().map(|a| json_str(&format!("{a}"))).collect();
         let (st, cached) = svc.dns_stats();
+        // DNS over TCP from clients (null with `dns_tcp=0`).
+        let (accepted, open) = svc.dns_tcp_status();
+        let tcp = if config::dns_tcp() {
+            format!("{{\"queries\":{},\"accepted\":{accepted},\"open\":{open}}}", st.tcp_queries)
+        } else {
+            String::from("null")
+        };
         let _ = write!(
             s,
-            ",\"dns\":{{\"source\":{},\"upstreams\":[{}],\"tls\":{},\"cached\":{},\"queries\":{},\"local\":{},\"hidden\":{},\"cache_hits\":{},\"forwarded\":{},\"merged\":{},\"timeouts\":{},\"servfails\":{},\"rebind_blocked\":{},\"prefetches\":{},\"prefetch_failed\":{},\"stale_answers\":{}",
+            ",\"dns\":{{\"source\":{},\"upstreams\":[{}],\"tls\":{},\"cached\":{},\"queries\":{},\"local\":{},\"hidden\":{},\"cache_hits\":{},\"forwarded\":{},\"merged\":{},\"timeouts\":{},\"servfails\":{},\"rebind_blocked\":{},\"prefetches\":{},\"prefetch_failed\":{},\"stale_answers\":{},\"tcp\":{}",
             json_str(svc.upstream_source()),
             ups.join(","),
             svc.dot_status_json().unwrap_or_else(|| "null".into()),
@@ -1416,7 +1423,8 @@ fn status_json(
             st.rebind_blocked,
             st.prefetches,
             st.prefetch_failed,
-            st.stale_answers
+            st.stale_answers,
+            tcp
         );
         // Local names ([[dns.host]], config order) and the queries each
         // answered.

@@ -133,6 +133,23 @@ timeout, rebind protection, bounded pending queries.
 Own upstreams (`dns.upstreams`) and strict DNS over TLS (`dns.tls`,
 `crates/proto-dot`, docs/dns-over-tls.md) are implemented; answers to LAN
 clients are cut to their EDNS size with TC.
+**DNS over TCP from clients** (RFC 7766, 2026-11-19; boot argument
+`dns_tcp=0` turns it off): TCP port 53 on every network's address
+(`kernel/src/net/dns_tcp.rs`), so a client whose UDP answer came back
+truncated gets it whole over TCP (up to 64 KiB, `handle_query_tcp`).
+Length-prefixed messages, several queries per connection answered as they
+come (pipelining), 4 connections per network, queries up to 1 KiB, at most
+16 unanswered per connection (then reading pauses), 128 KiB of queued
+answers, closed after 10 s idle (aborted after 30 s). Upstream queries
+always announce EDNS with 1232 bytes, whatever the client sent, so the
+cache gets whole answers for TCP clients too; clients without EDNS get
+their answers without an OPT record (RFC 6891 §7). Counters in
+`/api/status` `dns.tcp` (`queries`, `accepted`, `open`), CLI `status`,
+the DNS page. Lab check: big.isp.example (an 850-byte TXT answer from the
+ISP's dnsmasq) truncated over UDP, whole over TCP; negative control
+`LAB_ROUTER_ARGS=dns_tcp=0`. Not done: an upstream answer above 1232 bytes
+comes back truncated and is not asked again over TCP (over TLS it is
+whole).
 **Prefetch** (`dns.prefetch`, default on; boot argument `dns_prefetch=0`):
 a cache hit in the last tenth of an entry's TTL (TTLs of 10 s and more) is
 answered from the cache and renews the entry in the background with the
@@ -165,7 +182,7 @@ Blocked (15) with a reason on rebind-protection refusals; errors from the
 upstream pass through unchanged (with its EDE). Added only where nothing
 moves (OPT last, or a new OPT); lab check: the stale answer to a crafted
 EDNS query carries EDE 3.
-**Open:** TCP port 53 from clients, randomised upstream source port
+**Open:** retrying truncated upstream answers over TCP, randomised upstream source port
 per query (Kaminsky hardening; one fixed random port today), DoH,
 blocklists, DNSSEC validation, static local records (`[[dns.host]]`:
 in the schema, refused by the kernel so far).

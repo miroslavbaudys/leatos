@@ -9,7 +9,8 @@
 //! asked over TLS only (`net::dot`), never in plain text.
 //!
 //! Per network (`config::networks`): `0.0.0.0:67` (DHCP, unless switched
-//! off) and `:53` (DNS from clients) on its interface; one resolver and
+//! off) and `:53` (DNS from clients, UDP and TCP: `net::dns_tcp`) on its
+//! interface; one resolver and
 //! local zone for all of them. WAN `:<random high port>` (queries to
 //! upstream servers over UDP), or TCP connections to port 853 for DNS
 //! over TLS. `:5353` on networks taking part in mDNS reflection
@@ -17,6 +18,7 @@
 
 use crate::config;
 use crate::config::schema::{HostName, LocalHost, NameVisibility};
+use crate::net::dns_tcp;
 use crate::net::dot::Dot;
 use crate::net::mdns::Mdns;
 use crate::net::ntp::{self, Ntp};
@@ -49,6 +51,8 @@ struct Net {
     host: usize,
     dhcp: Option<(dhcp::Server, SocketHandle)>,
     dns_sock: SocketHandle,
+    /// TCP :53 (none with `dns_tcp=0`).
+    dns_tcp: Option<dns_tcp::Listener>,
 }
 
 pub struct LanServices {
@@ -179,12 +183,14 @@ fn open_net(cfg: config::Lan, host: usize, hosts: &mut [HostIf]) -> Net {
     let mut s = udp_socket(32, 32 * 1024);
     s.bind(DNS_PORT).expect("bind :53");
     let dns_sock = sockets.add(s);
+    let dns_tcp = config::dns_tcp().then(|| dns_tcp::Listener::open(sockets));
     log_net(&cfg);
     Net {
         cfg,
         host,
         dhcp,
         dns_sock,
+        dns_tcp,
     }
 }
 
@@ -196,7 +202,7 @@ fn open_dhcp(cfg: &config::Lan, sockets: &mut SocketSet<'static>) -> (dhcp::Serv
 
 fn log_net(cfg: &config::Lan) {
     println!(
-        "  lan services    : {}: {}, dns {}:53 (.{})",
+        "  lan services    : {}: {}, dns {}:53 {} (.{})",
         cfg.name,
         if cfg.dhcp {
             alloc::format!(
@@ -209,6 +215,7 @@ fn log_net(cfg: &config::Lan) {
             alloc::string::String::from("no dhcp")
         },
         cfg.addr,
+        if config::dns_tcp() { "udp+tcp" } else { "udp" },
         cfg.domain,
     );
 }
@@ -364,6 +371,9 @@ impl LanServices {
                 sockets.remove(sock);
             }
             sockets.remove(net.dns_sock);
+            if let Some(l) = net.dns_tcp {
+                l.close(sockets);
+            }
             println!("  lan services    : {}: removed", net.cfg.name);
         }
         let (names, local_hosts) = config::dns_names();
@@ -507,12 +517,21 @@ impl LanServices {
     fn send_dns(&mut self, hosts: &mut [HostIf], actions: Vec<Action>) {
         for a in actions {
             match a {
-                Action::Reply { to, data } if to == ntp::SELF_CLIENT => {
+                Action::Reply { to, data, .. } if to == ntp::SELF_CLIENT => {
                     if let Some(n) = self.ntp.as_mut() {
                         n.dns_answer(&data, now_ms());
                     }
                 }
-                Action::Reply { to, data } => {
+                Action::Reply { to, data, tcp: true } => {
+                    // The connection's network (the one its query came in on).
+                    for net in &mut self.nets {
+                        let sockets = &mut hosts[net.host].sockets;
+                        if net.dns_tcp.as_mut().is_some_and(|l| l.send(sockets, to, &data, now_ms())) {
+                            break;
+                        }
+                    }
+                }
+                Action::Reply { to, data, tcp: false } => {
                     let IpAddr::V4(ip) = to.ip() else { continue };
                     let Some(net) = self.nets.iter().find(|n| n.cfg.contains(ip)) else {
                         continue;
@@ -582,6 +601,15 @@ impl LanServices {
                 let actions = self.dns.handle_query_in(now_ms(), client, View::network(i), &qbuf[..n]);
                 self.send_dns(hosts, actions);
             }
+            let host = &mut hosts[host];
+            let queries = match self.nets[i].dns_tcp.as_mut() {
+                Some(l) => l.recv(&mut host.sockets, now_ms()),
+                None => Vec::new(),
+            };
+            for (client, q) in queries {
+                let actions = self.dns.handle_query_tcp(now_ms(), client, View::network(i), &q);
+                self.send_dns(hosts, actions);
+            }
         }
         // DNS: upstream responses. Over TLS only from the TLS connections:
         // a UDP datagram is never an answer then (no query went out by UDP,
@@ -625,7 +653,19 @@ impl LanServices {
             dot.flush(&mut hosts[0]);
         }
 
+        for net in &mut self.nets {
+            if let Some(l) = net.dns_tcp.as_mut() {
+                l.step(&mut hosts[net.host].sockets, now_ms());
+            }
+        }
+
         self.mdns.step(hosts, links);
+    }
+
+    /// DNS over TCP: connections accepted since boot, open now.
+    pub fn dns_tcp_status(&self) -> (u64, usize) {
+        let open = self.nets.iter().filter_map(|n| n.dns_tcp.as_ref()).map(dns_tcp::Listener::open_conns).sum();
+        (dns_tcp::accepted(), open)
     }
 
     /// When `step` must run again even without traffic.
@@ -635,6 +675,9 @@ impl LanServices {
         let expire_in = self.next_expire.saturating_sub(now_secs()) * 1000;
         let mut wait_ms = dns_in.map_or(expire_in, |d| d.min(expire_in));
         if let Some(at) = self.ntp.as_ref().and_then(Ntp::next_deadline_ms) {
+            wait_ms = wait_ms.min(at.saturating_sub(ms_now));
+        }
+        if let Some(at) = self.nets.iter().filter_map(|n| n.dns_tcp.as_ref()?.next_deadline()).min() {
             wait_ms = wait_ms.min(at.saturating_sub(ms_now));
         }
         if self.mdns.wants_soon() {
