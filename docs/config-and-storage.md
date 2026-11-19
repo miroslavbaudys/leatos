@@ -1,6 +1,6 @@
 # Configuration and persistent storage
 
-How rrouter keeps its configuration (and later, other state) across
+How leatos keeps its configuration (and later, other state) across
 reboots, and how the management web interface changes it. Part of M8.
 
 ## 1. Principles
@@ -24,7 +24,7 @@ partition next to the boot partition:
 
 ```
 p1  FAT32, 1–64 MiB    Limine + kernel (read-only for the kernel)
-p2  type 0xda, 16 MiB  rrouter store (64–80 MiB; formatted by tools/leatstore)
+p2  type 0xda, 16 MiB  leatos store (64–80 MiB; formatted by tools/leatstore)
 ```
 
 The store starts with a **store header** (sector 0) that lists the
@@ -300,7 +300,7 @@ password exists) needs auth then, status and config reads included; a
 401 (session unused for 12 h, logout, reboot, password change) brings the
 login screen back, pending changes kept, and the request is sent again
 after the login. Without a password the page is read-only, its reads
-public. The page's requests carry `X-Rrouter-UI: 1`, so a 401 has no
+public. The page's requests carry `X-Leatos-UI: 1`, so a 401 has no
 `WWW-Authenticate` and the browser shows no password dialog of its own.
 Scripts use Basic auth on every request (checked once, then cached).
 Networks, zones, rules and port forwards are described in
@@ -363,7 +363,7 @@ overwrite the previous record, the only confirmed one. Without a previous
 record, a revert lands on the defaults.
 
 ### Serial console (`kernel/src/cli.rs`, `crates/cli`)
-For when the network is not an option: the console prompt `rrouter> `.
+For when the network is not an option: the console prompt `leatos> `.
 - Commands:
   - `status`, `leases`, `help`, `reboot`
   - `log [N|all|clear]` (the RAM log: after boot, log messages go there
@@ -422,7 +422,7 @@ For when the network is not an option: the console prompt `rrouter> `.
 - `crates/config-store`: layout and record round trips, every corruption
   case, slot selection with schema versions, power cuts and torn sectors
   at every point of a write.
-- `scripts/store-test.sh` (`RROUTER_ARCH=x86_64` too): empty store →
+- `scripts/store-test.sh` (`LEATOS_ARCH=x86_64` too): empty store →
   defaults; stored config used; a stored config that fails validation →
   defaults; `config=defaults` ignores the store; save through the web
   interface (401 without password, 422 for invalid or inconsistent
@@ -433,14 +433,14 @@ For when the network is not an option: the console prompt `rrouter> `.
   next boot reverts. Negative controls: corrupt the new record → the previous one;
   corrupt both → `config: defaults`.
 
-- `scripts/lease-test.sh` (`RROUTER_ARCH=x86_64`, `QEMU_STORE_BUS=sd` too):
+- `scripts/lease-test.sh` (`LEATOS_ARCH=x86_64`, `QEMU_STORE_BUS=sd` too):
   the lab client takes a lease; the router is killed after its periodic
   save and started again (a power cut), then a second lease (other MAC)
   is followed at once by `POST /api/reboot`. After each restart, before any
   new DHCP, the router lists the lease and resolves the name. Negative
   control: `LEASE_TEST_NO_STORE=1`.
 
-- `scripts/cli-test.sh` (`RROUTER_ARCH=x86_64`, `QEMU_STORE_BUS=sd` too)
+- `scripts/cli-test.sh` (`LEATOS_ARCH=x86_64`, `QEMU_STORE_BUS=sd` too)
   types into the UART: help, status, leases, line editing, unknown
   commands and settings, a refused invalid save, a live save, a LAN
   change that reboots and is kept. Negative control:

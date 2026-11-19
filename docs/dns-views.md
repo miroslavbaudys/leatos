@@ -187,7 +187,7 @@ On the DNS page:
     - `LAB_DNS_VIEWS=0` (`all`): the hiding checks fail.
     - `LAB_GUEST_RULES=0`: `nas.lan` fails too.
     - `LAB_DNS_HOSTS=0` (no `[[dns.host]]`): the split and override checks fail.
-  - Also with `LAB_GUEST_LIVE=1`, `LAB_DOT=1`, `RROUTER_ARCH=x86_64`,
+  - Also with `LAB_GUEST_LIVE=1`, `LAB_DOT=1`, `LEATOS_ARCH=x86_64`,
     `QEMU_ACCEL=tcg`.
 - Also `cli-test`, `store-test` (saving the new fields), `cargo test`,
   `clippy`, `kclippy`, `kcheck-x86`.

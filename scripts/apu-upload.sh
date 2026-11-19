@@ -13,7 +13,7 @@
 #   scripts/apu-upload.sh --persist --no-confirm   # leave the trial unconfirmed (rolls back)
 #   scripts/apu-upload.sh --persist --stable-secs 60   # longer stability window before confirming
 #   scripts/apu-upload.sh --confirm | --revert # confirm / roll back the running trial kernel
-#   scripts/apu-upload.sh --host 192.168.1.156 --cmdline "mgmt=wan mgmt_pass=... shape_up=20000"
+#   scripts/apu-upload.sh --host ROUTER_IP --cmdline "mgmt=wan mgmt_pass=... shape_up=20000"
 #   scripts/apu-upload.sh --debug              # debug kernel (bigger, slower)
 #   scripts/apu-upload.sh --reboot             # only reboot the router
 #   scripts/apu-upload.sh --features fault-hang --cmdline "... cores=1"

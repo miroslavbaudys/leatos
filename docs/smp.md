@@ -1,11 +1,11 @@
 # Multicore (M11)
 
-The apu4 has four Jaguar cores. rrouter used one until M11. This document
+The apu4 has four Jaguar cores. leatos used one until M11. This document
 describes how the others are used and why it is done this way.
 
 ## Constraint: one CAKE per direction
 CAKE shapes and shares bandwidth fairly only if one instance sees every
-flow of a direction. So rrouter does not spread packets over cores by
+flow of a direction. So leatos does not spread packets over cores by
 flow (RSS), the usual way routers scale. It parallelises by **direction**
 and by **kind of work** instead:
 

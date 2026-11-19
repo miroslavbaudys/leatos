@@ -189,7 +189,7 @@ services = ["_airplay._tcp", "_raop._tcp", "_googlecast._tcp", "_ipp._tcp"]
   and the router's IGMP reports for 224.0.0.251 on both networks.
   Negative control `LAB_MDNS_RULES=0` (the rule disabled: all three
   fail). Combines with `LAB_GUEST_LIVE=1` (added live) and
-  `RROUTER_ARCH=x86_64`.
+  `LEATOS_ARCH=x86_64`.
 - Open: a browse test with real mDNS software (`avahi-publish` on one
   network, `avahi-browse` on the other, in **separate network
   namespaces**: a host on both links finds the service directly and

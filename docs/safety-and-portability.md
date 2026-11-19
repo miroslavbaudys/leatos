@@ -73,7 +73,7 @@ Every dependency is reviewed for `no_std` support and its own unsafe surface bef
 
 **Status: x86_64 runs on QEMU and on hardware.** On QEMU q35 (TCG on
 Apple Silicon), the x86_64 kernel passes the same smoke tests and the full
-lab (`RROUTER_ARCH=x86_64 scripts/lab-test.sh`) since M9b (2026-11-09).
+lab (`LEATOS_ARCH=x86_64 scripts/lab-test.sh`) since M9b (2026-11-09).
 Since M10 it runs on the PC Engines apu4 (booted by Limine through
 Multiboot2), the developer's home router since 2026-11-15.
 
@@ -119,7 +119,7 @@ crates. Neutral code calls only the `arch::` API.
 **Guards:**
 - `cargo kcheck-x86`: type-checks neutral code for x86_64.
 - `cargo kclippy-x86`: lints the x86 kernel, with every feature like `kclippy`.
-- `RROUTER_ARCH=x86_64` on `scripts/smoke-test.sh` and `scripts/lab-test.sh`
+- `LEATOS_ARCH=x86_64` on `scripts/smoke-test.sh` and `scripts/lab-test.sh`
   boots the x86 kernel.
 
 **Unsafe on x86_64** (`scripts/unsafe-report.sh`):
@@ -145,7 +145,7 @@ crates. Neutral code calls only the `arch::` API.
 - **virtio caveat:** `virtio-drivers` 0.13 doesn't assign MSI-X vectors to
   the queues. `VirtioNet::route_msix` writes `msix_config` and
   `queue_msix_vector` once, after init. This is documented in
-  `drivers/virtio_net.rs` as the one place where rrouter touches
+  `drivers/virtio_net.rs` as the one place where leatos touches
   registers the crate also maps. Remove it once `virtio-drivers` supports
   MSI-X.
 

@@ -228,7 +228,7 @@ datapath cores (arch work, out of scope here).
   (LAN unreachable), no `wg` input bit (`LAB_WG_INPUT=0`: silent).
 - The WAN probe check keeps TCP 22/80/61000 and ping silent; UDP 51820
   answers only valid handshakes.
-- Matrix: `QEMU_SMP=4`, `RROUTER_ARCH=x86_64`, `QEMU_ACCEL=tcg`,
+- Matrix: `QEMU_SMP=4`, `LEATOS_ARCH=x86_64`, `QEMU_ACCEL=tcg`,
   `QEMU_NIC=igb`, `LAB_PPPOE=pap` (MTU 1432).
 
 ## 10. Order of work

@@ -1,6 +1,6 @@
 # Bufferbloat mitigation with CAKE
 
-**Goal:** low latency under load is a first-class feature of rrouter, not an
+**Goal:** low latency under load is a first-class feature of leatos, not an
 add-on. The target behaviour is that a saturated uplink or downlink adds no
 more than about 5–10 ms of queueing delay (in Linux terms, "A+" on bufferbloat
 tests), with fair sharing between flows and between LAN hosts.
@@ -17,7 +17,7 @@ where a smart queue manages it.
 
 ## 2. What CAKE consists of (what we have to implement)
 
-| Component | What it does | Notes for rrouter |
+| Component | What it does | Notes for leatos |
 |---|---|---|
 | **Shaper** | Rate-based (not token bucket): computes when the next packet may leave, with ns precision | Needs **high-resolution, tickless timers** |
 | **Overhead compensation** | Counts real on-wire bytes: PPPoE (8), Ethernet (14+4 FCS), VLAN (4), ATM cells (48/53), PTM (64/65), MPU | Essential with PPPoE. The PPPoE layer knows the encapsulation, so derive defaults automatically |
@@ -212,10 +212,10 @@ statistics every 10 s while there's traffic (sent, AQM drops, ECN marks,
 overflow drops, backlog, max sojourn), and a boot self-test checks ECN
 marking on a real packet buffer.
 
-**Expected effect on the real line:** CoDel only acts where rrouter's
+**Expected effect on the real line:** CoDel only acts where leatos's
 *own* queue builds. If the bottleneck is upstream (home router/ISP/Wi-Fi,
-§6b), rrouter's queue stays short and nothing changes. The qdisc stats
-show which case applies. The **shaper** (next step) makes rrouter the
+§6b), leatos's queue stays short and nothing changes. The qdisc stats
+show which case applies. The **shaper** (next step) makes leatos the
 bottleneck on purpose, so that CoDel/CAKE control the queue.
 
 ### Status: shaper (M6 step 3)
@@ -243,7 +243,7 @@ Rates are **boot arguments**: `shape_up=` / `shape_down=` (kbit/s) and
 | negative control: unshaped router, same client expectations | fails (221 / 137 Mbit/s) |
 
 ### First real-line run with shaping (42/50 Mbit/s)
-The queue **moved into rrouter**: the WAN shaper throttled 113k times, and
+The queue **moved into leatos**: the WAN shaper throttled 113k times, and
 the macOS Wi-Fi path no longer holds the standing queue. But CoDel's
 signals barely slowed the senders:
 
@@ -268,7 +268,7 @@ fallback sources were added.
 - **Upload: drops work, CE marks mostly don't.** macOS has classic ECN on
   (`net.inet.tcp.ecn=1`, L4S off), so L4S isn't the explanation. Leading
   hypothesis: **ECN bleaching** upstream (the home router or ISP clears the
-  ECN bits after rrouter marks them), so the receiver never echoes ECE.
+  ECN bits after leatos marks them), so the receiver never echoes ECE.
   Diagnostic added: per-port counters of ECN codepoints and TCP ECE/CWR
   flags on forwarded packets (`ecn rx …` console lines). ECE on ACKs
   arriving from the WAN would show that the marks survived.
@@ -371,20 +371,20 @@ only for now. A second LAN host in the lab is a follow-up.
   - The bulk flows' own queues still reach the hard limit (WAN max sojourn
     166–238 ms, 383 overflow drops, only 91 BLUE drops).
 - **ECN marks on upload are lost on the path (confirmed).** During the
-  upload rrouter set ~7,700 CE marks on WAN egress. The Mac's upload data
+  upload leatos set ~7,700 CE marks on WAN egress. The Mac's upload data
   was ECT(0), so ECN was negotiated. Yet ACKs arriving from the WAN carried
-  ECE only 7 more times (17 → 24). Something between rrouter and the
+  ECE only 7 more times (17 → 24). Something between leatos and the
   server clears the CE bits (*ECN bleaching*: the home router at
   192.168.8.1 or the ISP). The single-queue run shows the same (5,484 marks,
   ECE 13 → 17).
-- **ECN works on download.** rrouter's CE marks on LAN egress reach the
+- **ECN works on download.** leatos's CE marks on LAN egress reach the
   Mac. The Mac echoes ECE (18.5k → 35.5k ACKs), and the servers answer
   with CWR (279 → 526).
-- **The remaining download latency is upstream of rrouter.**
-  - The ping's own queue in rrouter is the sparse fast path.
+- **The remaining download latency is upstream of leatos.**
+  - The ping's own queue in leatos is the sparse fast path.
   - Download throughput (41.9) stayed below the 45 Mbit/s shaping rate, so
     the real downlink was at times the bottleneck and queued in front of
-    rrouter.
+    leatos.
   - Idle latency already varies (p50 8 ms, max 26 ms): the line's rate
     varies. A lower download rate, or later CAKE autorate (M9), addresses
     this.
@@ -407,7 +407,7 @@ overfit one line and one server:
   call those flows bleached.
 - **CAKE already has a safety net:** BLUE, for flows that ignore marks.
 
-Instead rrouter follows common SQM practice (OpenWrt's sqm-scripts default
+Instead leatos follows common SQM practice (OpenWrt's sqm-scripts default
 to ECN on ingress, off on egress):
 - **`ecn_up` = 0 (upload, WAN egress: drop).** The senders are local, a drop
   costs one retransmission over a short path, and it works on every path.
@@ -434,14 +434,14 @@ to ECN on ingress, off on egress):
 | default, TCG | 29 drops | 52 marks | PASS |
 
 **Real line with the new defaults (2026-11-09 22:32, shaped 38/36, one run):**
-- **Upload:** 28.8 Mbit/s, +35.7 ms. rrouter's upload queue now drops
+- **Upload:** 28.8 Mbit/s, +35.7 ms. leatos's upload queue now drops
   instead of marking (141 drops, 0 marks). The bulk uploads' own max
   sojourn fell to **41 ms** after the start (121 ms in the first interval),
   against 123–130 ms with marks.
 - **Download:** 33.1 Mbit/s, +39.4 ms, against +9.6 ms at the same 36 Mbit/s
   earlier. ECN marks only (3,252); LAN max sojourn 127 → 89 → 48 ms.
 - **The line was noisier this time:** idle ping max 134 ms, p99 28 ms.
-  The ping bypasses rrouter's bulk queues, so its remaining variation
+  The ping bypasses leatos's bulk queues, so its remaining variation
   comes from the line.
 - **Conclusion:** single runs on this line can't separate configurations
   that differ by less than ~30 ms. Comparisons need repeated, interleaved
@@ -487,14 +487,14 @@ ecn = true
 - **QEMU lab:** the ISP VM emulates a bloated bottleneck link
   (`tc qdisc ... tbf rate 20mbit burst ... limit 1mb` or `netem`). Run
   **flent RRUL** (from bufferbloat.net) and `irtt` from the client VM through
-  rrouter. Compare latency under load with QoS off and on. Track the results
+  leatos. Compare latency under load with QoS off and on. Track the results
   per release.
 - **Real line:** the Waveform bufferbloat test, and flent against a remote netserver.
 
 ## 6b. Baseline measurements (before CAKE)
 Measured with `scripts/bufferbloat.sh` on the developer's MacBook: Wi-Fi to
 the home router (192.168.8.1), line ≈ 55 Mbit/s down / 46 Mbit/s up.
-rrouter runs in QEMU/HVF via `scripts/mac-internet.sh` with a BFifo qdisc
+leatos runs in QEMU/HVF via `scripts/mac-internet.sh` with a BFifo qdisc
 (128 KB tail drop) and NIC rings limited to 8 frames in flight. "Added" is
 loaded p90 minus idle p50. Only valid runs are shown (2026-11-08/09):
 
@@ -505,14 +505,16 @@ loaded p90 minus idle p50. Only valid runs are shown (2026-11-08/09):
 | rrouter-debug | 1 | 55.7 ms | 58.0 ms | 129 ms | 55 / 45 |
 | rrouter-release + hybrid idle + CoDel | 1 | 47.8 ms | **199.2 ms** | 323 ms | 53 / 47 |
 
+(Path labels from before the project was renamed from rrouter to leatos.)
+
 **Findings:**
-1. **Download is the same with or without rrouter** (≈ +50–57 ms at the
+1. **Download is the same with or without leatos** (≈ +50–57 ms at the
    same throughput). The queue builds upstream (home router / ISP), and
-   rrouter adds nothing measurable. A fix needs **ingress shaping** in rrouter
-   slightly below ~54 Mbit/s (§3.4), so the queue moves into rrouter.
-2. ~~Upload is ~3× better through rrouter~~, **corrected 2026-11-09.**
-   The early rrouter runs (+52–100 ms vs direct +242 ms) were most likely an
-   *accident of rrouter being slow*: before hybrid idle it woke up to 3 ms
+   leatos adds nothing measurable. A fix needs **ingress shaping** in leatos
+   slightly below ~54 Mbit/s (§3.4), so the queue moves into leatos.
+2. ~~Upload is ~3× better through leatos~~, **corrected 2026-11-09.**
+   The early leatos runs (+52–100 ms vs direct +242 ms) were most likely an
+   *accident of leatos being slow*: before hybrid idle it woke up to 3 ms
    late, and its 128 KB FIFO tail-dropped. Both throttled the Mac's TCP and
    kept the downstream queue short. With hybrid idle + CoDel (384-packet
    hard limit), upload went to **+199 ms**, close to direct. The qdisc
@@ -521,18 +523,18 @@ loaded p90 minus idle p50. Only valid runs are shown (2026-11-08/09):
    ```
    qdisc wan0 : aqm drops 0, ecn marks 0, overflow drops 2456, max sojourn 15.8–23.2 ms
    ```
-   CoDel never acted, because rrouter's queue never *stood* above 5 ms. It
+   CoDel never acted, because leatos's queue never *stood* above 5 ms. It
    overflowed in **bursts** (the Mac pushes multi-Gbit/s through vmnet;
-   rrouter's TX drains at ~200 Mbit/s), so the standing queue lives
-   **downstream of rrouter**: the macOS Wi-Fi transmit path behind
+   leatos's TX drains at ~200 Mbit/s), so the standing queue lives
+   **downstream of leatos**: the macOS Wi-Fi transmit path behind
    vmnet-bridged, or the access point, at ~46 Mbit/s. That's a hidden queue
-   (§3.1) created by the host, invisible to rrouter.
-   **Consequence:** an AQM alone can't help. rrouter must **shape** below
+   (§3.1) created by the host, invisible to leatos.
+   **Consequence:** an AQM alone can't help. leatos must **shape** below
    the real bottleneck (≈ 42 Mbit/s up, ≈ 50 Mbit/s down) to become the
    bottleneck itself; then the queue forms where CoDel/CAKE control it.
    Hybrid idle vs. queue limit as the cause of the change wasn't separated
    (no A/B); neither is a design property worth keeping.
-3. **Upload via rrouter still varies (52–100 ms):** the BFifo has no AQM and
+3. **Upload via leatos still varies (52–100 ms):** the BFifo has no AQM and
    no flow isolation (a ping waits behind the upload). This is what COBALT
    + flow queueing address.
 4. **The build type doesn't matter at this rate** (debug ≈ release), so CPU

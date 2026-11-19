@@ -16,8 +16,8 @@ Requirements: QEMU ≥ 8 (`brew install qemu`) and the Rust toolchain. The
 | `cargo kclippy [--features <f>]` | clippy for the kernel (run for each feature below) |
 | `cargo kcheck-x86` | type-check the kernel for x86_64 |
 | `cargo kbuild-x86` / `cargo krun-x86` / `cargo kclippy-x86` | build / boot (QEMU q35, TCG) / lint the x86_64 kernel |
-| `RROUTER_ARCH=x86_64 scripts/smoke-test.sh` | the smoke tests with the x86_64 kernel |
-| `RROUTER_ARCH=x86_64 scripts/lab-test.sh` | the lab with an x86_64 router (client and ISP VMs stay aarch64) |
+| `LEATOS_ARCH=x86_64 scripts/smoke-test.sh` | the smoke tests with the x86_64 kernel |
+| `LEATOS_ARCH=x86_64 scripts/lab-test.sh` | the lab with an x86_64 router (client and ISP VMs stay aarch64) |
 | `scripts/unsafe-report.sh` | list modules allowed to use `unsafe` and count unsafe constructs |
 | `scripts/lab-test.sh` | end-to-end test with client + ISP VMs: DHCP, DNS, NAT, firewall, shaping, … (see below) |
 | `scripts/store-test.sh`, `lease-test.sh`, `cli-test.sh`, `pppoe-test.sh`, `vlan-test.sh`, `upgrade-test.sh`, `persist-test.sh` | feature tests; when to run each is listed in `CLAUDE.md` "Commands" |
@@ -89,9 +89,9 @@ gdb target/aarch64-unknown-none/debug/leatos -ex 'target remote :1234'
 Useful QEMU options: `QEMU_EXTRA="-d int,guest_errors -D qemu.log"` logs
 exceptions and invalid guest accesses (TCG only).
 
-## Lab: client VM + rrouter + ISP VM (`scripts/lab-test.sh`)
+## Lab: client VM + leatos + ISP VM (`scripts/lab-test.sh`)
 ```
-[client VM]  ──LAN──  [rrouter]  ──WAN──  [ISP VM]
+[client VM]  ──LAN──  [leatos]  ──WAN──  [ISP VM]
 Alpine 3.24           192.168.1.1/24       203.0.113.1/24
 52:54:00:00:00:10     WAN by DHCP from ISP udhcpd (lease .10–.20), httpd (+CGI), dnsd
 udp :10004<->:10003   udp :10005<->:10006  (QEMU -netdev dgram: no root needed)
@@ -109,12 +109,12 @@ negative controls is in `CLAUDE.md` "Commands":
 
 | Area | Check |
 |---|---|
-| DHCP | lease from rrouter (address, router, DNS, domain) |
+| DHCP | lease from leatos (address, router, DNS, domain) |
 | DNS | `nas.lan` (static), `router.lan`, own DHCP hostname, reverse PTR, NXDOMAIN for unknown `.lan`, **upstream** `isp.example` via the ISP's dnsd |
 | Router | ping 192.168.1.1 |
 | NAT | HTTP to the ISP; the ISP sees the router's **WAN address** as source (`/cgi-bin/ip`) |
 | ICMP | ping through NAT (echo identifier translation) |
-| TTL / ICMP errors | `traceroute`: hop 1 = rrouter's time-exceeded; hop 2 = the ISP's port-unreachable, **NAT-translated back** |
+| TTL / ICMP errors | `traceroute`: hop 1 = leatos's time-exceeded; hop 2 = the ISP's port-unreachable, **NAT-translated back** |
 | Conntrack | 20 sequential TCP connections |
 | Shaper (M6) | router boots with `shape_up=shape_down=10000`. The client downloads 5 MB and uploads 20 × 120 KB (byte counts verified by the ISP's sink); both must land in 8.0–10.5 Mbit/s, and ping to the router *during* the download must average < 3 ms (flow isolation; `LAB_ROUTER_ARGS=qdisc=codel` fails it). `LAB_SHAPE_KBIT=0 LAB_EXPECT_KBIT=10000` is the negative control (must fail). This busybox's `wget --post-file` sends no body, hence `--post-data` chunks. |
 | DNS cache | prefetch (ISP TTL 12 s) and serve-stale with the ISP's DNS stopped, EDE 3 on a crafted EDNS query |
@@ -127,13 +127,13 @@ WAN/LAN pcaps), `LAB_KEEP_LOGS=1`, `QEMU_ACCEL=tcg`, `LAB_TIMEOUT=120`,
 `LAB_ROUTER_ARGS="..."` (extra boot arguments). Open: flent/irtt load
 tests for CAKE and a second LAN host (M6).
 
-## Your Mac on rrouter's LAN (`scripts/mac-lab.sh`)
+## Your Mac on leatos's LAN (`scripts/mac-lab.sh`)
 ```
-MacBook ──bridgeN (vmnet-host)── [rrouter LAN 192.168.1.1]
-                                 [rrouter WAN] ──udp── [ISP VM 203.0.113.1]
+MacBook ──bridgeN (vmnet-host)── [leatos LAN 192.168.1.1]
+                                 [leatos WAN] ──udp── [ISP VM 203.0.113.1]
 ```
-The Mac joins rrouter's LAN through macOS **vmnet-host**. **Only lab traffic
-goes through rrouter:** the script adds one route (203.0.113.0/24 via
+The Mac joins leatos's LAN through macOS **vmnet-host**. **Only lab traffic
+goes through leatos:** the script adds one route (203.0.113.0/24 via
 192.168.1.1) and scoped DNS resolvers for `*.lan` / `*.example`
 (`/etc/resolver/`). Your normal internet keeps using Wi-Fi or Ethernet.
 Everything is removed on exit (Ctrl-C), including VMs, the route, and the
@@ -148,33 +148,33 @@ scripts/mac-lab.sh --check   # start + checks, tear down; exit 1 on failure
   ISP VM doesn't).
 - vmnet-host runs its own small DHCP service on the segment. The script sets
   its range to 192.168.1.2–9 (`MAC_LAN_RANGE`), so the Mac's side gets
-  **192.168.1.2**, clear of rrouter (.1) and its DHCP pool (.100–.199). The
-  Mac is therefore statically addressed on this LAN; rrouter's DHCP server is
+  **192.168.1.2**, clear of leatos (.1) and its DHCP pool (.100–.199). The
+  Mac is therefore statically addressed on this LAN; leatos's DHCP server is
   tested by the VM lab.
 - The script refuses to start if the Mac already uses 192.168.1.0/24 or 203.0.113.0/24.
-- Checks from the Mac: ping rrouter; `dig` for `nas.lan` and upstream
+- Checks from the Mac: ping leatos; `dig` for `nas.lan` and upstream
   `isp.example`; the macOS resolver for `router.lan`; curl through NAT; the
   NATed source as seen by the ISP; ping and traceroute through NAT. A
   firewall probe into the Mac is informational only (the macOS application
   firewall could also block it; the VM lab has the rigorous check).
 - Useful while it runs: `sudo tcpdump -ni bridgeN` or Wireshark on
-  `bridgeN` to watch rrouter's traffic; `tail -f <logs>/router.log` for the console.
+  `bridgeN` to watch leatos's traffic; `tail -f <logs>/router.log` for the console.
 
-## Your Mac's internet through rrouter (`scripts/mac-internet.sh`, "Level 3")
+## Your Mac's internet through leatos (`scripts/mac-internet.sh`, "Level 3")
 ```
-MacBook ──bridgeN (vmnet-host, 192.168.1.2)── [rrouter LAN 192.168.1.1]
-                                              [rrouter WAN] ══ vmnet-bridged on enX ══ home router → internet
+MacBook ──bridgeN (vmnet-host, 192.168.1.2)── [leatos LAN 192.168.1.1]
+                                              [leatos WAN] ══ vmnet-bridged on enX ══ home router → internet
 ```
 ```sh
 scripts/mac-internet.sh                  # confirm, switch, run checks, stay up (Ctrl-C restores)
 scripts/mac-internet.sh --check --yes    # switch, run checks, restore, exit code = result
 scripts/mac-internet.sh --wan-if en7     # bridge onto a specific interface (e.g. USB Ethernet)
-scripts/mac-internet.sh --ipv4-only      # turn IPv6 off while running (rrouter has no IPv6 yet)
-scripts/mac-internet.sh --release        # optimised rrouter build (faster datapath)
+scripts/mac-internet.sh --ipv4-only      # turn IPv6 off while running (leatos has no IPv6 yet)
+scripts/mac-internet.sh --release        # optimised leatos build (faster datapath)
 scripts/mac-internet.sh --release --shape 42:50   # shape upload/download (Mbit/s) below the line rate
 scripts/mac-internet.sh --restore        # undo a previous run (after a crash, kill -9, reboot)
 ```
-- **WAN:** `vmnet-bridged` puts rrouter's WAN NIC (52:54:00:00:00:01) directly
+- **WAN:** `vmnet-bridged` puts leatos's WAN NIC (52:54:00:00:00:01) directly
   on your home network, where it gets its own DHCP lease (double NAT). It
   must be layer-2 bridged: a slirp or `vmnet-shared` WAN would route through
   the Mac itself and loop.
@@ -192,25 +192,25 @@ scripts/mac-internet.sh --restore        # undo a previous run (after a crash, k
   Mac ARPed for the destination itself ("Host is down"), while `128.0.0.0/1`
   worked. The split routes avoid the `0.0.0.0` key. After adding, test
   addresses across the space are verified, and the script restores at once if
-  any doesn't route via rrouter. DNS for the active service is set to
+  any doesn't route via leatos. DNS for the active service is set to
   192.168.1.1, and with `--ipv4-only`, IPv6 is turned off.
 - **Safety:**
   - it asks for confirmation;
-  - it switches only after rrouter has a WAN lease and answers on the LAN;
+  - it switches only after leatos has a WAN lease and answers on the LAN;
   - the original DNS/IPv6 settings go to `lab/cache/mac-internet.state` *before* any change;
   - it restores on exit, Ctrl-C or error, and via `--restore` (a stale state file blocks new runs until restored);
-  - a **watchdog** restores the network if rrouter exits or stops answering for ~15 s.
-- **Checks:** the route for 1.1.1.1 goes via rrouter; traceroute hop 1 =
-  rrouter, hop 2 = home router; system DNS resolves through rrouter;
+  - a **watchdog** restores the network if leatos exits or stops answering for ~15 s.
+- **Checks:** the route for 1.1.1.1 goes via leatos; traceroute hop 1 =
+  leatos, hop 2 = home router; system DNS resolves through leatos;
   `router.lan`; HTTPS to example.com; ping 1.1.1.1.
 - **Known limits:**
-  - IPv6 traffic bypasses rrouter unless you use `--ipv4-only`;
+  - IPv6 traffic bypasses leatos unless you use `--ipv4-only`;
   - DNS rebind protection refuses home-LAN names that resolve to private addresses;
   - QEMU-on-macOS timer slack (see above) adds latency jitter.
 
 ## Bufferbloat measurements (`scripts/bufferbloat.sh`)
 ```sh
-scripts/bufferbloat.sh                    # auto-labels the path: direct / rrouter-debug / rrouter-release
+scripts/bufferbloat.sh                    # auto-labels the path: direct / leatos-debug / leatos-release
 scripts/bufferbloat.sh --label wifi-5ghz --streams 8 --duration 20 --no-upload
 ```
 The script runs three phases while pinging 1.1.1.1 every 0.2 s: **idle**

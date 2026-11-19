@@ -72,7 +72,7 @@ Pitfalls:
 - Reconnect with exponential backoff. Send PADT on shutdown so the ISP
   doesn't keep a stale session. Handle forced daily disconnects.
 - On multi-core hardware, NIC RSS can't hash inside PPPoE, so all traffic
-  lands on one core. rrouter doesn't use RSS: it splits by direction
+  lands on one core. leatos doesn't use RSS: it splits by direction
   (docs/smp.md), which PPPoE doesn't affect.
 
 ## DHCP

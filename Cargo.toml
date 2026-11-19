@@ -10,7 +10,7 @@ default-members = ["crates/*", "tools/*"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = ""
+repository = "https://github.com/miroslavbaudys/leatos"
 
 [workspace.dependencies]
 proto-pppoe = { path = "crates/proto-pppoe" }

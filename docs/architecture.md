@@ -1,6 +1,6 @@
-# rrouter architecture
+# leatos architecture
 
-rrouter is a SOHO router OS written in Rust, running **bare metal** as a
+leatos is a SOHO router OS written in Rust, running **bare metal** as a
 **single-address-space unikernel** on aarch64 and x86_64. Development
 runs on QEMU (`virt` with HVF on Apple Silicon; q35 under TCG for x86_64);
 the hardware target is a PC Engines apu4 (x86_64, 4× Intel i211), which has

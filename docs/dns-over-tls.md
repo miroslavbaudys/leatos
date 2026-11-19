@@ -89,7 +89,7 @@ server names it resolves through this resolver, over TLS. Until the first
 sync (`proto_dot::verify`):
 
 - a chain is checked as of the moment its leaf became valid (`notBefore`),
-  never earlier than the kernel's build time (`RROUTER_BUILD_TIME`, the
+  never earlier than the kernel's build time (`LEATOS_BUILD_TIME`, the
   built commit's date, from `build.rs`), so signatures, the name and the
   chain are checked as always, and a certificate that expired before the
   kernel was built is still refused;

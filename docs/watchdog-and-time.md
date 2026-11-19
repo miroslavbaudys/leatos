@@ -1,6 +1,6 @@
 # Watchdog, panic → reboot, SNTP (M8)
 
-rrouter has no isolation (`docs/architecture.md`): one stuck core or one
+leatos has no isolation (`docs/architecture.md`): one stuck core or one
 panic stops routing. A router that halts stays down until someone
 power-cycles it. One that reboots is back in seconds.
 
@@ -86,7 +86,7 @@ Tests (`scripts/smoke-test.sh`; each passes only if a second boot is seen):
   (docs/dns-over-tls.md). After each sync it is set from the wall clock if
   more than 2 s off (`rtc : was N s off, set to …`). Only the time
   registers are written, never the rest of CMOS (coreboot's options); the
-  century is taken as 20. Lab: `RROUTER_ARCH=x86_64 LAB_DOT=1
+  century is taken as 20. Lab: `LEATOS_ARCH=x86_64 LAB_DOT=1
   QEMU_EXTRA="-rtc base=2040-01-01" LAB_EXPECT_DATES=expired`.
 - Lab: the ISP VM runs `busybox ntpd -l`, a stratum 1 server from the
   host's clock, and `dnsd` serves `ntp.isp.example`. `scripts/lab-test.sh`
