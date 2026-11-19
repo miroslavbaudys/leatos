@@ -88,6 +88,22 @@ impl Aqm {
         format!("{kind}{}", if ecn { " + ECN" } else { " (drop only)" })
     }
 
+    /// The shared byte limit over all flows.
+    pub fn limit_bytes(&self) -> usize {
+        match self {
+            Self::Cake(c) => c.params().codel.limit_bytes,
+            Self::FqCodel(f) => f.limit_bytes(),
+        }
+    }
+
+    /// Change the byte limit in place (live shaping change, queue kept).
+    pub fn set_limit_bytes(&mut self, bytes: usize) {
+        match self {
+            Self::Cake(c) => c.set_limit_bytes(bytes),
+            Self::FqCodel(f) => f.set_limit_bytes(bytes),
+        }
+    }
+
     pub fn take_max_sojourn_ns(&mut self) -> u64 {
         match self {
             Self::Cake(c) => c.take_max_sojourn_ns(),

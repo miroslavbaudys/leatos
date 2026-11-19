@@ -1213,9 +1213,9 @@ fn status_json(
     for (n, nif) in sh.ports.iter().enumerate() {
         let snap = *nif.snap.lock();
         let st = snap.stats;
-        let (q, rate) = {
+        let (q, rate, limit) = {
             let q = nif.qdisc.lock();
-            (q.stats(), q.rate())
+            (q.stats(), q.rate(), q.inner().limit_bytes())
         };
         let link = match snap.link {
             Some((up, mbps, full)) => {
@@ -1241,7 +1241,7 @@ fn status_json(
             s,
             "{}{{\"name\":{},\"model\":{},\"mac\":{},\"vlan\":{vlan},\"link\":{link},\"addrs\":[{}],\
              \"rx_packets\":{},\"rx_bytes\":{},\"rx_no_buf\":{},\"tx_packets\":{},\"tx_bytes\":{},\
-             \"qdisc\":{{\"shaped_kbit\":{rate},\"sent\":{},\"dropped\":{},\"ecn_marked\":{},\"backlog_packets\":{}}}}}",
+             \"qdisc\":{{\"shaped_kbit\":{rate},\"limit_bytes\":{limit},\"sent\":{},\"dropped\":{},\"ecn_marked\":{},\"backlog_packets\":{}}}}}",
             if n > 0 { "," } else { "" },
             json_str(nif.name),
             json_str(nif.model),
@@ -1262,9 +1262,9 @@ fn status_json(
     // `shape_ingress=0`, where lan0 egress shapes it).
     s.push_str("],\"ingress\":");
     {
-        let (on, q, rate, charged) = {
+        let (on, q, rate, charged, limit) = {
             let q = sh.ingress.lock();
-            (crate::config::qos().ingress, q.stats(), q.rate(), q.charged_bytes)
+            (crate::config::qos().ingress, q.stats(), q.rate(), q.charged_bytes, q.inner().limit_bytes())
         };
         if on {
             let rate = rate
@@ -1272,7 +1272,7 @@ fn status_json(
                 .unwrap_or_else(|| String::from("null"));
             let _ = write!(
                 s,
-                "{{\"shaped_kbit\":{rate},\"sent\":{},\"dropped\":{},\"ecn_marked\":{},\"backlog_packets\":{},\"charged_bytes\":{charged}}}",
+                "{{\"shaped_kbit\":{rate},\"limit_bytes\":{limit},\"sent\":{},\"dropped\":{},\"ecn_marked\":{},\"backlog_packets\":{},\"charged_bytes\":{charged}}}",
                 q.dequeued, q.dropped, q.marked, q.backlog_packets
             );
         } else {

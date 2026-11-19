@@ -268,6 +268,7 @@ pub fn overrides() -> Vec<(String, &'static str)> {
         ("ecn", "shaping.ecn_down"),
         ("qdisc", "shaping.qdisc"),
         ("isolation", "shaping.isolation"),
+        ("queue_ms", "shaping.queue_ms"),
         ("ntp", "time.ntp_servers"),
         ("dns", "dns.upstreams"),
         ("dns_tls", "dns.tls"),
@@ -388,6 +389,9 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
     }
     if let Some(o) = arg_u64(args, "shape_overhead") {
         s.overhead = o as u32;
+    }
+    if let Some(ms) = arg_u64(args, "queue_ms") {
+        s.queue_ms = ms.min(u32::MAX as u64) as u32;
     }
     if let Some(v) = arg_u64(args, "ecn_up").or(arg_u64(args, "ecn")) {
         s.ecn_up = v != 0;
@@ -1062,7 +1066,8 @@ fn arg_u64(bootargs: &str, key: &str) -> Option<u64> {
 /// `qdisc=cake|fq_codel|codel` (egress AQM, default `cake`; `codel` = one
 /// queue, for A/B tests) and
 /// `isolation=triple-isolate|dual-srchost|dual-dsthost|flows` (CAKE's
-/// fairness, default `triple-isolate`).
+/// fairness, default `triple-isolate`) and `queue_ms=` (a shaped queue's
+/// limit as time at its rate, default 100; `0` = the fixed limit).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AqmKind {
     Cake,
@@ -1097,6 +1102,8 @@ pub struct Qos {
     /// The download is shaped in the WAN ingress stage (default), not on
     /// LAN egress (boot argument `shape_ingress=0`; fixed at boot).
     pub ingress: bool,
+    /// A shaped queue's limit as time at its rate (ms); 0 = fixed.
+    pub queue_ms: u32,
 }
 
 pub fn qos() -> Qos {
@@ -1122,6 +1129,7 @@ pub fn qos() -> Qos {
         wan_vlan: c.wan.vlan.is_some(),
         wan_pppoe: c.wan.mode == schema::WanMode::Pppoe,
         ingress: arg_u64(bootargs(), "shape_ingress") != Some(0),
+        queue_ms: s.queue_ms,
     }
 }
 
@@ -1161,6 +1169,19 @@ impl Qos {
             tag += proto_pppoe::wire::SESSION_OVERHEAD as u32;
         }
         tag
+    }
+
+    /// Byte limit of a queue shaped at `rate`: what it sends in
+    /// `queue_ms` (`qdisc::shaper::Rate::queue_limit_bytes`), at least
+    /// `min`, at most `max` (the fixed limit). Unshaped queues, and
+    /// `queue_ms = 0`, keep `max`.
+    pub fn queue_limit(&self, rate: Option<qdisc::shaper::Rate>, min: usize, max: usize) -> usize {
+        match rate {
+            Some(r) if self.queue_ms > 0 => {
+                r.queue_limit_bytes(self.queue_ms as u64 * 1_000_000, min, max)
+            }
+            _ => max,
+        }
     }
 
     fn rate(&self, kbit: Option<u64>, encap: u32) -> Option<qdisc::shaper::Rate> {

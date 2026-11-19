@@ -218,6 +218,18 @@ impl<P: Packet> FqCodel<P> {
     }
 
     /// Number of flow queues.
+    /// The shared byte limit (`FqParams::codel.limit_bytes`).
+    pub fn limit_bytes(&self) -> usize {
+        self.p.codel.limit_bytes
+    }
+
+    /// Change the byte limit in place (a live shaping change). A backlog
+    /// above a smaller limit is trimmed by the next enqueues, from the
+    /// fattest flow as on any overflow.
+    pub fn set_limit_bytes(&mut self, bytes: usize) {
+        self.p.codel.limit_bytes = bytes;
+    }
+
     pub fn flows(&self) -> usize {
         self.flows.len()
     }

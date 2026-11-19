@@ -679,7 +679,7 @@ pub enum Isolation {
 
 /// Shaping and AQM; the same settings as the boot arguments `shape_up=`,
 /// `shape_down=`, `shape_overhead=`, `ecn_up=`, `ecn_down=`, `qdisc=`,
-/// `isolation=`.
+/// `isolation=`, `queue_ms=`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Shaping {
@@ -697,6 +697,19 @@ pub struct Shaping {
     pub ecn_down: bool,
     pub qdisc: Qdisc,
     pub isolation: Isolation,
+    /// Queue limit of a shaped queue as time at its rate, in ms: a full
+    /// queue waits about this long (bounds TCP slow start's overshoot).
+    /// 0 = the fixed limit (384 full-size packets) whatever the rate.
+    /// Left out at the default, so older kernels still read the config.
+    #[serde(skip_serializing_if = "is_default_queue_ms")]
+    pub queue_ms: u32,
+}
+
+/// Default [`Shaping::queue_ms`].
+pub const DEFAULT_QUEUE_MS: u32 = 100;
+
+fn is_default_queue_ms(ms: &u32) -> bool {
+    *ms == DEFAULT_QUEUE_MS
 }
 
 impl Default for Shaping {
@@ -709,6 +722,7 @@ impl Default for Shaping {
             ecn_down: true,
             qdisc: Qdisc::Cake,
             isolation: Isolation::Triple,
+            queue_ms: DEFAULT_QUEUE_MS,
         }
     }
 }

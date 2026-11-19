@@ -30,6 +30,9 @@
 #                        second forwarded query, no renewal), or dns_stale=0
 #                        (the negative control for the serve-stale check:
 #                        SERVFAIL with the ISP's DNS stopped)
+#   LAB_EXPECT_QUEUE_MS=N the WAN queue's worst delay the check allows, minus
+#                        20 ms slack (default 100 = shaping.queue_ms's default;
+#                        negative control LAB_ROUTER_ARGS=queue_ms=0)
 #   LAB_EXPECT_ECN=U:D   ECN the check expects per direction (1 = marks, 0 =
 #                        drops; default: derived from the router arguments,
 #                        i.e. 0:1). Set it against the router's real setting
@@ -545,6 +548,25 @@ if [[ "$SHAPE_KBIT" != 0 ]]; then
       router_fails=$((router_fails + 1))
     fi
   done
+  # Queue limit follows the rate (shaping.queue_ms, docs/bufferbloat-cake.md):
+  # the client's UDP burst fills the WAN queue (overflow drops prove it did,
+  # else the check is invalid), and the worst delay of a full queue stays
+  # near LAB_EXPECT_QUEUE_MS (default 100) + 20 ms. Negative control
+  # LAB_ROUTER_ARGS=queue_ms=0 (the fixed 384 packets: ~465 ms at 10 Mbit/s).
+  qms=${LAB_EXPECT_QUEUE_MS:-100}
+  wq=$(tr -d '\r' <"$WORK/router.log" | grep "qdisc wan0 ")
+  ovf=$(echo "$wq" | tail -1 | sed -n 's/.*overflow drops \([0-9]*\).*/\1/p')
+  worst=$(echo "$wq" | sed -n 's/.*max sojourn \([0-9]*\)\.[0-9]* ms.*/\1/p' | sort -n | tail -1)
+  what="wan0 worst sojourn ${worst:-?} ms, overflow drops ${ovf:-?} (expected <= $((qms + 20)) ms)"
+  if [[ -z "$ovf" || -z "$worst" ]]; then
+    echo "  LAB FAIL: queue limit: no router counters"; router_fails=$((router_fails + 1))
+  elif [[ "$ovf" == 0 ]]; then
+    echo "  LAB FAIL: queue limit: INVALID, the burst never filled the queue ($what)"; router_fails=$((router_fails + 1))
+  elif [[ "$worst" -le $((qms + 20)) ]]; then
+    echo "  LAB PASS: queue limit follows the rate: $what"
+  else
+    echo "  LAB FAIL: queue limit: $what"; router_fails=$((router_fails + 1))
+  fi
 fi
 
 # PPPoE: the session came up (MTU 1492, DNS from IPCP) before the client

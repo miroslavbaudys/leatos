@@ -499,6 +499,13 @@ if [ -n "$want" ] && [ "$want" != 0 ]; then
   # the negative control) gives ~8 ms.
   avg=$($bb awk -F'/' '/min\/avg\/max/{print int($4)}' /tmp/ping-load)
   if [ -n "$avg" ] && [ "$avg" -lt 3 ]; then pass "latency under shaped load: avg ${avg} ms ($($bb grep -o 'min/avg/max = [^ ]*' /tmp/ping-load))"; else fail "latency under shaped load: avg '${avg}' ms"; $bb tail -2 /tmp/ping-load | $bb sed 's/^/    | /'; fi
+  # A UDP burst far above the upload rate (2.5 MB to the ISP's discard
+  # port as fast as this VM sends): the WAN queue fills to its limit, so
+  # scripts/lab-test.sh can check that a full queue's delay follows the
+  # rate (shaping.queue_ms). After the CPU sample: it is not part of the
+  # task split's load phase.
+  $bb head -c 2500000 /dev/zero | $bb nc -u -w 1 "$ISP" 9 >/dev/null 2>&1
+  echo "LAB INFO: upload burst sent (2.5 MB UDP)"
 fi
 
 # --- guest network (docs/config-v2.md): VLAN 20 on the LAN port, zone "guest" -------

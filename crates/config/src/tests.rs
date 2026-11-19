@@ -119,6 +119,7 @@ fn full_document_parses() {
             ecn_down: false,
             qdisc: Qdisc::FqCodel,
             isolation: Isolation::DualDstHost,
+            queue_ms: DEFAULT_QUEUE_MS,
         }
     );
     assert!(c.mgmt.on_wan);
@@ -421,6 +422,13 @@ fn shaping_and_dns_checks() {
         ["shaping.down_kbit"]
     );
     assert_eq!(invalid(|c| c.shaping.overhead = 300), ["shaping.overhead"]);
+    assert_eq!(invalid(|c| c.shaping.queue_ms = 5), ["shaping.queue_ms"]);
+    assert_eq!(invalid(|c| c.shaping.queue_ms = 1001), ["shaping.queue_ms"]);
+    for ok in [0, 10, 1000] {
+        let mut c = Config::default();
+        c.shaping.queue_ms = ok;
+        assert_eq!(c.validate(), Ok(()), "queue_ms {ok}");
+    }
     assert_eq!(invalid(|c| c.dns.cache_entries = 0), ["dns.cache_entries"]);
     let c = parse("[shaping]\nqdisc = \"codel\"\nisolation = \"flows\"\n").unwrap();
     assert_eq!(
@@ -1787,4 +1795,16 @@ fn routed_subnets_belong_to_their_routers_network_in_dns_views() {
     assert_eq!(v.seen_by(ip(10, 40, 1, 9)), LAN, "the longer route wins");
     c.routes[0].enabled = false;
     assert_eq!(c.name_visibility().seen_by(ip(10, 40, 9, 9)), LAN | 2 | 4, "a disabled route: outside");
+}
+
+/// `shaping.queue_ms` is left out at its default (older kernels refuse
+/// unknown fields), written when set, and read back.
+#[test]
+fn queue_ms_written_only_when_set() {
+    let d = Config::default();
+    assert!(!d.to_toml().contains("queue_ms"), "{}", d.to_toml());
+    let c = parse("[shaping]\nqueue_ms = 50\n").unwrap();
+    assert_eq!(c.shaping.queue_ms, 50);
+    assert!(c.to_toml().contains("queue_ms = 50"));
+    assert_eq!(parse(&c.to_toml()).unwrap().shaping.queue_ms, 50);
 }

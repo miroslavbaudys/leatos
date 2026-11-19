@@ -73,6 +73,13 @@ pub struct CakeParams {
     pub blue: bool,
     /// Seed for BLUE's random drops.
     pub seed: u64,
+    /// CoDel intervals a flow must have been signalled (CoDel's dropping
+    /// state) before its overflows raise BLUE's drop probability
+    /// ([`Cake::drop_from_fattest`]). CoDel's interval is meant to cover
+    /// the worst round trip, so a responsive sender reacts within one
+    /// interval of a signal plus the queue's own delay: the default 2
+    /// leaves room for both. 0 = every overflow counts (as in CAKE).
+    pub blue_after: u32,
 }
 
 impl Default for CakeParams {
@@ -86,6 +93,7 @@ impl Default for CakeParams {
             isolation: Isolation::Triple,
             blue: true,
             seed: 0x2545_f491_4f6c_dd1d,
+            blue_after: 2,
         }
     }
 }
@@ -251,6 +259,13 @@ impl<P: Packet> Cake<P> {
         &self.p
     }
 
+    /// Change the byte limit in place (a live shaping change). A backlog
+    /// above a smaller limit is trimmed by the next enqueues, from the
+    /// fattest flow as on any overflow.
+    pub fn set_limit_bytes(&mut self, bytes: usize) {
+        self.p.codel.limit_bytes = bytes;
+    }
+
     /// Sojourn time of the last dequeued packet (diagnostics).
     pub fn last_sojourn_ns(&self) -> u64 {
         self.soj.last_ns
@@ -387,12 +402,22 @@ impl<P: Packet> Cake<P> {
         f.list = List::None;
     }
 
-    /// Head-drop from the flow with the most bytes queued; BLUE notes it.
+    /// Head-drop from the flow with the most bytes queued. BLUE notes it
+    /// only for a flow CoDel has been signalling for
+    /// [`CakeParams::blue_after`]
+    /// intervals: one that had time to slow down and didn't. A TCP flow in
+    /// slow start overflows before CoDel's first signal has reached its
+    /// sender (CoDel waits an interval, the sender reacts a round trip
+    /// later); counting that against it would make BLUE drop its packets
+    /// for seconds after it has already backed off (CAKE counts every
+    /// overflow, but its default buffer is large enough that slow start
+    /// rarely overflows it).
     fn drop_from_fattest(&mut self, now: u64) -> Option<P> {
         let target = self.p.codel.target_ns;
+        let after = self.p.blue_after as u64 * self.p.codel.interval_ns;
         let fat = self.flows.iter_mut().max_by_key(|f| f.q.bytes)?;
         let (p, _) = fat.q.pop(&mut self.slab)?;
-        if self.p.blue {
+        if self.p.blue && (after == 0 || fat.vars.signalling_for(now).is_some_and(|d| d >= after)) {
             fat.blue.queue_full(now, target);
         }
         self.packets -= 1;
@@ -797,5 +822,138 @@ mod tests {
             share(&f)
         );
         assert!(c.utilisation > 0.9);
+    }
+
+    /// TCP-like senders starting together in slow start (initial window
+    /// 10, +1 per ACK, then +1/cwnd; a loss halves the window once per
+    /// RTT, noticed one RTT plus the queue's delay after the drop) through
+    /// `q`, drained at `link` packets per ms. Returns (largest sojourn,
+    /// utilisation after the first second, overflow drops).
+    fn slow_start(q: &mut Cake<Pkt>, flows: usize, link: f64, rtt_ms: u64) -> (u64, f64, u64) {
+        use std::collections::VecDeque;
+        struct Tcp {
+            cwnd: f64,
+            ssthresh: f64,
+            inflight: u64,
+            acks: VecDeque<u64>,
+            losses: VecDeque<u64>,
+            seen_drops: u64,
+            last_cut: u64,
+        }
+        reset_drops();
+        let rtt = rtt_ms * MS;
+        let mut tcp: Vec<Tcp> = (0..flows)
+            .map(|_| Tcp {
+                cwnd: 10.0,
+                ssthresh: f64::INFINITY,
+                inflight: 0,
+                acks: VecDeque::new(),
+                losses: VecDeque::new(),
+                seen_drops: 0,
+                last_cut: 0,
+            })
+            .collect();
+        let total = 40_000u64; // 4 s at 0.1 ms
+        let (mut credit, mut seq, mut max_soj, mut sent_after, mut slots) = (0.0, 0, 0, 0u64, 0.0);
+        for t in 0..total {
+            let now = t * MS / 10;
+            let delay = (q.stats().backlog_bytes as f64 / 1514.0 / link * MS as f64) as u64;
+            for (f, s) in tcp.iter_mut().enumerate() {
+                while s.acks.front().is_some_and(|&a| a <= now) {
+                    s.acks.pop_front();
+                    s.inflight -= 1;
+                    s.cwnd += if s.cwnd < s.ssthresh { 1.0 } else { 1.0 / s.cwnd };
+                }
+                let d = drops(f);
+                for _ in s.seen_drops..d {
+                    s.losses.push_back(now + rtt + delay);
+                }
+                s.seen_drops = d;
+                while s.losses.front().is_some_and(|&l| l <= now) {
+                    s.losses.pop_front();
+                    s.inflight -= 1;
+                    if now - s.last_cut > rtt + delay {
+                        s.ssthresh = (s.cwnd / 2.0).max(2.0);
+                        s.cwnd = s.ssthresh;
+                        s.last_cut = now;
+                    }
+                }
+                while (s.inflight as f64) < s.cwnd {
+                    seq += 1;
+                    let mut p = host_pkt(f as u32, 1, 100 + f as u32, seq);
+                    p.len = 1514;
+                    p.sent = now;
+                    let _ = q.enqueue(p, now);
+                    s.inflight += 1;
+                }
+            }
+            credit += link / 10.0;
+            if t >= total / 4 {
+                slots += link / 10.0;
+            }
+            while credit >= 1.0 {
+                let Some(p) = take(q, now) else {
+                    credit = 0.0;
+                    break;
+                };
+                credit -= 1.0;
+                max_soj = max_soj.max(now - p.sent);
+                if t >= total / 4 {
+                    sent_after += 1;
+                }
+                tcp[p.flow as usize].acks.push_back(now + rtt);
+            }
+        }
+        (max_soj, sent_after as f64 / slots, q.overflow_drops)
+    }
+
+    /// The fixed limit (384 full packets, ~260 ms at 18 Mbit/s) lets slow
+    /// start build a queue far past CoDel's target before CoDel's first
+    /// drops take effect (the upload spike measured on the apu4); a limit
+    /// set from the rate (100 ms) caps it without costing throughput, as
+    /// long as BLUE leaves the overflowing slow-start flow alone (control:
+    /// `blue_after = 0`, every overflow counts, and throughput collapses).
+    #[test]
+    fn rate_based_limit_caps_the_slow_start_spike() {
+        let link = 18_000_000.0 / (1514.0 * 8.0) / 1000.0; // 18 Mbit/s in packets/ms
+        let rate = crate::shaper::Rate::kbit(18_000);
+        let fixed = 384 * 1514;
+        let budget = rate.queue_limit_bytes(100 * MS, 16 * 1514, fixed);
+        for (flows, rtt_ms) in [(1, 20), (4, 20), (1, 80), (4, 80)] {
+            let run = |limit_bytes, blue_after| {
+                let mut q = Cake::new(CakeParams {
+                    codel: Params {
+                        limit_bytes,
+                        ..params(false)
+                    },
+                    blue_after,
+                    ..CakeParams::default()
+                });
+                let (soj, util, ovf) = slow_start(&mut q, flows, link, rtt_ms);
+                (soj, util, ovf, q.blue_drops)
+            };
+            let (old_soj, old_util, old_ovf, _) = run(fixed, 2);
+            let (new_soj, new_util, new_ovf, new_blue) = run(budget, 2);
+            let (_, ctl_util, _, ctl_blue) = run(budget, 0);
+            std::eprintln!(
+                "slow start, {flows} flow(s), RTT {rtt_ms} ms, 18 Mbit/s: fixed limit peak {} ms (util {old_util:.3}, {old_ovf} overflow) | \
+                 100 ms limit ({} pkts) peak {} ms (util {new_util:.3}, {new_ovf} overflow, {new_blue} blue) | \
+                 control blue_after 0: util {ctl_util:.3}, {ctl_blue} blue",
+                old_soj / MS,
+                budget / 1514,
+                new_soj / MS,
+            );
+            let what = std::format!("{flows} flow(s), RTT {rtt_ms} ms");
+            assert!(new_soj <= 101 * MS, "{what}: peak {} ms", new_soj / MS);
+            assert!(old_soj > 150 * MS, "control, {what}: fixed limit peak only {} ms", old_soj / MS);
+            assert!(
+                new_util > 0.8 && new_util > old_util - 0.03,
+                "{what}: util {new_util:.3} vs {old_util:.3}"
+            );
+            assert_eq!(new_blue, 0, "{what}");
+            if flows == 1 {
+                assert!(ctl_util < new_util - 0.2, "control, {what}: util {ctl_util:.3}");
+            }
+        }
     }
 }

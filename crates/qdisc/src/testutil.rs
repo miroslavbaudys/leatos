@@ -16,6 +16,11 @@ std::thread_local! {
     static DROPS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Forget the drops counted so far (a new simulation run).
+pub fn reset_drops() {
+    DROPS.with(|d| d.borrow_mut().clear());
+}
+
 pub fn drops(flow: usize) -> u64 {
     DROPS.with(|d| d.borrow().get(flow).copied().unwrap_or(0))
 }

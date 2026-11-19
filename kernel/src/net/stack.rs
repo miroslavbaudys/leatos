@@ -42,6 +42,27 @@ use spin::Mutex;
 /// (3 × 384 + 128 = 1280) stay within the packet pool (`net_pool_size`).
 const QDISC_PACKETS: usize = 384;
 const QDISC_BYTES: usize = 384 * 1514;
+/// A shaped queue's byte limit follows its rate (`shaping.queue_ms`,
+/// `config::Qos::queue_limit`), between this floor (bursts at very low
+/// rates) and `QDISC_BYTES`.
+const QDISC_MIN_BYTES: usize = 16 * 1514;
+
+/// The byte limit of a queue shaped at `rate` (unshaped: `QDISC_BYTES`).
+fn queue_bytes(qos: &crate::config::Qos, rate: Option<qdisc::shaper::Rate>) -> usize {
+    qos.queue_limit(rate, QDISC_MIN_BYTES, QDISC_BYTES)
+}
+
+/// For the qos log lines: the limit and how long a full queue waits.
+fn describe_limit(bytes: usize, rate: Option<qdisc::shaper::Rate>) -> alloc::string::String {
+    match rate {
+        Some(r) => alloc::format!(
+            "queue {} KiB ({} ms)",
+            bytes / 1024,
+            (bytes as u64 * 8 * 1000) / r.bits_per_sec.max(1)
+        ),
+        None => alloc::format!("queue {} KiB", bytes / 1024),
+    }
+}
 
 fn cidr(n: &crate::config::Lan) -> Ipv4Cidr {
     Ipv4Cidr::new(n.addr, n.prefix)
@@ -153,23 +174,25 @@ pub fn bring_up(
         crate::entropy::mix(&mac);
         let rate = qos.port_rate(i == 0);
         let ecn = if i == 0 { qos.ecn_up } else { qos.ecn_down };
+        let limit = queue_bytes(qos, rate);
         let aqm = Aqm::new(
             qos,
             ecn,
             QDISC_PACKETS,
-            QDISC_BYTES,
+            limit,
             timer::ticks() ^ mac_seed(&mac),
         );
         let desc = aqm.describe(ecn);
         let qdisc = PortQdisc::new(aqm, rate);
+        let lim = describe_limit(limit, rate);
         match rate {
             Some(r) => println!(
-                "  qos {name}       : shaped {} kbit/s ({}), overhead {} B, {desc}",
+                "  qos {name}       : shaped {} kbit/s ({}), overhead {} B, {lim}, {desc}",
                 r.bits_per_sec / 1000,
                 if i == 0 { "upload" } else { "download" },
                 r.overhead,
             ),
-            None => println!("  qos {name}       : unshaped, {desc}"),
+            None => println!("  qos {name}       : unshaped, {lim}, {desc}"),
         }
         let pppoe = i == 0 && crate::config::pppoe().is_some();
         let port = PortShared {
@@ -272,7 +295,7 @@ fn ingress_qdisc(qos: &crate::config::Qos) -> PortQdisc {
         qos,
         qos.ecn_down,
         QDISC_PACKETS,
-        QDISC_BYTES,
+        queue_bytes(qos, qos.ingress_rate()),
         timer::ticks() ^ 0x1a9e_55c0_de0f_0001,
     );
     PortQdisc::ingress(aqm, qos.ingress_rate())
@@ -284,9 +307,10 @@ fn log_ingress(qos: &crate::config::Qos, rate: Option<qdisc::shaper::Rate>, what
     let now = if what.is_some() { "now " } else { "" };
     match rate {
         Some(r) => println!(
-            "  qos ingress    : {now}shaped {} kbit/s (download), overhead {} B, {}",
+            "  qos ingress    : {now}shaped {} kbit/s (download), overhead {} B, {}, {}",
             r.bits_per_sec / 1000,
             r.overhead,
+            describe_limit(queue_bytes(qos, rate), rate),
             what.unwrap_or("CAKE in ingress mode")
         ),
         None if !qos.ingress => println!("  qos ingress    : off (shape_ingress=0: download shaped on lan0)"),
@@ -392,7 +416,9 @@ pub fn apply_qos(sh: &Shared, old: &crate::config::Qos, new: &crate::config::Qos
             *sh.ingress.lock() = fresh;
             desc
         } else {
-            sh.ingress.lock().set_rate(new.ingress_rate());
+            let mut q = sh.ingress.lock();
+            q.set_rate(new.ingress_rate());
+            q.inner_mut().set_limit_bytes(queue_bytes(new, new.ingress_rate()));
             alloc::string::String::from("queue kept")
         };
         log_ingress(new, new.ingress_rate(), Some(&what));
@@ -406,12 +432,13 @@ pub fn apply_qos(sh: &Shared, old: &crate::config::Qos, new: &crate::config::Qos
             (old.ecn_down, new.ecn_down)
         };
         let rebuild = old.aqm != new.aqm || old.isolation != new.isolation || ecn_old != ecn_new;
+        let limit = queue_bytes(new, rate);
         let what = if rebuild {
             let aqm = Aqm::new(
                 new,
                 ecn_new,
                 QDISC_PACKETS,
-                QDISC_BYTES,
+                limit,
                 timer::ticks() ^ mac_seed(&port.mac),
             );
             let desc = aqm.describe(ecn_new);
@@ -419,17 +446,20 @@ pub fn apply_qos(sh: &Shared, old: &crate::config::Qos, new: &crate::config::Qos
             *port.qdisc.lock() = PortQdisc::new(aqm, rate);
             desc
         } else {
-            port.qdisc.lock().set_rate(rate);
+            let mut q = port.qdisc.lock();
+            q.set_rate(rate);
+            q.inner_mut().set_limit_bytes(limit);
             alloc::string::String::from("queue kept")
         };
+        let lim = describe_limit(limit, rate);
         match rate {
             Some(r) => println!(
-                "  qos {}       : now shaped {} kbit/s, overhead {} B, {what}",
+                "  qos {}       : now shaped {} kbit/s, overhead {} B, {lim}, {what}",
                 port.name,
                 r.bits_per_sec / 1000,
                 r.overhead
             ),
-            None => println!("  qos {}       : now unshaped, {what}", port.name),
+            None => println!("  qos {}       : now unshaped, {lim}, {what}", port.name),
         }
         // The datapath re-reads the shaper on its next pass.
         sh.tx_kick[i].signal();

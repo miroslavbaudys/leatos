@@ -399,6 +399,7 @@
       <div class="form">
         <label>Queue discipline<select data-path="shaping.qdisc"><option value="cake">CAKE</option><option value="fq_codel">FQ-CoDel</option><option value="codel">CoDel (one queue)</option></select></label>
         <label>Fairness<select data-path="shaping.isolation"><option value="triple-isolate">triple-isolate (per host, then per flow)</option><option value="dual-srchost">dual-srchost</option><option value="dual-dsthost">dual-dsthost</option><option value="flows">flows only</option></select></label>
+        <label>Queue limit, ms at the shaped rate (empty = 100, 0 = fixed 384 packets)<input data-path="shaping.queue_ms" data-opt type="number" min="0" max="1000" placeholder="100"></label>
         <div>
           <label class="check"><input data-path="shaping.ecn_up" type="checkbox">ECN marking on upload</label>
           <label class="check"><input data-path="shaping.ecn_down" type="checkbox">ECN marking on download</label>
@@ -889,7 +890,7 @@ async function refresh() {
       `<td class=num>${n(i.tx_packets)} pkts<br><span class="muted">${bytes(i.tx_bytes)}</span></td><td class=num>${r ? bits(r.rx) + "<br>" + bits(r.tx) : "–"}</td></tr>`; }).join("");
   // The download is shaped where it arrives (WAN ingress stage); lan0's
   // egress is then unshaped, so traffic between networks is not capped.
-  const qrow = (name, what, q) => `<tr><td>${esc(name)} <span class="muted">(${what})</span></td><td>${q.shaped_kbit === null ? "unshaped" : n(q.shaped_kbit) + " kbit/s"}</td>` +
+  const qrow = (name, what, q) => `<tr><td>${esc(name)} <span class="muted">(${what})</span></td><td>${q.shaped_kbit === null ? "unshaped" : n(q.shaped_kbit) + " kbit/s"}${q.limit_bytes === undefined ? "" : `<br><span class="muted">limit ${bytes(q.limit_bytes)}${q.shaped_kbit ? `, ${Math.round(q.limit_bytes * 8 / q.shaped_kbit)} ms` : ""}</span>`}</td>` +
     `<td class=num>${n(q.sent)}</td><td class=num>${n(q.dropped)}</td><td class=num>${n(q.ecn_marked)}</td><td class=num>${n(q.backlog_packets)} pkts</td></tr>`;
   const qrows = "<tr><th>Queue</th><th>Shaper</th><th class=num>Sent</th><th class=num>Dropped</th><th class=num>ECN marked</th><th class=num>Queued now</th></tr>" +
     st.interfaces.map((i) => qrow(i.name + " egress", i === st.interfaces[0] ? "upload" : st.ingress ? "to the LAN, unshaped" : "download", i.qdisc)).join("") +

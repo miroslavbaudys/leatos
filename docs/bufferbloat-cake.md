@@ -336,10 +336,16 @@ and slab, and adds three CAKE features:
   while its queue runs empty. Like CAKE, BLUE drops ECN-capable packets too.
   It therefore contains senders that ignore marks, or whose marks are
   bleached on the path, which was the real-line upload symptom.
+  An overflow counts toward BLUE only once CoDel has been signalling that
+  flow for two intervals (`CakeParams::blue_after`; CAKE counts every
+  overflow): a TCP flow in slow start overflows before CoDel's first
+  signal reaches its sender, and counting that made BLUE drop its packets
+  for seconds after it had backed off (see "Queue limit follows the rate").
 
-Not yet implemented: DiffServ tins, the ACK filter, a rate-aware target,
-ingress mode (counting drops against the shaper), and COBALT's own CoDel
-variant (RFC 8289 CoDel is used).
+Not yet implemented: DiffServ tins, the ACK filter, a rate-aware CoDel
+target, and COBALT's own CoDel variant (RFC 8289 CoDel is used). Ingress
+mode came later (§3.4), and so did a queue limit that follows the rate
+(below).
 
 **Kernel:** CAKE is the default egress AQM on both ports.
 - Boot args `qdisc=cake|fq_codel|codel` for A/B tests, and
@@ -447,10 +453,57 @@ to ECN on ingress, off on egress):
   that differ by less than ~30 ms. Comparisons need repeated, interleaved
   runs, and a variable-rate line ultimately needs autorate.
 
+### Queue limit follows the rate (2026-11-19)
+Every qdisc had the same fixed limit, 384 packets or 384 × 1514 B. That
+is a different delay at every rate: 4.6 ms at 1 Gbit/s, 52 ms at
+90 Mbit/s, **260 ms at 18 Mbit/s**. CoDel keeps standing queues near 5 ms,
+but TCP slow start fills the queue faster than CoDel can stop it (CoDel
+waits one interval before its first signal, and the sender reacts a round
+trip later), so the limit is what bounds that spike. On the apu4 the
+upload started with 130 overflow drops and a 355 ms peak sojourn.
+
+Now a shaped queue's byte limit is the full-size packets its rate (with
+overhead) sends in `shaping.queue_ms` (default 100 ms; boot argument
+`queue_ms=`, `0` = the old fixed limit), at least 16 × 1514 B and at most
+the fixed limit (`qdisc::shaper::Rate::queue_limit_bytes`,
+`config::Qos::queue_limit`). Unshaped queues keep the fixed limit; the
+384-packet count limit stays everywhere (it protects the packet pool).
+Live saves change the limit with the rate, keeping the queue. At 18 Mbit/s
+the upload queue holds 145 packets (~100 ms); at 90 Mbit/s the download
+stays at 384 packets (the cap: 52 ms). The boot log's `qos` lines and
+`/api/status` (`limit_bytes`) show it, and the web page's queue table.
+
+The first simulation run showed a trap: with the smaller limit, slow
+start's overflow raised BLUE's drop probability (+1/256 per overflow
+event, −1/4096 per empty event), and BLUE then dropped the flow's packets
+for seconds after it had already backed off: utilisation **0.24** for one
+flow. So overflows now count toward BLUE only for a flow CoDel has been
+signalling for two intervals (§ CAKE core). The flood test (a sender
+ignoring ECN) is contained as before (p50 12 ms, 0.1 ms ping p99).
+
+| Evidence (host simulation, `rate_based_limit_caps_the_slow_start_spike`: TCP-like senders in slow start, 18 Mbit/s, CAKE) | fixed limit | `queue_ms` 100 | control: every overflow counts toward BLUE |
+|---|---|---|---|
+| 1 flow, RTT 20 ms | peak **208 ms**, util 0.95 | peak **98 ms**, util 0.95 | util **0.24** |
+| 4 flows, RTT 20 ms | peak 228 ms, util 0.92 | peak 97 ms, util 1.00 | util 0.95 |
+| 1 flow, RTT 80 ms | peak 189 ms, util 0.62 | peak 97 ms, util 0.83 | util 0.06 |
+| 4 flows, RTT 80 ms | peak 183 ms, util 0.82 | peak 95 ms, util 0.83 | util 0.25 |
+
+**Lab** (`scripts/lab-test.sh`, 10/10 Mbit/s, HVF): the client's TCP
+upload never reaches either limit (max sojourn ~30 ms, no overflow), so
+the client also sends a 2.5 MB UDP burst at its line rate; overflow drops
+prove the queue filled. Check `queue limit follows the rate`: worst WAN
+sojourn ≤ `LAB_EXPECT_QUEUE_MS` (100) + 20 ms. Default **97 ms** (1610
+overflow drops): PASS. Negative control `LAB_ROUTER_ARGS=queue_ms=0`:
+**419 ms**: FAIL. All other checks pass in both runs (shaper 9.5/9.4
+Mbit/s, latency under load avg 2 ms, ECN per direction).
+
+Not yet measured on the apu4: the upload start-up spike at 90/18 with the
+new limit (expected ≤ ~100 ms instead of 355 ms).
+
 ## 5. Configuration UX
 **Implemented** (`[shaping]`, docs/config-and-storage.md §5; boot
 arguments `shape_up=`, `shape_down=`, `shape_overhead=`, `qdisc=`,
-`isolation=`, `ecn_up=`, `ecn_down=`):
+`isolation=`, `ecn_up=`, `ecn_down=`, `queue_ms=`):
 ```toml
 [shaping]
 up_kbit = 18000              # unset = not shaped
@@ -460,6 +513,7 @@ ecn_up = false
 ecn_down = true
 qdisc = "cake"               # cake | fq_codel | codel
 isolation = "triple-isolate" # dual-srchost | dual-dsthost | flows
+queue_ms = 100               # shaped queue limit as time at its rate (§4); 0 = fixed
 ```
 **Target** (not implemented: framing/MPU, DiffServ, ACK filter, a true
 ingress stage):

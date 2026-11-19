@@ -76,6 +76,8 @@ pub(crate) struct Vars {
     count: u32,
     lastcount: u32,
     dropping: bool,
+    /// When the current dropping state began.
+    dropping_since: u64,
 }
 
 /// Sojourn-time diagnostics.
@@ -95,6 +97,12 @@ pub(crate) trait Source<P> {
 }
 
 impl Vars {
+    /// How long CoDel has been signalling this queue (drops or marks)
+    /// without leaving the dropping state; `None` = not dropping.
+    pub(crate) fn signalling_for(&self, now: u64) -> Option<u64> {
+        self.dropping.then(|| now.saturating_sub(self.dropping_since))
+    }
+
     /// RFC 8289 `dodequeue`: pop one packet and decide whether CoDel is in
     /// the "persistently above target" state where dropping is allowed.
     fn do_dequeue<P: Packet>(
@@ -188,6 +196,7 @@ impl Vars {
     /// resume from the previous drop rate instead of starting at 1.
     fn enter_dropping(&mut self, params: &Params, now: u64) {
         self.dropping = true;
+        self.dropping_since = now;
         let delta = self.count.wrapping_sub(self.lastcount);
         self.count = if delta > 1 && now.saturating_sub(self.drop_next) < 16 * params.interval_ns {
             delta

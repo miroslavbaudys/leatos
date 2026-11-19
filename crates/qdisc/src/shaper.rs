@@ -55,6 +55,22 @@ impl Rate {
         let bits = (len as u64 + self.overhead as u64) * 8;
         (bits as u128 * 1_000_000_000).div_ceil(self.bits_per_sec.max(1) as u128) as u64
     }
+
+    /// Byte limit for a queue drained at this rate, so that a full queue
+    /// waits about `budget_ns`: the full-size packets (with `overhead`)
+    /// the rate sends in that time, clamped to `min..=max` (`max` wins if
+    /// they cross). A fixed byte limit is a different delay at every rate
+    /// (384 × 1514 B: 52 ms at 90 Mbit/s, 260 ms at 18 Mbit/s): TCP slow
+    /// start fills the queue faster than CoDel's first drop (one interval)
+    /// can stop it, so the limit is what bounds that spike.
+    pub fn queue_limit_bytes(&self, budget_ns: u64, min: usize, max: usize) -> usize {
+        let per_packet = self.tx_time_ns(crate::codel::MAX_PACKET).max(1);
+        let packets = (budget_ns / per_packet) as usize;
+        packets
+            .saturating_mul(crate::codel::MAX_PACKET)
+            .max(min)
+            .min(max)
+    }
 }
 
 pub struct Shaper<Q> {
@@ -420,6 +436,24 @@ mod tests {
         e.charge(3000, 2, 0);
         e.enqueue(P(1500), 0).unwrap();
         assert!(matches!(e.dequeue(0), Dequeue::Packet(_)));
+    }
+
+    #[test]
+    fn queue_limit_follows_the_rate() {
+        let r = |kbit, overhead| Rate {
+            overhead,
+            ..Rate::kbit(kbit)
+        };
+        let (min, max) = (16 * 1514, 384 * 1514);
+        // 18 Mbit/s: 673 µs per 1514 B frame, 148 of them in 100 ms.
+        assert_eq!(r(18_000, 0).queue_limit_bytes(100 * MS, min, max), 148 * 1514);
+        // Overhead makes each frame take longer: fewer fit.
+        assert_eq!(r(18_000, 32).queue_limit_bytes(100 * MS, min, max), 145 * 1514);
+        // Fast links hit the cap, slow ones the floor.
+        assert_eq!(r(90_000, 0).queue_limit_bytes(100 * MS, min, max), max);
+        assert_eq!(r(500, 0).queue_limit_bytes(100 * MS, min, max), min);
+        // A floor above the cap: the cap wins.
+        assert_eq!(r(500, 0).queue_limit_bytes(100 * MS, max + 1, max), max);
     }
 
     #[test]

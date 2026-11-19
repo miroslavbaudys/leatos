@@ -40,6 +40,10 @@ const MAX_LEASE_SECS: u32 = 30 * 86400;
 const MIN_RATE_KBIT: u64 = 64;
 const MAX_RATE_KBIT: u64 = 10_000_000;
 const MAX_OVERHEAD: u32 = 256;
+/// `shaping.queue_ms`: below one CoDel target's worth of bursts the queue
+/// overflows on ordinary bursts; above a second it bounds nothing.
+const MIN_QUEUE_MS: u32 = 10;
+const MAX_QUEUE_MS: u32 = 1000;
 /// Highest usable 802.1Q VLAN ID (4095 is reserved, 0 means untagged).
 pub const MAX_VLAN_ID: u16 = 4094;
 /// Longest PPPoE user name, password, service or AC name.
@@ -154,6 +158,12 @@ pub(crate) fn check(c: &Config) -> Result<(), Vec<Issue>> {
                 format!("must be {MIN_RATE_KBIT}–{MAX_RATE_KBIT} kbit/s (omit it to not shape)"),
             );
         }
+    }
+    if s.queue_ms != 0 && !(MIN_QUEUE_MS..=MAX_QUEUE_MS).contains(&s.queue_ms) {
+        x.add(
+            "shaping.queue_ms",
+            format!("must be {MIN_QUEUE_MS}–{MAX_QUEUE_MS} ms, or 0 for the fixed limit"),
+        );
     }
     if s.overhead > MAX_OVERHEAD {
         x.add(

@@ -177,6 +177,7 @@ ecn_up = false
 ecn_down = true
 qdisc = "cake"           # cake | fq_codel | codel
 isolation = "triple-isolate"
+queue_ms = 100           # shaped queue limit as time at its rate; 0 = fixed 384 packets
 
 [mgmt]
 on_wan = false
