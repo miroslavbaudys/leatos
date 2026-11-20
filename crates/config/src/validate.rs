@@ -145,6 +145,7 @@ pub(crate) fn check(c: &Config) -> Result<(), Vec<Issue>> {
     routes(c, &mut x);
     dns(c, &mut x);
     mdns(c, &mut x);
+    ipv6(c, &mut x);
     let s = &c.shaping;
     for (name, rate) in [
         ("shaping.up_kbit", s.up_kbit),
@@ -232,6 +233,18 @@ fn wan(c: &Config, x: &mut Issues) {
             }
         }
         _ => {}
+    }
+}
+
+fn ipv6(c: &Config, x: &mut Issues) {
+    if let Some(p) = c.ipv6.ula_prefix {
+        let fc00 = u128::from(p.addr) >> 121 == 0x7e; // fc00::/7
+        if p.prefix != 48 || !fc00 || p.addr != p.network() {
+            x.add("ipv6.ula_prefix", "must be a unique local /48 such as fd12:3456:789a::/48");
+        }
+    }
+    if c.networks.len() > 0xffff {
+        x.add("ipv6", "too many networks for /64 subnets");
     }
 }
 

@@ -1,4 +1,4 @@
-//! Minimal Ethernet / ARP / IPv4 / TCP / UDP / ICMP field access and
+//! Minimal Ethernet / ARP / IPv4 / IPv6 / TCP / UDP / ICMP field access and
 //! checksum maintenance for the forwarding path.
 //!
 //! Frames are `&mut [u8]` starting at the Ethernet header. All accessors
@@ -6,11 +6,12 @@
 //! successful parse, field offsets are known to be in range.
 //! Checksums are updated incrementally (RFC 1624) when fields change.
 
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
 
 pub const ETH_HDR: usize = 14;
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
 pub const ETHERTYPE_ARP: u16 = 0x0806;
+pub const ETHERTYPE_IPV6: u16 = 0x86dd;
 /// IEEE 802.1Q VLAN tag (C-tag).
 pub const ETHERTYPE_VLAN: u16 = 0x8100;
 /// IEEE 802.1ad service tag (QinQ outer tag).
@@ -20,6 +21,16 @@ pub const VLAN_HDR: usize = 4;
 pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
+pub const PROTO_ICMPV6: u8 = 58;
+
+pub const ICMPV6_ECHO_REQUEST: u8 = 128;
+pub const ICMPV6_ECHO_REPLY: u8 = 129;
+pub const ICMPV6_MLD_QUERY: u8 = 130;
+pub const ICMPV6_MLD_REPORT: u8 = 131;
+pub const ICMPV6_MLD_DONE: u8 = 132;
+pub const ICMPV6_ROUTER_SOLICIT: u8 = 133;
+pub const ICMPV6_REDIRECT: u8 = 137;
+pub const ICMPV6_MLD2_REPORT: u8 = 143;
 
 pub const ICMP_ECHO_REPLY: u8 = 0;
 pub const ICMP_DEST_UNREACH: u8 = 3;
@@ -189,6 +200,229 @@ pub fn l4_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, segment: &[u8]) -> u
 }
 
 // ---- IPv4 ------------------------------------------------------------------------
+
+/// Validated offsets into an IPv6-in-Ethernet frame, past the extension
+/// headers (RFC 8200 §4): Hop-by-Hop (first only, skipped, not
+/// processed: RFC 9098), Destination Options, Routing (type 0 refused,
+/// RFC 5095) and Fragment. At most [`Self::MAX_EXT_HEADERS`] of them in
+/// [`Self::MAX_EXT_BYTES`]; anything else ends the walk as the upper-layer
+/// protocol (`proto`).
+#[derive(Clone, Copy, Debug)]
+pub struct Ipv6View {
+    /// Offset of the IPv6 header.
+    pub ip: usize,
+    /// Upper-layer protocol (the last Next Header).
+    pub proto: u8,
+    /// Offset of the upper-layer header.
+    pub l4: usize,
+    /// Bytes from `l4` to the end of the packet.
+    pub l4_len: usize,
+    /// A Fragment header that is not atomic (offset or M set).
+    pub is_fragment: bool,
+    /// Fragment offset in 8-byte units (0: no fragment, or the first).
+    pub frag_offset: u16,
+}
+
+impl Ipv6View {
+    pub const MAX_EXT_HEADERS: usize = 8;
+    pub const MAX_EXT_BYTES: usize = 256;
+
+    /// Parse the IPv6 header at `ip` (14 for plain Ethernet). Checks the
+    /// version and the payload length (no jumbograms) and walks the
+    /// extension headers.
+    pub fn parse(frame: &[u8], ip: usize) -> Option<Self> {
+        let h = frame.get(ip..ip + 40)?;
+        if h[0] >> 4 != 6 {
+            return None;
+        }
+        let end = ip + 40 + get16(h, 4) as usize;
+        if end > frame.len() {
+            return None;
+        }
+        let (mut nh, mut off, mut count) = (h[6], ip + 40, 0);
+        let (mut is_fragment, mut frag_offset) = (false, 0);
+        loop {
+            let len = match nh {
+                0 if count == 0 => (*frame.get(off + 1).filter(|_| off + 2 <= end)? as usize + 1) * 8,
+                0 => return None,
+                60 => (*frame.get(off + 1).filter(|_| off + 2 <= end)? as usize + 1) * 8,
+                43 => {
+                    if off + 4 > end || frame[off + 2] == 0 {
+                        return None;
+                    }
+                    (frame[off + 1] as usize + 1) * 8
+                }
+                44 => {
+                    if off + 8 > end {
+                        return None;
+                    }
+                    let fo = get16(frame, off + 2);
+                    frag_offset = fo >> 3;
+                    is_fragment = frag_offset != 0 || fo & 1 != 0;
+                    8
+                }
+                _ => break,
+            };
+            if off + len > end {
+                return None;
+            }
+            nh = frame[off];
+            off += len;
+            count += 1;
+            if count > Self::MAX_EXT_HEADERS || off - (ip + 40) > Self::MAX_EXT_BYTES {
+                return None;
+            }
+            if frag_offset != 0 {
+                break; // a later fragment: no upper-layer header here
+            }
+        }
+        Some(Self {
+            ip,
+            proto: nh,
+            l4: off,
+            l4_len: end - off,
+            is_fragment,
+            frag_offset,
+        })
+    }
+
+    pub fn src(&self, f: &[u8]) -> Ipv6Addr {
+        get_ip6(f, self.ip + 8)
+    }
+    pub fn dst(&self, f: &[u8]) -> Ipv6Addr {
+        get_ip6(f, self.ip + 24)
+    }
+    pub fn hop_limit(&self, f: &[u8]) -> u8 {
+        f[self.ip + 7]
+    }
+    /// The upper-layer header is in this packet (not a later fragment).
+    pub fn has_l4(&self) -> bool {
+        self.frag_offset == 0
+    }
+}
+
+pub fn get_ip6(b: &[u8], off: usize) -> Ipv6Addr {
+    let mut a = [0u8; 16];
+    a.copy_from_slice(&b[off..off + 16]);
+    Ipv6Addr::from(a)
+}
+
+/// The link-local address of an interface with `mac` (modified EUI-64,
+/// RFC 4291 §2.5.1).
+pub fn link_local(mac: Mac) -> Ipv6Addr {
+    let mut a = [0u8; 16];
+    a[0] = 0xfe;
+    a[1] = 0x80;
+    a[8] = mac[0] ^ 0x02;
+    a[9] = mac[1];
+    a[10] = mac[2];
+    a[11] = 0xff;
+    a[12] = 0xfe;
+    a[13] = mac[3];
+    a[14] = mac[4];
+    a[15] = mac[5];
+    Ipv6Addr::from(a)
+}
+
+/// ICMPv6 checksum of `msg` (its checksum field included as it is) between
+/// `src` and `dst` (RFC 8200 §8.1 pseudo-header).
+pub fn icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, msg: &[u8]) -> u16 {
+    let mut acc = sum(&src.octets(), 0);
+    acc = sum(&dst.octets(), acc);
+    acc = sum(&(msg.len() as u32).to_be_bytes(), acc);
+    acc = sum(&[0, 0, 0, PROTO_ICMPV6], acc);
+    !fold(sum(msg, acc))
+}
+
+/// The solicited-node group of `a`: `ff02::1:ff` + its last 24 bits.
+pub fn solicited_node(a: Ipv6Addr) -> Ipv6Addr {
+    let o = a.octets();
+    Ipv6Addr::from(u128::from(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 0)) | u128::from(u32::from_be_bytes([0, o[13], o[14], o[15]])))
+}
+
+/// Bytes of a neighbor hint ([`ipv6_neighbor_hint`]).
+pub const NEIGHBOR_HINT_LEN: usize = ETH_HDR + 40 + 32;
+
+/// For a host IPv6 stack that learns neighbors only from neighbor
+/// discovery (smoltcp): an IPv6 unicast frame from a neighbor, not itself
+/// ND, as a Neighbor Solicitation from that neighbor (its address and MAC
+/// in the source link-layer option) to the frame's destination, so the
+/// stack can answer without first resolving it (and dropping the answer
+/// while it does). Sent to the unicast address, so the stack records the
+/// neighbor but does not answer it. Returns the neighbor's address and
+/// MAC, written to `out` ([`NEIGHBOR_HINT_LEN`] bytes).
+pub fn ipv6_neighbor_hint(frame: &[u8], out: &mut [u8; NEIGHBOR_HINT_LEN]) -> Option<(Ipv6Addr, Mac)> {
+    if ethertype(frame) != Some(ETHERTYPE_IPV6) || frame.len() < ETH_HDR + 40 || frame[ETH_HDR] >> 4 != 6 {
+        return None;
+    }
+    let (src, dst) = (get_ip6(frame, ETH_HDR + 8), get_ip6(frame, ETH_HDR + 24));
+    let mut smac = [0u8; 6];
+    smac.copy_from_slice(&frame[6..12]);
+    if dst.is_multicast() || src.is_multicast() || src.is_unspecified() || is_multicast_mac(&smac) {
+        return None;
+    }
+    if frame[ETH_HDR + 6] == PROTO_ICMPV6 && frame.get(ETH_HDR + 40).is_some_and(|t| (133..=137).contains(t)) {
+        return None; // ND itself: the stack learns from it already
+    }
+    out.fill(0);
+    out[0..6].copy_from_slice(&frame[0..6]);
+    out[6..12].copy_from_slice(&smac);
+    put16(out, 12, ETHERTYPE_IPV6);
+    let ip = ETH_HDR;
+    out[ip] = 0x60;
+    put16(out, ip + 4, 32);
+    out[ip + 6] = PROTO_ICMPV6;
+    out[ip + 7] = 255;
+    out[ip + 8..ip + 24].copy_from_slice(&src.octets());
+    out[ip + 24..ip + 40].copy_from_slice(&dst.octets());
+    let m = ip + 40;
+    out[m] = 135; // Neighbor Solicitation
+    out[m + 8..m + 24].copy_from_slice(&dst.octets());
+    out[m + 24] = 1; // source link-layer address
+    out[m + 25] = 1;
+    out[m + 26..m + 32].copy_from_slice(&smac);
+    let c = icmpv6_checksum(src, dst, &out[m..m + 32]);
+    put16(out, m + 2, c);
+    Some((src, smac))
+}
+
+/// A unicast Neighbor Solicitation (a reachability probe, RFC 4861 §7.3.3)
+/// readdressed to its target's solicited-node group, for a host stack that
+/// answers only those (smoltcp 0.14): the destination address and MAC and
+/// the checksum change, nothing else. Returns whether it did.
+pub fn ipv6_ns_to_solicited(frame: &mut [u8]) -> bool {
+    let ip = ETH_HDR;
+    let m = ip + 40;
+    if ethertype(frame) != Some(ETHERTYPE_IPV6)
+        || frame.len() < m + 24
+        || frame[ip] >> 4 != 6
+        || frame[ip + 6] != PROTO_ICMPV6
+        || frame[m] != 135
+    {
+        return false;
+    }
+    let (dst, target) = (get_ip6(frame, ip + 24), get_ip6(frame, m + 8));
+    if dst.is_multicast() || dst != target {
+        return false;
+    }
+    let group = solicited_node(target);
+    let (old, new) = (dst.octets(), group.octets());
+    let mut c = get16(frame, m + 2);
+    for i in (0..16).step_by(2) {
+        c = csum_update16(c, u16::from_be_bytes([old[i], old[i + 1]]), u16::from_be_bytes([new[i], new[i + 1]]));
+    }
+    put16(frame, m + 2, c);
+    frame[ip + 24..ip + 40].copy_from_slice(&new);
+    frame[0..2].copy_from_slice(&[0x33, 0x33]);
+    frame[2..6].copy_from_slice(&new[12..16]);
+    true
+}
+
+/// `ff02::1:ffXX:XXXX` (RFC 4291 §2.7.1).
+pub fn is_solicited_node(a: Ipv6Addr) -> bool {
+    let o = a.octets();
+    o[..11] == [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0] && o[11] == 1 && o[12] == 0xff
+}
 
 /// Validated offsets into an IPv4-in-Ethernet frame.
 #[derive(Clone, Copy, Debug)]
@@ -676,6 +910,68 @@ mod tests {
             assert_eq!(get16(&f, v.l4 + 2), 0xffff, "payload {payload:?}");
             assert!(checksums_ok(&f));
         }
+    }
+
+    fn v6_frame(dmac: Mac, smac: Mac, src: Ipv6Addr, dst: Ipv6Addr, proto: u8, l4: &[u8]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&dmac);
+        f.extend_from_slice(&smac);
+        f.extend_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
+        f.extend_from_slice(&[0x60, 0, 0, 0]);
+        f.extend_from_slice(&(l4.len() as u16).to_be_bytes());
+        f.extend_from_slice(&[proto, 255]);
+        f.extend_from_slice(&src.octets());
+        f.extend_from_slice(&dst.octets());
+        f.extend_from_slice(l4);
+        f
+    }
+
+    const RMAC: Mac = [0x52, 0x54, 0, 0, 0, 2];
+    const CMAC: Mac = [0x52, 0x54, 0, 0, 0, 0x10];
+
+    #[test]
+    fn neighbor_hint_is_a_valid_unanswered_solicitation() {
+        let c: Ipv6Addr = "fd00:1:2:1:5054:ff:fe00:10".parse().unwrap();
+        let r: Ipv6Addr = "fd00:1:2:1::1".parse().unwrap();
+        let f = v6_frame(RMAC, CMAC, c, r, PROTO_UDP, &[0u8; 20]);
+        let mut out = [0u8; NEIGHBOR_HINT_LEN];
+        assert_eq!(ipv6_neighbor_hint(&f, &mut out), Some((c, CMAC)));
+        let v = Ipv6View::parse(&out, ETH_HDR).unwrap();
+        assert_eq!((v.proto, v.src(&out), v.dst(&out), v.hop_limit(&out)), (PROTO_ICMPV6, c, r, 255));
+        let msg = &out[v.l4..];
+        assert_eq!((msg[0], get_ip6(msg, 8)), (135, r), "NS for the destination");
+        assert_eq!(&msg[24..32], &[1, 1, 0x52, 0x54, 0, 0, 0, 0x10], "source link-layer option");
+        assert_eq!(icmpv6_checksum(c, r, msg), 0, "checksum");
+        // Not for multicast, ND itself, other EtherTypes, or a short frame.
+        let ns = v6_frame(RMAC, CMAC, c, r, PROTO_ICMPV6, &[135, 0, 0, 0, 0, 0, 0, 0]);
+        let m = v6_frame([0x33, 0x33, 0, 0, 0, 1], CMAC, c, "ff02::1".parse().unwrap(), PROTO_UDP, &[0; 8]);
+        for g in [&ns[..], &m[..], &f[..50]] {
+            assert_eq!(ipv6_neighbor_hint(g, &mut out), None);
+        }
+    }
+
+    #[test]
+    fn unicast_ns_goes_to_the_solicited_node_group() {
+        let c: Ipv6Addr = "fe80::5054:ff:fe00:10".parse().unwrap();
+        let r: Ipv6Addr = "fd00:1:2:0::1".parse().unwrap();
+        let mut ns = alloc::vec![135u8, 0, 0, 0, 0, 0, 0, 0];
+        ns.extend_from_slice(&r.octets());
+        ns.extend_from_slice(&[1, 1, 0x52, 0x54, 0, 0, 0, 0x10]);
+        let c0 = icmpv6_checksum(c, r, &ns);
+        put16(&mut ns, 2, c0);
+        let mut f = v6_frame(RMAC, CMAC, c, r, PROTO_ICMPV6, &ns);
+        assert!(ipv6_ns_to_solicited(&mut f));
+        let g: Ipv6Addr = "ff02::1:ff00:1".parse().unwrap();
+        assert_eq!(get_ip6(&f, ETH_HDR + 24), g);
+        assert_eq!(&f[0..6], &[0x33, 0x33, 0xff, 0, 0, 1]);
+        assert_eq!(icmpv6_checksum(c, g, &f[ETH_HDR + 40..]), 0, "checksum after the readdressing");
+        assert!(!ipv6_ns_to_solicited(&mut f), "already multicast");
+        // Another target than the destination (not a probe for it): left alone.
+        let mut ns2 = ns.clone();
+        ns2[8..24].copy_from_slice(&c.octets());
+        let mut f2 = v6_frame(RMAC, CMAC, c, r, PROTO_ICMPV6, &ns2);
+        assert!(!ipv6_ns_to_solicited(&mut f2));
+        assert_eq!(solicited_node("2001:db8::abcd:1234:5678".parse().unwrap()), "ff02::1:ff34:5678".parse::<Ipv6Addr>().unwrap());
     }
 
     #[test]

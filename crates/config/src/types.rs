@@ -3,7 +3,7 @@
 
 use alloc::string::String;
 use core::fmt;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
 use core::str::FromStr;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -74,6 +74,45 @@ impl FromStr for Cidr {
     }
 }
 
+/// An IPv6 prefix: `fd12:3456:789a::/48`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cidr6 {
+    pub addr: Ipv6Addr,
+    pub prefix: u8,
+}
+
+impl Cidr6 {
+    pub const fn new(addr: Ipv6Addr, prefix: u8) -> Self {
+        Cidr6 { addr, prefix }
+    }
+
+    /// The address with the host bits cleared.
+    pub fn network(&self) -> Ipv6Addr {
+        let p = u32::from(self.prefix.min(128));
+        let mask = if p == 0 { 0 } else { u128::MAX << (128 - p) };
+        Ipv6Addr::from(u128::from(self.addr) & mask)
+    }
+}
+
+impl fmt::Display for Cidr6 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix)
+    }
+}
+
+impl FromStr for Cidr6 {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (a, p) = s.split_once('/').ok_or("expected an IPv6 prefix such as fd12:3456:789a::/48")?;
+        let addr = a.parse().map_err(|_| "bad IPv6 address")?;
+        let prefix: u8 = p.parse().map_err(|_| "bad prefix length")?;
+        if prefix > 128 {
+            return Err("prefix length above 128");
+        }
+        Ok(Cidr6 { addr, prefix })
+    }
+}
+
 /// A MAC address: `52:54:00:00:00:05` (written in lower case; upper case
 /// is accepted).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -136,6 +175,7 @@ macro_rules! string_serde {
 }
 
 string_serde!(Cidr);
+string_serde!(Cidr6);
 string_serde!(Mac);
 
 /// An address or subnet in a firewall rule: `10.10.0.20` (= /32) or

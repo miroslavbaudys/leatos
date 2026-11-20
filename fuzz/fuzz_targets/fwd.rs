@@ -3,13 +3,14 @@
 //! knows (valid checksums, so they reach NAT, conntrack and the firewall),
 //! replies and ICMP errors to what it forwarded (the NAT reverse path),
 //! later fragments, policy changes, expiry and raw damaged frames.
-//! Checks: forwarded frames stay inside the buffer, and a frame that came
+//! IPv6 to the router (extension headers, ND, the zone input filter).
+//! Checks: forwarded frames stay inside the buffer, a frame that came
 //! in with valid checksums leaves with valid checksums (NAT rewrites them
-//! incrementally).
+//! incrementally), and IPv6 is never forwarded (docs/ipv6.md step 1).
 #![no_main]
 
 use arbitrary::Arbitrary;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
 use fwd::conntrack::Budget;
 use fwd::forwarder::{
     Action, Forwarder, Interface, Policy, PortForward, Redirect, Role, Rule, RuleTo, Verdict, proto, svc,
@@ -33,8 +34,14 @@ enum Op {
     Reply { flags: Option<u8>, noise: Option<Vec<u8>> },
     /// An ICMP error about the last forwarded packet, from `from`.
     IcmpError { from: Addr, kind: u8, code: u8 },
+    /// An IPv6 packet on interface `ifx % 3` to one of the router's
+    /// addresses or groups (or another host), behind extension headers
+    /// (`ext`: kinds from Hop-by-Hop, Destination Options, Routing,
+    /// Fragment), with `proto` and a port or ICMPv6 type.
+    Packet6 { ifx: u8, dst: u8, hop: u8, ext: Vec<(u8, u8)>, proto: u8, port: u16, noise: Option<Vec<u8>> },
     /// Arbitrary bytes on an interface.
     Raw { ifx: u8, data: Vec<u8> },
+    SetIpv6(bool),
     Tick(u16),
     Expire(u8),
     SetPolicy(bool),
@@ -94,7 +101,97 @@ fn router() -> Forwarder {
     fw.set_default_route(Some((WAN, Ipv4Addr::new(203, 0, 113, 1))));
     fw.set_static_routes(&[(Ipv4Addr::new(10, 30, 0, 0), 24, Ipv4Addr::new(192, 168, 1, 100))]);
     fw.set_policy(Some(policy()));
+    fw.ipv6 = true;
+    fw.set_ula6(1, Some(ULA[1]));
+    fw.set_ula6(2, Some(ULA[2]));
     fw
+}
+
+const ULA: [Ipv6Addr; 3] = [
+    Ipv6Addr::UNSPECIFIED,
+    Ipv6Addr::new(0xfd00, 1, 2, 0, 0, 0, 0, 1),
+    Ipv6Addr::new(0xfd00, 1, 2, 1, 0, 0, 0, 1),
+];
+
+/// An Ethernet + IPv6 frame (see [`Op::Packet6`]).
+fn ipv6_frame(ifx: u8, dst: u8, hop: u8, ext: &[(u8, u8)], proto: u8, port: u16) -> Vec<u8> {
+    let dsts = [
+        wire::link_local(MACS[ifx as usize]),
+        ULA[ifx as usize],
+        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1),
+        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2),
+        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb),
+        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 1),
+        Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+        ULA[(ifx as usize + 1) % 3],
+    ];
+    let dst = dsts[dst as usize % dsts.len()];
+    let protos = [wire::PROTO_ICMPV6, PROTO_UDP, PROTO_TCP, 59, proto];
+    let proto = protos[proto as usize % protos.len()];
+    let kinds = [0u8, 60, 43, 44];
+    let mut hdrs: Vec<(u8, Vec<u8>)> = Vec::new();
+    for &(k, arg) in ext.iter().take(10) {
+        let kind = kinds[k as usize % 4];
+        let h = match kind {
+            44 => vec![0, 0, (arg >> 4) as u16 as u8, arg & 0x9, 0, 0, 0, 1], // offset / M from arg
+            43 => vec![0, 0, arg % 3, 0, 0, 0, 0, 0],
+            _ => {
+                let len = arg as usize % 3;
+                let mut h = vec![0u8; 8 * (len + 1)];
+                h[1] = len as u8;
+                h
+            }
+        };
+        hdrs.push((kind, h));
+    }
+    let mut l4 = vec![0u8; 20];
+    if proto == wire::PROTO_ICMPV6 {
+        l4[0] = (port >> 8) as u8;
+    } else {
+        l4[0..2].copy_from_slice(&40000u16.to_be_bytes());
+        l4[2..4].copy_from_slice(&port.to_be_bytes());
+    }
+    let mut body = Vec::new();
+    for (i, (_, h)) in hdrs.iter().enumerate() {
+        let mut h = h.clone();
+        h[0] = hdrs.get(i + 1).map_or(proto, |n| n.0);
+        body.extend_from_slice(&h);
+    }
+    body.extend_from_slice(&l4);
+    let mac = if dst.is_multicast() { [0x33, 0x33, 0, 0, 0, 1] } else { MACS[ifx as usize] };
+    let mut f = Vec::new();
+    f.extend_from_slice(&mac);
+    f.extend_from_slice(&PEER);
+    f.extend_from_slice(&wire::ETHERTYPE_IPV6.to_be_bytes());
+    f.extend_from_slice(&[0x60, 0, 0, 0]);
+    f.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    f.push(hdrs.first().map_or(proto, |h| h.0));
+    f.push(hop);
+    f.extend_from_slice(&Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 9).octets());
+    f.extend_from_slice(&dst.octets());
+    f.extend_from_slice(&body);
+    f
+}
+
+/// The router stack's ND help (`kernel/src/net/device.rs`): a hint is a
+/// valid NS with a correct checksum; readdressing a probe keeps a valid
+/// checksum valid.
+fn nd_helpers(f: &[u8]) {
+    let mut hint = [0u8; wire::NEIGHBOR_HINT_LEN];
+    if wire::ipv6_neighbor_hint(f, &mut hint).is_some() {
+        let v = wire::Ipv6View::parse(&hint, ETH_HDR).expect("hint parses");
+        assert_eq!(wire::icmpv6_checksum(v.src(&hint), v.dst(&hint), &hint[v.l4..]), 0, "hint checksum");
+    }
+    let mut g = f.to_vec();
+    let valid = |g: &[u8]| {
+        let v = wire::Ipv6View::parse(g, ETH_HDR)?;
+        let end = v.l4 + v.l4_len;
+        (v.l4 == ETH_HDR + 40).then(|| wire::icmpv6_checksum(v.src(g), v.dst(g), &g[v.l4..end]) == 0)
+    };
+    let before = valid(&g);
+    if wire::ipv6_ns_to_solicited(&mut g) && before == Some(true) {
+        assert_eq!(valid(&g), Some(true), "readdressed NS checksum");
+    }
 }
 
 /// What the forwarder last sent: (egress, frame).
@@ -235,13 +332,33 @@ fuzz_target!(|ops: Vec<Op>| {
                 };
                 (l.egress, pkt.frame(MACS[l.egress as usize], PEER, TAIL), false)
             }
+            Op::Packet6 { ifx, dst, hop, ext, proto, port, noise } => {
+                let ifx = ifx % 3;
+                let mut f = ipv6_frame(ifx, dst, hop, &ext, proto, port);
+                if let Some(noise) = &noise {
+                    damage(&mut f, noise);
+                }
+                let n = f.len();
+                f.resize(n + TAIL, 0);
+                let v = fw.process(now, ifx, &mut f, n);
+                assert!(!matches!(v, Verdict::Forward { .. }), "IPv6 forwarded: {v:?}");
+                continue;
+            }
+            Op::SetIpv6(on) => {
+                fw.ipv6 = on;
+                continue;
+            }
             Op::Raw { ifx, data } => {
                 let mut f = data;
                 f.truncate(1600);
+                nd_helpers(&f);
                 let n = f.len();
                 f.resize(n + TAIL, 0);
                 let ifx = ifx % 3;
                 let v = fw.process(now, ifx, &mut f, n);
+                if wire::ethertype(&f[..n]) == Some(wire::ETHERTYPE_IPV6) {
+                    assert!(!matches!(v, Verdict::Forward { .. }), "IPv6 forwarded: {v:?}");
+                }
                 check_forward(&v, &f, false);
                 continue;
             }

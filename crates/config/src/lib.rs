@@ -33,7 +33,7 @@ mod validate;
 
 pub use edit::{diff_lines, flat_lines};
 pub use names::{HostName, LocalHost, NameVisibility};
-pub use types::{Cidr, Mac, Net, PortRange, Target};
+pub use types::{Cidr, Cidr6, Mac, Net, PortRange, Target};
 pub use validate::Issue;
 pub use validate::{MAX_NETWORKS, MAX_VLAN_ID};
 
@@ -80,6 +80,8 @@ pub struct Config {
     pub dns: Dns,
     #[serde(skip_serializing_if = "Mdns::is_empty")]
     pub mdns: Mdns,
+    #[serde(skip_serializing_if = "Ipv6::is_default")]
+    pub ipv6: Ipv6,
     pub shaping: Shaping,
     pub mgmt: Mgmt,
     pub time: Time,
@@ -96,6 +98,7 @@ impl Default for Config {
             routes: Vec::new(),
             dns: Dns::default(),
             mdns: Mdns::default(),
+            ipv6: Ipv6::default(),
             shaping: Shaping::default(),
             mgmt: Mgmt::default(),
             time: Time::default(),
@@ -881,6 +884,25 @@ pub struct Mgmt {
     /// is stored or used ([`Config::hash_new_password`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+}
+
+/// IPv6 on the router's networks (docs/ipv6.md; M7 step 1: link-local
+/// and a ULA /64 per network, Router Advertisements, DNS and the web
+/// interface over IPv6; nothing forwarded yet).
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Ipv6 {
+    pub enabled: bool,
+    /// The networks' unique local /48 (RFC 4193): network `i` (in config
+    /// order) gets `<prefix>:<i>::/64`. Unset = derived from the WAN MAC.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ula_prefix: Option<Cidr6>,
+}
+
+impl Ipv6 {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// The wall clock: SNTP servers, asked over the WAN.

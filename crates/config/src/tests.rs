@@ -1819,3 +1819,25 @@ fn ack_filter_written_only_when_on() {
     assert!(c.to_toml().contains("ack_filter = true"));
     assert!(parse(&c.to_toml()).unwrap().shaping.ack_filter);
 }
+
+#[test]
+fn ipv6_section_round_trips_and_validates_the_ula() {
+    // Off and unset: not written at all.
+    assert!(!Config::default().to_toml().contains("[ipv6]"));
+    let c = parse(&lan_doc("10.10.0.1/24", "[ipv6]\nenabled = true\nula_prefix = \"fd12:3456:789a::/48\"\n")).unwrap();
+    assert!(c.ipv6.enabled);
+    assert_eq!(c.ipv6.ula_prefix.unwrap().to_string(), "fd12:3456:789a::/48");
+    assert_eq!(parse(&c.to_toml()).unwrap(), c);
+    let ula = |s: &str| {
+        invalid(|c| {
+            c.ipv6.enabled = true;
+            c.ipv6.ula_prefix = Some(s.parse().unwrap());
+        })
+    };
+    for bad in ["2001:db8::/48", "fd12:3456:789a::/56", "fd12:3456:789a:1::/48", "fe80::/48"] {
+        assert_eq!(ula(bad), vec![String::from("ipv6.ula_prefix")], "{bad}");
+    }
+    assert!(issues(|c| c.ipv6.ula_prefix = Some("fc00:1:2::/48".parse().unwrap())).is_empty());
+    assert!(parse(&lan_doc("10.10.0.1/24", "[ipv6]\nula_prefix = \"fd::/129\"\n")).is_err());
+    assert!(parse(&lan_doc("10.10.0.1/24", "[ipv6]\nbogus = 1\n")).is_err());
+}
