@@ -524,6 +524,16 @@ pub fn port_macs(ports: &[PortShared]) -> Vec<[u8; 6]> {
 pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: &[usize], macs: &[[u8; 6]]) {
     if let Some(wan) = hosts.first_mut() {
         set_host_routes(&mut wan.iface, &crate::config::wan_routes());
+        // The router's own IPv6 traffic out (DNS to the ISP's IPv6
+        // servers): a default route while the WAN has one.
+        match crate::config::wan6() {
+            Some(w) => {
+                let _ = wan.iface.routes_mut().add_default_ipv6_route(w.gateway);
+            }
+            None => {
+                wan.iface.routes_mut().remove_default_ipv6_route();
+            }
+        }
         // IPv6 on the WAN: its link-local address (the MAC's on Ethernet,
         // IPv6CP's on PPPoE while it is up), which the DHCPv6 client and
         // router solicitations use, and a static global one (development:

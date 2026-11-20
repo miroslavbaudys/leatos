@@ -135,6 +135,14 @@ elif [ -n "$v6" ]; then
     fi
   fi
 fi
+# The ISP's IPv6-only resolver (Kea hands it out): v6dns.isp.example ->
+# 203.0.113.66, nothing else; the client's check stops the IPv4 DNS first.
+if [ "$v6" = pd ]; then
+  if [ -n "$pppoe" ]; then $bb ip -6 addr add 2001:db8:ffff::53/128 dev lo; else $bb ip -6 addr add 2001:db8:ffff::53/64 dev "$IF"; fi
+  /usr/sbin/dnsmasq --conf-file=/dev/null --no-resolv --no-hosts --listen-address=2001:db8:ffff::53 --bind-dynamic \
+    --port=53 --user=root --address=/v6dns.isp.example/203.0.113.66 --pid-file=/tmp/dns6.pid \
+    || echo "LAB FAIL: isp: IPv6 resolver did not start"
+fi
 $bx httpd -p 80 -h /www
 # Long single-connection upload sink (ECN/AQM check): replies with the byte count.
 $bx tcpsvd -E 0.0.0.0 5001 $bb wc -c &

@@ -1,12 +1,17 @@
 #!/usr/bin/busybox sh
 # Kea's DHCPv6 server for prefix delegation (scripts/lab-test.sh LAB_IPV6,
 # docs/ipv6.md step 3): lab-kea start IF POOL (a /48 delegated as /56s,
-# leases not kept, renew 10 s) | stop.
+# leases not kept, renew 10 s; ALLOC random: a random /56, so only the
+# client's hint brings back its old one) | stop. DNS: 2001:db8:ffff::53
+# (the ISP's IPv6-only resolver) unless lab_dns6=0.
 bb=/usr/bin/busybox
 case "$1" in
   start)
     echo "$2" >/tmp/kea-if
     echo "$3" >/tmp/kea-pool
+    alloc="iterative"; [ "$4" = random ] && alloc=random
+    opts='"option-data": [ { "name": "dns-servers", "data": "2001:db8:ffff::53" } ],'
+    $bb grep -q 'lab_dns6=0' /proc/cmdline && opts=''
     $bb mkdir -p /run/kea /var/lib/kea /run/lock/kea /var/run/kea
     $bb cat >/tmp/kea-dhcp6.conf <<EOF
 { "Dhcp6": {
@@ -14,18 +19,24 @@ case "$1" in
   "lease-database": { "type": "memfile", "persist": false },
   "renew-timer": 10, "rebind-timer": 20, "preferred-lifetime": 60, "valid-lifetime": 120,
   "subnet6": [ { "id": 1, "subnet": "2001:db8:ffff::/64", "interface": "$2",
-    "pd-pools": [ { "prefix": "$3", "prefix-len": 48, "delegated-len": 56 } ],
-    "option-data": [ { "name": "dns-servers", "data": "2001:db8:ffff::1" } ] } ],
+    "pd-allocator": "$alloc", $opts
+    "pd-pools": [ { "prefix": "$3", "prefix-len": 48, "delegated-len": 56 } ] } ],
   "loggers": [ { "name": "kea-dhcp6", "output-options": [ { "output": "stdout" } ], "severity": "INFO" } ]
 } }
 EOF
     /usr/sbin/kea-dhcp6 -c /tmp/kea-dhcp6.conf >>/tmp/kea.out 2>&1 &
     echo $! >/tmp/kea.pid
-    echo "LAB isp: kea delegating $3/48 as /56s on $2"
+    echo "LAB isp: kea delegating $3/48 as /56s on $2 ($alloc)" | $bb tee -a /tmp/kea.out
     ;;
   stop)
-    [ -f /tmp/kea.pid ] && $bb kill "$($bb cat /tmp/kea.pid)" 2>/dev/null
-    $bb sleep 1
+    # Every kea-dhcp6, and until it is gone: a second one would find the
+    # first's lock and leave, and the old leases would stay.
+    $bb killall kea-dhcp6 2>/dev/null
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      $bb pidof kea-dhcp6 >/dev/null || break
+      $bb sleep 0.5
+    done
+    $bb killall -9 kea-dhcp6 2>/dev/null
     $bb rm -f /tmp/kea.pid /run/kea/*.pid /run/lock/kea/* 2>/dev/null
     ;;
 esac

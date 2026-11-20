@@ -464,6 +464,18 @@ fn status(ctx: &Ctx, wan: &str) {
             q.backlog_packets
         );
     }
+    if let Some(w) = crate::net::wan6::state() {
+        println!(
+            "wan ipv6 : prefix {} (DHCPv6-PD {}), address {}, router {}",
+            w.prefix.map_or(String::from("none"), |(p, l)| alloc::format!("{p}/{l}")),
+            w.pd_state,
+            w.prefix.and_then(|(p, l)| config::wan_address6(p, l)).map_or(String::from("none"), |a| alloc::format!("{a}")),
+            match w.gateway {
+                Some(g) => alloc::format!("{g} ({})", if w.from_ra { "RA" } else { "PPPoE peer, no RA" }),
+                None => String::from("none"),
+            }
+        );
+    }
     for (name, m) in ctx.services.map(LanServices::mdns_status).unwrap_or_default() {
         println!(
             "mdns     : {name}: {} in, {} out, {} filtered, {} dup, {} rate-limited, {} bad, {} foreign",

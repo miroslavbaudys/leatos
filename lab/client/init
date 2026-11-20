@@ -561,6 +561,12 @@ if [ -n "$v6on" ]; then
         gr=$(v6global 1)
       done
       w6=$(v6st | $bb grep -o '"wan_ipv6":{[^}]*}')
+      from=ra; $bb grep -q 'lab_pppoe_kick=' /proc/cmdline && from=ipv6cp
+      if echo "$w6" | $bb grep -q '"addr":"2001:db8:100:ff::1"' && echo "$w6" | $bb grep -q "\"router_from\":\"$from\""; then
+        pass "ipv6 pd: WAN address 2001:db8:100:ff::1 (the prefix's last /64), router from $from"
+      else
+        fail "ipv6 pd: WAN address / router source (want 2001:db8:100:ff::1, $from): $w6"
+      fi
       if echo "$w6" | $bb grep -q '"source":"dhcpv6-pd"' && echo "$w6" | $bb grep -q '"prefix":"2001:db8:100::/56"' && echo "$w6" | $bb grep -q '"gateway":"fe80::'; then
         pass "ipv6 pd: delegated 2001:db8:100::/56, default router $(echo "$w6" | $bb sed -n 's/.*"gateway":"\([^"]*\)".*/\1/p')"
       else
@@ -620,6 +626,21 @@ if [ -n "$v6on" ]; then
       $bb ip -6 addr del 2001:db8:999::5/128 dev eth0 2>/dev/null
       s1=$(spoofed6)
       if [ "${s1:-0}" -gt "${s0:-0}" ]; then pass "ipv6 wan: forged source 2001:db8:999::5 dropped (spoofed $s0 -> $s1)"; else fail "ipv6 wan: forged source not dropped (spoofed $s0 -> $s1)"; fi
+      # The router's own DNS over IPv6 (step 5): with the ISP's IPv4 DNS
+      # stopped, v6dns.isp.example (known only to the ISP's IPv6-only
+      # resolver, which DHCPv6 handed out) resolves through the WAN's
+      # global address. Negative control LAB_IPV6_DNS6=0.
+      if [ "$v6mode" = pd ]; then
+        stopped=$(isp_dns stop)
+        out=$($bb nslookup -type=a v6dns.isp.example 192.168.1.1 2>&1)
+        started=$(isp_dns start)
+        if [ "$stopped" = stop=OK ] && [ "$started" = start=OK ] && echo "$out" | $bb grep -q '203.0.113.66'; then
+          pass "ipv6 dns: v6dns.isp.example via the ISP's IPv6 resolver 2001:db8:ffff::53 (IPv4 DNS stopped)"
+        else
+          fail "ipv6 dns: v6dns.isp.example over IPv6 ($stopped/$started): $(echo "$out" | $bb tail -2 | $bb tr '\n' ' ')"
+          v6st | $bb grep -o '"wan_ipv6":{[^}]*}' | $bb sed 's/^/    | /'
+        fi
+      fi
       # A new prefix (step 3): the ISP's server restarts on another pool;
       # at the router's next renewal (10 s) the networks are readdressed,
       # the old prefix advertised as deprecated.
@@ -1030,6 +1051,30 @@ if [ -n "$kick" ]; then
       fail "pppoe: no IPv6 after the reconnect"
       { $bb ip -6 addr show dev eth0; $bb ip -6 route; $bb ping6 -c 1 -W 2 "$ISP6"; v6st | $bb grep -o '"wan_ipv6":{[^}]*}\|"drop_reasons":{[^}]*}'; } 2>&1 | $bb sed 's/^/    | /'
     fi
+  fi
+fi
+
+# --- IPv6 prefix kept across a reboot (docs/ipv6.md step 5) ------------------
+# The router reboots (its lease record keeps the prefix) while the ISP's
+# server forgets every lease and allocates at random: only the router's
+# hint brings the same prefix back. Negative control
+# LAB_ROUTER_ARGS=pd_keep=0 (a random /56 instead).
+if [ "$v6mode" = pd ] && $bb grep -q 'lab_pd_keep=1' /proc/cmdline; then
+  pfx() { v6st | $bb grep -o '"wan_ipv6":{[^}]*}' | $bb sed -n 's/.*"prefix":"\([^"]*\)".*/\1/p'; }
+  before=$(pfx)
+  fr=$($bb wget -q -T 5 -O - "http://$ISP/cgi-bin/pd?fresh" 2>&1)
+  $bb wget -q -T 5 -O /dev/null --post-data= "http://admin:lab-pass@192.168.1.1/api/reboot" 2>/dev/null
+  $bb sleep 5
+  after=""
+  for i in $($bb seq 1 60); do
+    after=$(pfx)
+    [ -n "$after" ] && break
+    $bb sleep 1
+  done
+  if [ -n "$before" ] && [ "$fr" = pd=fresh ] && [ "$after" = "$before" ]; then
+    pass "ipv6 pd: prefix $before kept across a reboot (the ISP's server had forgotten it)"
+  else
+    fail "ipv6 pd: prefix after the reboot '${after:-none}', before '$before' ($fr)"
   fi
 fi
 

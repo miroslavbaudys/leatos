@@ -101,7 +101,16 @@ pub fn bootargs() -> &'static str {
 /// starts and before anything reads [`get`].
 /// `virtual_machine`: the lab's fixtures (the `nas` reservation) are added
 /// to the defaults only there, never on hardware.
+/// Running on a virtual machine (QEMU), as the platform reported it.
+static VIRTUAL_MACHINE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg_attr(feature = "smoke-test", allow(dead_code))] // the smoke test powers off before the line that uses it
+pub fn virtual_machine() -> bool {
+    VIRTUAL_MACHINE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn load(store: Option<&mut crate::store::Store>, virtual_machine: bool) {
+    VIRTUAL_MACHINE.store(virtual_machine, core::sync::atomic::Ordering::Relaxed);
     let (stored, source) = stored(store);
     let from_store = stored.is_some();
     let mut c = stored.unwrap_or_default();
@@ -1099,16 +1108,32 @@ pub fn wan6() -> Option<Wan6> {
     if !ipv6() {
         return None;
     }
+    let st = crate::net::wan6::state();
+    // The WAN's global address: from the delegated prefix (RFC 7084
+    // WAA-? allows one from the prefix; many ISPs give no IA_NA).
+    let addr = st.as_ref().and_then(|s| s.prefix).and_then(|(p, l)| wan_address6(p, l)).map(|a| (a, 128));
     if matches!(wan_link(), WanLink::Pppoe(_)) {
         crate::net::wan6::ppp_link()?;
-        let g = crate::net::wan6::state().and_then(|s| s.gateway).or_else(crate::net::wan6::ppp_gateway)?;
-        return Some(Wan6 { addr: None, gateway: g });
+        let g = st.and_then(|s| s.gateway).or_else(crate::net::wan6::ppp_gateway)?;
+        return Some(Wan6 { addr, gateway: g });
     }
     if let Some(s) = wan6_static() {
         return Some(s);
     }
-    let g = crate::net::wan6::state()?.gateway?;
-    Some(Wan6 { addr: None, gateway: g })
+    let g = st?.gateway?;
+    Some(Wan6 { addr, gateway: g })
+}
+
+/// The router's own global address in a delegated prefix: `::1` in its
+/// last /64, which no network gets ([`gua_router`]). None for a /64 (the
+/// one /64 is the first network's).
+pub fn wan_address6(prefix: Ipv6Addr, len: u8) -> Option<Ipv6Addr> {
+    if len >= 64 {
+        return None;
+    }
+    let p = schema::Cidr6::new(prefix, len).network();
+    let last = (1u128 << (64 - u32::from(len))) - 1;
+    Some(Ipv6Addr::from(u128::from(p) | (last << 64) | 1))
 }
 
 /// Prefix delegation runs on the WAN: IPv6 and `ipv6.dhcpv6_pd` on, no
@@ -1119,6 +1144,12 @@ pub fn pd_wanted() -> bool {
         && c.ipv6.dhcpv6_pd
         && wan6_static().is_none()
         && arg(bootargs(), "lan6_prefix").is_none()
+}
+
+/// Ask for the last delegated prefix again after a restart (default);
+/// `pd_keep=0`: not (the lab's negative control).
+pub fn pd_keep() -> bool {
+    arg(bootargs(), "pd_keep") != Some("0")
 }
 
 /// `lan6_prefix=addr/len` (development, with `ipv6` on): the delegated
@@ -1146,8 +1177,11 @@ pub fn gua_router(index: usize) -> Option<Ipv6Addr> {
     if p.prefix > 64 {
         return None;
     }
+    // A prefix's /64s, less the last one (the WAN's own address,
+    // [`wan_address6`]) when there are several.
     let bits = 64 - u32::from(p.prefix);
-    if bits < 64 && index as u64 >= 1u64 << bits {
+    let usable = if bits == 0 { 1 } else { (1u128 << bits) - 1 };
+    if index as u128 >= usable {
         return None;
     }
     Some(Ipv6Addr::from(u128::from(p.network()) | ((index as u128) << 64) | 1))

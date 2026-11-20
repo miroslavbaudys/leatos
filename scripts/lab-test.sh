@@ -219,6 +219,17 @@
 #                        2001:db8:200::/48): new addresses, the old one
 #                        deprecated, traffic through the new one. Negative
 #                        control LAB_IPV6_PD=0 (no Kea: no delegated prefix).
+#                        Step 5: the router's WAN address from the prefix
+#                        (the last /64's ::1) and the default router's
+#                        source (ra / ipv6cp) in its status; its own DNS
+#                        over IPv6: Kea hands out 2001:db8:ffff::53, an
+#                        IPv6-only resolver answering v6dns.isp.example,
+#                        resolved with the ISP's IPv4 DNS stopped (negative
+#                        control LAB_IPV6_DNS6=0: no servers handed out).
+#                        With a store (LAB_GUEST=1): the prefix kept across
+#                        a reboot while the ISP's server forgot every lease
+#                        and allocates at random (cgi-bin/pd?fresh);
+#                        negative control LAB_ROUTER_ARGS=pd_keep=0.
 #                        IPv6 on the router's networks (docs/ipv6.md step
 #                        1; router ipv6=1): the client gets a SLAAC
 #                        address from the main LAN's ULA /64, no default
@@ -310,6 +321,7 @@ IPV6_OPEN="${LAB_IPV6_OPEN:-}"
 [[ "$IPV6" == 1 ]] && IPV6=pd
 ISP_IPV6="$IPV6"
 ISP_PD="${LAB_IPV6_PD:-1}"
+ISP_DNS6="${LAB_IPV6_DNS6:-1}"
 if [[ "$IPV6" == static && -n "$ISP_PPPOE" ]]; then
   echo "lab-test: LAB_IPV6=static is for an Ethernet WAN; with LAB_PPPOE use LAB_IPV6=1" >&2
   exit 2
@@ -582,7 +594,7 @@ PIDS+=($!)
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
   VM_NIC2="${PORTS:+52:54:00:00:00:11 $((LAN1_PORT + 1)) $LAN1_PORT}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${ACK:+ lab_ack=1} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${ACK:+ lab_ack=1} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so
@@ -600,6 +612,11 @@ if [[ "${LAB_VERBOSE:-0}" == "1" ]]; then
     echo "== $vm console"; tr -d '\r' <"$WORK/$vm.log" | sed "s/^/  ${vm:0:1}| /"
   done
 fi
+
+# The router's checks read its log up to a reboot (the client's last
+# check, LAB_IPV6=1 with a store, reboots it: counters start over).
+RLOG="$WORK/router-checks.log"
+tr -d '\r' <"$WORK/router.log" | awk '/leatos: boot ok/ { n++ } n < 2' >"$RLOG"
 
 echo "== router"
 tr -d '\r' <"$WORK/router.log" | grep -E "dhcp  |lan services|dns-over-tls|rtc  |dns upstreams|net lan0  |net wan0 .*(lease|vlan|PPPoE)|pppoe |net ping|qos |qdisc |cpu  |ntp  |watchdog  |vlan  " | sed 's/^/  /' || true
@@ -624,7 +641,7 @@ if [[ "$SHAPE_KBIT" != 0 ]]; then
   [[ -n "$ACK" ]] && pairs=("$downq download $down")
   for pair in "${pairs[@]}"; do
     set -- $pair
-    line=$(tr -d '\r' <"$WORK/router.log" | grep "qdisc $1 " | tail -1)
+    line=$(cat "$RLOG" | grep "qdisc $1 " | tail -1)
     drops=$(echo "$line" | sed -n 's/.*aqm drops \([0-9]*\).*/\1/p')
     marks=$(echo "$line" | sed -n 's/.*ecn marks \([0-9]*\).*/\1/p')
     what="$2 ($1): aqm drops ${drops:-?}, ecn marks ${marks:-?}"
@@ -649,7 +666,7 @@ if [[ "$SHAPE_KBIT" != 0 ]]; then
   # the client's download check shows TCP still delivered the file whole.
   # Negative control LAB_ACK_FILTER=0: no ACK drops, the check fails.
   if [[ -n "$ACK" ]]; then
-    wl=$(tr -d '\r' <"$WORK/router.log" | grep "qdisc wan0 " | tail -1)
+    wl=$(cat "$RLOG" | grep "qdisc wan0 " | tail -1)
     ackd=$(echo "$wl" | sed -n 's/.*ack drops \([0-9]*\).*/\1/p')
     sent=$(echo "$wl" | sed -n 's/.*, sent \([0-9]*\),.*/\1/p')
     if [[ -n "$ackd" && "$ackd" -gt 0 ]]; then
@@ -659,7 +676,7 @@ if [[ "$SHAPE_KBIT" != 0 ]]; then
     fi
   fi
   qms=${LAB_EXPECT_QUEUE_MS:-100}
-  wq=$(tr -d '\r' <"$WORK/router.log" | grep "qdisc wan0 ")
+  wq=$(cat "$RLOG" | grep "qdisc wan0 ")
   ovf=$(echo "$wq" | tail -1 | sed -n 's/.*overflow drops \([0-9]*\).*/\1/p')
   worst=$(echo "$wq" | sed -n 's/.*max sojourn \([0-9]*\)\.[0-9]* ms.*/\1/p' | sort -n | tail -1)
   what="wan0 worst sojourn ${worst:-?} ms, overflow drops ${ovf:-?} (expected <= $((qms + 20)) ms)"
@@ -679,17 +696,17 @@ fi
 # PPPoE: the session came up (MTU 1492, DNS from IPCP) before the client
 # ran; the reconnect is the client's check.
 if [[ -n "$ISP_PPPOE" ]]; then
-  up=$(tr -d '\r' <"$WORK/router.log" | grep "pppoe wan0 .*: up," | head -1 || true)
+  up=$(cat "$RLOG" | grep "pppoe wan0 .*: up," | head -1 || true)
   if echo "$up" | grep -q "203.0.113.50 peer 203.0.113.1 dns \[203.0.113.1\] mtu 1492 (AC isp-ac)"; then
     echo "  LAB PASS: pppoe ($ISP_PPPOE): ${up##*: }"
   else
     echo "  LAB FAIL: pppoe ($ISP_PPPOE): no session (${up:-no 'up' line in the router log})"
-    tr -d '\r' <"$WORK/router.log" | grep "pppoe " | tail -3 | sed 's/^/    | /'
+    cat "$RLOG" | grep "pppoe " | tail -3 | sed 's/^/    | /'
     router_fails=$((router_fails + 1))
   fi
   if [[ -n "$IPV6" ]]; then
     # IPv6CP negotiated (docs/ipv6.md step 4).
-    v6=$(tr -d '\r' <"$WORK/router.log" | grep "pppoe wan0 .*: IPv6CP up, fe80::" | head -1 || true)
+    v6=$(cat "$RLOG" | grep "pppoe wan0 .*: IPv6CP up, fe80::" | head -1 || true)
     if [[ -n "$v6" ]]; then
       echo "  LAB PASS: pppoe ipv6: ${v6##*: }"
     else
@@ -698,7 +715,7 @@ if [[ -n "$ISP_PPPOE" ]]; then
     fi
   else
     # The ISP's IPv6CP offer is logged (docs/ipv6.md step 0).
-    v6=$(tr -d '\r' <"$WORK/router.log" | grep "pppoe wan0 .*: the access concentrator offers IPv6 (IPv6CP, interface id " | head -1 || true)
+    v6=$(cat "$RLOG" | grep "pppoe wan0 .*: the access concentrator offers IPv6 (IPv6CP, interface id " | head -1 || true)
     if [[ -n "$v6" ]]; then
       echo "  LAB PASS: pppoe ipv6 offer: ${v6##*: }"
     else
@@ -711,7 +728,7 @@ fi
 # Static WAN: the router configured its address (no DHCP server at the
 # ISP), and the ISP saw it as the NATed source.
 if [[ -n "$ISP_STATIC" ]]; then
-  st=$(tr -d '\r' <"$WORK/router.log" | grep "net wan0 .*: static " | head -1 || true)
+  st=$(cat "$RLOG" | grep "net wan0 .*: static " | head -1 || true)
   seen=$(tr -d '\r' <"$WORK/client.log" | grep "LAB PASS: nat: ISP sees source" | head -1 || true)
   if echo "$st" | grep -q "static 203.0.113.60/24 gw 203.0.113.1 dns \[203.0.113.1\]" && echo "$seen" | grep -q "source 203.0.113.60 "; then
     echo "  LAB PASS: static wan: ${st##*: } (NATed source 203.0.113.60)"
@@ -724,7 +741,7 @@ fi
 # DNS over TLS: the router's connection came up, and the ISP's DoT server
 # (dnsmasq behind stunnel) answered queries.
 if [[ -n "$DOT" ]]; then
-  up=$(tr -d '\r' <"$WORK/router.log" | grep "dns-over-tls    : 203.0.113.1#.* up:" | head -1 || true)
+  up=$(cat "$RLOG" | grep "dns-over-tls    : 203.0.113.1#.* up:" | head -1 || true)
   n=$(tr -d '\r' <"$WORK/isp.log" | grep -c "isp-dot: .*query\[" || true)
   if [[ -n "$up" && "$n" -gt 0 ]]; then
     echo "  LAB PASS: dns over tls: ${up##*: 203.0.113.1#} ($n queries at the ISP's DoT server)"
@@ -740,7 +757,7 @@ if [[ -n "$DOT" ]]; then
       echo "  LAB FAIL: dns over tls dates before SNTP: expected '$pat' ($want)"; router_fails=$((router_fails + 1))
     fi
     if [[ "$want" == expired ]]; then
-      set_line=$(tr -d '\r' <"$WORK/router.log" | grep "rtc  .*: was .* s off, set to" | head -1 || true)
+      set_line=$(cat "$RLOG" | grep "rtc  .*: was .* s off, set to" | head -1 || true)
       if [[ -n "$set_line" ]]; then
         echo "  LAB PASS: rtc corrected after SNTP: ${set_line##*: }"
       else
@@ -749,14 +766,14 @@ if [[ -n "$DOT" ]]; then
     fi
   else
     echo "  LAB FAIL: dns over tls: ${up:-no connection} ($n queries at the ISP's DoT server)"
-    tr -d '\r' <"$WORK/router.log" | grep "dns-over-tls" | tail -3 | sed 's/^/    | /'
+    cat "$RLOG" | grep "dns-over-tls" | tail -3 | sed 's/^/    | /'
     router_fails=$((router_fails + 1))
   fi
 fi
 
 # SNTP: synced, and the time it then reported is the host's (±5 s; the
 # ISP VM's clock comes from the host's RTC).
-sync=$(tr -d '\r' <"$WORK/router.log" | grep "ntp  .*synced to" | head -1 || true)
+sync=$(cat "$RLOG" | grep "ntp  .*synced to" | head -1 || true)
 utc=$(echo "$sync" | sed -n 's/.*: \([0-9-]*T[0-9:]*Z\)$/\1/p')
 router_s=$( [[ -n "$utc" ]] && date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$utc" +%s 2>/dev/null || true)
 seen_s=$(cat "$WORK/ntp-seen" 2>/dev/null || true)
@@ -784,7 +801,7 @@ fi
 # 2. placement: with QEMU_SMP >= 3 dp_up runs on core 1, else on core 0
 #    (LAB_EXPECT_UP_CORE overrides). Negative control: QEMU_SMP=4 with
 #    LAB_ROUTER_ARGS=cores=2 keeps dp_up on core 0 and fails.
-line=$(tr -d '\r' <"$WORK/router.log" | grep "  cpu  " | tail -1 || true)
+line=$(cat "$RLOG" | grep "  cpu  " | tail -1 || true)
 task_ms() { echo "$line" | sed -n "s/.*, $1@[0-9]* \([0-9]*\) ms.*/\1/p"; }
 task_core() { echo "$line" | sed -n "s/.*, $1@\([0-9]*\) .*/\1/p"; }
 load=$(tr -d '\r' <"$WORK/client.log" | grep "^LAB CPU load:" | tail -1 || true)

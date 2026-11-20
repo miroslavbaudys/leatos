@@ -31,7 +31,7 @@ use crate::{println, timer};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use proto_dhcp::v4::packet::{CLIENT_PORT, SERVER_PORT};
 use proto_dhcp::v4::persist;
 use proto_dhcp::v4::server::{self as dhcp, Event as DhcpEvent};
@@ -75,6 +75,9 @@ pub struct LanServices {
     upstream_sock: Option<SocketHandle>,
     /// The WAN lease's DNS servers (used without `dns.upstreams`).
     lease_dns: Vec<Ipv4Addr>,
+    /// The ISP's IPv6 DNS servers (DHCPv6, `net::wan6`): after the lease's,
+    /// while the WAN has a global address to ask them from.
+    lease_dns6: Vec<Ipv6Addr>,
     /// UDP port per configured upstream (53 unless given).
     udp_ports: Vec<(Ipv4Addr, u16)>,
     /// `dns.tls`: upstream queries only through `dot`; if that is `None`
@@ -317,6 +320,7 @@ impl LanServices {
             local_hosts,
             upstream_sock,
             lease_dns: Vec::new(),
+            lease_dns6: Vec::new(),
             udp_ports: Vec::new(),
             tls: false,
             dot: None,
@@ -335,7 +339,7 @@ impl LanServices {
     fn apply_upstreams(&mut self, hosts: &mut [HostIf]) {
         let d = config::dns();
         let own = !d.upstreams.is_empty() || d.tls;
-        let ips: Vec<Ipv4Addr> = if own { d.upstreams.iter().map(|u| u.ip).collect() } else { self.lease_dns.clone() };
+        let ips: Vec<IpAddr> = if own { d.upstreams.iter().map(|u| IpAddr::V4(u.ip)).collect() } else { self.lease_upstreams() };
         self.dns.set_upstreams(&ips);
         self.udp_ports = d.upstreams.iter().map(|u| (u.ip, u.port(false))).collect();
         self.tls = d.tls;
@@ -366,7 +370,7 @@ impl LanServices {
     }
 
     /// The upstreams the resolver asks.
-    pub fn upstreams(&self) -> &[Ipv4Addr] {
+    pub fn upstreams(&self) -> &[IpAddr] {
         self.dns.upstreams()
     }
 
@@ -543,8 +547,31 @@ impl LanServices {
     /// names its own (`dns.upstreams`, `dns.tls`).
     pub fn set_upstreams(&mut self, servers: &[Ipv4Addr]) {
         self.lease_dns = servers.to_vec();
-        if !self.tls && self.udp_ports.is_empty() {
-            self.dns.set_upstreams(servers);
+        self.refresh_lease_upstreams();
+    }
+
+    /// The ISP's IPv6 DNS servers (`net::wan6`), or the WAN's IPv6 address
+    /// came or went: the resolver's list follows.
+    pub fn set_dns6(&mut self, servers: &[Ipv6Addr]) {
+        self.lease_dns6 = servers.to_vec();
+        self.refresh_lease_upstreams();
+    }
+
+    /// The WAN's servers: the lease's IPv4 ones, then the IPv6 ones once
+    /// the WAN has a global IPv6 address (the source to ask them from).
+    fn lease_upstreams(&self) -> Vec<IpAddr> {
+        let v6 = config::wan6().is_some_and(|w| w.addr.is_some());
+        let mut v: Vec<IpAddr> = self.lease_dns.iter().map(|&a| IpAddr::V4(a)).collect();
+        if v6 {
+            v.extend(self.lease_dns6.iter().map(|&a| IpAddr::V6(a)));
+        }
+        v
+    }
+
+    fn refresh_lease_upstreams(&mut self) {
+        let ups = self.lease_upstreams();
+        if !self.tls && self.udp_ports.is_empty() && self.dns.upstreams() != ups.as_slice() {
+            self.dns.set_upstreams(&ups);
         }
     }
 
@@ -591,8 +618,8 @@ impl LanServices {
     }
 
     /// The UDP port of an upstream: as configured, else 53.
-    fn udp_port(&self, server: Ipv4Addr) -> u16 {
-        self.udp_ports.iter().find(|(ip, _)| *ip == server).map_or(DNS_PORT, |&(_, p)| p)
+    fn udp_port(&self, server: IpAddr) -> u16 {
+        self.udp_ports.iter().find(|(ip, _)| IpAddr::V4(*ip) == server).map_or(DNS_PORT, |&(_, p)| p)
     }
 
     /// Send resolver output: answers to clients go out on the socket of
@@ -633,13 +660,13 @@ impl LanServices {
                 }
                 // Strict: with `dns.tls` never UDP, also when TLS is unavailable.
                 Action::Upstream { server, data } if self.tls => {
-                    if let Some(dot) = self.dot.as_mut() {
+                    if let (Some(dot), IpAddr::V4(server)) = (self.dot.as_mut(), server) {
                         dot.send(&mut hosts[0], server, &data);
                     }
                 }
                 Action::Upstream { server, data } => {
                     if let Some(h) = self.upstream_sock {
-                        let ep = IpEndpoint::new(IpAddr::V4(server).into(), self.udp_port(server));
+                        let ep = IpEndpoint::new(server.into(), self.udp_port(server));
                         let _ = hosts[0].sockets.get_mut::<udp::Socket>(h).send_slice(&data, ep);
                     }
                 }
@@ -725,10 +752,10 @@ impl LanServices {
         if let Some(h) = self.upstream_sock {
             let mut rbuf = [0u8; 4096]; // EDNS responses may exceed 1500 B
             while let Ok((n, meta)) = hosts[0].sockets.get_mut::<udp::Socket>(h).recv_slice(&mut rbuf) {
-                let from = match IpAddr::from(meta.endpoint.addr) {
-                    IpAddr::V4(a) if !self.tls && meta.endpoint.port == self.udp_port(a) => a,
-                    _ => continue,
-                };
+                let from = IpAddr::from(meta.endpoint.addr);
+                if self.tls || meta.endpoint.port != self.udp_port(from) {
+                    continue;
+                }
                 let actions = self.dns.handle_upstream(now_ms(), from, &rbuf[..n]);
                 self.send_dns(hosts, actions);
             }

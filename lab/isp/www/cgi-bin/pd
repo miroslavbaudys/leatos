@@ -6,6 +6,15 @@ bb=/usr/bin/busybox
 echo "Content-Type: text/plain"
 echo
 case "$QUERY_STRING" in
+  fresh)
+    # A server that has forgotten every lease and picks prefixes at
+    # random (the router's reboot check: only its hint brings the old
+    # prefix back). Stopped now, the new one 3 s later (the caller reboots
+    # the router meanwhile, so no renewal reaches it first).
+    /usr/sbin/lab-kea stop
+    ( $bb sleep 3; /usr/sbin/lab-kea start "$($bb cat /tmp/kea-if)" "$($bb cat /tmp/kea-pool)" random >/dev/null ) </dev/null >/dev/null 2>&1 &
+    echo "pd=fresh"
+    ;;
   change)
     /usr/sbin/lab-kea stop
     /usr/sbin/lab-kea start "$($bb cat /tmp/kea-if)" 2001:db8:200:: >/dev/null

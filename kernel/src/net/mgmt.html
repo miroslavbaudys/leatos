@@ -912,7 +912,7 @@ async function refresh() {
       ...(l.via ? [["Link", `${esc(l.via)}, MTU ${l.mtu}`]] : [])] : [["Lease", "none"]]), ...ppp,
     ...(st.pppoe_drops ? [["PPPoE drops", n(st.pppoe_drops)]] : []),
     ...(st.wan_ipv6 ? [["IPv6", st.wan_ipv6.source === "dhcpv6-pd"
-      ? `prefix ${esc(st.wan_ipv6.prefix ?? "none")} (DHCPv6-PD ${esc(st.wan_ipv6.state)}${st.wan_ipv6.prefix ? `, valid ${st.wan_ipv6.valid} s` : ""}) · router ${esc(st.wan_ipv6.gateway ?? "none")}`
+      ? `prefix ${esc(st.wan_ipv6.prefix ?? "none")} (DHCPv6-PD ${esc(st.wan_ipv6.state)}${st.wan_ipv6.prefix ? `, valid ${st.wan_ipv6.valid} s` : ""})${st.wan_ipv6.addr ? ` · address ${esc(st.wan_ipv6.addr)}` : ""} · router ${esc(st.wan_ipv6.gateway ?? "none")}${st.wan_ipv6.router_from ? ` (${st.wan_ipv6.router_from === "ra" ? "from its RA" : "the PPPoE peer: no RA"})` : ""}${(st.wan_ipv6.dns || []).length ? ` · DNS ${st.wan_ipv6.dns.map(esc).join(", ")}` : ""}`
       : `${esc(st.wan_ipv6.addr ?? "")} · router ${esc(st.wan_ipv6.gateway)} (static)`]] : []),
     ...(p?.ipv6cp_offered ? [["IPv6", `offered by the access concentrator (${n(p.ipv6cp_offered)} IPv6CP request(s)), not used yet`]] : [])]);
   const d = st.dns;

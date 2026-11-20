@@ -43,7 +43,7 @@ linux_vm() { # initrd mac local_port remote_port log [extra kernel args]
 # PPPoE access concentrator (both need ALPINE_DIR from
 # `fetch-alpine.sh modloop`), with ISP_STATIC=1 it runs no DHCP server.
 start_isp() { # wan_port log
-  local args="${ISP_VLAN:+lab_vlan=$ISP_VLAN} ${ISP_PPPOE:+lab_pppoe=$ISP_PPPOE} ${ISP_PPPOE_IPV6:+lab_pppoe_ipv6=$ISP_PPPOE_IPV6} ${ISP_STATIC:+lab_static=1} ${ISP_IPV6:+lab_ipv6=$ISP_IPV6 lab_pd=$ISP_PD}"
+  local args="${ISP_VLAN:+lab_vlan=$ISP_VLAN} ${ISP_PPPOE:+lab_pppoe=$ISP_PPPOE} ${ISP_PPPOE_IPV6:+lab_pppoe_ipv6=$ISP_PPPOE_IPV6} ${ISP_STATIC:+lab_static=1} ${ISP_IPV6:+lab_ipv6=$ISP_IPV6 lab_pd=$ISP_PD lab_dns6=$ISP_DNS6}"
   if [[ -n "${ISP_VLAN:-}${ISP_PPPOE:-}" ]]; then
     VM_DISK="$ALPINE_DIR/modloop-virt" linux_vm "$ISP_INITRD" 52:54:00:00:01:01 $(($1 + 1)) "$1" "$2" "$args"
   else

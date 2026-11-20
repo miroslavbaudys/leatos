@@ -41,11 +41,30 @@ pub struct State {
     pub prefix: Option<(Ipv6Addr, u8)>,
     pub preferred_secs: u32,
     pub valid_secs: u32,
+    /// The ISP's DNS servers from the delegation's reply.
+    pub dns: Vec<Ipv6Addr>,
+    /// The default router came from an RA (else, on PPPoE, the IPv6CP
+    /// peer).
+    pub from_ra: bool,
     /// The DHCPv6 client's state (status).
     pub pd_state: &'static str,
 }
 
 static STATE: spin::Mutex<Option<State>> = spin::Mutex::new(None);
+
+/// The last delegated prefix (this boot, or from the store's lease
+/// record): asked for again, kept across restarts.
+static LAST: spin::Mutex<Option<(Ipv6Addr, u8)>> = spin::Mutex::new(None);
+
+/// The prefix from the store at boot (`svc::LeaseStore`).
+pub fn set_last(p: Option<(Ipv6Addr, u8)>) {
+    *LAST.lock() = p;
+}
+
+/// The last delegated prefix, for the store.
+pub fn last() -> Option<(Ipv6Addr, u8)> {
+    *LAST.lock()
+}
 
 /// PPPoE: IPv6CP's link-local addresses (ours, the peer's) while IPv6 is
 /// up on the session.
@@ -64,6 +83,11 @@ pub fn ppp_link() -> Option<(Ipv6Addr, Option<Ipv6Addr>)> {
 /// The WAN's link-local address: IPv6CP's on PPPoE, else the MAC's.
 pub fn wan_link_local(sh: &Shared) -> Option<Ipv6Addr> {
     if sh.ports[0].is_pppoe() { ppp_link().map(|l| l.0) } else { Some(fwd::wire::link_local(sh.ports[0].mac)) }
+}
+
+/// The ISP's IPv6 DNS servers (none while prefix delegation is not bound).
+pub fn dns() -> Vec<Ipv6Addr> {
+    state().map(|s| s.dns).unwrap_or_default()
 }
 
 /// The WAN's learned IPv6, if prefix delegation runs.
@@ -106,7 +130,7 @@ impl Wan6 {
         s.bind(pd::CLIENT_PORT).expect("bind :546");
         let sock = wan.sockets.add(s);
         let hint = crate::config::get_ipv6().prefix_hint;
-        let pd = Client::new(PdConfig { mac, iaid: 1, hint_len: hint }, now, crate::timer::ticks());
+        let pd = Client::new(PdConfig { mac, iaid: 1, hint_len: hint, last: last().filter(|_| crate::config::pd_keep()) }, now, crate::timer::ticks());
         println!("  wan6            : DHCPv6 prefix delegation (asking for a /{hint}), router solicitations");
         let shown = State { pd_state: pd.state().name(), ..State::default() };
         *STATE.lock() = Some(shown.clone());
@@ -163,6 +187,9 @@ impl Wan6 {
             }
         }
         let d = self.pd.delegation();
+        if let Some(d) = d {
+            *LAST.lock() = Some((d.prefix, d.len));
+        }
         let now_state = State {
             // PPPoE: the RA's router, else the IPv6CP peer (point to point:
             // the session is the route).
@@ -170,9 +197,11 @@ impl Wan6 {
             prefix: d.map(|d| (d.prefix, d.len)),
             preferred_secs: d.map_or(0, |d| d.preferred_secs),
             valid_secs: d.map_or(0, |d| d.valid_secs),
+            dns: d.map(|d| d.dns.clone()).unwrap_or_default(),
+            from_ra: self.router.is_some(),
             pd_state: self.pd.state().name(),
         };
-        let changed = now_state.gateway != self.shown.gateway || now_state.prefix != self.shown.prefix;
+        let changed = now_state.gateway != self.shown.gateway || now_state.prefix != self.shown.prefix || now_state.dns != self.shown.dns;
         if changed && now_state.gateway != self.shown.gateway {
             match now_state.gateway {
                 Some(g) => println!("  wan6            : default router {g}"),
@@ -211,12 +240,19 @@ pub fn status_json() -> Option<Vec<u8>> {
     let q = |v: Option<alloc::string::String>| v.map_or_else(|| alloc::string::String::from("null"), |s| alloc::format!("\"{s}\""));
     Some(
         alloc::format!(
-            "{{\"source\":\"dhcpv6-pd\",\"state\":\"{}\",\"gateway\":{},\"prefix\":{},\"preferred\":{},\"valid\":{}}}",
+            "{{\"source\":\"dhcpv6-pd\",\"state\":\"{}\",\"gateway\":{},\"router_from\":{},\"prefix\":{},\"preferred\":{},\"valid\":{},\"addr\":{},\"dns\":[{}]}}",
             s.pd_state,
             q(s.gateway.map(|g| alloc::format!("{g}"))),
+            match (s.gateway, s.from_ra) {
+                (None, _) => "null",
+                (Some(_), true) => "\"ra\"",
+                (Some(_), false) => "\"ipv6cp\"",
+            },
             q(s.prefix.map(|(p, l)| alloc::format!("{p}/{l}"))),
             s.preferred_secs,
-            s.valid_secs
+            s.valid_secs,
+            q(s.prefix.and_then(|(p, l)| crate::config::wan_address6(p, l)).map(|a| alloc::format!("{a}"))),
+            s.dns.iter().map(|d| alloc::format!("\"{d}\"")).collect::<Vec<_>>().join(",")
         )
         .into_bytes(),
     )

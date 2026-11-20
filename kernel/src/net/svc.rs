@@ -470,10 +470,12 @@ fn reapply_networks(
         }
         sh.post_networks(msg);
         if let Some(svc) = services {
+            svc.set_dns6(&crate::net::wan6::dns());
             svc.reconfigure(hosts, &links);
         }
         mgmt.add_sockets(hosts, &links);
     } else if let Some(svc) = services {
+        svc.set_dns6(&crate::net::wan6::dns());
         svc.reconfigure(hosts, &[]);
     }
 }
@@ -595,6 +597,8 @@ struct LeaseStore {
     enabled: bool,
     /// What the store holds (or, after a restore, what was kept of it).
     saved: Vec<persist::Network>,
+    /// The WAN's last delegated IPv6 prefix as stored (`net::wan6::last`).
+    saved_prefix: Option<(core::net::Ipv6Addr, u8)>,
     next_check: timer::Instant,
 }
 
@@ -603,25 +607,29 @@ impl LeaseStore {
         let mut me = LeaseStore {
             enabled: false,
             saved: Vec::new(),
+            saved_prefix: None,
             next_check: timer::Instant::now().checked_add(LEASE_CHECK).unwrap_or(timer::Instant::now()),
         };
         let (Some(st), Some(svc)) = (st, svc) else {
             return me;
         };
-        match st.read_current(LEASE_AREA, persist::FORMAT).await {
+        match st.read_current(LEASE_AREA, persist::FORMAT_V2).await {
             Err(e) => {
                 println!("  leases          : not kept ({e})");
                 return me;
             }
             Ok((None, _)) => println!("  leases          : none stored"),
-            Ok((Some(rec), _)) => match persist::decode(&rec.payload) {
-                Ok(nets) => {
+            Ok((Some(rec), _)) => match persist::decode_version(rec.header.version, &rec.payload) {
+                Ok((nets, prefix)) => {
                     let (kept, saved) = svc.restore_leases(&nets);
                     println!(
-                        "  leases          : restored {kept} of {saved} (slot {}, seq {})",
+                        "  leases          : restored {kept} of {saved} (slot {}, seq {}){}",
                         crate::store::slot_name(rec.slot),
-                        rec.header.seq
+                        rec.header.seq,
+                        prefix.map_or(String::new(), |(p, l)| alloc::format!(", last IPv6 prefix {p}/{l}"))
                     );
+                    crate::net::wan6::set_last(prefix);
+                    me.saved_prefix = prefix;
                 }
                 Err(e) => println!("  leases          : stored record unreadable ({e}), starting empty"),
             },
@@ -646,11 +654,12 @@ impl LeaseStore {
             return;
         };
         let snap = svc.lease_snapshot();
-        if snap == self.saved {
+        let prefix = crate::net::wan6::last();
+        if snap == self.saved && prefix == self.saved_prefix {
             return;
         }
-        let data = persist::encode(&snap);
-        match st.write_record(LEASE_AREA, persist::FORMAT, persist::FORMAT, &data, 0).await {
+        let data = persist::encode_v2(&snap, prefix);
+        match st.write_record(LEASE_AREA, persist::FORMAT_V2, persist::FORMAT_V2, &data, 0).await {
             Ok((slot, h)) => {
                 println!(
                     "  leases          : saved {} (slot {}, seq {}, {} bytes)",
@@ -660,6 +669,7 @@ impl LeaseStore {
                     h.len
                 );
                 self.saved = snap;
+                self.saved_prefix = prefix;
             }
             // Tried again at the next check.
             Err(e) => println!("  leases          : save failed: {e}"),
