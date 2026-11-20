@@ -13,6 +13,7 @@ use core::net::Ipv4Addr;
 
 pub const PORT: u16 = 5353;
 pub const GROUP_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
+pub const GROUP_V6: core::net::Ipv6Addr = core::net::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
 pub const HEADER_LEN: usize = 12;
 /// RFC 6762 §17: messages up to 9000 bytes.
 pub const MAX_MESSAGE: usize = 9000;

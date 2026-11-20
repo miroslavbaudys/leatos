@@ -15,13 +15,15 @@
 //! questions: a name in use on the other network is still defended) and
 //! additional records. Received messages are dropped when they come from a
 //! port other than 5353 (legacy unicast, not handled), from outside the
-//! network's subnet or from the router itself, when the source network is
-//! over its rate, and when they equal a message sent within the last
-//! second (another reflector echoing ours).
+//! network's subnet (IPv6: link-local or the network's /64s) or from the
+//! router itself, when the source network is over its rate, and when they
+//! equal a message sent within the last second (another reflector echoing
+//! ours). Each copy goes out in the family its message came in on
+//! ([`Output::v6`]: to ff02::fb instead of 224.0.0.251).
 
 use alloc::vec::Vec;
 use core::fmt;
-use core::net::{Ipv4Addr, SocketAddrV4};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::wire::{CLASS_TOP_BIT, Message, PORT, Record, TYPE_SRV};
 
@@ -38,6 +40,8 @@ pub const DUP_WINDOW_MS: u64 = 1000;
 pub const MAX_HOSTS: usize = 128;
 /// Largest message sent: one unfragmented IPv4 UDP datagram at MTU 1500.
 pub const MAX_OUTPUT: usize = 1472;
+/// The same over IPv6 (40 bytes of header instead of 20).
+pub const MAX_OUTPUT_V6: usize = 1452;
 /// Cap on how long a learned host stays (RFC 6762 §10: 75 min for most
 /// records).
 const MAX_HOST_TTL_SECS: u64 = 4500;
@@ -83,17 +87,41 @@ impl fmt::Display for ServiceType {
     }
 }
 
-/// The router's address on a network and the network's prefix length.
+/// The router's address on a network and the network's prefix length;
+/// with IPv6, its addresses there (link-local, unique local, global: the
+/// last two name the network's /64s).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Net {
     pub addr: Ipv4Addr,
     pub prefix_len: u8,
+    pub addrs6: [Option<Ipv6Addr>; 3],
 }
 
 impl Net {
-    fn contains(&self, a: Ipv4Addr) -> bool {
-        let mask = u32::MAX.checked_shl(32 - u32::from(self.prefix_len.min(32))).unwrap_or(0);
-        u32::from(a) & mask == u32::from(self.addr) & mask
+    /// An IPv4-only network.
+    pub const fn v4(addr: Ipv4Addr, prefix_len: u8) -> Self {
+        Net { addr, prefix_len, addrs6: [None; 3] }
+    }
+
+    fn contains(&self, a: IpAddr) -> bool {
+        match a {
+            IpAddr::V4(a) => {
+                let mask = u32::MAX.checked_shl(32 - u32::from(self.prefix_len.min(32))).unwrap_or(0);
+                u32::from(a) & mask == u32::from(self.addr) & mask
+            }
+            // On the link (link-local) or in one of the network's /64s.
+            IpAddr::V6(a) => {
+                a.segments()[0] & 0xffc0 == 0xfe80
+                    || self.addrs6[1..].iter().flatten().any(|&p| u128::from(p) >> 64 == u128::from(a) >> 64)
+            }
+        }
+    }
+
+    fn is_mine(&self, a: IpAddr) -> bool {
+        match a {
+            IpAddr::V4(a) => a == self.addr,
+            IpAddr::V6(a) => self.addrs6.contains(&Some(a)),
+        }
     }
 }
 
@@ -132,11 +160,13 @@ pub struct Stats {
     pub oversize: u64,
 }
 
-/// A message to send to `224.0.0.251:5353` on `net`.
+/// A message to send to `224.0.0.251:5353` on `net` (`v6`: to
+/// `[ff02::fb]:5353`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Output {
     pub net: NetId,
     pub msg: Vec<u8>,
+    pub v6: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -205,13 +235,15 @@ impl Reflector {
     }
 
     /// One message received on `from` from `src`. Returns the copies to send.
-    pub fn handle(&mut self, now_ms: u64, from: NetId, src: SocketAddrV4, msg: &[u8]) -> Vec<Output> {
+    pub fn handle(&mut self, now_ms: u64, from: NetId, src: impl Into<SocketAddr>, msg: &[u8]) -> Vec<Output> {
+        let src: SocketAddr = src.into();
+        let v6 = src.is_ipv6();
         let Some(Some(net)) = self.cfg.nets.get(from).copied() else {
             return Vec::new();
         };
         self.stats[from].received += 1;
-        let own = self.cfg.nets.iter().flatten().any(|n| n.addr == *src.ip());
-        if src.port() != PORT || own || !net.contains(*src.ip()) {
+        let own = self.cfg.nets.iter().flatten().any(|n| n.is_mine(src.ip()));
+        if src.port() != PORT || own || !net.contains(src.ip()) {
             self.stats[from].foreign += 1;
             return Vec::new();
         }
@@ -220,7 +252,7 @@ impl Reflector {
             return Vec::new();
         }
         self.recent.retain(|&(_, t)| now_ms.saturating_sub(t) < DUP_WINDOW_MS);
-        let hash = fnv1a(msg);
+        let hash = fnv1a(msg) ^ u64::from(v6);
         if self.recent.iter().any(|&(h, _)| h == hash) {
             self.stats[from].duplicate += 1;
             return Vec::new();
@@ -238,10 +270,10 @@ impl Reflector {
         let mut out = Vec::new();
         for (net, copy) in copies {
             match copy.to_bytes() {
-                Ok(b) if b.len() <= MAX_OUTPUT => {
-                    self.remember_sent(now_ms, fnv1a(&b));
+                Ok(b) if b.len() <= if v6 { MAX_OUTPUT_V6 } else { MAX_OUTPUT } => {
+                    self.remember_sent(now_ms, fnv1a(&b) ^ u64::from(v6));
                     self.stats[net].sent += 1;
-                    out.push(Output { net, msg: b });
+                    out.push(Output { net, msg: b, v6 });
                 }
                 _ => self.stats[from].oversize += 1,
             }

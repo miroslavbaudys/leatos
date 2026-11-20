@@ -22,7 +22,7 @@ fn svc(s: &str) -> ServiceType {
 }
 
 fn config() -> Config {
-    let net = |a: [u8; 4]| Some(Net { addr: Ipv4Addr::from(a), prefix_len: 24 });
+    let net = |a: [u8; 4]| Some(Net::v4(Ipv4Addr::from(a), 24));
     Config {
         nets: vec![net([10, 10, 0, 1]), net([10, 30, 0, 1]), net([10, 20, 0, 1])],
         rules: vec![Rule { from: IOT, to: vec![LAN], services: vec![svc("_airplay._tcp"), svc("_ipp._tcp")] }],
@@ -479,4 +479,51 @@ fn reconfigure_keeps_counters_forgets_hosts() {
     r.reconfigure(Config { rules: vec![], ..config() });
     assert!(!r.takes_part(LAN));
     assert!(r.handle(2, LAN, from(PHONE), &bytes(&query(vec![q("_ipp._tcp.local", TYPE_PTR)]))).is_empty());
+}
+
+fn config6() -> Config {
+    let mut c = config();
+    for (k, x) in [(0u16, 0u16), (1, 1), (2, 2)] {
+        if let Some(n) = c.nets[usize::from(k)].as_mut() {
+            n.addrs6 = [
+                Some(core::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1 + x)),
+                Some(core::net::Ipv6Addr::new(0xfd00, 1, 2, x, 0, 0, 0, 1)),
+                Some(core::net::Ipv6Addr::new(0x2001, 0xdb8, 0x100, x, 0, 0, 0, 1)),
+            ];
+        }
+    }
+    c
+}
+
+fn from6(s: &str) -> core::net::SocketAddr {
+    core::net::SocketAddr::new(s.parse::<core::net::Ipv6Addr>().unwrap().into(), PORT)
+}
+
+#[test]
+fn ipv6_messages_are_reflected_over_ipv6() {
+    let mut r = Reflector::new(config6());
+    // From a device's link-local address on iot: out to lan, over IPv6.
+    let out = r.handle(0, IOT, from6("fe80::1234"), &bytes(&announcement()));
+    assert_eq!(out.len(), 1);
+    assert_eq!((out[0].net, out[0].v6), (LAN, true));
+    // The same rules: the IPv4 copy of it goes out over IPv4.
+    let out = r.handle(2000, IOT, from(SPEAKER), &bytes(&announcement()));
+    assert_eq!((out[0].net, out[0].v6), (LAN, false));
+    // From the network's /64s too; not from another network's, not from
+    // the router's own addresses.
+    assert!(!r.handle(4000, IOT, from6("fd00:1:2:1::50"), &bytes(&announcement())).is_empty());
+    let before = r.stats(IOT).foreign;
+    assert!(r.handle(6000, IOT, from6("fd00:1:2:0::50"), &bytes(&announcement())).is_empty(), "lan's /64");
+    assert!(r.handle(8000, IOT, from6("fe80::2"), &bytes(&announcement())).is_empty(), "the router (iot)");
+    assert!(r.handle(9000, IOT, from6("2001:db8:999::5"), &bytes(&announcement())).is_empty());
+    assert_eq!(r.stats(IOT).foreign, before + 3);
+}
+
+#[test]
+fn ipv4_only_networks_take_link_local_ipv6_only() {
+    // Without IPv6 addresses a network still accepts link-local sources
+    // (the device is on the link) but no global ones.
+    let mut r = Reflector::new(config());
+    assert!(!r.handle(0, IOT, from6("fe80::1234"), &bytes(&announcement())).is_empty());
+    assert!(r.handle(2000, IOT, from6("2001:db8::5"), &bytes(&announcement())).is_empty());
 }

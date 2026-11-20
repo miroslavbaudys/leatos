@@ -27,4 +27,4 @@ pub use reflector::{
     BURST, MAX_HOSTS, MAX_OUTPUT, MAX_SERVICES, Config, DUP_WINDOW_MS, Net, NetId, Output, RATE_PER_SEC, Reflector, Rule,
     ServiceType, Stats,
 };
-pub use wire::{GROUP_V4, PORT};
+pub use wire::{GROUP_V4, GROUP_V6, PORT};
