@@ -1,10 +1,14 @@
-//! Neighbor (ARP) cache for forwarding, generic over the packet type.
+//! Neighbor cache for forwarding (ARP for IPv4, neighbor discovery for
+//! IPv6), generic over the packet type and the address family.
 //!
 //! Entries are learned by snooping ARP on each interface. A packet to an
 //! unresolved neighbor waits in a **tiny bounded** queue (at most
 //! [`MAX_PENDING`] per neighbor, oldest dropped) while an ARP request is
 //! retried; this is the only buffering outside the qdisc and is bounded by
-//! design (docs/bufferbloat-cake.md §3.1).
+//! design (docs/bufferbloat-cake.md §3.1). With
+//! [`NeighTable::with_incomplete_cap`] at most that many neighbors are
+//! being resolved at once (RFC 6583: a scan of an IPv6 /64 must not fill
+//! the table); a packet to another unknown one is dropped.
 
 use crate::IfIndex;
 use crate::wire::Mac;
@@ -36,26 +40,43 @@ pub enum Resolve<P> {
     Queued { send_arp: bool },
 }
 
-pub struct NeighTable<P> {
-    entries: BTreeMap<(IfIndex, Ipv4Addr), Entry<P>>,
+pub struct NeighTable<P, A = Ipv4Addr> {
+    entries: BTreeMap<(IfIndex, A), Entry<P>>,
     pub dropped: u64,
+    /// Entries being resolved, and the most allowed at once.
+    incomplete: usize,
+    max_incomplete: usize,
+    /// Packets dropped because [`Self::max_incomplete`] was reached (also
+    /// in `dropped`).
+    pub incomplete_drops: u64,
 }
 
-impl<P> Default for NeighTable<P> {
+impl<P, A> Default for NeighTable<P, A> {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
             dropped: 0,
+            incomplete: 0,
+            max_incomplete: usize::MAX,
+            incomplete_drops: 0,
         }
     }
 }
 
-impl<P> NeighTable<P> {
+impl<P, A: Copy + Ord> NeighTable<P, A> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn lookup(&self, ifx: IfIndex, ip: Ipv4Addr, now: u64) -> Option<Mac> {
+    /// At most `max` neighbors being resolved at once.
+    pub fn with_incomplete_cap(max: usize) -> Self {
+        Self {
+            max_incomplete: max,
+            ..Self::default()
+        }
+    }
+
+    pub fn lookup(&self, ifx: IfIndex, ip: A, now: u64) -> Option<Mac> {
         match self.entries.get(&(ifx, ip)) {
             Some(Entry::Reachable { mac, learned }) if now < learned + REACHABLE_MS => Some(*mac),
             _ => None,
@@ -63,18 +84,21 @@ impl<P> NeighTable<P> {
     }
 
     /// Learn `ip → mac`; returns packets that were waiting for it.
-    pub fn learn(&mut self, ifx: IfIndex, ip: Ipv4Addr, mac: Mac, now: u64) -> Vec<P> {
+    pub fn learn(&mut self, ifx: IfIndex, ip: A, mac: Mac, now: u64) -> Vec<P> {
         let old = self
             .entries
             .insert((ifx, ip), Entry::Reachable { mac, learned: now });
         match old {
-            Some(Entry::Incomplete { pending, .. }) => pending.into_iter().collect(),
+            Some(Entry::Incomplete { pending, .. }) => {
+                self.incomplete -= 1;
+                pending.into_iter().collect()
+            }
             _ => Vec::new(),
         }
     }
 
     /// Resolve the next hop for `pkt`.
-    pub fn resolve(&mut self, ifx: IfIndex, ip: Ipv4Addr, pkt: P, now: u64) -> Resolve<P> {
+    pub fn resolve(&mut self, ifx: IfIndex, ip: A, pkt: P, now: u64) -> Resolve<P> {
         if let Some(mac) = self.lookup(ifx, ip, now) {
             return Resolve::Ready(mac, pkt);
         }
@@ -88,6 +112,12 @@ impl<P> NeighTable<P> {
                 Resolve::Queued { send_arp: false }
             }
             _ => {
+                if self.incomplete >= self.max_incomplete {
+                    self.dropped += 1;
+                    self.incomplete_drops += 1;
+                    return Resolve::Queued { send_arp: false };
+                }
+                self.incomplete += 1;
                 let mut pending = VecDeque::with_capacity(MAX_PENDING);
                 pending.push_back(pkt);
                 self.entries.insert(
@@ -105,7 +135,7 @@ impl<P> NeighTable<P> {
 
     /// Retry or give up on unresolved neighbors and age out stale entries.
     /// Returns the (interface, address) pairs to send ARP requests for.
-    pub fn poll(&mut self, now: u64) -> Vec<(IfIndex, Ipv4Addr)> {
+    pub fn poll(&mut self, now: u64) -> Vec<(IfIndex, A)> {
         let mut retry = Vec::new();
         let mut dead = Vec::new();
         for (&k, e) in self.entries.iter_mut() {
@@ -117,6 +147,7 @@ impl<P> NeighTable<P> {
                 } if now >= *last_try + RETRY_MS => {
                     if *tries >= MAX_TRIES {
                         self.dropped += pending.len() as u64;
+                        self.incomplete -= 1;
                         dead.push(k);
                     } else {
                         *tries += 1;
@@ -173,6 +204,28 @@ mod tests {
             n.resolve(0, IP, 9, 3001),
             Resolve::Queued { send_arp: true }
         ));
+    }
+
+    #[test]
+    fn incomplete_entries_are_capped() {
+        use core::net::Ipv6Addr;
+        let mut n: NeighTable<u32, Ipv6Addr> = NeighTable::with_incomplete_cap(2);
+        let a = |i: u16| Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i);
+        assert!(matches!(n.resolve(0, a(1), 1, 0), Resolve::Queued { send_arp: true }));
+        assert!(matches!(n.resolve(0, a(2), 2, 0), Resolve::Queued { send_arp: true }));
+        // A scan's third address: dropped, no solicitation.
+        assert!(matches!(n.resolve(0, a(3), 3, 0), Resolve::Queued { send_arp: false }));
+        assert_eq!((n.dropped, n.incomplete_drops), (1, 1));
+        // One resolves, one gives up: room again.
+        assert_eq!(n.learn(0, a(1), MAC, 1), [1]);
+        assert!(matches!(n.resolve(0, a(4), 4, 1), Resolve::Queued { send_arp: true }));
+        for t in [1000, 2000, 3000] {
+            n.poll(t);
+        }
+        assert!(matches!(n.resolve(0, a(5), 5, 3001), Resolve::Queued { send_arp: true }));
+        // Queuing behind a neighbor already being resolved is not capped.
+        assert!(matches!(n.resolve(0, a(5), 6, 3001), Resolve::Queued { send_arp: false }));
+        assert_eq!(n.incomplete_drops, 1);
     }
 
     #[test]

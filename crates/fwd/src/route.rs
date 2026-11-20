@@ -1,4 +1,5 @@
-//! IPv4 routing table: longest-prefix match.
+//! Routing table: longest-prefix match, for IPv4 (the default) or IPv6
+//! ([`RouteAddr`]).
 //!
 //! A sorted list is plenty for a SOHO router (connected subnets + default
 //! route). A DIR-24-8 / Poptrie structure can replace it behind the same
@@ -6,15 +7,34 @@
 
 use crate::IfIndex;
 use alloc::vec::Vec;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
+
+/// An address family a [`RouteTable`] routes.
+pub trait RouteAddr: Copy + Eq {
+    /// The first `len` bits of the address, the rest zero.
+    fn masked(self, len: u8) -> Self;
+}
+
+impl RouteAddr for Ipv4Addr {
+    fn masked(self, len: u8) -> Self {
+        Ipv4Addr::from(u32::from(self) & mask(len))
+    }
+}
+
+impl RouteAddr for Ipv6Addr {
+    fn masked(self, len: u8) -> Self {
+        let m = if len == 0 { 0 } else { u128::MAX << (128 - u32::from(len.min(128))) };
+        Ipv6Addr::from(u128::from(self) & m)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Route {
-    pub prefix: Ipv4Addr,
+pub struct Route<A = Ipv4Addr> {
+    pub prefix: A,
     pub len: u8,
     pub egress: IfIndex,
     /// `None` = directly connected (next hop is the destination itself).
-    pub gateway: Option<Ipv4Addr>,
+    pub gateway: Option<A>,
     pub kind: RouteKind,
 }
 
@@ -47,27 +67,32 @@ fn mask(len: u8) -> u32 {
     }
 }
 
-impl Route {
-    pub fn contains(&self, a: Ipv4Addr) -> bool {
-        u32::from(a) & mask(self.len) == u32::from(self.prefix) & mask(self.len)
+impl<A: RouteAddr> Route<A> {
+    pub fn contains(&self, a: A) -> bool {
+        a.masked(self.len) == self.prefix.masked(self.len)
     }
 }
 
-#[derive(Default)]
-pub struct RouteTable {
+pub struct RouteTable<A = Ipv4Addr> {
     /// Sorted by prefix length, longest first.
-    routes: Vec<Route>,
+    routes: Vec<Route<A>>,
 }
 
-impl RouteTable {
+impl<A> Default for RouteTable<A> {
+    fn default() -> Self {
+        Self { routes: Vec::new() }
+    }
+}
+
+impl<A: RouteAddr> RouteTable<A> {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Add or replace the route for (prefix, len).
-    pub fn set(&mut self, r: Route) {
+    pub fn set(&mut self, r: Route<A>) {
         let r = Route {
-            prefix: Ipv4Addr::from(u32::from(r.prefix) & mask(r.len)),
+            prefix: r.prefix.masked(r.len),
             ..r
         };
         self.routes
@@ -80,16 +105,16 @@ impl RouteTable {
         self.routes.insert(pos, r);
     }
 
-    pub fn remove(&mut self, prefix: Ipv4Addr, len: u8) {
-        let p = Ipv4Addr::from(u32::from(prefix) & mask(len));
+    pub fn remove(&mut self, prefix: A, len: u8) {
+        let p = prefix.masked(len);
         self.routes.retain(|x| !(x.prefix == p && x.len == len));
     }
 
-    pub fn lookup(&self, dst: Ipv4Addr) -> Option<&Route> {
+    pub fn lookup(&self, dst: A) -> Option<&Route<A>> {
         self.routes.iter().find(|r| r.contains(dst))
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Route> {
+    pub fn iter(&self) -> impl Iterator<Item = &Route<A>> {
         self.routes.iter()
     }
 
@@ -99,8 +124,8 @@ impl RouteTable {
     }
 
     /// The route for exactly (prefix, len).
-    pub fn get(&self, prefix: Ipv4Addr, len: u8) -> Option<&Route> {
-        let p = Ipv4Addr::from(u32::from(prefix) & mask(len));
+    pub fn get(&self, prefix: A, len: u8) -> Option<&Route<A>> {
+        let p = prefix.masked(len);
         self.routes.iter().find(|x| x.prefix == p && x.len == len)
     }
 }
@@ -135,5 +160,20 @@ mod tests {
             Ipv4Addr::new(192, 168, 1, 0),
             "prefix normalised"
         );
+    }
+
+    #[test]
+    fn ipv6_longest_prefix_wins() {
+        let a = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        let mut t: RouteTable<Ipv6Addr> = RouteTable::new();
+        t.set(Route { prefix: Ipv6Addr::UNSPECIFIED, len: 0, egress: 0, gateway: Some(a("fe80::1")), kind: RouteKind::Default });
+        t.set(Route { prefix: a("2001:db8:100:1::1"), len: 64, egress: 2, gateway: None, kind: RouteKind::Connected });
+        t.set(Route { prefix: a("2001:db8:100::"), len: 56, egress: 1, gateway: None, kind: RouteKind::Static });
+        assert_eq!(t.lookup(a("2001:db8:100:1::99")).unwrap().egress, 2);
+        assert_eq!(t.lookup(a("2001:db8:100:7::1")).unwrap().egress, 1);
+        assert_eq!(t.lookup(a("2001:db8:999::1")).unwrap().egress, 0);
+        assert_eq!(t.get(a("2001:db8:100:1::"), 64).unwrap().prefix, a("2001:db8:100:1::"), "prefix normalised");
+        assert_eq!(Ipv6Addr::masked(a("ffff::ffff"), 1), a("8000::"));
+        assert_eq!(Ipv6Addr::masked(a("ffff::ffff"), 128), a("ffff::ffff"));
     }
 }

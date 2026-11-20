@@ -27,6 +27,7 @@ use crate::IfIndex;
 use crate::conntrack::{Conn, Conntrack, Dir, Tuple};
 use crate::frag;
 use crate::route::{Route, RouteKind, RouteTable};
+use crate::wire::Ipv6View as V6;
 use crate::wire::{
     self, ETH_HDR, ETHERTYPE_IPV4, ETHERTYPE_IPV6, ICMP_DEST_UNREACH, ICMP_TIME_EXCEEDED, Ipv4View,
     Ipv6View, Mac, PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP,
@@ -434,6 +435,14 @@ pub enum Verdict {
         /// buffers).
         split: u16,
     },
+    /// IPv6: send `len` bytes out of `egress` to `next_hop` (never split:
+    /// routers do not fragment IPv6).
+    Forward6 {
+        egress: IfIndex,
+        next_hop: Ipv6Addr,
+        len: usize,
+        class: Classification,
+    },
     Drop(DropReason),
 }
 
@@ -507,12 +516,20 @@ pub struct Forwarder {
     /// The last [`Self::process`]'s first fragment, forwarded: what its
     /// datagram's later fragments need ([`Self::take_fragment`]).
     frag: Option<frag::Decision>,
-    /// IPv6 to the router (docs/ipv6.md step 1): off = every IPv6 frame
-    /// is dropped as `unsupported`.
+    /// IPv6 (docs/ipv6.md): off = every IPv6 frame is dropped as
+    /// `unsupported`.
     pub ipv6: bool,
-    /// Per interface: the router's unique local address (link-local comes
-    /// from the MAC: [`wire::link_local`]).
-    ula6: Vec<Option<Ipv6Addr>>,
+    /// Per interface: the router's IPv6 addresses besides the link-local
+    /// one (from the MAC: [`wire::link_local`]): [unique local, global]
+    /// on the networks, [_, the WAN address] on the WAN. Each has its /64
+    /// (the WAN: its prefix) as a connected route in `routes6`.
+    addrs6: Vec<[Option<(Ipv6Addr, u8)>; 2]>,
+    /// IPv6 connections: routed, not translated (same budget as `ct`).
+    pub ct6: crate::conntrack::Conntrack<Ipv6Addr>,
+    pub routes6: RouteTable<Ipv6Addr>,
+    /// Drop IPv6 from a network whose source is not in one of its /64s
+    /// (BCP 38; no NAT hides it); off only for the lab's negative control.
+    pub lan_antispoof: bool,
 }
 
 fn broadcast_of(addr: Ipv4Addr, len: u8) -> Ipv4Addr {
@@ -522,6 +539,76 @@ fn broadcast_of(addr: Ipv4Addr, len: u8) -> Ipv4Addr {
         u32::MAX << (32 - len as u32)
     };
     Ipv4Addr::from(u32::from(addr) | !mask)
+}
+
+/// What an IPv6 packet means to conntrack.
+enum Key6 {
+    Flow(crate::conntrack::Tuple<Ipv6Addr>, u8),
+    /// An ICMPv6 error (types 1–4) about the quoted packet's flow.
+    Related(crate::conntrack::Tuple<Ipv6Addr>),
+    Other,
+}
+
+fn key6(f: &[u8], v: &V6) -> Key6 {
+    use crate::conntrack::Tuple;
+    let (src, dst) = (v.src(f), v.dst(f));
+    let l4 = v.l4;
+    match v.proto {
+        PROTO_TCP if v.l4_len >= 20 => {
+            Key6::Flow(Tuple { proto: PROTO_TCP, src, sport: wire::get16(f, l4), dst, dport: wire::get16(f, l4 + 2) }, f[l4 + 13])
+        }
+        PROTO_UDP if v.l4_len >= 8 => Key6::Flow(Tuple { proto: PROTO_UDP, src, sport: wire::get16(f, l4), dst, dport: wire::get16(f, l4 + 2) }, 0),
+        PROTO_ICMPV6 if v.l4_len >= 8 => match f[l4] {
+            wire::ICMPV6_ECHO_REQUEST | wire::ICMPV6_ECHO_REPLY => {
+                let id = wire::get16(f, l4 + 4);
+                Key6::Flow(Tuple { proto: PROTO_ICMPV6, src, sport: id, dst, dport: id }, 0)
+            }
+            1..=4 => quoted6(f, l4 + 8).map_or(Key6::Other, Key6::Related),
+            _ => Key6::Other,
+        },
+        _ => Key6::Other,
+    }
+}
+
+/// The flow of the IPv6 packet an ICMPv6 error quotes at `at` (its header
+/// and at least 8 bytes behind it; extension headers are not walked).
+fn quoted6(f: &[u8], at: usize) -> Option<crate::conntrack::Tuple<Ipv6Addr>> {
+    let h = f.get(at..at + 48)?;
+    if h[0] >> 4 != 6 {
+        return None;
+    }
+    let (src, dst) = (wire::get_ip6(h, 8), wire::get_ip6(h, 24));
+    let l4 = &h[40..];
+    let (proto, sport, dport) = match h[6] {
+        p @ (PROTO_TCP | PROTO_UDP) => (p, wire::get16(l4, 0), wire::get16(l4, 2)),
+        PROTO_ICMPV6 if matches!(l4[0], wire::ICMPV6_ECHO_REQUEST | wire::ICMPV6_ECHO_REPLY) => {
+            let id = wire::get16(l4, 4);
+            (PROTO_ICMPV6, id, id)
+        }
+        _ => return None,
+    };
+    Some(crate::conntrack::Tuple { proto, src, sport, dst, dport })
+}
+
+/// Both directions of an IPv6 flow on one shard: a symmetric hash of its
+/// two endpoints (no NAT, so they look the same from either side).
+fn shard6(frame: &[u8], shards: usize, hash_key: u64) -> usize {
+    let Some(v) = V6::parse(frame, ETH_HDR) else {
+        return 0;
+    };
+    if !v.has_l4() {
+        return 0;
+    }
+    let t = match key6(frame, &v) {
+        Key6::Flow(t, _) | Key6::Related(t) => t,
+        Key6::Other => return 0,
+    };
+    let end = |a: Ipv6Addr, p: u16| {
+        let x = u128::from(a);
+        crate::conntrack::mix(hash_key ^ 0x7368_6172_6436, (x as u64) ^ ((x >> 64) as u64).rotate_left(23) ^ u64::from(p))
+    };
+    let h = end(t.src, t.sport) ^ end(t.dst, t.dport) ^ u64::from(t.proto);
+    (crate::conntrack::mix(hash_key, h) % shards as u64) as usize
 }
 
 fn extract_key(f: &[u8], v: &Ipv4View) -> Key {
@@ -659,8 +746,13 @@ pub fn endpoint_shard(proto: u8, ip: Ipv4Addr, port: u16, shards: usize, hash_ke
 /// those frames are local, dropped, or never tracked.
 pub fn shard_of(role: Role, frame: &[u8], shards: usize, hash_key: u64, hints: &ShardHints) -> usize {
     let internal = hints.internal;
-    if shards <= 1 || wire::ethertype(frame) != Some(ETHERTYPE_IPV4) {
+    if shards <= 1 {
         return 0;
+    }
+    match wire::ethertype(frame) {
+        Some(ETHERTYPE_IPV4) => {}
+        Some(ETHERTYPE_IPV6) => return shard6(frame, shards, hash_key),
+        _ => return 0,
     }
     let Some(v) = Ipv4View::parse(frame, ETH_HDR) else {
         return 0;
@@ -785,14 +877,17 @@ impl Forwarder {
             split: true,
             frag: None,
             ipv6: false,
-            ula6: Vec::new(),
+            addrs6: Vec::new(),
+            ct6: crate::conntrack::Conntrack::new_shard(max_conns, hash_key, shards, shard),
+            routes6: RouteTable::new(),
+            lan_antispoof: true,
         }
     }
 
     pub fn add_interface(&mut self, iface: Interface) -> IfIndex {
         self.ifs.push(iface);
         self.mtus.push(DEFAULT_MTU);
-        self.ula6.push(None);
+        self.addrs6.push([None, None]);
         let ifx = (self.ifs.len() - 1) as IfIndex;
         if let Some(a) = iface.addr {
             self.set_addr(ifx, Some(a));
@@ -806,7 +901,51 @@ impl Forwarder {
 
     /// The router's unique local address on an interface (IPv6).
     pub fn set_ula6(&mut self, ifx: IfIndex, addr: Option<Ipv6Addr>) {
-        self.ula6[ifx as usize] = addr;
+        self.set_addr6(ifx, 0, addr.map(|a| (a, 64)));
+    }
+
+    /// The router's global IPv6 address on a network (its /64), or the
+    /// WAN's (with its prefix length).
+    pub fn set_gua6(&mut self, ifx: IfIndex, addr: Option<(Ipv6Addr, u8)>) {
+        self.set_addr6(ifx, 1, addr);
+    }
+
+    fn set_addr6(&mut self, ifx: IfIndex, slot: usize, addr: Option<(Ipv6Addr, u8)>) {
+        let old = core::mem::replace(&mut self.addrs6[ifx as usize][slot], addr);
+        if old == addr {
+            return;
+        }
+        if let Some((a, l)) = old {
+            self.routes6.remove(a, l);
+        }
+        if let Some((a, l)) = addr {
+            self.routes6.set(Route { prefix: a, len: l, egress: ifx, gateway: None, kind: RouteKind::Connected });
+        }
+    }
+
+    /// The IPv6 default route: through `gw` on `egress` (the WAN), or none.
+    pub fn set_default_route6(&mut self, via: Option<(IfIndex, Ipv6Addr)>) {
+        match via {
+            Some((egress, gw)) => self.routes6.set(Route {
+                prefix: Ipv6Addr::UNSPECIFIED,
+                len: 0,
+                egress,
+                gateway: Some(gw),
+                kind: RouteKind::Default,
+            }),
+            None => self.routes6.remove(Ipv6Addr::UNSPECIFIED, 0),
+        }
+    }
+
+    /// One of the router's own IPv6 addresses on `ifx`.
+    fn is_mine6(&self, ifx: IfIndex, a: Ipv6Addr) -> bool {
+        a == wire::link_local(self.ifs[ifx as usize].mac) || self.addrs6[ifx as usize].iter().flatten().any(|&(m, _)| m == a)
+    }
+
+    /// `a` is in one of `ifx`'s prefixes.
+    fn on6(&self, ifx: IfIndex, a: Ipv6Addr) -> bool {
+        use crate::route::RouteAddr;
+        self.addrs6[ifx as usize].iter().flatten().any(|&(m, l)| m.masked(l) == a.masked(l))
     }
 
     /// The interface's own MAC (a network moved to another port).
@@ -899,6 +1038,7 @@ impl Forwarder {
     /// Count this shard's connections against `budget`, shared with the
     /// other shards (`conntrack::Budget`). Call before the first packet.
     pub fn set_conn_budget(&mut self, budget: alloc::sync::Arc<crate::conntrack::Budget>) {
+        self.ct6.set_budget(budget.clone());
         self.ct.set_budget(budget);
     }
 
@@ -941,8 +1081,44 @@ impl Forwarder {
         for &id in &dead {
             self.ct.remove(id);
         }
-        self.stats.revoked += dead.len() as u64;
-        dead.len()
+        let dead6: Vec<_> = self
+            .ct6
+            .iter_ids()
+            .filter(|(_, c)| !self.still_allowed6(&c.orig))
+            .map(|(id, _)| id)
+            .collect();
+        for &id in &dead6 {
+            self.ct6.remove(id);
+        }
+        let n = dead.len() + dead6.len();
+        self.stats.revoked += n as u64;
+        n
+    }
+
+    /// [`Forwarder::recheck`] for an IPv6 connection (no translation: the
+    /// zones of its two ends and the rules).
+    fn still_allowed6(&self, t: &crate::conntrack::Tuple<Ipv6Addr>) -> bool {
+        let (Some(a), Some(b)) = (self.routes6.lookup(t.src), self.routes6.lookup(t.dst)) else {
+            return true;
+        };
+        if a.egress == b.egress {
+            return false;
+        }
+        let (from, to) = (self.ifs[a.egress as usize], self.ifs[b.egress as usize]);
+        self.allowed6(&from, &to, t.proto, matches!(t.proto, PROTO_TCP | PROTO_UDP).then_some(t.dport)).0
+    }
+
+    /// May a new IPv6 flow go from `from` to `to`: (allowed, the rule that
+    /// decided). Rules without addresses, then the zone policy; without a
+    /// policy only LAN → WAN.
+    fn allowed6(&self, from: &Interface, to: &Interface, proto: u8, dport: Option<u16>) -> (bool, Option<usize>) {
+        match self.policy.as_ref() {
+            Some(p) => match p.rule6(from.zone, RuleTo::Zone(to.zone), proto, dport) {
+                Some((i, a)) => (a == Action::Accept, Some(i)),
+                None => (p.may_forward(from.zone, to.zone), None),
+            },
+            None => (from.role == Role::Lan && to.role == Role::Wan, None),
+        }
     }
 
     /// [`Forwarder::recheck`] for one connection.
@@ -1078,7 +1254,7 @@ impl Forwarder {
     /// router's own addresses (link-local, the interface's ULA) and the
     /// link-scope groups it is in goes through [`Self::input6`]; anything
     /// else is dropped.
-    fn process6(&mut self, ingress: IfIndex, buf: &[u8], len: usize) -> Verdict {
+    fn process6(&mut self, now: u64, ingress: IfIndex, buf: &mut [u8], len: usize) -> Verdict {
         if !self.ipv6 {
             return self.drop(DropReason::Unsupported);
         }
@@ -1099,11 +1275,188 @@ impl Forwarder {
             if !(dst == ALL_NODES || dst == ALL_ROUTERS || dst == MDNS || wire::is_solicited_node(dst)) {
                 return self.drop(DropReason::NotForUs);
             }
-        } else if dst != wire::link_local(iface.mac) && Some(dst) != self.ula6[ingress as usize] {
-            // Someone else's: forwarding IPv6 comes in step 2.
-            return self.drop(DropReason::Unsupported);
+        } else if !self.is_mine6(ingress, dst) {
+            return self.forward6(now, ingress, buf, len, &v);
         }
         self.input6(ingress, f, &v)
+    }
+
+    /// A forwarded IPv6 packet (docs/ipv6.md step 2b): not translated,
+    /// tracked in `ct6`, the zone firewall for new flows (rules without
+    /// addresses, then the zone policy), anti-spoofing both ways, hop limit
+    /// and MTU answered with ICMPv6 errors (never fragmented).
+    fn forward6(&mut self, now: u64, ingress: IfIndex, buf: &mut [u8], len: usize, v: &V6) -> Verdict {
+        let f = &buf[..len];
+        let (src, dst) = (v.src(f), v.dst(f));
+        let iface = self.ifs[ingress as usize];
+        // Never forwarded (RFC 4291 §2.5.6): link-local either side;
+        // unspecified, loopback or multicast sources.
+        let link_local = |a: Ipv6Addr| a.segments()[0] & 0xffc0 == 0xfe80;
+        if link_local(src) || link_local(dst) || src.is_unspecified() || src.is_loopback() || src.is_multicast() || dst.is_loopback() {
+            return self.drop(DropReason::Invalid);
+        }
+        let spoofed = match iface.role {
+            // A source in one of our networks cannot come from outside.
+            Role::Wan => self.wan_antispoof && (0..self.ifs.len()).any(|i| self.ifs[i].role == Role::Lan && self.on6(i as IfIndex, src)),
+            // A network's own /64s only.
+            Role::Lan => self.lan_antispoof && !self.on6(ingress, src),
+        };
+        if spoofed {
+            return self.drop(DropReason::Spoofed);
+        }
+        if !v.has_l4() {
+            return self.drop(DropReason::Fragment); // later fragments: step 2c
+        }
+        let key = key6(f, v);
+        // Never an ICMPv6 error about an ICMPv6 error (RFC 4443 §2.4 e),
+        // whether or not its quote is understood.
+        let is_error = v.proto == PROTO_ICMPV6 && v.l4_len >= 1 && f[v.l4] < 128;
+        if v.hop_limit(f) <= 1 {
+            if is_error {
+                return self.drop(DropReason::Invalid);
+            }
+            if !self.take_icmp_token(now) {
+                return self.drop(DropReason::IcmpRateLimit);
+            }
+            return self.icmp6_error(ingress, buf, len, v, 3, 0, 0);
+        }
+        let Some(route) = self.routes6.lookup(dst).copied() else {
+            return self.drop(DropReason::NoRoute);
+        };
+        if route.egress == ingress {
+            return self.drop(DropReason::Hairpin);
+        }
+        let egress_if = self.ifs[route.egress as usize];
+        let hit = match &key {
+            Key6::Flow(t, _) => self.ct6.lookup_live(now, t),
+            Key6::Related(inner) => self.ct6.lookup_live(now, &inner.inverse()),
+            Key6::Other => None,
+        };
+        let (id, dir) = match hit {
+            Some(h) => h,
+            None => {
+                let Key6::Flow(t, flags) = key else {
+                    return self.drop(if matches!(key, Key6::Related(_)) {
+                        DropReason::Invalid
+                    } else {
+                        DropReason::Unsupported
+                    });
+                };
+                let ports = matches!(t.proto, PROTO_TCP | PROTO_UDP).then_some(t.dport);
+                let (ok, rule) = self.allowed6(&iface, &egress_if, t.proto, ports);
+                if let Some(h) = rule.and_then(|i| self.rule_hits.get_mut(i)) {
+                    *h += 1;
+                }
+                if !ok {
+                    return self.drop(DropReason::Firewall);
+                }
+                let new_ok = match t.proto {
+                    PROTO_TCP => flags & (wire::TCP_SYN | wire::TCP_ACK | wire::TCP_RST) == wire::TCP_SYN,
+                    PROTO_ICMPV6 => f[v.l4] == wire::ICMPV6_ECHO_REQUEST,
+                    _ => true,
+                };
+                if !new_ok {
+                    return self.drop(DropReason::Invalid);
+                }
+                let (clashes, host_limit) = (self.ct6.stats.clashes, self.ct6.stats.host_limit);
+                match self.ct6.create_routed(now, t, flags) {
+                    Some(id) => (id, crate::conntrack::Dir::Original),
+                    None if self.ct6.stats.clashes != clashes => return self.drop(DropReason::Clash),
+                    None if self.ct6.stats.host_limit != host_limit => return self.drop(DropReason::HostLimit),
+                    None => return self.drop(DropReason::TableFull),
+                }
+            }
+        };
+        let mtu = self.mtus[route.egress as usize];
+        if v.total_len() > mtu as usize {
+            if is_error {
+                return self.drop(DropReason::TooBig);
+            }
+            if !self.take_icmp_token(now) {
+                return self.drop(DropReason::IcmpRateLimit);
+            }
+            return self.icmp6_error(ingress, buf, len, v, 2, 0, u32::from(mtu));
+        }
+        let tcp_flags = if let Key6::Flow(_, fl) = key { fl } else { 0 };
+        v.dec_hop_limit(buf);
+        if v.proto == PROTO_TCP && tcp_flags & wire::TCP_SYN != 0 {
+            let path_mtu = mtu.min(self.mtus[ingress as usize]);
+            wire::clamp_mss_at(buf, v.l4, v.l4_len, path_mtu.saturating_sub(60));
+        }
+        self.ct6.update(now, id, dir, tcp_flags, v.total_len());
+        let conn = self.ct6.get(id).expect("conntrack entry exists");
+        let f = &buf[..len];
+        let tc = v.traffic_class(f);
+        let (src_h, dst_h) = match dir {
+            crate::conntrack::Dir::Original => (conn.orig_src_hash, conn.orig_dst_hash),
+            crate::conntrack::Dir::Reply => (conn.orig_dst_hash, conn.orig_src_hash),
+        };
+        let is_pure_ack = v.proto == PROTO_TCP
+            && tcp_flags & !(wire::TCP_PSH) == wire::TCP_ACK
+            && v.l4_len == ((f[v.l4 + 12] >> 4) as usize) * 4;
+        let class = Classification {
+            flow_hash: conn.flow_hash,
+            src_host_hash: src_h,
+            dst_host_hash: dst_h,
+            dscp: tc >> 2,
+            ecn_capable: tc & 3 != 0,
+            is_pure_ack,
+        };
+        self.stats.forwarded += 1;
+        Verdict::Forward6 {
+            egress: route.egress,
+            next_hop: route.gateway.unwrap_or(dst),
+            len,
+            class,
+        }
+    }
+
+    /// An ICMPv6 error (RFC 4443) about the packet in `buf`, built in its
+    /// place: from the router's address on `ingress` of the sender's
+    /// scope, the packet quoted as far as the whole fits 1280 bytes; back
+    /// to the sender.
+    #[allow(clippy::too_many_arguments)]
+    fn icmp6_error(&mut self, ingress: IfIndex, buf: &mut [u8], len: usize, v: &V6, kind: u8, code: u8, param: u32) -> Verdict {
+        let f = &buf[..len];
+        let to = v.src(f);
+        let [ula, gua] = self.addrs6[ingress as usize];
+        let ula_src = to.segments()[0] & 0xfe00 == 0xfc00;
+        let from = match (ula_src, ula, gua) {
+            (true, Some((u, _)), _) => u,
+            (false, _, Some((g, _))) => g,
+            _ => wire::link_local(self.ifs[ingress as usize].mac),
+        };
+        let quote_len = v.total_len().min(1280 - 48);
+        let new_len = ETH_HDR + 48 + quote_len;
+        if buf.len() < new_len {
+            return self.drop(DropReason::Malformed);
+        }
+        let next_hop = match self.routes6.lookup(to) {
+            Some(r) if r.egress == ingress => r.gateway.unwrap_or(to),
+            _ => to,
+        };
+        buf.copy_within(v.ip..v.ip + quote_len, ETH_HDR + 48);
+        let ip = ETH_HDR;
+        buf[ip..ip + 4].copy_from_slice(&[0x6c, 0, 0, 0]); // traffic class CS6
+        wire::put16(buf, ip + 4, (8 + quote_len) as u16);
+        buf[ip + 6] = PROTO_ICMPV6;
+        buf[ip + 7] = 64;
+        buf[ip + 8..ip + 24].copy_from_slice(&from.octets());
+        buf[ip + 24..ip + 40].copy_from_slice(&to.octets());
+        let m = ip + 40;
+        buf[m] = kind;
+        buf[m + 1] = code;
+        buf[m + 2..m + 4].fill(0);
+        buf[m + 4..m + 8].copy_from_slice(&param.to_be_bytes());
+        let c = wire::icmpv6_checksum(from, to, &buf[m..new_len]);
+        wire::put16(buf, m + 2, c);
+        self.stats.icmp_errors_sent += 1;
+        Verdict::Forward6 {
+            egress: ingress,
+            next_hop,
+            len: new_len,
+            class: Classification { dscp: 0x30, ..Default::default() },
+        }
     }
 
     /// IPv6 for the router, like [`Self::input`]: neighbor discovery (hop
@@ -1326,12 +1679,13 @@ impl Forwarder {
     }
 
     pub fn expire(&mut self, now: u64) -> usize {
-        self.ct.expire(now)
+        self.ct.expire(now) + self.ct6.expire(now)
     }
 
     /// [`Forwarder::expire`], removing at most `max` connections.
     pub fn expire_some(&mut self, now: u64, max: usize) -> usize {
-        self.ct.expire_some(now, max)
+        let n = self.ct.expire_some(now, max);
+        n + self.ct6.expire_some(now, max - n)
     }
 
     fn drop(&mut self, r: DropReason) -> Verdict {
@@ -1369,7 +1723,7 @@ impl Forwarder {
         };
         if et != ETHERTYPE_IPV4 {
             if et == ETHERTYPE_IPV6 {
-                return self.process6(ingress, buf, len);
+                return self.process6(now, ingress, buf, len);
             }
             return self.local(); // ARP, …: the router stack decides
         }
@@ -3947,9 +4301,14 @@ mod tests {
             let f = ipv6_frame(GUEST_MAC, V6_HOST, dst, 64, &[], PROTO_ICMPV6, &icmp6(wire::ICMPV6_ECHO_REQUEST));
             assert_eq!(v6(&mut fw, GUEST, f), dropped(DropReason::Input));
         }
-        // The guest asking the LAN's ULA (another interface's): not ours there.
+        // The LAN's ULA from the guest network is forwarding, not input:
+        // with a main-LAN source spoofed, with a guest one refused by the
+        // zones (guest → WAN only).
         let f = ipv6_frame(GUEST_MAC, V6_HOST, ULA_LAN, 64, &[], PROTO_UDP, &l4(40000, 53));
-        assert_eq!(v6(&mut fw, GUEST, f), dropped(DropReason::Unsupported));
+        assert_eq!(v6(&mut fw, GUEST, f), dropped(DropReason::Spoofed));
+        let guest_host = Ipv6Addr::new(0xfd00, 0x1, 0x2, 1, 0, 0, 0, 0x100);
+        let f = ipv6_frame(GUEST_MAC, guest_host, ULA_LAN, 64, &[], PROTO_UDP, &l4(40000, 53));
+        assert_eq!(v6(&mut fw, GUEST, f), dropped(DropReason::Firewall));
         // The WAN: silent, but neighbor discovery and replies to the
         // router's clients pass.
         let wan_ll = wire::link_local(WAN_MAC);
@@ -4057,5 +4416,239 @@ mod tests {
         assert!(wire::is_solicited_node("ff02::1:ff12:3456".parse().unwrap()));
         assert!(!wire::is_solicited_node("ff02::1:fe12:3456".parse().unwrap()));
         assert!(!wire::is_solicited_node("ff02::2".parse().unwrap()));
+    }
+
+    // ---- IPv6 forwarding (docs/ipv6.md step 2b) --------------------------
+
+    fn a6(s: &str) -> Ipv6Addr {
+        s.parse().unwrap()
+    }
+    const GW6: &str = "2001:db8:ffff::1";
+    const H6: &str = "2001:db8:100::10"; // a LAN host
+    const G6: &str = "2001:db8:100:1::10"; // a guest host
+    const S6: &str = "2001:db8:9::1"; // a server outside
+
+    /// `router6()` with a WAN address and default route, GUAs on LAN and guest.
+    fn router6f() -> Forwarder {
+        let mut fw = router6();
+        fw.set_gua6(WAN, Some((a6("2001:db8:ffff::2"), 64)));
+        fw.set_default_route6(Some((WAN, a6(GW6))));
+        fw.set_gua6(LAN, Some((a6("2001:db8:100::1"), 64)));
+        fw.set_gua6(GUEST, Some((a6("2001:db8:100:1::1"), 64)));
+        fw
+    }
+
+    fn tcp6(src: &str, dst: &str, sport: u16, dport: u16, flags: u8, mss: Option<u16>) -> Vec<u8> {
+        let mut t = vec![0u8; 20];
+        wire::put16(&mut t, 0, sport);
+        wire::put16(&mut t, 2, dport);
+        t[12] = 5 << 4;
+        t[13] = flags;
+        wire::put16(&mut t, 14, 64240);
+        if let Some(m) = mss {
+            t.extend_from_slice(&[2, 4, (m >> 8) as u8, m as u8]);
+            t[12] = 6 << 4;
+        }
+        let c = wire::l4_checksum6(a6(src), a6(dst), PROTO_TCP, &t);
+        wire::put16(&mut t, 16, c);
+        t
+    }
+
+    fn udp6(src: &str, dst: &str, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+        let mut u = vec![0u8; 8];
+        wire::put16(&mut u, 0, sport);
+        wire::put16(&mut u, 2, dport);
+        wire::put16(&mut u, 4, (8 + payload.len()) as u16);
+        u.extend_from_slice(payload);
+        let c = wire::l4_checksum6(a6(src), a6(dst), PROTO_UDP, &u);
+        wire::put16(&mut u, 6, c);
+        u
+    }
+
+    fn echo6(src: &str, dst: &str, kind: u8, id: u16) -> Vec<u8> {
+        let mut e = vec![kind, 0, 0, 0, (id >> 8) as u8, id as u8, 0, 1];
+        e.extend_from_slice(b"ping6");
+        let c = wire::icmpv6_checksum(a6(src), a6(dst), &e);
+        wire::put16(&mut e, 2, c);
+        e
+    }
+
+    fn frame6(mac: Mac, src: &str, dst: &str, hop: u8, proto: u8, l4: &[u8]) -> Vec<u8> {
+        ipv6_frame(mac, a6(src), a6(dst), hop, &[], proto, l4)
+    }
+
+    /// The forwarded or answered frame's view and its L4 checksum validity.
+    fn out6(f: &[u8], len: usize) -> (V6, bool) {
+        let f = &f[..len];
+        let v = V6::parse(f, ETH_HDR).unwrap();
+        let seg = &f[v.l4..v.l4 + v.l4_len];
+        let ok = match v.proto {
+            PROTO_ICMPV6 => wire::icmpv6_checksum(v.src(f), v.dst(f), seg) == 0,
+            p => wire::l4_checksum6(v.src(f), v.dst(f), p, seg) == 0,
+        };
+        (v, ok)
+    }
+
+    #[test]
+    fn ipv6_out_and_back_untranslated() {
+        let mut fw = router6f();
+        let mut f = frame6(LAN_MAC, H6, S6, 64, PROTO_TCP, &tcp6(H6, S6, 40000, 443, wire::TCP_SYN, None));
+        let Verdict::Forward6 { egress, next_hop, len, class } = run(&mut fw, 0, LAN, &mut f) else { panic!() };
+        assert_eq!((egress, next_hop), (WAN, a6(GW6)));
+        let (v, ok) = out6(&f, len);
+        assert!(ok, "checksum still valid");
+        assert_eq!((v.src(&f), v.dst(&f), v.hop_limit(&f)), (a6(H6), a6(S6), 63));
+        assert!(class.flow_hash != 0);
+        // The answer comes back to the host directly (on-link).
+        let mut r = frame6(WAN_MAC, S6, H6, 60, PROTO_TCP, &tcp6(S6, H6, 443, 40000, wire::TCP_SYN | wire::TCP_ACK, None));
+        let Verdict::Forward6 { egress, next_hop, class: rc, .. } = run(&mut fw, 1, WAN, &mut r) else { panic!() };
+        assert_eq!((egress, next_hop), (LAN, a6(H6)));
+        assert_eq!(rc.flow_hash, class.flow_hash, "one CAKE flow both ways");
+        assert_eq!((fw.ct6.len(), fw.ct.len()), (1, 0));
+        // Echo out and its reply.
+        let mut e = frame6(LAN_MAC, H6, S6, 64, PROTO_ICMPV6, &echo6(H6, S6, 128, 7));
+        assert!(matches!(run(&mut fw, 2, LAN, &mut e), Verdict::Forward6 { egress: WAN, .. }));
+        let mut e = frame6(WAN_MAC, S6, H6, 60, PROTO_ICMPV6, &echo6(S6, H6, 129, 7));
+        assert!(matches!(run(&mut fw, 3, WAN, &mut e), Verdict::Forward6 { egress: LAN, .. }));
+    }
+
+    #[test]
+    fn ipv6_inbound_refused_and_zones() {
+        let mut fw = router6f();
+        // New from outside: refused (no rule, wan → lan not allowed).
+        let mut f = frame6(WAN_MAC, S6, H6, 60, PROTO_TCP, &tcp6(S6, H6, 5000, 22, wire::TCP_SYN, None));
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), dropped(DropReason::Firewall));
+        // An unanswered "reply" (no SYN) is no way in either.
+        let mut f = frame6(WAN_MAC, S6, H6, 60, PROTO_TCP, &tcp6(S6, H6, 443, 40000, wire::TCP_ACK, None));
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), dropped(DropReason::Firewall));
+        // Guest → WAN allowed, guest → LAN refused, LAN → guest allowed.
+        let mut f = frame6(GUEST_MAC, G6, S6, 64, PROTO_UDP, &udp6(G6, S6, 5000, 53, b"q"));
+        assert!(matches!(run(&mut fw, 0, GUEST, &mut f), Verdict::Forward6 { egress: WAN, .. }));
+        let mut f = frame6(GUEST_MAC, G6, H6, 64, PROTO_UDP, &udp6(G6, H6, 5000, 53, b"q"));
+        assert_eq!(run(&mut fw, 0, GUEST, &mut f), dropped(DropReason::Firewall));
+        let mut f = frame6(LAN_MAC, H6, G6, 64, PROTO_UDP, &udp6(H6, G6, 5000, 53, b"q"));
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward6 { egress: GUEST, .. }));
+        // A rule without addresses opens wan → lan TCP 22; a new policy
+        // without it ends the connection (recheck).
+        let mut p = fw.policy.clone().unwrap();
+        p.rules = vec![Rule { from: Some(0), to: RuleTo::Zone(1), protos: proto::TCP, src: None, dst: None, dport: Some((22, 22)), action: Action::Accept }];
+        fw.set_policy(Some(p));
+        let mut f = frame6(WAN_MAC, S6, H6, 60, PROTO_TCP, &tcp6(S6, H6, 5000, 22, wire::TCP_SYN, None));
+        assert!(matches!(run(&mut fw, 0, WAN, &mut f), Verdict::Forward6 { egress: LAN, .. }));
+        assert_eq!(fw.rule_hits, vec![1]);
+        let n = fw.ct6.len();
+        let mut p = fw.policy.clone().unwrap();
+        p.rules.clear();
+        fw.set_policy(Some(p));
+        assert_eq!(fw.recheck(), 1);
+        assert_eq!(fw.ct6.len(), n - 1);
+    }
+
+    #[test]
+    fn ipv6_hop_limit_and_packet_too_big() {
+        let mut fw = router6f();
+        let mut f = frame6(LAN_MAC, H6, S6, 1, PROTO_UDP, &udp6(H6, S6, 5000, 33434, b"x"));
+        let Verdict::Forward6 { egress, next_hop, len, .. } = run(&mut fw, 0, LAN, &mut f) else { panic!() };
+        assert_eq!((egress, next_hop), (LAN, a6(H6)));
+        let (v, ok) = out6(&f, len);
+        assert!(ok);
+        let m = &f[v.l4..];
+        assert_eq!((m[0], m[1], v.src(&f), v.dst(&f)), (3, 0, a6("2001:db8:100::1"), a6(H6)), "Time Exceeded from our GUA");
+        assert_eq!(wire::get_ip6(m, 8 + 8), a6(H6), "quotes the packet");
+        // Too big for the WAN: Packet Too Big with its MTU.
+        fw.set_mtu(WAN, 1400);
+        let mut f = frame6(LAN_MAC, H6, S6, 64, PROTO_UDP, &udp6(H6, S6, 5000, 9, &[7u8; 1400]));
+        f.resize(f.len() + 100, 0);
+        let len_in = f.len() - 164;
+        let Verdict::Forward6 { len, .. } = fw.process(0, LAN, &mut f, len_in) else { panic!() };
+        let (v, ok) = out6(&f, len);
+        assert!(ok && len <= ETH_HDR + 1280);
+        assert_eq!((f[v.l4], u32::from_be_bytes(f[v.l4 + 4..v.l4 + 8].try_into().unwrap())), (2, 1400));
+        assert_eq!(fw.stats.icmp_errors_sent, 2);
+        // An ICMPv6 error never gets one back.
+        let mut big = frame6(WAN_MAC, S6, H6, 1, PROTO_ICMPV6, &echo6(S6, H6, 1, 0));
+        assert_eq!(run(&mut fw, 0, WAN, &mut big), dropped(DropReason::Invalid));
+    }
+
+    #[test]
+    fn ipv6_related_error_reaches_the_host() {
+        let mut fw = router6f();
+        let syn = tcp6(H6, S6, 40000, 443, wire::TCP_SYN, None);
+        let mut f = frame6(LAN_MAC, H6, S6, 64, PROTO_TCP, &syn);
+        run(&mut fw, 0, LAN, &mut f);
+        // A Packet Too Big from a router on the way, quoting our packet.
+        let quoted = &frame6(LAN_MAC, H6, S6, 63, PROTO_TCP, &syn)[ETH_HDR..ETH_HDR + 40 + 20];
+        let mut ptb = vec![2u8, 0, 0, 0, 0, 0, 0x05, 0x00];
+        ptb.extend_from_slice(quoted);
+        let hop = "2001:db8:7::1";
+        let c = wire::icmpv6_checksum(a6(hop), a6(H6), &ptb);
+        wire::put16(&mut ptb, 2, c);
+        let mut e = frame6(WAN_MAC, hop, H6, 60, PROTO_ICMPV6, &ptb);
+        assert!(matches!(run(&mut fw, 1, WAN, &mut e), Verdict::Forward6 { egress: LAN, .. }));
+        // About a flow we never saw: invalid.
+        let other = &frame6(LAN_MAC, H6, S6, 63, PROTO_TCP, &tcp6(H6, S6, 40001, 443, wire::TCP_SYN, None))[ETH_HDR..ETH_HDR + 60];
+        let mut ptb = vec![2u8, 0, 0, 0, 0, 0, 0x05, 0x00];
+        ptb.extend_from_slice(other);
+        let c = wire::icmpv6_checksum(a6(hop), a6(H6), &ptb);
+        wire::put16(&mut ptb, 2, c);
+        let mut e = frame6(WAN_MAC, hop, H6, 60, PROTO_ICMPV6, &ptb);
+        assert_eq!(run(&mut fw, 1, WAN, &mut e), dropped(DropReason::Invalid));
+    }
+
+    #[test]
+    fn ipv6_spoofing_and_never_forwarded() {
+        let mut fw = router6f();
+        // From the WAN with one of our networks' sources.
+        let mut f = frame6(WAN_MAC, "2001:db8:100:1::5", S6, 60, PROTO_UDP, &udp6("2001:db8:100:1::5", S6, 1, 2, b""));
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), dropped(DropReason::Spoofed));
+        // From the LAN with a source outside its /64s (another network's, or anything).
+        for src in ["2001:db8:100:1::5", "2001:db8:999::5", "fd00:1:2:1::5"] {
+            let mut f = frame6(LAN_MAC, src, S6, 64, PROTO_UDP, &udp6(src, S6, 1, 2, b""));
+            assert_eq!(run(&mut fw, 0, LAN, &mut f), dropped(DropReason::Spoofed), "{src}");
+        }
+        // The ULA /64 is the network's too.
+        let ula_host = "fd00:1:2::77";
+        let mut f = frame6(LAN_MAC, ula_host, S6, 64, PROTO_UDP, &udp6(ula_host, S6, 1, 2, b""));
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward6 { .. }));
+        // Off (the lab's negative control): passes.
+        fw.lan_antispoof = false;
+        let mut f = frame6(LAN_MAC, "2001:db8:999::5", S6, 64, PROTO_UDP, &udp6("2001:db8:999::5", S6, 1, 2, b""));
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward6 { .. }));
+        // Link-local never leaves its link.
+        let mut f = frame6(LAN_MAC, "fe80::9", S6, 64, PROTO_UDP, &udp6("fe80::9", S6, 1, 2, b""));
+        assert_eq!(run(&mut fw, 0, LAN, &mut f), dropped(DropReason::Invalid));
+        // Nowhere to go without a default route.
+        fw.set_default_route6(None);
+        let mut f = frame6(LAN_MAC, H6, S6, 64, PROTO_UDP, &udp6(H6, S6, 1, 2, b""));
+        assert_eq!(run(&mut fw, 0, LAN, &mut f), dropped(DropReason::NoRoute));
+    }
+
+    #[test]
+    fn ipv6_mss_clamped_and_later_fragments_dropped() {
+        let mut fw = router6f();
+        fw.set_mtu(WAN, 1400);
+        let mut f = frame6(LAN_MAC, H6, S6, 64, PROTO_TCP, &tcp6(H6, S6, 40000, 443, wire::TCP_SYN, Some(1440)));
+        let Verdict::Forward6 { len, .. } = run(&mut fw, 0, LAN, &mut f) else { panic!() };
+        let (v, ok) = out6(&f, len);
+        assert!(ok, "checksum after the clamp");
+        assert_eq!(wire::get16(&f, v.l4 + 22), 1340, "MTU 1400 − 60");
+        let later = (44u8, vec![0u8, 0, 0, 8, 0, 0, 0, 7]);
+        let mut f = ipv6_frame(LAN_MAC, a6(H6), a6(S6), 64, &[later], PROTO_UDP, &[0u8; 16]);
+        assert_eq!(run(&mut fw, 0, LAN, &mut f), dropped(DropReason::Fragment));
+    }
+
+    #[test]
+    fn ipv6_both_directions_share_a_shard() {
+        let hints = ShardHints::default();
+        for i in 0..200u16 {
+            let out = frame6(LAN_MAC, H6, S6, 64, PROTO_TCP, &tcp6(H6, S6, 40000 + i, 443, wire::TCP_ACK, None));
+            let back = frame6(WAN_MAC, S6, H6, 60, PROTO_TCP, &tcp6(S6, H6, 443, 40000 + i, wire::TCP_ACK, None));
+            let (a, b) = (shard_of(Role::Lan, &out, 16, 42, &hints), shard_of(Role::Wan, &back, 16, 42, &hints));
+            assert_eq!(a, b, "flow {i}");
+        }
+        let spread: alloc::collections::BTreeSet<usize> = (0..200u16)
+            .map(|i| shard_of(Role::Lan, &frame6(LAN_MAC, H6, S6, 64, PROTO_UDP, &udp6(H6, S6, 1000 + i, 53, b"")), 16, 42, &hints))
+            .collect();
+        assert!(spread.len() > 8, "spread over the shards: {spread:?}");
     }
 }

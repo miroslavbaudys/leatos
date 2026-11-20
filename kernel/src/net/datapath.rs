@@ -804,6 +804,12 @@ impl Datapath {
                     self.send_out(egress, next_hop, &class, ifx, p, now, b);
                 }
             }
+            // IPv6 forwarding reaches the datapath with docs/ipv6.md step
+            // 2b's kernel part; until then as before (not forwarded).
+            Verdict::Forward6 { .. } => {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                DROP_REASONS[DropReason::Unsupported.index()].fetch_add(1, Ordering::Relaxed);
+            }
             Verdict::Drop(r) => {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
                 DROP_REASONS[r.index()].fetch_add(1, Ordering::Relaxed);

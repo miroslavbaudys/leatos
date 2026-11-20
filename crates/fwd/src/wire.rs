@@ -199,6 +199,15 @@ pub fn l4_checksum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, segment: &[u8]) -> u
     !fold(sum(segment, acc))
 }
 
+/// TCP/UDP checksum over the IPv6 pseudo-header (RFC 8200 §8.1).
+pub fn l4_checksum6(src: Ipv6Addr, dst: Ipv6Addr, proto: u8, segment: &[u8]) -> u16 {
+    let mut acc = sum(&src.octets(), 0);
+    acc = sum(&dst.octets(), acc);
+    acc = sum(&(segment.len() as u32).to_be_bytes(), acc);
+    acc += proto as u32;
+    !fold(sum(segment, acc))
+}
+
 // ---- IPv4 ------------------------------------------------------------------------
 
 /// Validated offsets into an IPv6-in-Ethernet frame, past the extension
@@ -298,6 +307,17 @@ impl Ipv6View {
     /// The upper-layer header is in this packet (not a later fragment).
     pub fn has_l4(&self) -> bool {
         self.frag_offset == 0
+    }
+    pub fn traffic_class(&self, f: &[u8]) -> u8 {
+        (f[self.ip] << 4) | (f[self.ip + 1] >> 4)
+    }
+    /// Header + payload.
+    pub fn total_len(&self) -> usize {
+        self.l4 + self.l4_len - self.ip
+    }
+    /// One hop less (the caller checked it is above 1); no checksum.
+    pub fn dec_hop_limit(&self, f: &mut [u8]) {
+        f[self.ip + 7] -= 1;
     }
 }
 
@@ -416,6 +436,76 @@ pub fn ipv6_ns_to_solicited(frame: &mut [u8]) -> bool {
     frame[0..2].copy_from_slice(&[0x33, 0x33]);
     frame[2..6].copy_from_slice(&new[12..16]);
     true
+}
+
+/// Bytes of a neighbor solicitation frame ([`build_ns`]).
+pub const NS_LEN: usize = NEIGHBOR_HINT_LEN;
+
+/// A Neighbor Solicitation for `target` from `src_ip` (the router's
+/// link-local address) at `src_mac`, to the target's solicited-node group
+/// (RFC 4861 §7.2.2), with the source link-layer option.
+pub fn build_ns(out: &mut [u8; NS_LEN], src_mac: Mac, src_ip: Ipv6Addr, target: Ipv6Addr) {
+    let group = solicited_node(target);
+    out.fill(0);
+    out[0..2].copy_from_slice(&[0x33, 0x33]);
+    out[2..6].copy_from_slice(&group.octets()[12..16]);
+    out[6..12].copy_from_slice(&src_mac);
+    put16(out, 12, ETHERTYPE_IPV6);
+    let ip = ETH_HDR;
+    out[ip] = 0x60;
+    put16(out, ip + 4, 32);
+    out[ip + 6] = PROTO_ICMPV6;
+    out[ip + 7] = 255;
+    out[ip + 8..ip + 24].copy_from_slice(&src_ip.octets());
+    out[ip + 24..ip + 40].copy_from_slice(&group.octets());
+    let m = ip + 40;
+    out[m] = 135;
+    out[m + 8..m + 24].copy_from_slice(&target.octets());
+    out[m + 24] = 1;
+    out[m + 25] = 1;
+    out[m + 26..m + 32].copy_from_slice(&src_mac);
+    let c = icmpv6_checksum(src_ip, group, &out[m..m + 32]);
+    put16(out, m + 2, c);
+}
+
+/// What a neighbor discovery message tells about a neighbor (RFC 4861
+/// §7.2.5, §7.2.3, §6.3.4): a Neighbor Advertisement its target's MAC (the
+/// target link-layer option), a Solicitation or a Router Advertisement
+/// its sender's (the source link-layer option). Only with hop limit 255
+/// (on-link) and a valid checksum; no extension headers.
+pub fn parse_nd(frame: &[u8]) -> Option<(Ipv6Addr, Mac)> {
+    let ip = ETH_HDR;
+    let v = Ipv6View::parse(frame, ip)?;
+    if v.proto != PROTO_ICMPV6 || v.l4 != ip + 40 || v.hop_limit(frame) != 255 || v.l4_len < 8 {
+        return None;
+    }
+    let msg = &frame[v.l4..v.l4 + v.l4_len];
+    if icmpv6_checksum(v.src(frame), v.dst(frame), msg) != 0 {
+        return None;
+    }
+    let (who, opts_at, want) = match msg[0] {
+        135 if msg.len() >= 24 => (v.src(frame), 24, 1), // NS: the sender
+        136 if msg.len() >= 24 => (get_ip6(msg, 8), 24, 2), // NA: the target
+        134 if msg.len() >= 16 => (v.src(frame), 16, 1), // RA: the router
+        _ => return None,
+    };
+    if who.is_unspecified() || who.is_multicast() {
+        return None;
+    }
+    let mut o = &msg[opts_at..];
+    while o.len() >= 8 {
+        let len = o[1] as usize * 8;
+        if len == 0 || len > o.len() {
+            return None;
+        }
+        if o[0] == want && len == 8 {
+            let mut mac = [0u8; 6];
+            mac.copy_from_slice(&o[2..8]);
+            return (!is_multicast_mac(&mac)).then_some((who, mac));
+        }
+        o = &o[len..];
+    }
+    None
 }
 
 /// `ff02::1:ffXX:XXXX` (RFC 4291 §2.7.1).
@@ -594,14 +684,20 @@ const TCP_OPT_MSS: u8 = 2;
 /// checksum. Returns whether it changed. Segments without an MSS option
 /// are left alone (their default, 536, is already small).
 pub fn clamp_mss(f: &mut [u8], v: &Ipv4View, max: u16) -> bool {
-    if v.proto != PROTO_TCP || v.l4_len < 20 {
+    v.proto == PROTO_TCP && clamp_mss_at(f, v.l4, v.l4_len, max)
+}
+
+/// [`clamp_mss`] for the TCP segment at `l4` (`l4_len` bytes present):
+/// for IPv6 too (the checksum update does not involve the pseudo-header).
+pub fn clamp_mss_at(f: &mut [u8], l4: usize, l4_len: usize, max: u16) -> bool {
+    if l4_len < 20 {
         return false;
     }
-    let doff = ((f[v.l4 + 12] >> 4) as usize) * 4;
-    if doff < 20 || doff > v.l4_len {
+    let doff = ((f[l4 + 12] >> 4) as usize) * 4;
+    if doff < 20 || doff > l4_len {
         return false;
     }
-    let (mut i, end) = (v.l4 + 20, v.l4 + doff);
+    let (mut i, end) = (l4 + 20, l4 + doff);
     while i < end {
         match f[i] {
             0 => break,
@@ -623,13 +719,13 @@ pub fn clamp_mss(f: &mut [u8], v: &Ipv4View, max: u16) -> bool {
                     // At an odd offset from the segment start the field
                     // straddles two checksum words: its bytes count
                     // swapped (RFC 1071 byte-order independence).
-                    let (o, n) = if (i + 2 - v.l4).is_multiple_of(2) {
+                    let (o, n) = if (i + 2 - l4).is_multiple_of(2) {
                         (old, max)
                     } else {
                         (old.swap_bytes(), max.swap_bytes())
                     };
-                    let c = csum_update16(get16(f, v.l4 + 16), o, n);
-                    put16(f, v.l4 + 16, c);
+                    let c = csum_update16(get16(f, l4 + 16), o, n);
+                    put16(f, l4 + 16, c);
                     return true;
                 }
                 i += len;
@@ -972,6 +1068,37 @@ mod tests {
         let mut f2 = v6_frame(RMAC, CMAC, c, r, PROTO_ICMPV6, &ns2);
         assert!(!ipv6_ns_to_solicited(&mut f2));
         assert_eq!(solicited_node("2001:db8::abcd:1234:5678".parse().unwrap()), "ff02::1:ff34:5678".parse::<Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn ns_built_and_nd_parsed() {
+        let me: Ipv6Addr = "fe80::5054:ff:fe00:1".parse().unwrap();
+        let gw: Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
+        let mut ns = [0u8; NS_LEN];
+        build_ns(&mut ns, RMAC, me, gw);
+        assert_eq!(&ns[0..6], &[0x33, 0x33, 0xff, 0, 0, 1]);
+        // Our own NS parses as "me at RMAC" (what the gateway learns).
+        assert_eq!(parse_nd(&ns), Some((me, RMAC)));
+        // The gateway's NA: its target and target link-layer option.
+        let mut na = alloc::vec![136u8, 0, 0, 0, 0x60, 0, 0, 0];
+        na.extend_from_slice(&gw.octets());
+        na.extend_from_slice(&[2, 1, 0x52, 0x54, 0, 0, 0, 0x10]);
+        let c = icmpv6_checksum(gw, me, &na);
+        put16(&mut na, 2, c);
+        let f = v6_frame(RMAC, CMAC, gw, me, PROTO_ICMPV6, &na);
+        assert_eq!(parse_nd(&f), Some((gw, CMAC)));
+        // Not with a bad checksum, another hop limit, or no option.
+        let mut bad = f.clone();
+        bad[ETH_HDR + 40 + 2] ^= 1;
+        assert_eq!(parse_nd(&bad), None);
+        let mut off_link = f.clone();
+        off_link[ETH_HDR + 7] = 254;
+        assert_eq!(parse_nd(&off_link), None);
+        let mut bare = na[..24].to_vec();
+        put16(&mut bare, 2, 0);
+        let c = icmpv6_checksum(gw, me, &bare);
+        put16(&mut bare, 2, c);
+        assert_eq!(parse_nd(&v6_frame(RMAC, CMAC, gw, me, PROTO_ICMPV6, &bare)), None);
     }
 
     #[test]
