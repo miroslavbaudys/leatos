@@ -524,6 +524,9 @@ pub struct Forwarder {
     /// on the networks, [_, the WAN address] on the WAN. Each has its /64
     /// (the WAN: its prefix) as a connected route in `routes6`.
     addrs6: Vec<[Option<(Ipv6Addr, u8)>; 2]>,
+    /// Per interface: a link-local address other than the MAC's (PPPoE:
+    /// from IPv6CP's interface identifier), [`Self::set_ll6`].
+    ll6: Vec<Option<Ipv6Addr>>,
     /// IPv6 connections: routed, not translated (same budget as `ct`).
     pub ct6: crate::conntrack::Conntrack<Ipv6Addr>,
     pub routes6: RouteTable<Ipv6Addr>,
@@ -878,6 +881,7 @@ impl Forwarder {
             frag: None,
             ipv6: false,
             addrs6: Vec::new(),
+            ll6: Vec::new(),
             ct6: crate::conntrack::Conntrack::new_shard(max_conns, hash_key, shards, shard),
             routes6: RouteTable::new(),
             lan_antispoof: true,
@@ -888,6 +892,7 @@ impl Forwarder {
         self.ifs.push(iface);
         self.mtus.push(DEFAULT_MTU);
         self.addrs6.push([None, None]);
+        self.ll6.push(None);
         let ifx = (self.ifs.len() - 1) as IfIndex;
         if let Some(a) = iface.addr {
             self.set_addr(ifx, Some(a));
@@ -949,9 +954,19 @@ impl Forwarder {
         }
     }
 
+    /// The router's link-local address on `ifx`: from the MAC unless
+    /// `addr` (PPPoE: IPv6CP's); None = the MAC's again.
+    pub fn set_ll6(&mut self, ifx: IfIndex, addr: Option<Ipv6Addr>) {
+        self.ll6[ifx as usize] = addr;
+    }
+
+    fn ll6(&self, ifx: IfIndex) -> Ipv6Addr {
+        self.ll6[ifx as usize].unwrap_or_else(|| wire::link_local(self.ifs[ifx as usize].mac))
+    }
+
     /// One of the router's own IPv6 addresses on `ifx`.
     fn is_mine6(&self, ifx: IfIndex, a: Ipv6Addr) -> bool {
-        a == wire::link_local(self.ifs[ifx as usize].mac) || self.addrs6[ifx as usize].iter().flatten().any(|&(m, _)| m == a)
+        a == self.ll6(ifx) || self.addrs6[ifx as usize].iter().flatten().any(|&(m, _)| m == a)
     }
 
     /// `a` is in one of `ifx`'s prefixes.
@@ -1453,7 +1468,7 @@ impl Forwarder {
         let from = match (ula_src, ula, gua) {
             (true, Some((u, _)), _) => u,
             (false, _, Some((g, _))) => g,
-            _ => wire::link_local(self.ifs[ingress as usize].mac),
+            _ => self.ll6(ingress),
         };
         let quote_len = v.total_len().min(1280 - 48);
         let new_len = ETH_HDR + 48 + quote_len;
@@ -4341,6 +4356,22 @@ mod tests {
     const LOCAL: Verdict = Verdict::Local;
     const fn dropped(r: DropReason) -> Verdict {
         Verdict::Drop(r)
+    }
+
+    #[test]
+    fn ipv6_link_local_override_on_the_wan() {
+        // PPPoE: the WAN's link-local address comes from IPv6CP.
+        let mut fw = router6();
+        let ipv6cp = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x1234, 0, 0, 1);
+        let gw = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let reply = |dst| ipv6_frame(WAN_MAC, gw, dst, 64, &[], PROTO_UDP, &l4(547, 546));
+        assert_eq!(v6(&mut fw, WAN, reply(wire::link_local(WAN_MAC))), LOCAL);
+        assert_ne!(v6(&mut fw, WAN, reply(ipv6cp)), LOCAL);
+        fw.set_ll6(WAN, Some(ipv6cp));
+        assert_eq!(v6(&mut fw, WAN, reply(ipv6cp)), LOCAL);
+        assert_ne!(v6(&mut fw, WAN, reply(wire::link_local(WAN_MAC))), LOCAL);
+        fw.set_ll6(WAN, None);
+        assert_eq!(v6(&mut fw, WAN, reply(wire::link_local(WAN_MAC))), LOCAL);
     }
 
     #[test]
