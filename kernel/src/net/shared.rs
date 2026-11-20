@@ -30,7 +30,7 @@ use crate::net::packet::PacketBuf;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
@@ -135,7 +135,14 @@ pub struct LinkShared {
     /// A Router Solicitation came in (set as the router stack reads it,
     /// `net::device`; the network's RA advertiser answers, `net::services`).
     pub rs_seen: AtomicBool,
+    /// Global and unique local IPv6 neighbors the datapath saw in
+    /// neighbor discovery: (address, MAC, last seen ms). Bounded, the
+    /// oldest goes; the services task names them (AAAA for DHCP clients).
+    pub neigh6: Mutex<Vec<(Ipv6Addr, [u8; 6], u64)>>,
 }
+
+/// [`LinkShared::neigh6`]'s bound per link.
+pub const NEIGH6_MAX: usize = 128;
 
 impl LinkShared {
     pub fn new(port: usize, active: bool) -> Self {
@@ -145,7 +152,28 @@ impl LinkShared {
             active: AtomicBool::new(active),
             local_rx: Mutex::new(VecDeque::with_capacity(LOCAL_RX_MAX)),
             rs_seen: AtomicBool::new(false),
+            neigh6: Mutex::new(Vec::with_capacity(NEIGH6_MAX)),
         }
+    }
+
+    /// The datapath saw `ip` at `mac` (global or unique local only; no
+    /// allocation: the table is made full size).
+    pub fn note_neigh6(&self, ip: Ipv6Addr, mac: [u8; 6], now_ms: u64) {
+        let first = ip.segments()[0];
+        if !(first & 0xe000 == 0x2000 || first & 0xfe00 == 0xfc00) {
+            return;
+        }
+        let mut t = self.neigh6.lock();
+        if let Some(e) = t.iter_mut().find(|e| e.0 == ip) {
+            (e.1, e.2) = (mac, now_ms);
+            return;
+        }
+        if t.len() >= NEIGH6_MAX
+            && let Some(i) = (0..t.len()).min_by_key(|&i| t[i].2)
+        {
+            t.swap_remove(i);
+        }
+        t.push((ip, mac, now_ms));
     }
 
     /// A placeholder (smoltcp reads only a device's capabilities when an
@@ -157,6 +185,7 @@ impl LinkShared {
             active: AtomicBool::new(false),
             local_rx: Mutex::new(VecDeque::new()),
             rs_seen: AtomicBool::new(false),
+            neigh6: Mutex::new(Vec::new()),
         }
     }
 

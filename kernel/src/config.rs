@@ -1148,6 +1148,12 @@ pub fn pd_wanted() -> bool {
         && arg(bootargs(), "lan6_prefix").is_none()
 }
 
+/// AAAA (and ip6.arpa PTR) for the networks' DHCP clients from the IPv6
+/// neighbors seen (default); `dns_aaaa=0`: not (the lab's negative control).
+pub fn dns_aaaa() -> bool {
+    arg(bootargs(), "dns_aaaa") != Some("0")
+}
+
 /// Ask for the last delegated prefix again after a restart (default);
 /// `pd_keep=0`: not (the lab's negative control).
 pub fn pd_keep() -> bool {

@@ -94,7 +94,17 @@ pub struct LanServices {
     /// Advertisers sending their last RA (network or IPv6 gone): (link,
     /// advertiser).
     retiring: Vec<(usize, Advertiser)>,
+    /// The clients' IPv6 names in the zone: (domain, host, address, view),
+    /// from the datapath's neighbors (`LinkShared::neigh6`) joined with
+    /// leases and reservations by MAC; refreshed every [`AAAA_EVERY_MS`].
+    aaaa: Vec<(String, String, Ipv6Addr, View)>,
+    next_aaaa: u64,
 }
+
+/// How often the clients' AAAA records are compared with the neighbors.
+const AAAA_EVERY_MS: u64 = 5_000;
+/// A neighbor not seen for this long loses its AAAA record.
+const AAAA_FORGET_MS: u64 = 30 * 60_000;
 
 /// A network's RA settings: its ULA /64 (and global /64), the router's
 /// ULA as DNS server, its domain to search, the MAC of its link's
@@ -199,6 +209,9 @@ fn build_zone<'a>(
     for n in nets {
         if let Some(ula) = n.ula {
             zone.add_router6(&n.domain, ula);
+        }
+        if let Some(gua) = n.gua {
+            zone.add_subnet6(gua);
         }
     }
     for n in nets {
@@ -329,6 +342,8 @@ impl LanServices {
             ntp,
             mdns,
             retiring: Vec::new(),
+            aaaa: Vec::new(),
+            next_aaaa: 0,
         };
         me.apply_upstreams(hosts);
         Some(me)
@@ -465,6 +480,11 @@ impl LanServices {
         }
         let (names, local_hosts) = config::dns_names();
         *self.dns.zone_mut() = build_zone(&cfgs, &names, &local_hosts, self.leases_by_network());
+        // The clients' IPv6 names again (refreshed at the next step).
+        for (d, h, a, v) in &self.aaaa {
+            self.dns.zone_mut().add_host6_in(d, h, *a, *v);
+        }
+        self.next_aaaa = 0;
         // Hit counters follow their entries (same name and address) to
         // their new places; new entries start at 0.
         let old_hits = core::mem::take(&mut self.dns.host_hits);
@@ -541,6 +561,49 @@ impl LanServices {
                 .iter()
                 .flat_map(move |(s, _)| s.leases().map(move |l| (n.cfg.name.as_str(), l)))
         })
+    }
+
+    /// The clients' IPv6 addresses as AAAA names: each neighbor seen in
+    /// the last [`AAAA_FORGET_MS`] on a network, in one of its /64s, whose
+    /// MAC holds a bound lease or a reservation with a host name, gets
+    /// that name with the A record's view. The zone changes only when the
+    /// set does.
+    fn refresh_aaaa(&mut self, sh: &Shared, now: u64) {
+        let mut want: Vec<(String, String, Ipv6Addr, View)> = Vec::new();
+        if config::dns_aaaa() {
+            for net in &self.nets {
+                let prefixes: Vec<u128> = [net.cfg.ula, net.cfg.gua].into_iter().flatten().map(|a| u128::from(a) >> 64).collect();
+                if prefixes.is_empty() {
+                    continue;
+                }
+                let seen: Vec<(Ipv6Addr, [u8; 6], u64)> = sh.links[net.host].neigh6.lock().clone();
+                for (ip, mac, at) in seen {
+                    if now.saturating_sub(at) > AAAA_FORGET_MS || !prefixes.contains(&(u128::from(ip) >> 64)) {
+                        continue;
+                    }
+                    let lease = net.dhcp.as_ref().and_then(|(s, _)| {
+                        s.leases()
+                            .find(|l| l.mac == mac && l.state == dhcp::LeaseState::Bound && l.hostname.is_some())
+                            .map(|l| (l.hostname.clone().unwrap_or_default(), l.ip))
+                    });
+                    let named = lease.or_else(|| {
+                        net.cfg.statics.iter().find(|s| s.mac == mac).and_then(|s| s.hostname.clone().map(|h| (h, s.ip)))
+                    });
+                    if let Some((host, v4)) = named {
+                        want.push((net.cfg.domain.clone(), host, ip, seen_by(&self.names, v4)));
+                    }
+                }
+            }
+            want.sort_by(|a, b| (&a.0, &a.1, a.2).cmp(&(&b.0, &b.1, b.2)));
+        }
+        if want != self.aaaa {
+            let z = self.dns.zone_mut();
+            z.clear_hosts6();
+            for (d, h, a, v) in &want {
+                z.add_host6_in(d, h, *a, *v);
+            }
+            self.aaaa = want;
+        }
     }
 
     /// The WAN lease changed: its DNS servers, used unless the config
@@ -679,6 +742,11 @@ impl LanServices {
     /// `links[i]` is `hosts[i]`'s link).
     pub fn step(&mut self, hosts: &mut [HostIf], sh: &Shared) {
         let links = &sh.links;
+        let now_aaaa = now_ms();
+        if now_aaaa >= self.next_aaaa {
+            self.next_aaaa = now_aaaa + AAAA_EVERY_MS;
+            self.refresh_aaaa(sh, now_aaaa);
+        }
         // Router Advertisements: solicited, periodic, last ones.
         let now = now_ms();
         for net in &mut self.nets {

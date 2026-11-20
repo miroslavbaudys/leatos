@@ -972,6 +972,8 @@ impl Datapath {
             return;
         };
         let waiting = self.neigh6[ifx as usize].lock().learn(ifx, ip, mac, now);
+        // For the names of the networks' clients (AAAA, `net::services`).
+        self.sh.links[ifx as usize].note_neigh6(ip, mac, now);
         for pkt in waiting {
             self.send_resolved(ifx, mac, pkt, touched);
         }

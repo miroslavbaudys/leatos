@@ -236,6 +236,10 @@
 #                        address with another id, and again after the
 #                        prefix change. Negative control
 #                        LAB_IPV6_PINHOLE=0.
+#                        labclient.lan answers AAAA with the client's
+#                        global and ULA addresses (neighbor discovery x
+#                        its DHCP lease) and the PTR of the global one;
+#                        negative control LAB_ROUTER_ARGS=dns_aaaa=0.
 #                        IPv6 on the router's networks (docs/ipv6.md step
 #                        1; router ipv6=1): the client gets a SLAAC
 #                        address from the main LAN's ULA /64, no default

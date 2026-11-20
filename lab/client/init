@@ -619,6 +619,23 @@ if [ -n "$v6on" ]; then
         fi
         $bb ip -6 addr del "$other/64" dev eth0 2>/dev/null
       fi
+      # Our name over IPv6 (step 5b): labclient.lan AAAA = our global and
+      # unique local addresses (the router learned them from neighbor
+      # discovery, named by our DHCP lease), and the PTR of the global
+      # one. Negative control LAB_ROUTER_ARGS=dns_aaaa=0.
+      ula6=$($bb ip -6 addr show dev eth0 scope global | $bb sed -n 's/.*inet6 \(fd[0-9a-f:]*:5054:ff:fe00:10\)\/64.*/\1/p' | $bb head -1)
+      aaaa=""
+      for i in $($bb seq 1 15); do
+        aaaa=$($bb nslookup -type=AAAA labclient.lan 192.168.1.1 2>&1)
+        echo "$aaaa" | $bb grep -q "$ag" && echo "$aaaa" | $bb grep -q "${ula6:-none}" && break
+        $bb sleep 1
+      done
+      ptr=$($bb nslookup "$ag" 192.168.1.1 2>&1)
+      if echo "$aaaa" | $bb grep -q "$ag" && [ -n "$ula6" ] && echo "$aaaa" | $bb grep -q "$ula6" && echo "$ptr" | $bb grep -q 'labclient.lan'; then
+        pass "ipv6 names: labclient.lan AAAA $ag and $ula6, PTR back to labclient.lan"
+      else
+        fail "ipv6 names: labclient.lan AAAA ($ag, ${ula6:-no ULA}): $(echo "$aaaa" | $bb grep -i 'address\|answer\|NXDOMAIN' | $bb tr '\n' ' ') / PTR: $(echo "$ptr" | $bb grep -i 'name\|NXDOMAIN' | $bb tr '\n' ' ')"
+      fi
       # Packet Too Big: the WAN takes 1400 (wan_mtu=1400).
       # (busybox shows no path MTU cache: the router's ICMP error count,
       # read after its once-a-second sum.)
@@ -765,6 +782,11 @@ if [ -n "$guest" ]; then
       dnsstat; hid0=$(dnsc hidden)
       out=$(gl labclient.lan)
       if nx "$out"; then pass "views: labclient.lan hidden from the guest (NXDOMAIN)"; else fail "views: labclient.lan resolved from the guest"; echo "$out" | $bb sed 's/^/    | /'; fi
+      # Its AAAA too (step 5b): the same view as the A record.
+      if [ -n "$v6on" ]; then
+        out=$($bb nslookup -type=AAAA labclient.lan 10.20.0.1 2>&1)
+        if nx "$out"; then pass "views: labclient.lan AAAA hidden from the guest"; else fail "views: labclient.lan AAAA answered to the guest"; echo "$out" | $bb sed 's/^/    | /'; fi
+      fi
       out=$(gl 192.168.1.100)
       if nx "$out"; then pass "views: PTR of 192.168.1.100 hidden from the guest"; else fail "views: PTR of 192.168.1.100 answered to the guest"; echo "$out" | $bb sed 's/^/    | /'; fi
       dnsstat; hid1=$(dnsc hidden)
