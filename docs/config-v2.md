@@ -362,6 +362,20 @@ longest local domain it ends in (`crates/proto-dns` `Zone`). Lab check:
 `LAB_GUEST=1 scripts/lab-test.sh` (guest network `guest.lan`; negative
 control `LAB_GUEST_DOMAIN=0`).
 
+### `[ipv6]` (M7 step 1, docs/ipv6.md)
+```toml
+[ipv6]
+enabled = true                       # default false; boot argument ipv6=0|1
+ula_prefix = "fd12:3456:789a::/48"   # optional: else derived from the WAN MAC
+```
+With `enabled`, network `i` (config order) gets `<ula_prefix>:<i>::/64`:
+the router `::1` and its link-local address on the network, Router
+Advertisements (SLAAC, RDNSS = the router, DNSSL = the network's domain,
+router lifetime 0), DNS and the web interface over IPv6 under the zone's
+input policy. Nothing is forwarded over IPv6 yet. `ula_prefix` must be a
+/48 in `fc00::/7`. Applied live. `[wan.ipv6]` (prefix delegation) comes
+with step 3.
+
 ## 4. Validation (`crates/config`, one pass, paths for the UI)
 - Every key (`network.name`, `zone.name`, `rule.name`, `forward.name`) is
   unique. References (`network.zone`, `forward_to`, rule `from`/`to`)
@@ -658,7 +672,9 @@ In rough order of value:
    traffic between the networks on `lan0`.
 12. **IPv6 (M7).** DHCPv6-PD over DHCP and PPPoE (IPv6CP), a /64 per
    network with RA/RDNSS, the zone firewall for IPv6 (inbound blocked by
-   default), `[wan.ipv6]`.
+   default), `[wan.ipv6]`. Step 1 ✅ (QEMU, 2026-11-20): `[ipv6]` with a
+   ULA /64 per network, RAs, DNS and the web interface over IPv6, the zone
+   input policy for IPv6.
 13. **mDNS across networks** (`docs/mdns.md`; reflector, config and
    kernel and web page done in QEMU, `LAB_MDNS=1 scripts/lab-test.sh`;
    open: avahi browse test, apu4). A filtered reflector: `[[mdns.reflect]]` rules (from, to,

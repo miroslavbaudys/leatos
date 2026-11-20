@@ -1,6 +1,6 @@
 # IPv6 (M7, plan)
 
-Status (2026-11-20): step 0 done in QEMU (AAAA rebind protection, Kea for the lab, smoltcp limits, IPv6CP offer logged); the apu4 check of the offer waits for the soak run to end. First plan 2026-11-15 (checked at
+Status (2026-11-20): steps 0 and 1 done in QEMU (step 0: AAAA rebind protection, Kea for the lab, smoltcp limits, IPv6CP offer logged; step 1: IPv6 on the router's networks, below). The apu4 check of the IPv6CP offer waits for the soak run to end. Next: step 2a. First plan 2026-11-15 (checked at
 2712911); **revised 2026-11-20 against 74cb3d1**, after 135 commits that
 added routed LAN ports and live link slots, the WAN ingress stage, IPv4
 fragments, anti-spoofing, redirects, static routes, DNS views, DoT, the
@@ -165,24 +165,52 @@ New or changed (2026-11-20):
 - **Next hop in `PacketMeta`:** `next_hop` becomes `[u8; 16]` (IPv4 in the
   first 4 bytes, the family from the EtherType). 12 more bytes per packet
   meta, no indirection.
-- **Router addresses in the forwarder:** `Interface` gets a fixed array of
-  IPv6 addresses (link-local, ULA, global: no `Vec` on the hot path). These
-  addresses and their solicited-node groups decide `to_us`.
+- **Router addresses in the forwarder** (step 1): the link-local address
+  comes from the interface's MAC (`wire::link_local`), the ULA from
+  `Forwarder::set_ula6` (a list beside `Interface`, which stays as it is);
+  the global address joins it in step 3. These, ff02::1, ff02::2,
+  ff02::fb and solicited-node groups decide what is for the router.
+- **The IPv6 input filter comes first** (step 1): before 2026-11-20
+  every non-IPv4 frame went to the router stack without the zone input
+  policy (`Forwarder::input`). That was harmless only because smoltcp had
+  no IPv6 address. `Forwarder::process6`/`input6` apply it to IPv6: ND
+  (hop limit 255), MLD queries, ICMPv6 errors, echo replies and replies
+  to the router's UDP clients pass; then rules without addresses, then
+  the zone's services; refused input is dropped (`reject` answers for
+  IPv6 come with step 2). With `ipv6` off every IPv6 frame is dropped
+  (`unsupported`), which also keeps clients' ND/MLD out of `local_rx`.
 - **Router ND outside smoltcp.** The datapath snoops NA/NS for its
   neighbor table (like `snoop_arp`) and sends its own NS for forwarded
-  packets. smoltcp keeps answering NS for its own addresses. RS and RA
-  (ICMPv6 133/134) are taken out in `svc` before smoltcp, handled by the
-  sans-IO RA code and sent as frames into the link's qdisc, the way PPPoE
-  control frames are. smoltcp's `proto-ipv6-slaac` stays off: we need M/O,
-  RDNSS and MTU from the ISP's RA, and that RA also sets the forwarder's
-  default route.
+  packets (step 2). smoltcp keeps answering NS for its own addresses.
+  RAs come from the sans-IO `proto_dhcp::v6::ra` and go as whole frames
+  into the link's qdisc. An RS is noticed as the router stack reads it
+  (`net::device` sets `LinkShared::rs_seen`; smoltcp ignores it, being a
+  host). smoltcp's `proto-ipv6-slaac` stays off: we need M/O, RDNSS and
+  MTU from the ISP's RA, and that RA also sets the forwarder's default
+  route.
+- **smoltcp 0.14's neighbor discovery needs help** (found in the step 1
+  lab, 2026-11-20). It learns IPv6 neighbors only from ND and drops the
+  packet that makes it resolve one; clients know our MAC from the RA and
+  never solicit us, so the first answer after a quiet minute (its 60 s
+  entry lifetime) was lost (the first ping of six, the first DNS query).
+  And it answers only solicitations to a solicited-node group, not the
+  unicast reachability probes of RFC 4861 §7.3.3. `net::device` fixes
+  both at its input, with two pure functions in `fwd::wire`: before a
+  client's frame smoltcp gets a solicitation from that client to our
+  unicast address (`ipv6_neighbor_hint`: recorded, not answered), at most
+  every 20 s per neighbor (`NdHints`); unicast solicitations are
+  readdressed to the target's group (`ipv6_ns_to_solicited`). Worth
+  taking upstream; until then this stays the only place that knows.
 - **Neighbor table bounded against /64 scans (RFC 6583):** per interface
   a cap on incomplete entries, with the oldest dropped. Counter
   `neigh_incomplete_drops`.
-- **ULA** per network from a stable random /48 (RFC 4193, made from
-  `entropy` on the first boot that has IPv6, stored as
-  `ipv6.ula_prefix` in the config). Kept alongside the global prefix, so
-  local names and the web interface survive a prefix change or WAN loss.
+- **ULA** per network (decided 2026-11-20): the /48 is `fd` + 40 bits of
+  SHA-256 over a label and the WAN MAC (`config::ula_prefix`; RFC 4193
+  §3.2 allows any good source), so it stays the same across reboots
+  without a store write at boot; `ipv6.ula_prefix` sets it instead.
+  Network `i` (config order) gets `<ula>:<i>::/64`, the router `::1`. Kept
+  alongside the global prefix, so local names and the web interface
+  survive a prefix change or WAN loss.
 - **Firewall rules and address families:** a rule without addresses
   matches both families. A rule with IPv4 prefixes matches IPv4 only, one
   with IPv6 prefixes IPv6 only (OpenWrt semantics). An IPv6 "port
@@ -239,9 +267,19 @@ New or changed (2026-11-20):
   (5 246 696 B, release, aarch64); smoke (both arches) and lab pass.
 
 ### Step 1: router IPv6 on the LAN, no forwarding
-- Link-local addresses (EUI-64 from the port MAC) on every link, the WAN
-  included, and a ULA /64 per network slot (subnet id = slot), applied live
-  through `assign_slots` like IPv4.
+✅ in QEMU (2026-11-20). What was built differs from the plan below in
+places: the WAN gets no link-local address yet (step 3 needs it, PPPoE
+gets one from IPv6CP in step 4); the subnet id is the network's place in
+the config, not its slot; RS frames are not taken out of the router
+stack's input but noticed there; the IPv6 input filter and the smoltcp
+ND help (§2) were added. Known gaps: a client asking DNS from a
+link-local source gets no UDP answer (the reply's network is found from
+the client's ULA /64); a client's first query in its first second can
+fail while its SLAAC address is still tentative (the lab waits for DAD).
+
+- Link-local addresses (EUI-64 from the port MAC) on every network's
+  link and a ULA /64 per network, applied live like IPv4
+  (`stack::set_host_addrs`, `Datapath::apply`).
 - RA sender (`proto-dhcp` `v6::ra`, tickless: the crate returns the next
   deadline): unsolicited RAs (RFC 4861 timers), replies to RS. Prefix
   information (A flag), RDNSS (RFC 8106, the router's ULA), DNSSL (the
@@ -259,6 +297,22 @@ New or changed (2026-11-20):
   `LAB_GUEST=1` the guest gets its own ULA /64 and cannot open the web
   interface over IPv6. Negative control `LAB_ROUTER_ARGS=ipv6=0` (no
   address, checks fail). Also `LEATOS_ARCH=x86_64`, `QEMU_NIC=igb`.
+- Done (2026-11-20): `LAB_IPV6=1 [LAB_GUEST=1] scripts/lab-test.sh`, 66
+  checks pass on aarch64 (HVF), with `QEMU_NIC=igb`, `LEATOS_ARCH=x86_64`,
+  `QEMU_SMP=4` and `QEMU_ACCEL=tcg`; `LAB_PORTS=1` too (71). Negative
+  controls: `LAB_ROUTER_ARGS=ipv6=0` (the router reports no IPv6, the
+  IPv6 checks fail), `LAB_GUEST_ZONE=lan` (the guest reaches the web
+  interface over IPv6). The default lab (IPv6 off) passes unchanged and
+  the IPv4 datapath's CPU over the load phase stays within run-to-run
+  spread (dp_down 230–238 ms vs. 231 ms before). Host tests: the input
+  filter (with a mutation check: accepting everything fails 4 of 6
+  tests), the extension-header walk, `v6::ra` against smoltcp's parser,
+  router AAAA / `ip6.arpa`, `[ipv6]` validation; the `fwd` fuzz target
+  sends IPv6 to the router (never forwarded) and runs the ND helpers.
+  On the way the `fwd` target found an old IPv4 NAT bug: an echo reply
+  turned all-zero by the identifier rewrite got checksum 0x0000 instead
+  of 0xffff (`Ipv4View::set_port` now recounts; regression test in
+  `wire.rs`).
 
 ### Step 2a: conntrack core refactor (no IPv6 yet)
 - `ct::Table<T>` as in §2; IPv4 `Conntrack` on top, no behaviour change.
