@@ -41,7 +41,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
-use core::net::{Ipv4Addr, Ipv6Addr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use serde::{Deserialize, Serialize};
 
 /// Schema version this crate reads and writes.
@@ -460,10 +460,29 @@ pub struct Route {
     pub name: String,
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub enabled: bool,
-    /// Destination subnet (host bits zero) or address.
-    pub dst: Net,
-    /// The next router.
-    pub via: Ipv4Addr,
+    /// Destination subnet (host bits zero) or address, IPv4 or IPv6.
+    pub dst: AnyNet,
+    /// The next router, of the same family. IPv6: in a network's unique
+    /// local /64 (`<ula>:<i>::/64`, stable when the ISP renumbers).
+    pub via: IpAddr,
+}
+
+impl Route {
+    /// An IPv4 route: (destination, router).
+    pub fn v4(&self) -> Option<(Cidr, Ipv4Addr)> {
+        match (self.dst, self.via) {
+            (AnyNet::V4(n), IpAddr::V4(v)) => Some((n.0, v)),
+            _ => None,
+        }
+    }
+
+    /// An IPv6 route: (destination, router).
+    pub fn v6(&self) -> Option<(Cidr6, Ipv6Addr)> {
+        match (self.dst, self.via) {
+            (AnyNet::V6(n), IpAddr::V6(v)) => Some((n, v)),
+            _ => None,
+        }
+    }
 }
 
 /// Where a [`Route`] leaves the router.
@@ -572,7 +591,7 @@ impl Default for Dns {
 /// One entry of `dns.upstreams`: `ip[:port][#name]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Upstream {
-    pub ip: Ipv4Addr,
+    pub ip: IpAddr,
     /// Unset: 53, or 853 for DNS over TLS.
     pub port: Option<u16>,
     /// The name the server's certificate must carry: a host name, or the
@@ -586,17 +605,36 @@ impl Upstream {
             Some((a, n)) => (a, Some(n)),
             None => (s, None),
         };
-        let (ip, port) = match addr.split_once(':') {
-            Some((ip, p)) => (ip, Some(p.parse::<u16>().ok().filter(|&p| p != 0).ok_or("port must be 1–65535")?)),
-            None => (addr, None),
+        let port_of = |p: &str| p.parse::<u16>().ok().filter(|&p| p != 0).ok_or("port must be 1–65535");
+        // 1.1.1.1, 1.1.1.1:853, [2606:4700:4700::1111]:853, 2606:4700:4700::1111
+        let (ip, port) = if let Some(rest) = addr.strip_prefix('[') {
+            let (ip, after) = rest.split_once(']').ok_or("an IPv6 address with a port is written [addr]:port")?;
+            let port = match after {
+                "" => None,
+                p => Some(port_of(p.strip_prefix(':').ok_or("an IPv6 address with a port is written [addr]:port")?)?),
+            };
+            (ip, port)
+        } else if addr.matches(':').count() > 1 {
+            (addr, None)
+        } else {
+            match addr.split_once(':') {
+                Some((ip, p)) => (ip, Some(port_of(p)?)),
+                None => (addr, None),
+            }
         };
-        let ip: Ipv4Addr = ip.parse().map_err(|_| "must be an IPv4 address, e.g. 1.1.1.1 or 1.1.1.1#cloudflare-dns.com")?;
-        if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
+        let ip: IpAddr = ip
+            .parse()
+            .map_err(|_| "must be an IP address, e.g. 1.1.1.1, 1.1.1.1#cloudflare-dns.com or [2606:4700:4700::1111]:853#cloudflare-dns.com")?;
+        let bad = match ip {
+            IpAddr::V4(a) => a.is_unspecified() || a.is_broadcast() || a.is_multicast() || a.is_loopback(),
+            IpAddr::V6(a) => a.is_unspecified() || a.is_multicast() || a.is_loopback() || a.segments()[0] & 0xffc0 == 0xfe80,
+        };
+        if bad {
             return Err("not a server address");
         }
         let name = match name {
             None => None,
-            Some(n) if n.parse::<Ipv4Addr>().is_ok() || validate::is_domain(n) => Some(n.to_ascii_lowercase()),
+            Some(n) if n.parse::<IpAddr>().is_ok() || validate::is_domain(n) => Some(n.to_ascii_lowercase()),
             Some(_) => return Err("the name after '#' must be a DNS name (the server's certificate name)"),
         };
         Ok(Upstream { ip, port, name })
@@ -610,9 +648,10 @@ impl Upstream {
 
 impl core::fmt::Display for Upstream {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.ip)?;
-        if let Some(p) = self.port {
-            write!(f, ":{p}")?;
+        match (self.ip, self.port) {
+            (IpAddr::V6(a), Some(p)) => write!(f, "[{a}]:{p}")?,
+            (a, Some(p)) => write!(f, "{a}:{p}")?,
+            (a, None) => write!(f, "{a}")?,
         }
         if let Some(n) = &self.name {
             write!(f, "#{n}")?;
@@ -1119,7 +1158,13 @@ impl Config {
     /// Where a route leaves: the network whose subnet holds `via`, else
     /// the WAN.
     pub fn route_via(&self, r: &Route) -> RouteVia<'_> {
-        match self.networks.iter().find(|n| n.ipv4.contains(r.via)) {
+        let n = match r.via {
+            IpAddr::V4(v) => self.networks.iter().find(|n| n.ipv4.contains(v)),
+            // Network i's unique local /64 is <ula>:<i>::/64.
+            IpAddr::V6(v) if v.segments()[0] & 0xfe00 == 0xfc00 => self.networks.get(usize::from(v.segments()[3])),
+            IpAddr::V6(_) => None,
+        };
+        match n {
             Some(n) => RouteVia::Network(n),
             None => RouteVia::Wan,
         }
@@ -1131,7 +1176,8 @@ impl Config {
         self.routes
             .iter()
             .filter(|r| r.enabled && matches!(self.route_via(r), RouteVia::Network(n) if n.name == net))
-            .map(|r| (r.dst.0.network(), r.dst.0.prefix, r.via))
+            .filter_map(Route::v4)
+            .map(|(d, via)| (d.network(), d.prefix, via))
             .collect()
     }
 

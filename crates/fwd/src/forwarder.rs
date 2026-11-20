@@ -102,6 +102,8 @@ pub struct Policy {
     /// replies to the router's client and pass like UDP replies do. Any
     /// other TCP to those ports is input like everything else.
     pub router_tcp_peers: Vec<(Ipv4Addr, u16)>,
+    /// The same for IPv6 servers (DNS over TLS over IPv6).
+    pub router_tcp_peers6: Vec<(Ipv6Addr, u16)>,
 }
 
 /// A port forward (`[[firewall.forward]]`), compiled: new connections to
@@ -527,6 +529,9 @@ pub struct Forwarder {
     /// Configured routes (destination, prefix length, router); in
     /// `routes` while a connected subnet holds their router.
     statics: Vec<(Ipv4Addr, u8, Ipv4Addr)>,
+    /// The same for IPv6 (in `routes6` while a network's /64 holds the
+    /// router).
+    statics6: Vec<(Ipv6Addr, u8, Ipv6Addr)>,
     pub ct: Conntrack,
     pub stats: Stats,
     icmp_tokens: u64,
@@ -902,6 +907,7 @@ impl Forwarder {
             mtus: Vec::new(),
             routes: RouteTable::new(),
             statics: Vec::new(),
+            statics6: Vec::new(),
             ct: Conntrack::new_shard(max_conns, hash_key, shards, shard),
             stats: Stats::default(),
             icmp_tokens: ICMP_BURST,
@@ -973,6 +979,7 @@ impl Forwarder {
         if let Some((a, l)) = addr {
             self.routes6.set(Route { prefix: a, len: l, egress: ifx, gateway: None, kind: RouteKind::Connected });
         }
+        self.sync_static_routes6();
     }
 
     /// The IPv6 default route: through `gw` on `egress` (the WAN), or none.
@@ -1004,10 +1011,12 @@ impl Forwarder {
         a == self.ll6(ifx) || self.addrs6[ifx as usize].iter().flatten().any(|&(m, _)| m == a)
     }
 
-    /// `a` is in one of `ifx`'s prefixes.
+    /// `a` is in one of `ifx`'s prefixes, or a subnet routed through a
+    /// router there (`[[route]]`).
     fn on6(&self, ifx: IfIndex, a: Ipv6Addr) -> bool {
         use crate::route::RouteAddr;
         self.addrs6[ifx as usize].iter().flatten().any(|&(m, l)| m.masked(l) == a.masked(l))
+            || self.routes6.iter().any(|r| r.kind == RouteKind::Static && r.egress == ifx && r.prefix.masked(r.len) == a.masked(r.len))
     }
 
     /// The interface's own MAC (a network moved to another port).
@@ -1064,6 +1073,29 @@ impl Forwarder {
                 gateway: Some(via),
                 kind: RouteKind::Static,
             });
+        }
+    }
+
+    /// IPv6 `[[route]]`s: (destination, prefix length, router).
+    pub fn set_static_routes6(&mut self, routes: &[(Ipv6Addr, u8, Ipv6Addr)]) {
+        self.statics6 = routes.to_vec();
+        self.sync_static_routes6();
+    }
+
+    fn sync_static_routes6(&mut self) {
+        use crate::route::RouteAddr;
+        self.routes6.remove_kind(RouteKind::Static);
+        for &(prefix, len, via) in &self.statics6.clone() {
+            let Some(egress) = (0..self.ifs.len()).find(|&i| {
+                let i = i as IfIndex;
+                self.addrs6[i as usize].iter().flatten().any(|&(m, l)| m.masked(l) == via.masked(l)) && !self.is_mine6(i, via)
+            }) else {
+                continue;
+            };
+            if self.routes6.get(prefix, len).is_some() {
+                continue;
+            }
+            self.routes6.set(Route { prefix: prefix.masked(len), len, egress: egress as IfIndex, gateway: Some(via), kind: RouteKind::Static });
         }
     }
 
@@ -1381,7 +1413,10 @@ impl Forwarder {
         let Some(route) = self.routes6.lookup(dst).copied() else {
             return self.drop(DropReason::NoRoute);
         };
-        if route.egress == ingress {
+        // Back out where it came from: only towards a `[[route]]`'s router
+        // there (IPv6 hosts have no option 121; RFC 4191 route options are
+        // ignored by default, e.g. on Linux).
+        if route.egress == ingress && route.kind != RouteKind::Static {
             return self.drop(DropReason::Hairpin);
         }
         let egress_if = self.ifs[route.egress as usize];
@@ -1567,6 +1602,13 @@ impl Forwarder {
         let dport = (matches!(v.proto, PROTO_TCP | PROTO_UDP) && l4(4)).then(|| wire::get16(f, v.l4 + 2));
         // Replies to the router's UDP clients; 546: its DHCPv6 client.
         if v.proto == PROTO_UDP && dport.is_some_and(|d| d >= ROUTER_CLIENT_PORTS || d == 546) {
+            return self.local();
+        }
+        // TCP replies only from the servers it connects to (DNS over TLS).
+        if v.proto == PROTO_TCP
+            && dport.is_some_and(|d| d >= ROUTER_CLIENT_PORTS)
+            && self.policy.as_ref().is_some_and(|p| p.router_tcp_peers6.contains(&(v.src(f), wire::get16(f, v.l4))))
+        {
             return self.local();
         }
         if let Some((i, action)) = self
@@ -4727,6 +4769,30 @@ mod tests {
         fw.set_gua6(LAN, Some((a6("2001:db8:200::1"), 64)));
         assert!(open(&mut fw, "2001:db8:200::10", 8087), "survives a new prefix");
         assert_eq!(fw.rule_hits, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn ipv6_static_routes() {
+        let mut fw = router6f();
+        // fd00:30::/64 behind a router on the LAN's ULA /64.
+        let via = Ipv6Addr::new(0xfd00, 0x1, 0x2, 0, 0, 0, 0, 0x100);
+        let behind = "fd00:30::5";
+        fw.set_static_routes6(&[(a6("fd00:30::"), 64, via)]);
+        // From the WAN side network (an allowed guest -> LAN would be
+        // refused by zones; use LAN -> LAN-routed: same zone).
+        let mut f = frame6(LAN_MAC, H6, behind, 64, PROTO_UDP, &udp6(H6, behind, 5000, 53, b"q"));
+        let v = run(&mut fw, 0, LAN, &mut f); let Verdict::Forward6 { egress, next_hop, .. } = v else { panic!("not forwarded: {v:?}") };
+        assert_eq!((egress, next_hop), (LAN, via));
+        // A source behind it is no spoof on the LAN.
+        let mut f = frame6(LAN_MAC, behind, S6, 64, PROTO_UDP, &udp6(behind, S6, 5000, 53, b"q"));
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward6 { egress: WAN, .. }));
+        // ...but from the WAN it is ours: spoofed.
+        let mut f = frame6(WAN_MAC, behind, H6, 60, PROTO_UDP, &udp6(behind, H6, 5000, 53, b"q"));
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), dropped(DropReason::Spoofed));
+        // The router's /64 gone: the route goes with it.
+        fw.set_ula6(LAN, None);
+        let mut f = frame6(LAN_MAC, H6, behind, 64, PROTO_UDP, &udp6(H6, behind, 5000, 53, b"q"));
+        assert!(!matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward6 { egress: LAN, .. }));
     }
 
     #[test]

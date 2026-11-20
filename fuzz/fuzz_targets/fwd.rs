@@ -100,6 +100,7 @@ fn policy() -> Policy {
         ],
         redirects: vec![Redirect { from: None, protos: proto::UDP, lo: 123, hi: 123, to: Ipv4Addr::new(192, 168, 1, 101), to_port: None }],
         router_tcp_peers: vec![(Ipv4Addr::new(8, 8, 8, 8), 853)],
+        router_tcp_peers6: vec![],
     }
 }
 

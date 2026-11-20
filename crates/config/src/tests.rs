@@ -471,7 +471,7 @@ fn dns_upstreams_and_tls() {
     .unwrap();
     let ups = c.dns.upstream_list();
     assert_eq!(ups.len(), 2);
-    assert_eq!((ups[0].ip, ups[0].port(true), ups[0].name.as_deref()), (ip(1, 1, 1, 1), 853, Some("cloudflare-dns.com")));
+    assert_eq!((ups[0].ip, ups[0].port(true), ups[0].name.as_deref()), (core::net::IpAddr::V4(ip(1, 1, 1, 1)), 853, Some("cloudflare-dns.com")));
     assert_eq!((ups[1].port, ups[1].name.as_deref()), (Some(853), Some("cloudflare-dns.com")), "names lowercased");
     assert_eq!(alloc::format!("{}", ups[1]), "1.0.0.1:853#cloudflare-dns.com");
     assert!(c.unsupported().is_empty(), "implemented: {:?}", c.unsupported());
@@ -1691,7 +1691,7 @@ fn dns_views_and_hosts_from_the_cli() {
 }
 
 fn route(name: &str, dst: &str, via: core::net::Ipv4Addr) -> Route {
-    Route { name: name.into(), enabled: true, dst: dst.parse().unwrap(), via }
+    Route { name: name.into(), enabled: true, dst: dst.parse().unwrap(), via: via.into() }
 }
 
 #[test]
@@ -1704,7 +1704,7 @@ fn routes_parse_round_trip_and_feed_option_121() {
     );
     let c = parse(&doc).unwrap();
     assert_eq!(c.routes.len(), 3);
-    assert_eq!(c.routes[2].dst.0.prefix, 32, "an address is a /32");
+    assert_eq!(c.routes[2].v4().unwrap().0.prefix, 32, "an address is a /32");
     assert_eq!(parse(&c.to_toml()).unwrap(), c, "{}", c.to_toml());
     assert!(!c.to_toml().contains("enabled = true"));
     assert_eq!(c.route_via(&c.routes[0]), RouteVia::Network(&c.networks[0]));
@@ -1896,4 +1896,38 @@ action = "accept"
     let back = toml::to_string(&c).unwrap();
     assert!(back.contains("dst_iid = \"::5054:ff:fe00:10\""), "{back}");
     assert!(back.contains("dst = \"2001:db8:100::10\""), "{back}");
+}
+
+#[test]
+fn ipv6_upstreams_ntp_and_routes() {
+    use core::net::IpAddr;
+    // DNS upstreams: [addr]:port#name, a bare address, the name check.
+    let u = Upstream::parse("[2606:4700:4700::1111]:853#cloudflare-dns.com").unwrap();
+    assert_eq!((u.ip, u.port, u.name.as_deref()), ("2606:4700:4700::1111".parse::<IpAddr>().unwrap(), Some(853), Some("cloudflare-dns.com")));
+    assert_eq!(alloc::format!("{u}"), "[2606:4700:4700::1111]:853#cloudflare-dns.com");
+    let u = Upstream::parse("2001:4860:4860::8888").unwrap();
+    assert_eq!((u.port, alloc::format!("{u}")), (None, String::from("2001:4860:4860::8888")));
+    assert!(Upstream::parse("[2606:4700:4700::1111]853").is_err());
+    assert!(Upstream::parse("fe80::1").is_err(), "link-local");
+    assert!(Upstream::parse("::1").is_err());
+    assert!(Upstream::parse("[2606:4700:4700::1111]:853#2606:4700:4700::1111").is_ok(), "an IP certificate name");
+    // NTP: IPv6 literals.
+    assert!(issues(|c| c.time.ntp_servers = vec!["2001:db8::123".into()]).is_empty());
+    // Routes: IPv6 through a host in network 0's unique local /64.
+    let r6 = |dst: &str, via: &str| Route { name: "r6".into(), enabled: true, dst: dst.parse().unwrap(), via: via.parse().unwrap() };
+    let one = |r: Route| issues(move |c| c.routes.push(r));
+    assert!(one(r6("fd00:30::/64", "fd12:3456:789a::5")).is_empty());
+    assert!(one(r6("2001:db8:500::/48", "fd12:3456:789a::5")).is_empty());
+    assert_eq!(one(r6("fd00:30::5/64", "fd12:3456:789a::5")), ["route.r6.dst"], "host bits");
+    assert_eq!(one(r6("::/0", "fd12:3456:789a::5")), ["route.r6.dst"], "default");
+    assert_eq!(one(r6("fe80::/64", "fd12:3456:789a::5")), ["route.r6.dst"], "link-local");
+    assert_eq!(one(r6("fd00:30::/64", "2001:db8::5")), ["route.r6.via"], "not unique local");
+    assert_eq!(one(r6("fd00:30::/64", "fd12:3456:789a:7::5")), ["route.r6.via"], "no network 7");
+    assert_eq!(one(r6("fd00:30::/64", "fd12:3456:789a::1")), ["route.r6.via"], "the router");
+    assert_eq!(one(r6("fd00:30::/64", "192.168.1.2")), ["route.r6.via"], "mixed families");
+    let c = parse(&lan_doc("192.168.1.1/24", "[[route]]\nname = \"r6\"\ndst = \"fd00:30::/64\"\nvia = \"fd12:3456:789a::5\"\n")).unwrap();
+    assert!(c.routes[0].v6().is_some() && c.routes[0].v4().is_none());
+    assert_eq!(c.route_via(&c.routes[0]), RouteVia::Network(&c.networks[0]));
+    assert!(c.network_routes("lan").is_empty(), "no option 121 for IPv6");
+    assert_eq!(parse(&c.to_toml()).unwrap(), c);
 }

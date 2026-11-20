@@ -162,7 +162,7 @@ impl Config {
             .iter()
             .filter(|r| r.enabled)
             .filter_map(|r| match self.route_via(r) {
-                crate::RouteVia::Network(n) => Some((r.dst.0, self.networks.iter().position(|m| m.name == n.name)?)),
+                crate::RouteVia::Network(n) => Some((r.v4()?.0, self.networks.iter().position(|m| m.name == n.name)?)),
                 crate::RouteVia::Wan => None,
             })
             .collect();

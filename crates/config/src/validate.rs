@@ -13,7 +13,8 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
+use crate::Cidr6;
 
 /// Most reservations accepted, over all networks (bounded work and memory
 /// in the DHCP servers).
@@ -180,10 +181,10 @@ pub(crate) fn check(c: &Config) -> Result<(), Vec<Issue>> {
         );
     }
     for (i, n) in ntp.iter().enumerate() {
-        if n.parse::<Ipv4Addr>().is_err() && !is_domain(n) {
+        if n.parse::<core::net::IpAddr>().is_err() && !is_domain(n) {
             x.add(
                 format!("time.ntp_servers[{i}]"),
-                "must be a host name or an IPv4 address",
+                "must be a host name or an IP address",
             );
         }
     }
@@ -678,12 +679,23 @@ fn routes(c: &Config, x: &mut Issues) {
         subnets.push(("wan.static.ipv4".into(), s.ipv4));
     }
     for (i, (rt, p)) in r.iter().zip(&paths).enumerate() {
-        let dst = rt.dst.0;
         let dp = format!("{p}.dst");
+        let vp = format!("{p}.via");
+        if let Some((dst6, via6)) = rt.v6() {
+            route6(c, x, rt, (dst6, via6), (&dp, &vp));
+            if let Some(j) = r[..i].iter().position(|o| o.dst == rt.dst) {
+                x.add(&dp, format!("the same destination as {}", paths[j]));
+            }
+            continue;
+        }
+        let Some((dst, via)) = rt.v4() else {
+            x.add(&vp, "of another address family than dst");
+            continue;
+        };
         if dst.prefix == 0 {
             x.add(&dp, "the default route is the WAN's");
         } else if !rt.dst.is_network() {
-            net_ok(x, dp.clone(), &Some(rt.dst));
+            x.add(&dp, format!("host bits set: did you mean {}?", rt.dst.network_text()));
         } else if let Some(why) = special(&dst) {
             x.add(&dp, format!("{} is {why}", subnet(&dst)));
         }
@@ -694,38 +706,63 @@ fn routes(c: &Config, x: &mut Issues) {
                 x.add(&dp, format!("{} is inside {np} ({})", subnet(&dst), subnet(net)));
             }
         }
-        if let Some(j) = r[..i].iter().position(|o| o.dst.0.network() == dst.network() && o.dst.0.prefix == dst.prefix) {
+        if let Some(j) = r[..i].iter().position(|o| o.dst == rt.dst) {
             x.add(&dp, format!("the same destination as {}", paths[j]));
         }
-        let vp = format!("{p}.via");
         match c.route_via(rt) {
             crate::RouteVia::Network(n) => {
-                if n.ipv4.addr == rt.via {
+                if n.ipv4.addr == via {
                     x.add(&vp, "is the router's own address");
-                } else if !n.ipv4.is_host(rt.via) {
+                } else if !n.ipv4.is_host(via) {
                     x.add(&vp, format!("is not a host address in {}", subnet(&n.ipv4)));
                 }
             }
             // Only the WAN's (DHCP) subnet could hold it, and the route
             // would take that over.
-            crate::RouteVia::Wan if dst.prefix > 0 && dst.contains(rt.via) => {
+            crate::RouteVia::Wan if dst.prefix > 0 && dst.contains(via) => {
                 x.add(&vp, "is inside the destination itself");
             }
             crate::RouteVia::Wan => match (&c.wan.static_ip, c.wan.mode) {
                 (_, WanMode::Pppoe) => x.add(
                     &vp,
-                    format!("{} is in none of the networks (a PPPoE WAN has no other routers)", rt.via),
+                    format!("{via} is in none of the networks (a PPPoE WAN has no other routers)"),
                 ),
-                (Some(s), _) if !s.ipv4.is_host(rt.via) || s.ipv4.addr == rt.via => x.add(
+                (Some(s), _) if !s.ipv4.is_host(via) || s.ipv4.addr == via => x.add(
                     &vp,
                     format!("must be a host in one of the networks or in the WAN's {}", subnet(&s.ipv4)),
                 ),
-                _ if special(&Cidr::new(rt.via, 32)).is_some() || rt.via.is_broadcast() => {
+                _ if special(&Cidr::new(via, 32)).is_some() || via.is_broadcast() => {
                     x.add(&vp, "must be a unicast address")
                 }
                 _ => {}
             },
         }
+    }
+}
+
+/// An IPv6 route: a global or unique local destination outside the
+/// networks' unique local /48's own /64s, through a host in a network's
+/// unique local /64 (`<ula>:<i>::/64`: network `i`).
+fn route6(c: &Config, x: &mut Issues, rt: &crate::Route, (dst, via): (Cidr6, Ipv6Addr), (dp, vp): (&str, &str)) {
+    let first = dst.addr.segments()[0];
+    if dst.prefix == 0 {
+        x.add(dp, "the default route is the WAN's");
+    } else if dst.addr != dst.network() {
+        x.add(dp, format!("host bits set: did you mean {}/{}?", dst.network(), dst.prefix));
+    } else if !(first & 0xe000 == 0x2000 || first & 0xfe00 == 0xfc00) {
+        x.add(dp, "must be a global (2000::/3) or unique local (fc00::/7) prefix");
+    }
+    let s = via.segments();
+    if s[0] & 0xfe00 != 0xfc00 {
+        x.add(vp, "an IPv6 route's router must be in a network's unique local /64 (<ula>:<network index>::/64)");
+    } else if !matches!(c.route_via(rt), crate::RouteVia::Network(_)) {
+        x.add(vp, format!("no network {} (its unique local /64 has subnet id {:x})", s[3], s[3]));
+    } else if u128::from(via) as u64 == 1 {
+        x.add(vp, "is the router's own address");
+    } else if let Some(u) = c.ipv6.ula_prefix
+        && Cidr6::new(via, 48).network() != u.network()
+    {
+        x.add(vp, format!("not in ipv6.ula_prefix {u}"));
     }
 }
 
