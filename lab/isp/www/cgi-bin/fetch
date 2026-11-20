@@ -1,10 +1,14 @@
 #!/usr/bin/busybox sh
 # Port forward check: fetch http://<caller>:<port>/ back through the
 # caller's address (the router's WAN address after NAT), so the request
-# arrives at the router from the internet. Query string: the port.
+# arrives at the router from the internet. Query string: the port, then
+# optionally &to=ADDR (IPv6: another address of the caller, the pinhole
+# check of scripts/lab-test.sh LAB_IPV6).
 bb=/usr/bin/busybox
 addr=${REMOTE_ADDR#\[}; addr=${addr%\]}; addr=${addr#::ffff:}
-port=$(echo "$QUERY_STRING" | $bb tr -cd '0-9')
+port=$(echo "${QUERY_STRING%%&*}" | $bb tr -cd '0-9')
+to=$(echo "$QUERY_STRING" | $bb sed -n 's/.*&to=\([0-9a-fA-F:]*\).*/\1/p')
+[ -n "$to" ] && addr=$to
 echo "Content-Type: text/plain"
 echo
 host=$addr

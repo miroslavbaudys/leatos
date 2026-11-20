@@ -230,6 +230,12 @@
 #                        a reboot while the ISP's server forgot every lease
 #                        and allocates at random (cgi-bin/pd?fresh);
 #                        negative control LAB_ROUTER_ARGS=pd_keep=0.
+#                        Step 5b, with LAB_GUEST=1: rule v6-pinhole (wan ->
+#                        lan tcp 8087, dst_iid = the client's EUI-64 id):
+#                        the ISP reaches the client's :8087, not on a second
+#                        address with another id, and again after the
+#                        prefix change. Negative control
+#                        LAB_IPV6_PINHOLE=0.
 #                        IPv6 on the router's networks (docs/ipv6.md step
 #                        1; router ipv6=1): the client gets a SLAAC
 #                        address from the main LAN's ULA /64, no default
@@ -500,6 +506,19 @@ CFG
 name = "wan-open"
 from = "wan"
 to = "router"
+action = "accept"
+CFG
+  # IPv6 pinhole (docs/ipv6.md step 5b): the client's interface
+  # identifier, any prefix. Negative control LAB_IPV6_PINHOLE=0.
+  [[ -n "$IPV6" && "${LAB_IPV6_PINHOLE:-1}" != 0 ]] && cat >>"$WORK/config.toml" <<'CFG'
+
+[[firewall.rule]]
+name = "v6-pinhole"
+from = "wan"
+to = "lan"
+proto = "tcp"
+dst_iid = "::5054:ff:fe00:10"
+dst_port = 8087
 action = "accept"
 CFG
   [[ -n "$IPV6_OPEN" ]] && cat >>"$WORK/config.toml" <<'CFG'

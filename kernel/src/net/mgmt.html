@@ -1381,7 +1381,7 @@ function renderRules(list) {
   ruleOrig = list.map((r) => structuredClone(r));
   const zs = ["wan", ...zoneNames()];
   const t = $("rules");
-  t.replaceChildren(el("tr", {}, ["On", "Name", "From", "To", "Protocol", "Source", "Destination", "Port", "Action", "Hits", ""].map((h) => el("th", { textContent: h }))));
+  t.replaceChildren(el("tr", {}, ["On", "Name", "From", "To", "Protocol", "Source", "Destination", "IPv6 host ID", "Port", "Action", "Hits", ""].map((h) => el("th", { textContent: h }))));
   list.forEach((r, i) => {
     const tr = el("tr", { dataset: { orig: String(i) } });
     const sel = (key, opts, v) => { const x = el("select", { dataset: { key } }, opts.map((o) => el("option", { value: o, textContent: o }))); x.value = v; return el("td", {}, [x]); };
@@ -1389,7 +1389,9 @@ function renderRules(list) {
     const move = (d) => () => { const rs = readRules(); const j = i + d; if (j < 0 || j >= rs.length) return; [rs[i], rs[j]] = [rs[j], rs[i]]; renderRules(rs); updatePending(); };
     tr.append(el("td", {}, [el("input", { type: "checkbox", checked: r.enabled !== false, dataset: { key: "enabled" } })]),
       inp("name", r.name, "allow-printer", 12), sel("from", ["any", ...zs], r.from ?? "any"), sel("to", ["any", "router", ...zs], r.to ?? "any"),
-      sel("proto", PROTOS, r.proto ?? "any"), inp("src", r.src, "any", 13), inp("dst", r.dst, "any", 13), inp("dst_port", r.dst_port, "any", 9),
+      sel("proto", PROTOS, r.proto ?? "any"), inp("src", r.src, "any", 13), inp("dst", r.dst, "any", 13),
+      el("td", {}, [el("input", { value: r.dst_iid ?? "", placeholder: "any", size: 16, title: "IPv6 only: the destination's interface identifier (low 64 bits, e.g. ::5054:ff:fe00:10), under any prefix: a pinhole that survives renumbering", dataset: { key: "dst_iid" } })]),
+      inp("dst_port", r.dst_port, "any", 9),
       sel("action", ["accept", "drop", "reject"], r.action ?? "accept"), el("td", { className: "num", dataset: { hits: r.name ?? "" } }),
       el("td", {}, [el("button", { type: "button", className: "plain", textContent: "↑", title: "Move up", onclick: move(-1) }),
         el("button", { type: "button", className: "plain", textContent: "↓", title: "Move down", onclick: move(1) }),
@@ -1414,7 +1416,7 @@ function readRules() {
     if (v("enabled").checked) delete o.enabled; else o.enabled = false;
     for (const k of ["from", "to", "action"]) o[k] = v(k).value;
     if (v("proto").value === "any") delete o.proto; else o.proto = v("proto").value;
-    for (const k of ["src", "dst", "dst_port"]) { const x = v(k).value.trim(); if (x) o[k] = x; else delete o[k]; }
+    for (const k of ["src", "dst", "dst_iid", "dst_port"]) { const x = v(k).value.trim(); if (x) o[k] = x; else delete o[k]; }
     return o;
   });
 }

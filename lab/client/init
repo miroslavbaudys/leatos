@@ -601,6 +601,24 @@ if [ -n "$v6on" ]; then
       in=$($bb wget -q -T 8 -O - "http://[$ISP6]/cgi-bin/fetch?8086" 2>&1)
       d1=$(fwdrops6)
       if echo "$in" | $bb grep -q 'fetch=FAILED' && [ "${d1:-0}" -gt "${d0:-0}" ]; then pass "ipv6 wan: inbound refused (router firewall drops $d0 -> $d1)"; else fail "ipv6 wan: inbound: $in (firewall drops $d0 -> $d1)"; fi
+      # A pinhole by interface identifier (step 5b; with a store config:
+      # rule v6-pinhole, wan -> lan tcp 8087 to ::5054:ff:fe00:10): open
+      # to our EUI-64 address, closed to another address of ours.
+      if $bb grep -q 'lab_guest=' /proc/cmdline; then
+        $bx httpd -p "[::]:8087" -h /tmp/www6
+        other="${ag%:5054:ff:fe00:10}::abcd"
+        $bb ip -6 addr add "$other/64" dev eth0 2>/dev/null
+        pinhole() { $bb wget -q -T 8 -O - "http://[$ISP6]/cgi-bin/fetch?8087&to=$1" 2>&1; }
+        p1=$(pinhole "$ag")
+        for i in 1 2 3 4 5; do $bb ip -6 addr show dev eth0 | $bb grep "$other" | $bb grep -q tentative || break; $bb sleep 1; done
+        p2=$(pinhole "$other")
+        if echo "$p1" | $bb grep -q 'fetch=OK' && echo "$p2" | $bb grep -q 'fetch=FAILED'; then
+          pass "ipv6 pinhole: $ag:8087 reachable by interface identifier, $other:8087 not"
+        else
+          fail "ipv6 pinhole: $ag: $p1 / $other: $p2"
+        fi
+        $bb ip -6 addr del "$other/64" dev eth0 2>/dev/null
+      fi
       # Packet Too Big: the WAN takes 1400 (wan_mtu=1400).
       # (busybox shows no path MTU cache: the router's ICMP error count,
       # read after its once-a-second sum.)
@@ -654,6 +672,10 @@ if [ -n "$v6on" ]; then
         done
         if [ "$g2" = 2001:db8:200::1 ]; then pass "ipv6 pd: new prefix 2001:db8:200::/56 after the change"; else fail "ipv6 pd: no new prefix (router: '$g2')"; fi
         if an=$(v6slaac eth0 2001:db8:200:0); then pass "ipv6 pd: new address $an"; else fail "ipv6 pd: no address under 2001:db8:200::/64"; fi
+        if $bb grep -q 'lab_guest=' /proc/cmdline && [ -n "$an" ]; then
+          p3=$($bb wget -q -T 8 -O - "http://[$ISP6]/cgi-bin/fetch?8087&to=$an" 2>&1)
+          if echo "$p3" | $bb grep -q 'fetch=OK'; then pass "ipv6 pinhole: still open under the new prefix ($an:8087)"; else fail "ipv6 pinhole: closed under the new prefix: $p3"; fi
+        fi
         if $bb ip -6 addr show dev eth0 | $bb grep '2001:db8:100:0:' | $bb grep -q deprecated; then pass "ipv6 pd: the old address is deprecated"; else fail "ipv6 pd: the old address is not deprecated"; $bb ip -6 addr show dev eth0 | $bb grep inet6 | $bb sed 's/^/    | /'; fi
         if $bb ping6 -c 2 -W 2 "$ISP6" >/dev/null 2>&1; then pass "ipv6 pd: ping6 $ISP6 through the new prefix"; else fail "ipv6 pd: ping6 $ISP6 after the change"; fi
       fi

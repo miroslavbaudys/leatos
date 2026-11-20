@@ -733,8 +733,9 @@ pub fn firewall() -> fwd::forwarder::Policy {
             ),
         });
     }
-    use fwd::forwarder::{Action, Rule, RuleTo, proto};
-    let net = |n: &Option<schema::Net>| n.map(|n| (n.0.network(), n.0.prefix));
+    use fwd::forwarder::{Action, Rule, Rule6, RuleTo, proto};
+    let net = |n: &Option<schema::AnyNet>| n.and_then(|n| n.v4()).map(|n| (n.0.network(), n.0.prefix));
+    let net6 = |n: &Option<schema::AnyNet>| n.and_then(|n| n.v6()).map(|n| (n.network(), n.prefix));
     let rules = c
         .firewall
         .rules
@@ -756,6 +757,7 @@ pub fn firewall() -> fwd::forwarder::Policy {
             },
             src: net(&r.src),
             dst: net(&r.dst),
+            v6: Rule6 { src: net6(&r.src), dst: net6(&r.dst), dst_iid: r.dst_iid.map(|i| u128::from(i) as u64) },
             dport: r.dst_port.map(|p| (p.lo, p.hi)),
             action: match r.action {
                 schema::Action::Accept => Action::Accept,
@@ -779,7 +781,7 @@ pub fn firewall() -> fwd::forwarder::Policy {
             hi: f.wan_port.hi,
             to: f.to.ip,
             to_port: f.to.port,
-            src: net(&f.src),
+            src: f.src.map(|n| (n.0.network(), n.0.prefix)),
             hairpin: f.hairpin,
         })
         .collect();
