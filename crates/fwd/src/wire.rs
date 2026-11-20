@@ -337,6 +337,15 @@ impl Ipv4View {
                 if self.proto == PROTO_UDP && c == 0 {
                     c = 0xffff;
                 }
+                if self.proto == PROTO_ICMP && c == 0 {
+                    // 0x0000 is right only if the message sums to 0xffff; an
+                    // all-zero one needs 0xffff, which the incremental update
+                    // cannot tell apart (no pseudo-header in ICMP). Rare:
+                    // recount.
+                    put16(f, co, 0);
+                    let end = (self.l4 + self.l4_len).min(f.len());
+                    c = checksum(&f[self.l4..end]);
+                }
                 put16(f, co, c);
             }
         }
@@ -644,6 +653,28 @@ mod tests {
             );
             assert!(checksums_ok(&f), "l4 checksum ({proto})");
             assert_eq!((v.src(&f), v.ttl(&f)), (W, 63));
+        }
+    }
+
+    /// Fuzz find (fwd, 2026-11-20): NAT turning an echo reply's identifier
+    /// back to 0, with seq 0 and a zero payload, made the message all zero.
+    /// Its checksum must then be 0xffff; the incremental update (RFC 1624
+    /// eqn. 3) gave 0x0000, which receivers reject.
+    #[test]
+    fn icmp_identifier_rewrite_to_an_all_zero_message() {
+        for payload in [&b""[..], &b"\0"[..], &b"\0\0\0"[..]] {
+            let mut l4 = icmp_echo(ICMP_ECHO_REPLY, 0x2a00, 0);
+            l4.truncate(8); // no "pingdata"
+            l4.extend_from_slice(payload);
+            put16(&mut l4, 2, 0);
+            let c = checksum(&l4);
+            put16(&mut l4, 2, c);
+            let mut f = ipv4_frame(B, A, PROTO_ICMP, 64, &l4);
+            assert!(checksums_ok(&f));
+            let v = Ipv4View::parse(&f, ETH_HDR).unwrap();
+            v.set_port(&mut f, false, 0);
+            assert_eq!(get16(&f, v.l4 + 2), 0xffff, "payload {payload:?}");
+            assert!(checksums_ok(&f));
         }
     }
 
