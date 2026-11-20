@@ -96,6 +96,9 @@ struct Domain {
     name: String,
     /// host label → its records
     hosts: BTreeMap<String, Vec<Record>>,
+    /// host label → its IPv6 addresses (AAAA, [`Zone::add_host6_in`]), each
+    /// answered to the networks of its view.
+    hosts6: BTreeMap<String, Vec<(Ipv6Addr, View)>>,
 }
 
 pub struct Zone {
@@ -202,6 +205,7 @@ impl Zone {
         self.domains.push(Domain {
             name: name.clone(),
             hosts: BTreeMap::new(),
+            hosts6: BTreeMap::new(),
         });
         self.add_in(&name, "router", router_ip, Source::Static, View::ALL);
     }
@@ -214,6 +218,35 @@ impl Zone {
         if !self.routers6.iter().any(|(d, a)| *d == name && *a == addr) {
             self.routers6.push((name, addr));
         }
+        if !self.subnets6.iter().any(|&s| prefix64(s) == prefix64(addr)) {
+            self.subnets6.push(addr);
+        }
+    }
+
+    /// An IPv6 address of `host` in local domain `domain` (ignored if not
+    /// local): AAAA and its `ip6.arpa` PTR (make the /64 local with
+    /// [`Self::add_subnet6`]), answered to `seen_by`: the networks that see
+    /// the host's A record.
+    pub fn add_host6_in(&mut self, domain: &str, host: &str, ip: Ipv6Addr, seen_by: View) {
+        let Some(d) = self.find_mut(domain) else {
+            return;
+        };
+        let v = d.hosts6.entry(host.to_ascii_lowercase()).or_default();
+        if !v.iter().any(|&(a, _)| a == ip) {
+            v.push((ip, seen_by));
+        }
+    }
+
+    /// Forget every host's IPv6 addresses (before adding the current ones).
+    pub fn clear_hosts6(&mut self) {
+        for d in &mut self.domains {
+            d.hosts6.clear();
+        }
+    }
+
+    /// A network's /64 whose `ip6.arpa` names are local (its global one;
+    /// the unique local one comes with [`Self::add_router6`]).
+    pub fn add_subnet6(&mut self, addr: Ipv6Addr) {
         if !self.subnets6.iter().any(|&s| prefix64(s) == prefix64(addr)) {
             self.subnets6.push(addr);
         }
@@ -351,13 +384,25 @@ impl Zone {
             if !self.subnets6.iter().any(|&s| prefix64(s) == prefix64(ip6)) {
                 return (Lookup::NotLocal, None);
             }
-            let names: Vec<String> = self
+            let mut names: Vec<String> = self
                 .routers6
                 .iter()
                 .filter(|(_, a)| *a == ip6)
                 .map(|(d, _)| format!("router.{d}"))
                 .collect();
+            let mut anywhere = false;
+            for d in &self.domains {
+                for (h, addrs) in &d.hosts6 {
+                    for &(_, seen) in addrs.iter().filter(|(a, _)| *a == ip6) {
+                        anywhere = true;
+                        if seen.overlaps(view) {
+                            names.push(format!("{h}.{}", d.name));
+                        }
+                    }
+                }
+            }
             return match (names.is_empty(), qtype == TYPE_PTR) {
+                (true, _) if anywhere => (Lookup::Hidden, None),
                 (true, _) => (Lookup::NxDomain, None),
                 (false, true) => (Lookup::Ptr(names), None),
                 (false, false) => (Lookup::NoData, None),
@@ -402,9 +447,15 @@ impl Zone {
                 return (Lookup::Aaaa(v6), None);
             }
         }
+        let v6: Vec<Ipv6Addr> = d
+            .hosts6
+            .get(host)
+            .map(|v| v.iter().filter(|(_, seen)| seen.overlaps(view)).map(|&(a, _)| a).collect())
+            .unwrap_or_default();
         match d.hosts.get(host) {
             Some(recs) => match effective(recs, view) {
                 Some(r) if qtype == TYPE_A => (Lookup::A(alloc::vec![r.ip]), r.host),
+                Some(r) if qtype == TYPE_AAAA && !v6.is_empty() => (Lookup::Aaaa(v6), r.host),
                 Some(r) => (Lookup::NoData, r.host),
                 None => (Lookup::Hidden, None),
             },
@@ -676,5 +727,36 @@ mod tests {
         // Not 32 nibbles: not parsed as an address.
         assert!(matches!(z.lookup("a.8.9.7.ip6.arpa", TYPE_PTR, ALL), Lookup::NotLocal));
         assert!(matches!(z.lookup(&rev(lan6).replacen("1.", "x.", 1), TYPE_PTR, ALL), Lookup::NotLocal));
+    }
+
+    #[test]
+    fn aaaa_for_hosts_with_views_and_ptr() {
+        let mut z = Zone::new("lan", Ipv4Addr::new(192, 168, 1, 1), (Ipv4Addr::new(192, 168, 1, 0), 24));
+        let ula: Ipv6Addr = "fd00:1::1".parse().unwrap();
+        let gua: Ipv6Addr = "2001:db8:100::1".parse().unwrap();
+        z.add_router6("lan", ula);
+        z.add_subnet6(gua);
+        let lan = View::network(0);
+        z.add_in("lan", "laptop", Ipv4Addr::new(192, 168, 1, 50), Source::Dhcp, lan);
+        let a1: Ipv6Addr = "2001:db8:100::5054:ff:fe00:10".parse().unwrap();
+        let a2: Ipv6Addr = "fd00:1::5054:ff:fe00:10".parse().unwrap();
+        z.add_host6_in("lan", "laptop", a1, lan);
+        z.add_host6_in("lan", "laptop", a2, lan);
+        z.add_host6_in("lan", "laptop", a1, lan); // once
+        assert!(matches!(z.lookup("laptop.lan", TYPE_AAAA, lan), Lookup::Aaaa(v) if v == alloc::vec![a1, a2]));
+        assert!(matches!(z.lookup("laptop.lan", TYPE_A, lan), Lookup::A(_)));
+        // Another network: hidden, like the A record would be.
+        let guest = View::network(1);
+        assert!(matches!(z.lookup("laptop.lan", TYPE_AAAA, guest), Lookup::Hidden));
+        let rev = |a: Ipv6Addr| {
+            let h: alloc::string::String = a.octets().iter().rev().flat_map(|b| [b & 0xf, b >> 4]).map(|n| alloc::format!("{n:x}.")).collect();
+            alloc::format!("{h}ip6.arpa")
+        };
+        assert!(matches!(z.lookup(&rev(a1), TYPE_PTR, lan), Lookup::Ptr(n) if n == alloc::vec![alloc::string::String::from("laptop.lan")]));
+        assert!(matches!(z.lookup(&rev(a1), TYPE_PTR, guest), Lookup::Hidden));
+        assert!(matches!(z.lookup(&rev("2001:db8:100::99".parse().unwrap()), TYPE_PTR, lan), Lookup::NxDomain));
+        // A host without IPv6 addresses: no data, as before.
+        z.add_in("lan", "printer", Ipv4Addr::new(192, 168, 1, 60), Source::Static, View::ALL);
+        assert!(matches!(z.lookup("printer.lan", TYPE_AAAA, lan), Lookup::NoData));
     }
 }
