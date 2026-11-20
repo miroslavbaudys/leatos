@@ -93,10 +93,10 @@ CAKE handling IPv6 like IPv4.
 ### Lab
 - The ISP VM (Alpine aarch64) has dnsmasq 2.92, which can send RAs and
   run a DHCPv6 server, but **cannot delegate prefixes** (no IA_PD server).
-  None of the pinned packages can serve PD. Candidates: Kea
-  (`kea-dhcp6`, heavy dependency chain), wide-dhcpv6, ISC dhcpd
-  (`dhcpd -6`, end-of-life). They need checking against Alpine's
-  repositories before step 3.
+  Alpine v3.24 has no wide-dhcpv6 and no ISC dhcpd: **Kea 3.0.3**
+  (`kea-dhcp6`) is the only PD server. It is pinned in `fetch-alpine.sh
+  kea` (kea-common, kea-dhcp6, log4cplus, libstdc++, libgcc: about 6.5 MB
+  more in the ISP initrd, so only when an IPv6 lab asks for it).
 - The ISP needs a route for the delegated prefix to the router. The
   router's link-local address comes from its MAC (EUI-64), which is fixed
   in the lab, so a static `ip -6 route` works without server hooks.
@@ -219,9 +219,15 @@ New or changed (2026-11-20):
   `pppoe.ipv6cp_offered`). **Deploy on the apu4 only after the soak run
   ends (2026-11-22).** The prefix size is only learned in step 4 (PD over
   the session).
-- **Lab PD server:** pick and pin one (Kea or wide-dhcpv6 from Alpine
-  aarch64), check that it delegates a /56 to a Linux `dhcpcd` test client
-  inside the ISP VM image, and pin its hashes in `fetch-alpine.sh`.
+- ✅ **Lab PD server** (2026-11-20): Kea 3.0.3, pinned
+  (`fetch-alpine.sh kea`). Checked in a throwaway VM (Alpine virt kernel,
+  veth pair across two network namespaces, dhcpcd 10.5.2 as the client):
+  Solicit → Advertise → Request → Reply, `2001:db8:100::/56` delegated
+  from a `/48` pool, DUID-LL. Lab notes: busybox `ip link add … type veth
+  peer name X` ignores the peer name (it becomes `veth0`, so rename it);
+  Kea needs `service-sockets-max-retries` when it starts before the link
+  is up; `memfile` with `persist: false`. libssl3/libcrypto3 moved to
+  3.5.9-r1 at the same time (r0 left the mirror; PPPoE and DoT labs pass).
 - smoltcp features: `iface-max-addr-count-4`,
   `iface-max-multicast-group-count-8`. Measure heap and binary size.
 
