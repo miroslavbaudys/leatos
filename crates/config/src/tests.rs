@@ -1841,3 +1841,21 @@ fn ipv6_section_round_trips_and_validates_the_ula() {
     assert!(parse(&lan_doc("10.10.0.1/24", "[ipv6]\nula_prefix = \"fd::/129\"\n")).is_err());
     assert!(parse(&lan_doc("10.10.0.1/24", "[ipv6]\nbogus = 1\n")).is_err());
 }
+
+#[test]
+fn ipv6_prefix_delegation_settings() {
+    let c = Config::default();
+    assert!(c.ipv6.dhcpv6_pd && c.ipv6.prefix_hint == 56);
+    let c = parse(&lan_doc("10.10.0.1/24", "[ipv6]\nenabled = true\ndhcpv6_pd = false\nprefix_hint = 60\n")).unwrap();
+    assert!(!c.ipv6.dhcpv6_pd);
+    assert_eq!(c.ipv6.prefix_hint, 60);
+    assert_eq!(parse(&c.to_toml()).unwrap(), c);
+    for bad in [47, 65] {
+        assert_eq!(invalid(|c| c.ipv6.prefix_hint = bad), vec![String::from("ipv6.prefix_hint")], "{bad}");
+    }
+    // Defaults are not written out.
+    let mut d = Config::default();
+    d.ipv6.enabled = true;
+    let t = d.to_toml();
+    assert!(!t.contains("dhcpv6_pd") && !t.contains("prefix_hint"), "{t}");
+}

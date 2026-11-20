@@ -889,7 +889,7 @@ pub struct Mgmt {
 /// IPv6 on the router's networks (docs/ipv6.md; M7 step 1: link-local
 /// and a ULA /64 per network, Router Advertisements, DNS and the web
 /// interface over IPv6; nothing forwarded yet).
-#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Ipv6 {
     pub enabled: bool,
@@ -897,6 +897,23 @@ pub struct Ipv6 {
     /// order) gets `<prefix>:<i>::/64`. Unset = derived from the WAN MAC.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ula_prefix: Option<Cidr6>,
+    /// Ask the ISP for a prefix by DHCPv6 (prefix delegation) on a DHCP
+    /// or static Ethernet WAN; network `i` gets its `<prefix>:<i>::/64`.
+    #[serde(skip_serializing_if = "is_true")]
+    pub dhcpv6_pd: bool,
+    /// The prefix length asked for (a hint: the ISP decides), 48–64.
+    #[serde(skip_serializing_if = "is_56")]
+    pub prefix_hint: u8,
+}
+
+impl Default for Ipv6 {
+    fn default() -> Self {
+        Ipv6 { enabled: false, ula_prefix: None, dhcpv6_pd: true, prefix_hint: 56 }
+    }
+}
+
+fn is_56(v: &u8) -> bool {
+    *v == 56
 }
 
 impl Ipv6 {

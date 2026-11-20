@@ -246,6 +246,9 @@ fn ipv6(c: &Config, x: &mut Issues) {
     if c.networks.len() > 0xffff {
         x.add("ipv6", "too many networks for /64 subnets");
     }
+    if !(48..=64).contains(&c.ipv6.prefix_hint) {
+        x.add("ipv6.prefix_hint", "must be 48–64");
+    }
 }
 
 fn mgmt(c: &Config, x: &mut Issues) {
