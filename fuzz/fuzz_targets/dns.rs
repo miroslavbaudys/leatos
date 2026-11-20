@@ -8,7 +8,7 @@
 #![no_main]
 
 use arbitrary::Arbitrary;
-use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use libfuzzer_sys::fuzz_target;
 use proto_dns::resolver::{Action, Config, Resolver};
 use proto_dns::wire::{self, Rdata};
@@ -29,12 +29,30 @@ const NAMES: &[&str] = &[
     "a.b.c.d.e.f.g.h.example",
 ];
 
+/// An AAAA address: one rebind protection must refuse or let through, or any.
+#[derive(Arbitrary, Debug, Clone, Copy)]
+enum Addr6 {
+    Pick(u8),
+    Any(u128),
+}
+
+const ADDRS6: &[&str] = &["::1", "::", "fe80::1", "fd00::53", "::ffff:192.168.1.10", "::ffff:8.8.8.8", "2001:db8::1", "fec0::1"];
+
+impl Addr6 {
+    fn get(self) -> Ipv6Addr {
+        match self {
+            Addr6::Pick(i) => ADDRS6[i as usize % ADDRS6.len()].parse().unwrap(),
+            Addr6::Any(v) => Ipv6Addr::from(v),
+        }
+    }
+}
+
 #[derive(Arbitrary, Debug)]
 enum Op {
     Query { client: u8, view: u8, tcp: bool, id: u16, name: u8, qtype: u16, edns: bool, noise: Option<Vec<u8>> },
     RawQuery { client: u8, tcp: bool, data: Vec<u8> },
     /// Answer the resolver's last upstream query.
-    Answer { rcode: u8, answers: Vec<(Addr, u32)>, ptr: Option<u8>, wrong_server: bool, truncated: bool, noise: Option<Vec<u8>> },
+    Answer { rcode: u8, answers: Vec<(Addr, u32)>, aaaa: Vec<(Addr6, u32)>, ptr: Option<u8>, wrong_server: bool, truncated: bool, noise: Option<Vec<u8>> },
     RawUpstream { server: bool, data: Vec<u8> },
     Tick(u16),
     WireHelpers(Vec<u8>),
@@ -48,6 +66,7 @@ fn wire_helpers(b: &[u8]) {
     let _ = wire::parse_query(b);
     if let Ok(recs) = wire::records(b) {
         let _ = wire::answer_ipv4s(b, &recs);
+        let _ = wire::answer_ipv6s(b, &recs);
     }
     let _ = wire::error_response(b, wire::RCODE_FORMERR);
     let _ = wire::udp_limit(b, 1232);
@@ -100,10 +119,11 @@ fuzz_target!(|ops: Vec<Op>| {
                     r.handle_query(now, client(c), &data)
                 }
             }
-            Op::Answer { rcode, answers, ptr, wrong_server, truncated, noise } => {
+            Op::Answer { rcode, answers, aaaa, ptr, wrong_server, truncated, noise } => {
                 let Some((server, q)) = &last_up else { continue };
                 let Ok((_, _, end)) = wire::parse_query(q) else { continue };
                 let mut recs: Vec<(Rdata, u32)> = answers.iter().take(20).map(|(a, ttl)| (Rdata::A(a.get()), *ttl % 100_000)).collect();
+                recs.extend(aaaa.iter().take(20).map(|(a, ttl)| (Rdata::Aaaa(a.get()), *ttl % 100_000)));
                 if let Some(p) = ptr {
                     recs.push((Rdata::Ptr(NAMES[p as usize % NAMES.len()].into()), 60));
                 }

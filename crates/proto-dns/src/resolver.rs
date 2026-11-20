@@ -63,7 +63,7 @@ use crate::wire::{self, Rdata};
 use crate::zone::{Lookup, View, Zone};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::net::{Ipv4Addr, SocketAddr};
+use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// TTL for answers from the local zone.
 pub const LOCAL_TTL: u32 = 60;
@@ -221,6 +221,17 @@ pub struct Resolver {
 fn is_private(a: Ipv4Addr) -> bool {
     let o = a.octets();
     a.is_private() || a.is_loopback() || a.is_link_local() || o[0] == 0
+}
+
+/// Loopback, unspecified, link-local `fe80::/10`, unique local `fc00::/7`,
+/// and IPv4-mapped (`::ffff:a.b.c.d`) private addresses.
+fn is_private6(a: Ipv6Addr) -> bool {
+    let s = a.segments();
+    a.is_loopback()
+        || a.is_unspecified()
+        || s[0] & 0xffc0 == 0xfe80
+        || s[0] & 0xfe00 == 0xfc00
+        || a.to_ipv4_mapped().is_some_and(is_private)
 }
 
 impl Resolver {
@@ -530,9 +541,8 @@ impl Resolver {
         let in_local_domain = self.zone.is_local_name(&p.key.question.name);
         if self.cfg.rebind_protection && !in_local_domain {
             let recs = wire::records(response).unwrap_or_default();
-            if wire::answer_ipv4s(response, &recs)
-                .into_iter()
-                .any(is_private)
+            if wire::answer_ipv4s(response, &recs).into_iter().any(is_private)
+                || wire::answer_ipv6s(response, &recs).into_iter().any(is_private6)
             {
                 self.stats.rebind_blocked += 1;
                 data = wire::error_response(&p.query, wire::RCODE_REFUSED).unwrap_or_default();
@@ -863,6 +873,41 @@ mod tests {
         let a = r.handle_upstream(1, UP1, &answer(&up, Ipv4Addr::new(192, 168, 1, 1), 60));
         assert_eq!(rcode(reply(&a).1), RCODE_REFUSED);
         assert_eq!((r.stats.rebind_blocked, r.cache_len()), (1, 0));
+    }
+
+    #[test]
+    fn rebind_protection_blocks_private_aaaa_answers() {
+        use crate::wire::TYPE_AAAA;
+        let answer6 = |q: &[u8], ip: Ipv6Addr| {
+            let (_, _, end) = wire::parse_query(q).unwrap();
+            wire::build_response(q, end, RCODE_NOERROR, &[(Rdata::Aaaa(ip), 60)], false)
+        };
+        let blocked = [
+            "::1",
+            "::",
+            "fe80::1",
+            "febf::1",
+            "fd12:3456:789a::1",
+            "fc00::1",
+            "::ffff:192.168.1.1",
+            "::ffff:127.0.0.1",
+        ];
+        for (i, ip) in blocked.iter().enumerate() {
+            let mut r = resolver();
+            let q = build_query(1, "attacker.com", TYPE_AAAA);
+            let (_, up) = upstream(&r.handle_query(0, client(1), &q));
+            let a = r.handle_upstream(1, UP1, &answer6(&up, ip.parse().unwrap()));
+            assert_eq!(rcode(reply(&a).1), RCODE_REFUSED, "{ip}");
+            assert_eq!((r.stats.rebind_blocked, r.cache_len()), (1, 0), "{ip} ({i})");
+        }
+        for ip in ["2001:db8::1", "2a00:1450:4014::200e", "fec0::1", "::ffff:8.8.8.8"] {
+            let mut r = resolver();
+            let q = build_query(1, "example.com", TYPE_AAAA);
+            let (_, up) = upstream(&r.handle_query(0, client(1), &q));
+            let a = r.handle_upstream(1, UP1, &answer6(&up, ip.parse().unwrap()));
+            assert_eq!(rcode(reply(&a).1), RCODE_NOERROR, "{ip}");
+            assert_eq!((r.stats.rebind_blocked, r.cache_len()), (0, 1), "{ip}");
+        }
     }
 
     #[test]

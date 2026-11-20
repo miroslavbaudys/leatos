@@ -6,7 +6,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
 
 pub const HEADER_LEN: usize = 12;
 const MAX_POINTERS: usize = 16;
@@ -370,6 +370,17 @@ pub fn answer_ipv4s(msg: &[u8], recs: &[RecordInfo]) -> Vec<Ipv4Addr> {
         .collect()
 }
 
+/// AAAA addresses in the answer section.
+pub fn answer_ipv6s(msg: &[u8], recs: &[RecordInfo]) -> Vec<Ipv6Addr> {
+    recs.iter()
+        .filter(|r| r.section == 0 && r.rtype == TYPE_AAAA && r.rdata_len == 16)
+        .filter_map(|r| {
+            let d: [u8; 16] = msg[r.rdata_offset..r.rdata_offset + 16].try_into().ok()?;
+            Some(Ipv6Addr::from(d))
+        })
+        .collect()
+}
+
 pub fn set_id(msg: &mut [u8], id: u16) {
     if msg.len() >= 2 {
         msg[..2].copy_from_slice(&id.to_be_bytes());
@@ -380,6 +391,7 @@ pub fn set_id(msg: &mut [u8], id: u16) {
 #[derive(Clone, Debug)]
 pub enum Rdata {
     A(Ipv4Addr),
+    Aaaa(Ipv6Addr),
     Ptr(String),
 }
 
@@ -409,6 +421,7 @@ pub fn build_response(
         out.extend_from_slice(&[0xc0, HEADER_LEN as u8]); // name = question
         let (rtype, data) = match rdata {
             Rdata::A(a) => (TYPE_A, a.octets().to_vec()),
+            Rdata::Aaaa(a) => (TYPE_AAAA, a.octets().to_vec()),
             Rdata::Ptr(name) => {
                 let mut d = Vec::new();
                 if write_name(&mut d, name).is_err() {
