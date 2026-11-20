@@ -14,3 +14,4 @@ pub mod services;
 pub mod shared;
 pub mod stack;
 pub mod svc;
+pub mod wan6;

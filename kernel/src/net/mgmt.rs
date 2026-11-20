@@ -1332,11 +1332,16 @@ fn status_json(
     }
     s.push(']');
     // The WAN's IPv6 (development boot arguments, docs/ipv6.md step 2b).
-    match config::wan6() {
-        Some(((ip, len), gw)) => {
-            let _ = write!(s, ",\"wan_ipv6\":{{\"addr\":{},\"gateway\":{}}}", json_str(&format!("{ip}/{len}")), json_str(&format!("{gw}")));
+    match (crate::net::wan6::status_json(), config::wan6()) {
+        (Some(pd), _) => {
+            s.push_str(",\"wan_ipv6\":");
+            s.push_str(core::str::from_utf8(&pd).unwrap_or("null"));
         }
-        None => s.push_str(",\"wan_ipv6\":null"),
+        (None, Some(w)) => {
+            let addr = w.addr.map_or_else(|| String::from("null"), |(ip, len)| json_str(&format!("{ip}/{len}")));
+            let _ = write!(s, ",\"wan_ipv6\":{{\"source\":\"static\",\"addr\":{addr},\"gateway\":{}}}", json_str(&format!("{}", w.gateway)));
+        }
+        (None, None) => s.push_str(",\"wan_ipv6\":null"),
     }
     // The routing table, then configured routes not in use.
     s.push_str(",\"routes\":[");

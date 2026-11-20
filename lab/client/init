@@ -522,8 +522,9 @@ fi
 # lifetime 0: no IPv6 default route), answers DNS and the web interface on
 # its ULA. Its addresses come from /api/status (over IPv4). Negative
 # control: LAB_ROUTER_ARGS=ipv6=0 (no IPv6 at all: every check fails).
+v6mode=$($bb sed -n 's/.*lab_ipv6=\([a-z]*\).*/\1/p' /proc/cmdline)
 v6on=""
-$bb grep -q 'lab_ipv6=1' /proc/cmdline && v6on=1
+[ -n "$v6mode" ] && v6on=1
 v6st() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null; }
 fwdrops6() { v6st | $bb grep -o '"firewall":[0-9]*' | $bb head -1 | $bb cut -d: -f2; }
 spoofed6() { v6st | $bb grep -o '"spoofed":[0-9]*' | $bb head -1 | $bb cut -d: -f2; }
@@ -552,6 +553,20 @@ if [ -n "$v6on" ]; then
     pfx=${r6%::1}
     if a6=$(v6slaac eth0 "$pfx"); then pass "ipv6: slaac address $a6 (router advertisement)"; else fail "ipv6: no slaac address under $pfx::/64"; $bb ip -6 addr show dev eth0 | $bb sed 's/^/    | /'; fi
     gr=$(v6global 1)
+    # Prefix delegation (step 3) takes a moment after the WAN's RA.
+    if [ "$v6mode" = pd ]; then
+      for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        [ -n "$gr" ] && break
+        $bb sleep 1
+        gr=$(v6global 1)
+      done
+      w6=$(v6st | $bb grep -o '"wan_ipv6":{[^}]*}')
+      if echo "$w6" | $bb grep -q '"source":"dhcpv6-pd"' && echo "$w6" | $bb grep -q '"prefix":"2001:db8:100::/56"' && echo "$w6" | $bb grep -q '"gateway":"fe80::'; then
+        pass "ipv6 pd: delegated 2001:db8:100::/56, default router from the ISP's RA"
+      else
+        fail "ipv6 pd: wan_ipv6 $w6"
+      fi
+    fi
     if [ -z "$gr" ]; then
       if $bb ip -6 route show default 2>/dev/null | $bb grep -q .; then fail "ipv6: a default route appeared (router lifetime must be 0)"; else pass "ipv6: no default route (router lifetime 0)"; fi
     fi
@@ -605,6 +620,24 @@ if [ -n "$v6on" ]; then
       $bb ip -6 addr del 2001:db8:999::5/128 dev eth0 2>/dev/null
       s1=$(spoofed6)
       if [ "${s1:-0}" -gt "${s0:-0}" ]; then pass "ipv6 wan: forged source 2001:db8:999::5 dropped (spoofed $s0 -> $s1)"; else fail "ipv6 wan: forged source not dropped (spoofed $s0 -> $s1)"; fi
+      # A new prefix (step 3): the ISP's server restarts on another pool;
+      # at the router's next renewal (10 s) the networks are readdressed,
+      # the old prefix advertised as deprecated.
+      if [ "$v6mode" = pd ]; then
+        $bb wget -q -T 5 -O /dev/null "http://[$ISP6]/cgi-bin/pd?change" 2>/dev/null
+        g2=""
+        for i in $($bb seq 1 60); do
+          g2=$(v6global 1)
+          [ "$g2" = 2001:db8:200::1 ] && break
+          $bb sleep 1
+        done
+        if [ "$g2" = 2001:db8:200::1 ]; then pass "ipv6 pd: new prefix 2001:db8:200::/56 after the change"; else fail "ipv6 pd: no new prefix (router: '$g2')"; fi
+        if an=$(v6slaac eth0 2001:db8:200:0); then pass "ipv6 pd: new address $an"; else fail "ipv6 pd: no address under 2001:db8:200::/64"; fi
+        if $bb ip -6 addr show dev eth0 | $bb grep '2001:db8:100:0:' | $bb grep -q deprecated; then pass "ipv6 pd: the old address is deprecated"; else fail "ipv6 pd: the old address is not deprecated"; $bb ip -6 addr show dev eth0 | $bb grep inet6 | $bb sed 's/^/    | /'; fi
+        if $bb ping6 -c 2 -W 2 "$ISP6" >/dev/null 2>&1; then pass "ipv6 pd: ping6 $ISP6 through the new prefix"; else fail "ipv6 pd: ping6 $ISP6 after the change"; fi
+      fi
+    elif [ "$v6mode" = pd ]; then
+      fail "ipv6 pd: no delegated prefix on the LAN"
     fi
   fi
 fi

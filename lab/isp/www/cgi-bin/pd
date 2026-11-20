@@ -1,0 +1,14 @@
+#!/usr/bin/busybox sh
+# Prefix delegation (docs/ipv6.md step 3): ?change restarts Kea on the
+# 2001:db8:200::/48 pool, so the router's next renewal gets a new prefix.
+bb=/usr/bin/busybox
+echo "Content-Type: text/plain"
+echo
+case "$QUERY_STRING" in
+  change)
+    /usr/sbin/lab-kea stop
+    /usr/sbin/lab-kea start "$($bb cat /tmp/kea-if)" 2001:db8:200:: >/dev/null
+    echo "pd=changed"
+    ;;
+  *) echo "pd=?" ;;
+esac

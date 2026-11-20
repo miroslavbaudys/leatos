@@ -531,13 +531,15 @@ pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: 
         // address to ask for; IPv6 over PPPoE is step 4.)
         let ethernet = !matches!(crate::config::wan_link(), crate::config::WanLink::Pppoe(_));
         if let (true, Some(&mac)) = (ethernet, macs.first()) {
-            let want: Vec<IpCidr> = match crate::config::wan6() {
-                Some(((ip, len), _)) => alloc::vec![
-                    IpCidr::Ipv6(Ipv6Cidr::new(fwd::wire::link_local(mac), 64)),
-                    IpCidr::Ipv6(Ipv6Cidr::new(ip, len)),
-                ],
-                None => Vec::new(),
-            };
+            // With IPv6 on, always the link-local address (the DHCPv6
+            // client and router solicitations use it); a static one too.
+            let mut want: Vec<IpCidr> = Vec::new();
+            if crate::config::ipv6() {
+                want.push(IpCidr::Ipv6(Ipv6Cidr::new(fwd::wire::link_local(mac), 64)));
+                if let Some((ip, len)) = crate::config::wan6().and_then(|w| w.addr) {
+                    want.push(IpCidr::Ipv6(Ipv6Cidr::new(ip, len)));
+                }
+            }
             let have: Vec<IpCidr> = wan.iface.ip_addrs().iter().filter(|c| matches!(c, IpCidr::Ipv6(_))).copied().collect();
             if have != want {
                 wan.iface.update_ip_addrs(|a| {

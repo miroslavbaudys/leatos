@@ -20,6 +20,13 @@ if [[ "$ROLE" == isp ]]; then
   for apk in rp-pppoe ppp-daemon libpcap libssl3 libcrypto3 stunnel dnsmasq; do
     tar -xzf "$ALPINE_DIR/$apk"-[0-9]*.apk -C "$STAGE" --exclude '.*' 2>/dev/null
   done
+  # Kea's DHCPv6 server for prefix delegation (LAB_IPV6: fetch-alpine.sh kea).
+  if [[ -n "${LAB_INITRD_KEA:-}" ]]; then
+    for apk in kea-common kea-dhcp6 log4cplus libstdc++ libgcc; do
+      tar -xzf "$ALPINE_DIR/$apk"-[0-9]*.apk -C "$STAGE" --exclude '.*' 2>/dev/null \
+        || { echo "build-initrd: $apk missing (fetch-alpine.sh kea)" >&2; exit 1; }
+    done
+  fi
 fi
 cp -R "lab/$ROLE/." "$STAGE/"
 mkdir -p "$STAGE/usr/bin"

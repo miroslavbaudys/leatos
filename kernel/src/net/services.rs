@@ -101,9 +101,10 @@ fn ra_config(cfg: &config::Lan, host: &HostIf) -> Option<RaConfig> {
     let smoltcp::wire::HardwareAddress::Ethernet(mac) = host.iface.hardware_addr() else {
         return None;
     };
-    // A default router while the WAN has an IPv6 default route
-    // (development: `wan6_gw=`; docs/ipv6.md step 2b).
-    let default = config::wan6().is_some();
+    // A default router only while the WAN has an IPv6 default route and
+    // the network a global prefix (RFC 7084 G-4: with a ULA alone there
+    // is no source address to go out with).
+    let default = config::wan6().is_some() && cfg.gua.is_some();
     Some(RaConfig {
         mac: mac.0,
         prefixes: [Some(ula), cfg.gua].into_iter().flatten().collect(),
@@ -114,8 +115,9 @@ fn ra_config(cfg: &config::Lan, host: &HostIf) -> Option<RaConfig> {
     })
 }
 
-/// An RA into the qdisc of `link`'s port (with its VLAN tag).
-fn send_ra(sh: &Shared, link: usize, frame: &[u8]) {
+/// A frame of the router's own (an RA, a router solicitation) into the
+/// qdisc of `link`'s port (with its VLAN tag).
+pub fn send_frame(sh: &Shared, link: usize, frame: &[u8]) {
     let l = &sh.links[link];
     let port = l.port();
     let Some(mut pkt) = crate::net::packet::PacketBuf::alloc() else {
@@ -658,12 +660,12 @@ impl LanServices {
                 ra.solicited(now);
             }
             if let Some(f) = ra.poll(now) {
-                send_ra(sh, net.host, &f);
+                send_frame(sh, net.host, &f);
             }
         }
         for (link, ra) in &mut self.retiring {
             if let Some(f) = ra.poll(now) {
-                send_ra(sh, *link, &f);
+                send_frame(sh, *link, &f);
             }
         }
         self.retiring.retain(|(_, ra)| !ra.is_done());

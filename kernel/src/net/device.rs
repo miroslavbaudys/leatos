@@ -214,6 +214,16 @@ pub struct PortDevice<'a> {
 #[derive(Default)]
 pub struct NdHints {
     recent: alloc::vec::Vec<(core::net::Ipv6Addr, [u8; 6], u64)>,
+    /// The last Router Advertisement the link received (the WAN's:
+    /// `net::wan6`).
+    last_ra: Option<alloc::vec::Vec<u8>>,
+}
+
+impl NdHints {
+    /// The last RA received, once.
+    pub fn take_ra(&mut self) -> Option<alloc::vec::Vec<u8>> {
+        self.last_ra.take()
+    }
 }
 
 impl NdHints {
@@ -322,6 +332,10 @@ impl Device for PortDevice<'_> {
             && fwd::wire::ethertype(pkt.data()) == Some(fwd::wire::ETHERTYPE_IPV6)
         {
             fwd::wire::ipv6_ns_to_solicited(pkt.data_mut());
+            let d = pkt.data();
+            if d.get(fwd::wire::ETH_HDR + 6) == Some(&fwd::wire::PROTO_ICMPV6) && d.get(fwd::wire::ETH_HDR + 40) == Some(&134) {
+                nd.last_ra = Some(d.to_vec());
+            }
             let mut hint = [0u8; fwd::wire::NEIGHBOR_HINT_LEN];
             if let Some((ip, mac)) = fwd::wire::ipv6_neighbor_hint(pkt.data(), &mut hint)
                 && nd.due(ip, mac, self.now_ns)

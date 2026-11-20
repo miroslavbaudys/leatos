@@ -203,3 +203,35 @@ fn t1_t2_zero_follow_the_preferred_lifetime() {
     c.handle(t, &answer(REPLY, &req, Some((pfx(), 56, 1000, 2000)), (0, 0), None));
     assert_eq!(c.next_deadline(), t + 500_000, "T1 = preferred / 2");
 }
+
+#[test]
+fn a_renewal_listing_the_old_prefix_at_zero_takes_the_new_one() {
+    let (mut c, t0) = bound();
+    while c.poll_event().is_some() {}
+    let ren = c.poll(t0 + 1_000_000).unwrap();
+    let mut reply = answer(REPLY, &ren, Some((pfx(), 56, 0, 0)), (1000, 1600), None);
+    // Append a second IAPREFIX (the new one) inside the IA_PD: rebuild it.
+    let new: Ipv6Addr = "2001:db8:200::".parse().unwrap();
+    let (_, xid, opts) = sent(&ren);
+    let mut b = vec![REPLY, xid[0], xid[1], xid[2]];
+    opt(&mut b, OPT_CLIENTID, has(&opts, OPT_CLIENTID).unwrap());
+    opt(&mut b, OPT_SERVERID, SRV);
+    let mut ia = Vec::new();
+    ia.extend_from_slice(&1u32.to_be_bytes());
+    ia.extend_from_slice(&1000u32.to_be_bytes());
+    ia.extend_from_slice(&1600u32.to_be_bytes());
+    for (p, pref, valid) in [(pfx(), 0u32, 0u32), (new, 3000, 4000)] {
+        let mut x = Vec::new();
+        x.extend_from_slice(&pref.to_be_bytes());
+        x.extend_from_slice(&valid.to_be_bytes());
+        x.push(56);
+        x.extend_from_slice(&p.octets());
+        opt(&mut ia, OPT_IAPREFIX, &x);
+    }
+    opt(&mut b, OPT_IA_PD, &ia);
+    reply.clear();
+    reply.extend_from_slice(&b);
+    c.handle(t0 + 1_000_010, &reply);
+    assert!(matches!(c.poll_event(), Some(Event::Bound(d)) if d.prefix == new), "straight to the new prefix");
+    assert_eq!(c.state(), State::Bound);
+}

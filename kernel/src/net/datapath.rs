@@ -465,8 +465,8 @@ impl Datapath {
         for s in &self.shards {
             let mut f = s.lock();
             f.ipv6 = ipv6;
-            f.set_gua6(WAN, wan6.map(|(ip, _)| ip));
-            f.set_default_route6(wan6.map(|(_, gw)| (WAN, gw)));
+            f.set_gua6(WAN, wan6.and_then(|w| w.addr));
+            f.set_default_route6(wan6.map(|w| (WAN, w.gateway)));
             f.set_static_routes(&n.routes);
             f.set_policy(Some(n.policy.clone()));
             if crate::config::fw_recheck() {

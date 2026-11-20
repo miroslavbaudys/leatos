@@ -1067,20 +1067,53 @@ pub fn fw_recheck() -> bool {
     arg_u64(bootargs(), "fw_recheck") != Some(0)
 }
 
-/// IPv6 on the WAN for development (docs/ipv6.md step 2b; DHCPv6-PD
-/// replaces it in step 3): `wan6_ip=addr/len` (the WAN's address) and
-/// `wan6_gw=addr` (the default router, global or link-local). Both, with
-/// `ipv6` on, or nothing.
-pub fn wan6() -> Option<((Ipv6Addr, u8), Ipv6Addr)> {
-    // Not on PPPoE yet (IPv6CP: step 4): no default route, so the networks'
-    // RAs do not offer one either (it would be a black hole).
-    if !ipv6() || matches!(wan_link(), WanLink::Pppoe(_)) {
-        return None;
-    }
+/// The `[ipv6]` section in effect.
+pub fn get_ipv6() -> schema::Ipv6 {
+    get().ipv6.clone()
+}
+
+/// The WAN's IPv6 default route: its next hop and the WAN's own address,
+/// if it has one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wan6 {
+    pub addr: Option<(Ipv6Addr, u8)>,
+    pub gateway: Ipv6Addr,
+}
+
+/// The development override (docs/ipv6.md step 2b): `wan6_ip=addr/len`
+/// and `wan6_gw=addr` (global or link-local).
+fn wan6_static() -> Option<Wan6> {
     let args = bootargs();
     let ip = arg(args, "wan6_ip")?.parse::<schema::Cidr6>().ok()?;
     let gw = arg(args, "wan6_gw")?.parse::<Ipv6Addr>().ok()?;
-    Some(((ip.addr, ip.prefix), gw))
+    Some(Wan6 { addr: Some((ip.addr, ip.prefix)), gateway: gw })
+}
+
+/// The WAN's IPv6 default route, with `ipv6` on: the development boot
+/// arguments, else the ISP's router learned by prefix delegation
+/// (`net::wan6`: from its Router Advertisement). None on PPPoE (IPv6CP:
+/// step 4), so the networks' RAs offer no default route either (it would
+/// be a black hole).
+pub fn wan6() -> Option<Wan6> {
+    if !ipv6() || matches!(wan_link(), WanLink::Pppoe(_)) {
+        return None;
+    }
+    if let Some(s) = wan6_static() {
+        return Some(s);
+    }
+    let g = crate::net::wan6::state()?.gateway?;
+    Some(Wan6 { addr: None, gateway: g })
+}
+
+/// Prefix delegation runs on the WAN: IPv6 and `ipv6.dhcpv6_pd` on, an
+/// Ethernet WAN, no development override.
+pub fn pd_wanted() -> bool {
+    let c = get();
+    c.ipv6.enabled
+        && c.ipv6.dhcpv6_pd
+        && !matches!(wan_link(), WanLink::Pppoe(_))
+        && wan6_static().is_none()
+        && arg(bootargs(), "lan6_prefix").is_none()
 }
 
 /// `lan6_prefix=addr/len` (development, with `ipv6` on): the delegated
@@ -1093,10 +1126,21 @@ fn lan6_prefix() -> Option<schema::Cidr6> {
     arg(bootargs(), "lan6_prefix")?.parse::<schema::Cidr6>().ok().filter(|p| p.prefix <= 64)
 }
 
-/// The router's global address in network `index`'s /64 of
-/// `lan6_prefix`, if there is one.
+/// The router's global address in network `index`'s /64 of the prefix:
+/// `lan6_prefix` (development), else the delegated one; none if the
+/// prefix holds fewer /64s.
 pub fn gua_router(index: usize) -> Option<Ipv6Addr> {
-    let p = lan6_prefix()?;
+    let p = match lan6_prefix() {
+        Some(p) => p,
+        None if ipv6() => {
+            let (a, l) = crate::net::wan6::state()?.prefix?;
+            schema::Cidr6::new(a, l)
+        }
+        None => return None,
+    };
+    if p.prefix > 64 {
+        return None;
+    }
     let bits = 64 - u32::from(p.prefix);
     if bits < 64 && index as u64 >= 1u64 << bits {
         return None;

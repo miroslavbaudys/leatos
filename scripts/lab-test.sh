@@ -206,7 +206,17 @@
 #                        route, the ISP forging 10.30.0.5 is dropped as
 #                        spoofed. Negative control: LAB_ROUTES=0 (the route
 #                        disabled: every check fails).
-#   LAB_IPV6=1           IPv6 on the router's networks (docs/ipv6.md step
+#   LAB_IPV6=1           (or pd; LAB_IPV6=static: step 2b's boot arguments
+#                        instead) the ISP VM sends RAs (dnsmasq, ra-only)
+#                        and delegates prefixes (Kea, 2001:db8:100::/48 →
+#                        /56, renew 10 s); the router gets ipv6=1 only and
+#                        learns its default router and prefix (step 3):
+#                        status wan_ipv6 from dhcpv6-pd, every check below
+#                        through it, then a prefix change (cgi-bin/pd?change:
+#                        2001:db8:200::/48): new addresses, the old one
+#                        deprecated, traffic through the new one. Negative
+#                        control LAB_IPV6_PD=0 (no Kea: no delegated prefix).
+#                        IPv6 on the router's networks (docs/ipv6.md step
 #                        1; router ipv6=1): the client gets a SLAAC
 #                        address from the main LAN's ULA /64, no default
 #                        route (router lifetime 0), pings the router's ULA
@@ -289,18 +299,25 @@ if [[ -n "$ISP_PPPOE" ]]; then
 fi
 ISP_STATIC="${LAB_WAN_STATIC:-}"
 [[ -n "$ISP_STATIC" ]] && ROUTER_ARGS="$ROUTER_ARGS wan_mode=static wan_ip=203.0.113.60/24 wan_gw=203.0.113.1 wan_dns=203.0.113.1"
+# 1 (or pd): the ISP delegates a prefix (DHCPv6-PD, docs/ipv6.md step
+# 3); static: the development boot arguments of step 2b.
 IPV6="${LAB_IPV6:-}"
 IPV6_OPEN="${LAB_IPV6_OPEN:-}"
-[[ -n "$IPV6_OPEN" ]] && IPV6=1
+[[ -n "$IPV6_OPEN" && -z "$IPV6" ]] && IPV6=1
+[[ "$IPV6" == 1 ]] && IPV6=pd
 ISP_IPV6="$IPV6"
+ISP_PD="${LAB_IPV6_PD:-1}"
 if [[ -n "$IPV6" && -n "$ISP_PPPOE" ]]; then
   echo "lab-test: LAB_IPV6 with LAB_PPPOE: IPv6 over PPPoE comes with docs/ipv6.md step 4" >&2
   exit 2
 fi
-if [[ -n "$IPV6" ]]; then
+if [[ "$IPV6" == static ]]; then
   ROUTER_ARGS="$ROUTER_ARGS ipv6=1 wan6_ip=2001:db8:ffff::2/64 wan6_gw=2001:db8:ffff::1 lan6_prefix=2001:db8:100::/56 wan_mtu=1400"
-  BIG_PING="${LAB_BIG_PING:-1372}"
+elif [[ -n "$IPV6" ]]; then
+  ROUTER_ARGS="$ROUTER_ARGS ipv6=1 wan_mtu=1400"
+  export LAB_INITRD_KEA=1 # the ISP's prefix delegation server
 fi
+[[ -n "$IPV6" ]] && BIG_PING="${LAB_BIG_PING:-1372}"
 GUEST="${LAB_GUEST:-}"
 GUEST_LIVE="${LAB_GUEST_LIVE:-}"
 [[ -n "$GUEST_LIVE" ]] && GUEST=1
@@ -350,7 +367,7 @@ ARCH="${LEATOS_ARCH:-aarch64}"
 cargo build -q -p leatos-kernel --target "$ARCH-unknown-none"
 MODLOOP=""
 [[ -n "$ISP_VLAN$ISP_PPPOE$GUEST" ]] && MODLOOP=modloop
-ALPINE_DIR=$(scripts/lab/fetch-alpine.sh $MODLOOP | tail -1)
+ALPINE_DIR=$(scripts/lab/fetch-alpine.sh $MODLOOP ${LAB_INITRD_KEA:+kea} | tail -1)
 ISP_INITRD=$(scripts/lab/build-initrd.sh isp | tail -1)
 CLIENT_INITRD=$(scripts/lab/build-initrd.sh client | tail -1)
 
@@ -558,7 +575,7 @@ PIDS+=($!)
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
   VM_NIC2="${PORTS:+52:54:00:00:00:11 $((LAN1_PORT + 1)) $LAN1_PORT}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${ACK:+ lab_ack=1} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=1}"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${ACK:+ lab_ack=1} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so

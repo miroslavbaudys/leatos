@@ -94,12 +94,34 @@ fi
 # IPv6 (scripts/lab-test.sh LAB_IPV6=1, docs/ipv6.md step 2b): the WAN
 # link's 2001:db8:ffff::/64, the router's delegated 2001:db8:100::/56
 # through it, MTU 1400 (the router's Packet Too Big check).
-if $bb grep -q 'lab_ipv6=1' /proc/cmdline; then
+# lab_ipv6=pd (step 3): RAs (dnsmasq, ra-only) and prefix delegation (Kea,
+# lab-kea) unless lab_pd=0; lab_ipv6=static: the router has its prefix
+# from boot arguments. Both: the delegated prefixes are routed to the
+# router's WAN link-local address.
+v6=$($bb sed -n 's/.*lab_ipv6=\([a-z]*\).*/\1/p' /proc/cmdline)
+pd=$($bb sed -n 's/.*lab_pd=\([0-9]*\).*/\1/p' /proc/cmdline)
+if [ -n "$v6" ]; then
   $bb ip link set "$IF" mtu 1400
-  if $bb ip -6 addr add 2001:db8:ffff::1/64 dev "$IF" && $bb ip -6 route add 2001:db8:100::/56 via 2001:db8:ffff::2 dev "$IF"; then
-    echo "LAB isp: IPv6 2001:db8:ffff::1/64, 2001:db8:100::/56 via 2001:db8:ffff::2, MTU 1400"
+  rll=fe80::5054:ff:fe00:1
+  if $bb ip -6 addr add 2001:db8:ffff::1/64 dev "$IF" \
+     && $bb ip -6 route add 2001:db8:100::/48 via $rll dev "$IF" \
+     && $bb ip -6 route add 2001:db8:200::/48 via $rll dev "$IF"; then
+    echo "LAB isp: IPv6 2001:db8:ffff::1/64, 2001:db8:100::/48 and 2001:db8:200::/48 via the router, MTU 1400"
   else
     echo "LAB FAIL: isp: IPv6 setup"
+  fi
+  if [ "$v6" = pd ]; then
+    $bb sleep 2 # the link-local address past DAD
+    $bb touch /tmp/ra.log /tmp/kea.log /tmp/kea.out
+    $bb tail -F /tmp/ra.log /tmp/kea.log /tmp/kea.out 2>/dev/null | while IFS= read -r l; do echo "isp-v6: $l"; done &
+    /usr/sbin/dnsmasq --conf-file=/dev/null --user=root --port=0 --enable-ra --interface="$IF" \
+      --dhcp-range=::,constructor:"$IF",ra-only --pid-file=/tmp/dnsmasq-ra.pid --log-facility=/tmp/ra.log >>/tmp/ra.log 2>&1 \
+      || echo "LAB FAIL: isp: RA dnsmasq did not start"
+    if [ "$pd" != 0 ]; then
+      /usr/sbin/lab-kea start "$IF" 2001:db8:100:: || echo "LAB FAIL: isp: kea did not start"
+    else
+      echo "LAB isp: no prefix delegation (lab_pd=0)"
+    fi
   fi
 fi
 $bx httpd -p 80 -h /www

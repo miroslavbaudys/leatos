@@ -412,9 +412,51 @@ fn apply_saved(
     }
     // Also picks up the WAN tag's 4 bytes and PPPoE's 8 of shaper overhead.
     stack::apply_qos(sh, &old, &crate::config::qos());
-    // Networks and firewall, live (docs/config-v2.md §7): a network keeps
-    // its slot while its name stays; addresses for the router stack, the
-    // rest for the datapath.
+    reapply_networks(sh, hosts, services, mgmt, slots, Some(&old_nets));
+    change
+}
+
+/// What prefix delegation depends on: the WAN's mode and `[ipv6]`.
+fn wan6_key() -> (crate::config::WanLink, crate::config::schema::Ipv6) {
+    (crate::config::wan_link(), crate::config::get_ipv6())
+}
+
+/// After a saved config: restart prefix delegation if what it depends on
+/// changed (a new WAN mode, IPv6 or PD switched). True when it did (the
+/// networks follow: the old prefix is gone).
+fn wan6_follow(
+    w: &mut Option<crate::net::wan6::Wan6>,
+    before: &(crate::config::WanLink, crate::config::schema::Ipv6),
+    wan: &mut HostIf,
+    sh: &Shared,
+) -> bool {
+    if wan6_key() == *before {
+        return false;
+    }
+    if let Some(old) = w.take() {
+        old.stop(wan);
+    }
+    *w = crate::net::wan6::Wan6::new(wan, sh, now_ms());
+    true
+}
+
+/// Milliseconds since boot (the WAN's IPv6 timers).
+fn now_ms() -> u64 {
+    timer::uptime().as_millis() as u64
+}
+
+/// Networks and firewall, live (docs/config-v2.md §7): a network keeps its
+/// slot while its name stays; addresses for the router stack, the rest for
+/// the datapath; the services follow. After a saved config (`old`: the
+/// networks before, for the log) or a new WAN prefix (`net::wan6`).
+fn reapply_networks(
+    sh: &Shared,
+    hosts: &mut [HostIf],
+    services: Option<&mut LanServices>,
+    mgmt: &mut Mgmt,
+    slots: &mut Vec<Option<String>>,
+    old: Option<&[crate::config::Lan]>,
+) {
     if sh.links.len() > 1 {
         let (placed, links, msg) = stack::place_networks(slots);
         *slots = placed;
@@ -423,7 +465,7 @@ fn apply_saved(
         let shape = |v: &[crate::config::Lan]| -> Vec<(String, usize, u16, core::net::Ipv4Addr, u8, u8)> {
             v.iter().map(|n| (n.name.clone(), n.port, n.vid, n.addr, n.prefix, n.zone)).collect()
         };
-        if shape(&old_nets) != shape(&nets) {
+        if old.is_some_and(|o| shape(o) != shape(&nets)) {
             stack::log_networks(&nets);
         }
         sh.post_networks(msg);
@@ -434,7 +476,6 @@ fn apply_saved(
     } else if let Some(svc) = services {
         svc.reconfigure(hosts, &[]);
     }
-    change
 }
 
 /// Tell everyone who depends on the WAN address about a change.
@@ -641,6 +682,8 @@ pub async fn run(
     let mut mgmt = Mgmt::new(&mut hosts, &links, store.is_some());
     let mut cli = Cli::new(store.is_some());
     let mut pppoe = crate::config::pppoe().map(|c| Pppoe::new(c, &sh.ports[0]));
+    // The WAN's IPv6 by prefix delegation (docs/ipv6.md step 3).
+    let mut wan6 = crate::net::wan6::Wan6::new(&mut hosts[0], sh, now_ms());
     if let crate::config::WanLink::Static(s) = crate::config::wan_link() {
         let c = configure_static(sh.ports[0].name, &mut hosts[0], &mut pinger, &s);
         publish_wan(&c, sh, &mut mgmt, &mut cli, services.as_mut());
@@ -683,6 +726,12 @@ pub async fn run(
             publish_wan(&change, sh, &mut mgmt, &mut cli, services.as_mut());
         }
         pinger.step(&mut hosts[0].sockets);
+        if let Some(w) = wan6.as_mut()
+            && w.step(&mut hosts[0], sh, now_ms())
+        {
+            // A router or prefix came, changed or went: the networks follow.
+            reapply_networks(sh, &mut hosts, services.as_mut(), &mut mgmt, &mut slots, None);
+        }
         if let Some(svc) = services.as_mut() {
             svc.step(&mut hosts, sh);
         }
@@ -705,8 +754,12 @@ pub async fn run(
                 // Saved without a trial: run it now, no reboot.
                 let cfg = (**cfg).clone();
                 let svc = services.as_mut();
+                let wan6_before = wan6_key();
                 if let Some(c) = apply_saved((cfg, source.clone()), sh, &mut hosts, (&mut pppoe, &mut pinger), svc, &mut mgmt, &mut slots) {
                     publish_wan(&c, sh, &mut mgmt, &mut cli, services.as_mut());
+                }
+                if wan6_follow(&mut wan6, &wan6_before, &mut hosts[0], sh) {
+                    reapply_networks(sh, &mut hosts, services.as_mut(), &mut mgmt, &mut slots, None);
                 }
             }
             mgmt.op_done(conn, &op, r.map(|(detail, _)| detail));
@@ -749,8 +802,12 @@ pub async fn run(
                                 action = Some(crate::net::mgmt::Action::Reboot);
                             } else if let Some(source) = source {
                                 let svc = services.as_mut();
+                                let wan6_before = wan6_key();
                                 if let Some(c) = apply_saved((*cfg, source), sh, &mut hosts, (&mut pppoe, &mut pinger), svc, &mut mgmt, &mut slots) {
                                     publish_wan(&c, sh, &mut mgmt, &mut cli, services.as_mut());
+                                }
+                                if wan6_follow(&mut wan6, &wan6_before, &mut hosts[0], sh) {
+                                    reapply_networks(sh, &mut hosts, services.as_mut(), &mut mgmt, &mut slots, None);
                                 }
                             }
                             cli.save_done(Ok(detail), reboot);
@@ -798,6 +855,9 @@ pub async fn run(
         }
         if let Some(at) = pinger.deadline() {
             delay = delay.min(at.saturating_duration_since(timer::Instant::now()));
+        }
+        if let Some(w) = &wan6 {
+            delay = delay.min(Duration::from_millis(w.next_deadline().saturating_sub(now_ms())));
         }
         if let Some(at) = pppoe.as_ref().and_then(Pppoe::wake_at) {
             delay = delay.min(at.saturating_duration_since(timer::Instant::now()));

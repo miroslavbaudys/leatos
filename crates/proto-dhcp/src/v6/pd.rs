@@ -443,7 +443,9 @@ impl<'a> Msg<'a> {
                     let mut ia = IaPd { t1: be32(4), t2: be32(8), prefix: None, status_stops: false };
                     for (c, x) in options(&d[12..]) {
                         match c {
-                            OPT_IAPREFIX if x.len() >= 25 && ia.prefix.is_none() => {
+                            // The first still valid (a renewal may list the
+                            // old one with lifetime 0 beside a new one).
+                            OPT_IAPREFIX if x.len() >= 25 && ia.prefix.is_none_or(|p| p.valid == 0) => {
                                 let len = x[8];
                                 let a: [u8; 16] = x[9..25].try_into().ok()?;
                                 let be = |i: usize| u32::from_be_bytes([x[i], x[i + 1], x[i + 2], x[i + 3]]);

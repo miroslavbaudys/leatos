@@ -911,6 +911,9 @@ async function refresh() {
     ...(l ? [["Address", esc(l.addr)], ["Gateway", esc(l.gateway ?? "–")], ["DNS servers", l.dns.map(esc).join(", ") || "–"],
       ...(l.via ? [["Link", `${esc(l.via)}, MTU ${l.mtu}`]] : [])] : [["Lease", "none"]]), ...ppp,
     ...(st.pppoe_drops ? [["PPPoE drops", n(st.pppoe_drops)]] : []),
+    ...(st.wan_ipv6 ? [["IPv6", st.wan_ipv6.source === "dhcpv6-pd"
+      ? `prefix ${esc(st.wan_ipv6.prefix ?? "none")} (DHCPv6-PD ${esc(st.wan_ipv6.state)}${st.wan_ipv6.prefix ? `, valid ${st.wan_ipv6.valid} s` : ""}) · router ${esc(st.wan_ipv6.gateway ?? "none")}`
+      : `${esc(st.wan_ipv6.addr ?? "")} · router ${esc(st.wan_ipv6.gateway)} (static)`]] : []),
     ...(p?.ipv6cp_offered ? [["IPv6", `offered by the access concentrator (${n(p.ipv6cp_offered)} IPv6CP request(s)), not used yet`]] : [])]);
   const d = st.dns;
   const ups = d ? (d.upstreams.length ? d.upstreams.map(esc).join(", ") + ` <span class=hint>(${esc(d.source)})</span>` : "none" + (d.source === "WAN lease" ? " (no WAN lease)" : ""))
