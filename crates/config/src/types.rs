@@ -214,6 +214,77 @@ impl FromStr for Net {
     }
 }
 
+/// An address or prefix of either family, for firewall rules and routes:
+/// `10.10.0.20`, `10.10.0.0/24`, `2001:db8::5` (= /128), `2001:db8::/48`.
+/// Host bits must be zero (checked by validation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnyNet {
+    V4(Net),
+    V6(Cidr6),
+}
+
+impl AnyNet {
+    pub fn v4(&self) -> Option<Net> {
+        match self {
+            AnyNet::V4(n) => Some(*n),
+            AnyNet::V6(_) => None,
+        }
+    }
+    pub fn v6(&self) -> Option<Cidr6> {
+        match self {
+            AnyNet::V6(n) => Some(*n),
+            AnyNet::V4(_) => None,
+        }
+    }
+    pub fn is_network(&self) -> bool {
+        match self {
+            AnyNet::V4(n) => n.is_network(),
+            AnyNet::V6(n) => n.addr == n.network(),
+        }
+    }
+    /// The same prefix with the host bits cleared (for "did you mean").
+    pub fn network_text(&self) -> String {
+        match self {
+            AnyNet::V4(n) => alloc::format!("{}/{}", n.0.network(), n.0.prefix),
+            AnyNet::V6(n) => alloc::format!("{}/{}", n.network(), n.prefix),
+        }
+    }
+}
+
+impl fmt::Display for AnyNet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AnyNet::V4(n) => n.fmt(f),
+            AnyNet::V6(n) if n.prefix == 128 => write!(f, "{}", n.addr),
+            AnyNet::V6(n) => n.fmt(f),
+        }
+    }
+}
+
+impl FromStr for AnyNet {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.contains(':') {
+            return s.parse().map(AnyNet::V4);
+        }
+        match s.split_once('/') {
+            Some(_) => s.parse().map(AnyNet::V6),
+            None => {
+                let a: Ipv6Addr = s.parse().map_err(|_| "expected an address or prefix (a.b.c.d/len, 2001:db8::/48)")?;
+                Ok(AnyNet::V6(Cidr6::new(a, 128)))
+            }
+        }
+    }
+}
+
+string_serde!(AnyNet);
+
+impl From<Net> for AnyNet {
+    fn from(n: Net) -> Self {
+        AnyNet::V4(n)
+    }
+}
+
 /// A port or an inclusive range: `443`, `"443"`, `"8000-8100"`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortRange {

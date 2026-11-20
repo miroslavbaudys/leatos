@@ -151,7 +151,9 @@ impl Config {
             .rules
             .iter()
             .filter(accepts)
-            .map(|r| (self.zone_mask(&r.from), self.zone_mask(&r.to), r.dst))
+            // IPv6-only rules open no path to IPv4 addresses.
+            .filter(|r| r.dst_iid.is_none() && !r.src.is_some_and(|n| n.v6().is_some()) && !r.dst.is_some_and(|n| n.v6().is_some()))
+            .map(|r| (self.zone_mask(&r.from), self.zone_mask(&r.to), r.dst.and_then(|n| n.v4())))
             .filter(|(from, to, _)| *from != 0 && *to != 0)
             .collect();
         let mut subnets: Vec<(Cidr, usize)> = self.networks.iter().enumerate().map(|(k, n)| (n.ipv4, k)).collect();

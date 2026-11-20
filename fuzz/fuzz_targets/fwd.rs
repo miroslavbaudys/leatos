@@ -15,7 +15,7 @@ use arbitrary::Arbitrary;
 use core::net::{Ipv4Addr, Ipv6Addr};
 use fwd::conntrack::Budget;
 use fwd::forwarder::{
-    Action, Forwarder, Interface, Policy, PortForward, Redirect, Role, Rule, RuleTo, Verdict, proto, svc,
+    Action, Forwarder, Interface, Policy, PortForward, Redirect, Role, Rule, Rule6, RuleTo, Verdict, proto, svc,
 };
 use fwd::wire::{self, ETH_HDR, PROTO_ICMP, PROTO_TCP, PROTO_UDP, SplitPlan};
 use libfuzzer_sys::fuzz_target;
@@ -69,6 +69,7 @@ fn policy() -> Policy {
                 dst: Some((nas, 32)),
                 dport: None,
                 action: Action::Accept,
+                v6: Rule6::default(),
             },
             Rule {
                 from: Some(2),
@@ -78,8 +79,20 @@ fn policy() -> Policy {
                 dst: None,
                 dport: Some((80, 80)),
                 action: Action::Reject,
+                v6: Rule6::default(),
             },
-            Rule { from: None, to: RuleTo::Router, protos: proto::ANY, src: Some((Ipv4Addr::new(10, 0, 0, 0), 8)), dst: None, dport: None, action: Action::Drop },
+            Rule { from: None, to: RuleTo::Router, protos: proto::ANY, src: Some((Ipv4Addr::new(10, 0, 0, 0), 8)), dst: None, dport: None, action: Action::Drop, v6: Rule6::default() },
+            // An IPv6 pinhole by interface identifier (wan -> lan TCP 8087).
+            Rule {
+                from: Some(0),
+                to: RuleTo::Zone(1),
+                protos: proto::TCP,
+                src: None,
+                dst: None,
+                dport: Some((8087, 8087)),
+                action: Action::Accept,
+                v6: Rule6 { dst_iid: Some(0x10), ..Rule6::default() },
+            },
         ],
         forwards: vec![
             PortForward { protos: proto::TCP | proto::UDP, lo: 8080, hi: 8081, to: nas, to_port: Some(80), src: None, hairpin: true },

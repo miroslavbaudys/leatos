@@ -260,6 +260,30 @@ pub struct Rule {
     /// Inclusive destination port range (TCP/UDP only).
     pub dport: Option<(u16, u16)>,
     pub action: Action,
+    /// IPv6 matches; any set: the rule is for IPv6 only (one with `src`
+    /// or `dst` is for IPv4 only, one with neither for both).
+    pub v6: Rule6,
+}
+
+/// A [`Rule`]'s IPv6 matches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rule6 {
+    pub src: Option<(Ipv6Addr, u8)>,
+    pub dst: Option<(Ipv6Addr, u8)>,
+    /// The destination's interface identifier (low 64 bits) under any
+    /// prefix: a pinhole that survives renumbering.
+    pub dst_iid: Option<u64>,
+}
+
+impl Rule6 {
+    fn any(&self) -> bool {
+        self.src.is_some() || self.dst.is_some() || self.dst_iid.is_some()
+    }
+}
+
+fn in_net6(ip: Ipv6Addr, net: Option<(Ipv6Addr, u8)>) -> bool {
+    use crate::route::RouteAddr;
+    net.is_none_or(|(a, l)| ip.masked(l) == a.masked(l))
 }
 
 /// What a matching [`Rule`] does with a new flow or a packet for the router.
@@ -281,12 +305,23 @@ fn in_net(ip: Ipv4Addr, net: Option<(Ipv4Addr, u8)>) -> bool {
 
 impl Rule {
     fn matches(&self, from: u8, to: RuleTo, p: u8, src: Ipv4Addr, dst: Ipv4Addr, dport: Option<u16>) -> bool {
+        !self.v6.any() && self.matches_common(from, to, p, dport) && in_net(src, self.src) && in_net(dst, self.dst)
+    }
+
+    fn matches6(&self, from: u8, to: RuleTo, p: u8, src: Ipv6Addr, dst: Ipv6Addr, dport: Option<u16>) -> bool {
+        self.src.is_none()
+            && self.dst.is_none()
+            && self.matches_common(from, to, p, dport)
+            && in_net6(src, self.v6.src)
+            && in_net6(dst, self.v6.dst)
+            && self.v6.dst_iid.is_none_or(|i| u128::from(dst) as u64 == i)
+    }
+
+    fn matches_common(&self, from: u8, to: RuleTo, p: u8, dport: Option<u16>) -> bool {
         let pbit = proto_bit(p);
         self.from.is_none_or(|z| z == from)
             && (self.to == RuleTo::Any || self.to == to)
             && (self.protos == proto::ANY || self.protos & pbit != 0)
-            && in_net(src, self.src)
-            && in_net(dst, self.dst)
             && self
                 .dport
                 .is_none_or(|(lo, hi)| dport.is_some_and(|d| (lo..=hi).contains(&d)))
@@ -294,13 +329,13 @@ impl Rule {
 }
 
 impl Policy {
-    /// The first rule without addresses that matches an IPv6 packet (rules
-    /// with IPv4 prefixes are for IPv4 only).
-    fn rule6(&self, from: u8, to: RuleTo, p: u8, dport: Option<u16>) -> Option<(usize, Action)> {
-        let any = Ipv4Addr::UNSPECIFIED;
+    /// The first rule that matches an IPv6 packet (rules with IPv4
+    /// prefixes are for IPv4 only).
+    #[allow(clippy::too_many_arguments)]
+    fn rule6(&self, from: u8, to: RuleTo, p: u8, src: Ipv6Addr, dst: Ipv6Addr, dport: Option<u16>) -> Option<(usize, Action)> {
         self.rules
             .iter()
-            .position(|r| r.src.is_none() && r.dst.is_none() && r.matches(from, to, p, any, any, dport))
+            .position(|r| r.matches6(from, to, p, src, dst, dport))
             .map(|i| (i, self.rules[i].action))
     }
 
@@ -1132,15 +1167,15 @@ impl Forwarder {
             return false;
         }
         let (from, to) = (self.ifs[a.egress as usize], self.ifs[b.egress as usize]);
-        self.allowed6(&from, &to, t.proto, matches!(t.proto, PROTO_TCP | PROTO_UDP).then_some(t.dport)).0
+        self.allowed6(&from, &to, t.proto, (t.src, t.dst), matches!(t.proto, PROTO_TCP | PROTO_UDP).then_some(t.dport)).0
     }
 
     /// May a new IPv6 flow go from `from` to `to`: (allowed, the rule that
     /// decided). Rules without addresses, then the zone policy; without a
     /// policy only LAN → WAN.
-    fn allowed6(&self, from: &Interface, to: &Interface, proto: u8, dport: Option<u16>) -> (bool, Option<usize>) {
+    fn allowed6(&self, from: &Interface, to: &Interface, proto: u8, (src, dst): (Ipv6Addr, Ipv6Addr), dport: Option<u16>) -> (bool, Option<usize>) {
         match self.policy.as_ref() {
-            Some(p) => match p.rule6(from.zone, RuleTo::Zone(to.zone), proto, dport) {
+            Some(p) => match p.rule6(from.zone, RuleTo::Zone(to.zone), proto, src, dst, dport) {
                 Some((i, a)) => (a == Action::Accept, Some(i)),
                 None => (p.may_forward(from.zone, to.zone), None),
             },
@@ -1366,7 +1401,7 @@ impl Forwarder {
                     });
                 };
                 let ports = matches!(t.proto, PROTO_TCP | PROTO_UDP).then_some(t.dport);
-                let (ok, rule) = self.allowed6(&iface, &egress_if, t.proto, ports);
+                let (ok, rule) = self.allowed6(&iface, &egress_if, t.proto, (t.src, t.dst), ports);
                 if let Some(h) = rule.and_then(|i| self.rule_hits.get_mut(i)) {
                     *h += 1;
                 }
@@ -1537,7 +1572,7 @@ impl Forwarder {
         if let Some((i, action)) = self
             .policy
             .as_ref()
-            .and_then(|p| p.rule6(zone, RuleTo::Router, v.proto, dport))
+            .and_then(|p| p.rule6(zone, RuleTo::Router, v.proto, v.src(f), v.dst(f), dport))
         {
             if let Some(h) = self.rule_hits.get_mut(i) {
                 *h += 1;
@@ -3156,7 +3191,7 @@ mod tests {
 
     fn rule(from: Option<u8>, to: RuleTo, protos: u8, accept: bool) -> Rule {
         let action = if accept { Action::Accept } else { Action::Drop };
-        Rule { from, to, protos, src: None, dst: None, dport: None, action }
+        Rule { from, to, protos, src: None, dst: None, dport: None, action, v6: Rule6::default() }
     }
 
     fn with_rules(fw: &mut Forwarder, rules: Vec<Rule>) {
@@ -3845,6 +3880,7 @@ mod tests {
             dst: None,
             dport: Some((80, 80)),
             action: Action::Drop,
+            v6: Rule6::default(),
         };
         fw.set_policy(zone_policy(vec![0, 0b101, 0b001], vec![no_web]));
         assert_eq!(fw.recheck(), 1, "TCP 80 only");
@@ -3853,7 +3889,7 @@ mod tests {
         let mut f = udp_frame(GUEST_MAC, GUEST_HOST, NAS, 7002, 161);
         fw.set_policy(zone_policy(vec![0, 0b101, 0b011], vec![]));
         assert!(matches!(run(&mut fw, 0, GUEST, &mut f), Verdict::Forward { egress: LAN, .. }));
-        let snmp = Rule { from: Some(2), to: RuleTo::Zone(1), protos: proto::UDP, src: None, dst: Some((NAS, 32)), dport: Some((161, 161)), action: Action::Accept };
+        let snmp = Rule { from: Some(2), to: RuleTo::Zone(1), protos: proto::UDP, src: None, dst: Some((NAS, 32)), dport: Some((161, 161)), action: Action::Accept, v6: Rule6::default() };
         fw.set_policy(zone_policy(vec![0, 0b101, 0b001], vec![snmp]));
         assert_eq!(fw.recheck(), 0);
         fw.set_policy(zone_policy(vec![0, 0b101, 0b001], vec![]));
@@ -4465,8 +4501,8 @@ mod tests {
         let p = fw.policy.as_mut().unwrap();
         // An IPv4-only rule (it has a source prefix) and one for any family.
         p.rules = vec![
-            Rule { from: Some(2), to: RuleTo::Router, protos: proto::TCP, src: Some((GUEST_HOST, 32)), dst: None, dport: Some((80, 80)), action: Action::Accept },
-            Rule { from: Some(2), to: RuleTo::Router, protos: proto::ICMP, src: None, dst: None, dport: None, action: Action::Accept },
+            Rule { from: Some(2), to: RuleTo::Router, protos: proto::TCP, src: Some((GUEST_HOST, 32)), dst: None, dport: Some((80, 80)), action: Action::Accept, v6: Rule6::default() },
+            Rule { from: Some(2), to: RuleTo::Router, protos: proto::ICMP, src: None, dst: None, dport: None, action: Action::Accept, v6: Rule6::default() },
         ];
         fw.set_policy(fw.policy.clone());
         let f = ipv6_frame(GUEST_MAC, V6_HOST, ULA_GUEST, 64, &[], PROTO_TCP, &l4(40000, 80));
@@ -4634,7 +4670,7 @@ mod tests {
         // A rule without addresses opens wan → lan TCP 22; a new policy
         // without it ends the connection (recheck).
         let mut p = fw.policy.clone().unwrap();
-        p.rules = vec![Rule { from: Some(0), to: RuleTo::Zone(1), protos: proto::TCP, src: None, dst: None, dport: Some((22, 22)), action: Action::Accept }];
+        p.rules = vec![Rule { from: Some(0), to: RuleTo::Zone(1), protos: proto::TCP, src: None, dst: None, dport: Some((22, 22)), action: Action::Accept, v6: Rule6::default() }];
         fw.set_policy(Some(p));
         let mut f = frame6(WAN_MAC, S6, H6, 60, PROTO_TCP, &tcp6(S6, H6, 5000, 22, wire::TCP_SYN, None));
         assert!(matches!(run(&mut fw, 0, WAN, &mut f), Verdict::Forward6 { egress: LAN, .. }));
@@ -4645,6 +4681,72 @@ mod tests {
         fw.set_policy(Some(p));
         assert_eq!(fw.recheck(), 1);
         assert_eq!(fw.ct6.len(), n - 1);
+    }
+
+    #[test]
+    fn ipv6_pinhole_by_interface_identifier_and_prefix_rules() {
+        let mut fw = router6f();
+        let open = |fw: &mut Forwarder, dst: &str, port: u16| {
+            let mut f = frame6(WAN_MAC, S6, dst, 60, PROTO_TCP, &tcp6(S6, dst, 5000, port, wire::TCP_SYN, None));
+            matches!(run(fw, 0, WAN, &mut f), Verdict::Forward6 { egress: LAN, .. })
+        };
+        let mut p = fw.policy.clone().unwrap();
+        p.rules = vec![
+            // wan → lan TCP 8087 to interface identifier ::10, any prefix.
+            Rule {
+                from: Some(0),
+                to: RuleTo::Zone(1),
+                protos: proto::TCP,
+                src: None,
+                dst: None,
+                dport: Some((8087, 8087)),
+                action: Action::Accept,
+                v6: Rule6 { dst_iid: Some(0x10), ..Rule6::default() },
+            },
+            // wan → lan TCP 22 from one IPv6 prefix only.
+            Rule {
+                from: Some(0),
+                to: RuleTo::Zone(1),
+                protos: proto::TCP,
+                src: None,
+                dst: None,
+                dport: Some((22, 22)),
+                action: Action::Accept,
+                v6: Rule6 { src: Some((a6("2001:db8:9::"), 48)), ..Rule6::default() },
+            },
+            // An IPv4 rule never opens IPv6.
+            Rule { from: Some(0), to: RuleTo::Zone(1), protos: proto::TCP, src: None, dst: Some((Ipv4Addr::new(192, 168, 1, 10), 32)), dport: Some((9000, 9000)), action: Action::Accept, v6: Rule6::default() },
+        ];
+        fw.set_policy(Some(p));
+        assert!(open(&mut fw, H6, 8087), "the pinhole");
+        assert!(!open(&mut fw, "2001:db8:100::11", 8087), "another interface identifier");
+        assert!(!open(&mut fw, H6, 8086), "another port");
+        assert!(open(&mut fw, H6, 22), "from the allowed prefix");
+        assert!(!open(&mut fw, H6, 9000), "the IPv4 rule");
+        // Renumbered: the same interface identifier under the new prefix.
+        fw.set_gua6(LAN, Some((a6("2001:db8:200::1"), 64)));
+        assert!(open(&mut fw, "2001:db8:200::10", 8087), "survives a new prefix");
+        assert_eq!(fw.rule_hits, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn ipv4_skips_ipv6_rules() {
+        let p = Policy {
+            rules: vec![Rule {
+                from: None,
+                to: RuleTo::Any,
+                protos: proto::ANY,
+                src: None,
+                dst: None,
+                dport: None,
+                action: Action::Accept,
+                v6: Rule6 { dst_iid: Some(1), ..Rule6::default() },
+            }],
+            ..Policy::default()
+        };
+        let any = Ipv4Addr::UNSPECIFIED;
+        assert_eq!(p.rule(0, RuleTo::Zone(1), PROTO_TCP, any, any, Some(80)), None);
+        assert!(p.rule6(0, RuleTo::Zone(1), PROTO_TCP, a6("::"), a6("2001:db8::1"), Some(80)).is_some());
     }
 
     #[test]

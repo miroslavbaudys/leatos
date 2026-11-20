@@ -33,7 +33,7 @@ mod validate;
 
 pub use edit::{diff_lines, flat_lines};
 pub use names::{HostName, LocalHost, NameVisibility};
-pub use types::{Cidr, Cidr6, Mac, Net, PortRange, Target};
+pub use types::{AnyNet, Cidr, Cidr6, Mac, Net, PortRange, Target};
 pub use validate::Issue;
 pub use validate::{MAX_NETWORKS, MAX_VLAN_ID};
 
@@ -41,7 +41,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
 use serde::{Deserialize, Serialize};
 
 /// Schema version this crate reads and writes.
@@ -368,10 +368,17 @@ pub struct Rule {
     pub to: String,
     #[serde(default, skip_serializing_if = "Proto::is_any")]
     pub proto: Proto,
+    /// An IPv4 or IPv6 address or prefix; a rule with IPv4 ones is for
+    /// IPv4 only, one with IPv6 ones (or `dst_iid`) for IPv6 only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub src: Option<Net>,
+    pub src: Option<AnyNet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dst: Option<Net>,
+    pub dst: Option<AnyNet>,
+    /// IPv6 destination by interface identifier (`::5054:ff:fe00:10`: the
+    /// low 64 bits) under any prefix: a pinhole that survives the ISP
+    /// renumbering the networks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst_iid: Option<Ipv6Addr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dst_port: Option<PortRange>,
     pub action: Action,

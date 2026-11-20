@@ -982,7 +982,7 @@ fn v2_document_parses_and_round_trips() {
     assert_eq!(c.zone("wan"), Some(Zone::builtin_wan()));
     let r = &c.firewall.rules;
     assert_eq!(r[0].dst_port, Some(PortRange::one(9100)), "integer port");
-    assert_eq!(r[0].dst, Some(Net(Cidr::new(ip(10, 10, 0, 20), 32))));
+    assert_eq!(r[0].dst, Some(AnyNet::V4(Net(Cidr::new(ip(10, 10, 0, 20), 32)))));
     assert!(!r[1].enabled);
     let f = &c.firewall.forwards;
     assert_eq!((f[0].proto, f[0].wan_port, f[0].to), (Proto::Tcp, PortRange::one(8443), Target { ip: ip(10, 10, 0, 10), port: Some(443) }));
@@ -1081,6 +1081,14 @@ fn zone_rule_and_forward_checks() {
     assert_eq!(with_v2(|c| c.firewall.rules[0].proto = Proto::Icmp), ["firewall.rule.printer.dst_port"]);
     assert_eq!(with_v2(|c| c.firewall.rules[0].src = Some("10.20.0.5/24".parse().unwrap())), ["firewall.rule.printer.src"]);
     assert_eq!(with_v2(|c| c.firewall.rules[1].name = "printer".into()), ["firewall.rule[1].name"]);
+    // IPv6 rules (docs/ipv6.md step 5b).
+    let v6 = |s: &str| -> Option<AnyNet> { Some(s.parse().unwrap()) };
+    assert!(with_v2(|c| { c.firewall.rules[0].src = None; c.firewall.rules[0].dst = v6("2001:db8:100::/56") }).is_empty());
+    assert!(with_v2(|c| { c.firewall.rules[0].dst = None; c.firewall.rules[0].dst_iid = Some("::5054:ff:fe00:10".parse().unwrap()) }).is_empty());
+    assert_eq!(with_v2(|c| { c.firewall.rules[0].src = None; c.firewall.rules[0].dst = v6("2001:db8:100::5/56") }), ["firewall.rule.printer.dst"], "host bits");
+    assert_eq!(with_v2(|c| { c.firewall.rules[0].src = v6("2001:db8::/32"); c.firewall.rules[0].dst = v6("10.10.0.20") }), ["firewall.rule.printer.dst"], "two families");
+    assert_eq!(with_v2(|c| { c.firewall.rules[0].dst = None; c.firewall.rules[0].dst_iid = Some("2001:db8::10".parse().unwrap()) }), ["firewall.rule.printer.dst_iid"], "prefix bits");
+    assert_eq!(with_v2(|c| { c.firewall.rules[0].dst = None; c.firewall.rules[0].dst_iid = Some("::".parse().unwrap()) }), ["firewall.rule.printer.dst_iid"], "zero");
 
     let fw = |f: fn(&mut Forward)| with_v2(move |c| f(&mut c.firewall.forwards[0]));
     assert_eq!(fw(|f| f.to.ip = ip(192, 0, 2, 1)), ["firewall.forward.nas-https.to"]);
@@ -1858,4 +1866,34 @@ fn ipv6_prefix_delegation_settings() {
     d.ipv6.enabled = true;
     let t = d.to_toml();
     assert!(!t.contains("dhcpv6_pd") && !t.contains("prefix_hint"), "{t}");
+}
+
+#[test]
+fn ipv6_rule_fields_roundtrip() {
+    let t = r#"
+[[firewall.rule]]
+name = "qbit6"
+from = "wan"
+to = "lan"
+proto = "tcp+udp"
+dst_iid = "::5054:ff:fe00:10"
+dst_port = 9524
+action = "accept"
+
+[[firewall.rule]]
+name = "admin6"
+from = "wan"
+to = "lan"
+src = "2001:db8:9::/48"
+dst = "2001:db8:100::10"
+action = "accept"
+"#;
+    let c: Config = toml::from_str(&alloc::format!("version = 2\n{t}")).unwrap();
+    let r = &c.firewall.rules;
+    assert_eq!(r[0].dst_iid, Some("::5054:ff:fe00:10".parse().unwrap()));
+    assert_eq!(r[1].src.unwrap().v6().unwrap().prefix, 48);
+    assert_eq!(r[1].dst.unwrap().v6().unwrap().prefix, 128, "a bare address is /128");
+    let back = toml::to_string(&c).unwrap();
+    assert!(back.contains("dst_iid = \"::5054:ff:fe00:10\""), "{back}");
+    assert!(back.contains("dst = \"2001:db8:100::10\""), "{back}");
 }

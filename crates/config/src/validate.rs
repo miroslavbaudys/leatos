@@ -563,8 +563,27 @@ fn rules(c: &Config, x: &mut Issues) {
                 "needs proto = \"tcp\", \"udp\" or \"tcp+udp\"",
             );
         }
-        net_ok(x, format!("{p}.src"), &r.src);
-        net_ok(x, format!("{p}.dst"), &r.dst);
+        for (f, n) in [("src", &r.src), ("dst", &r.dst)] {
+            if let Some(n) = n
+                && !n.is_network()
+            {
+                x.add(format!("{p}.{f}"), format!("host bits set: did you mean {}?", n.network_text()));
+            }
+        }
+        let v4 = r.src.is_some_and(|n| n.v4().is_some()) || r.dst.is_some_and(|n| n.v4().is_some());
+        let v6 = r.src.is_some_and(|n| n.v6().is_some()) || r.dst.is_some_and(|n| n.v6().is_some()) || r.dst_iid.is_some();
+        if v4 && v6 {
+            x.add(format!("{p}.dst"), "IPv4 and IPv6 addresses in one rule: make two rules");
+        }
+        if let Some(i) = r.dst_iid {
+            let b = u128::from(i);
+            if b >> 64 != 0 || b == 0 {
+                x.add(format!("{p}.dst_iid"), "an interface identifier: the low 64 bits only, e.g. ::5054:ff:fe00:10");
+            }
+            if r.to == "router" {
+                x.add(format!("{p}.dst_iid"), "not for rules to the router");
+            }
+        }
     }
 }
 
