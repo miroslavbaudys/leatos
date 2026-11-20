@@ -155,7 +155,9 @@
 #                        on the LAN capture, the copy from 192.168.1.1 to
 #                        224.0.0.251 with TTL 255 holding _ipp but not
 #                        _ssh, plus the router's IGMP joins on both
-#                        networks. Negative control: LAB_MDNS_RULES=0 (the
+#                        networks. With LAB_IPV6=1 the same over ff02::fb
+#                        (the copy from the router's link-local address,
+#                        hop limit 255). Negative control: LAB_MDNS_RULES=0 (the
 #                        rule disabled: every mDNS check fails).
 #   LAB_DNS_VIEWS=1      (implies LAB_GUEST=1) split-horizon local DNS
 #                        (docs/dns-views.md): dns.views = "firewall", a
@@ -906,6 +908,23 @@ if [[ -n "$MDNS" ]]; then
       echo "  LAB PASS: mdns wire: copy from 192.168.1.1 to 224.0.0.251, ttl 255, _ipp only"
     else
       echo "  LAB FAIL: mdns wire: no proper copy on the LAN (${copy:0:300})"; router_fails=$((router_fails + 1))
+    fi
+  fi
+  # IPv6 (LAB_IPV6, docs/ipv6.md step 5b): the copy from the router's
+  # link-local address to ff02::fb, hop limit 255, _ipp only.
+  if [[ -n "$IPV6" ]]; then
+    tcpdump -nn -e -v -r "$PCAP_DIR/lan.pcap" 'ip6 and udp port 5353' 2>/dev/null \
+      | awk '/^[^ \t]/ { if (l != "") print l; l = $0; next } { l = l " " $0 } END { if (l != "") print l }' >"$WORK/mdns6.txt"
+    if ! tr -d '\r' <"$WORK/client.log" | grep -q "LAB MDNS6 SENT"; then
+      echo "  LAB FAIL: mdns ipv6 wire: the client's reflection check did not pass"; router_fails=$((router_fails + 1))
+    else
+      copy=$(grep -v "vlan 20" "$WORK/mdns6.txt" | grep "fe80::5054:ff:fe00:2.5353 > ff02::fb.5353" | grep "labprn._ipp._tcp.local" | head -1 || true)
+      if [[ "$copy" == *"hlim 255"* && "$copy" != *"_ssh"* ]]; then
+        echo "  LAB PASS: mdns ipv6 wire: copy from fe80::5054:ff:fe00:2 to ff02::fb, hlim 255, _ipp only"
+      else
+        echo "  LAB FAIL: mdns ipv6 wire: no proper copy on the LAN (${copy:0:300})"; router_fails=$((router_fails + 1))
+        grep -v "vlan 20" "$WORK/mdns6.txt" | head -3 | cut -c1-200 | sed 's/^/    | /'
+      fi
     fi
   fi
   igmp_lan=$(grep -v "vlan 20" "$WORK/mdns.txt" | grep -c "192.168.1.1 > 224.0.0.251: igmp v2 report 224.0.0.251" || true)

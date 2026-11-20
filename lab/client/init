@@ -940,6 +940,24 @@ if [ -n "$guest" ]; then
       else
         fail "mdns: not reflected (guest received ${r0:-none} -> ${r1:-none}, lan sent ${s0:-none} -> ${s1:-none}) $($bb cat /tmp/mdns-nc)"
       fi
+      # The same over IPv6 (step 5b): to ff02::fb on the guest VLAN, from
+      # our link-local address; reflected to the LAN over IPv6.
+      if [ -n "$v6on" ]; then
+        $bb sleep 2 # past the duplicate window
+        r0=$(mstat guest received); s0=$(mstat lan sent)
+        $bb ip -6 route add ff02::fb/128 dev eth0.20 2>/tmp/mdns6-route
+        $bb printf '\000\000\204\000\000\000\000\002\000\000\000\000\004\137\151\160\160\004\137\164\143\160\005\154\157\143\141\154\000\000\014\000\001\000\000\021\224\000\030\006\154\141\142\160\162\156\004\137\151\160\160\004\137\164\143\160\005\154\157\143\141\154\000\004\137\163\163\150\004\137\164\143\160\005\154\157\143\141\154\000\000\014\000\001\000\000\021\224\000\030\006\154\141\142\160\162\156\004\137\163\163\150\004\137\164\143\160\005\154\157\143\141\154\000' \
+          | $bb nc -u -p 5353 -w 1 'ff02::fb%eth0.20' 5353 2>/tmp/mdns-nc6; echo "nc exit $?" >>/tmp/mdns-nc6
+        $bb ip -6 route del ff02::fb/128 dev eth0.20 2>/dev/null
+        $bb sleep 1
+        r1=$(mstat guest received); s1=$(mstat lan sent)
+        if [ -n "$r1" ] && [ -n "$s1" ] && [ "$r1" -gt "${r0:-0}" ] && [ "$s1" -gt "${s0:-0}" ]; then
+          pass "mdns ipv6: announcement to ff02::fb on guest reflected to lan (guest received ${r0:-0} -> $r1, lan sent ${s0:-0} -> $s1)"
+          echo "LAB MDNS6 SENT"
+        else
+          fail "mdns ipv6: not reflected (guest received ${r0:-none} -> ${r1:-none}, lan sent ${s0:-none} -> ${s1:-none}) $($bb cat /tmp/mdns-nc6 /tmp/mdns6-route)"
+        fi
+      fi
     fi
     # A new policy also ends tracked connections (Forwarder::recheck): a
     # ping from the guest to the ISP runs (one ICMP id, one tracked

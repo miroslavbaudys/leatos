@@ -11,8 +11,11 @@
 //! changed leaves (on the old tag) and joins again (on the new one). Each datagram goes to the reflector with the
 //! network's index (`config::networks` order); its copies are sent to
 //! `224.0.0.251:5353` on their networks, from the router's address there,
-//! with TTL 255 (RFC 6762 §11). Everything happens in the services task;
-//! the datapath only passes 5353 up when the zone allows `mdns`.
+//! with TTL 255 (RFC 6762 §11). With IPv6 on, the same over ff02::fb
+//! (docs/ipv6.md step 5b): joined beside 224.0.0.251 (smoltcp sends the
+//! MLD report), each copy sent in the family its message came in on, from
+//! the router's link-local address. Everything happens in the services
+//! task; the datapath only passes 5353 up when the zone allows `mdns`.
 
 use crate::config;
 use crate::net::shared::LinkShared;
@@ -21,8 +24,8 @@ use crate::{println, timer};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::net::{IpAddr, SocketAddrV4};
-use proto_mdns::{GROUP_V4, PORT, Reflector, Stats};
+use core::net::{IpAddr, SocketAddr};
+use proto_mdns::{GROUP_V4, GROUP_V6, PORT, Reflector, Stats};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::udp;
 use smoltcp::wire::{IpAddress, IpEndpoint};
@@ -45,6 +48,8 @@ struct Sock {
 struct Member {
     host: usize,
     vid: u16,
+    /// ff02::fb too (IPv6 on, the network has its /64).
+    v6: bool,
 }
 
 pub struct Mdns {
@@ -68,13 +73,34 @@ fn now_ms() -> u64 {
     timer::uptime().as_millis() as u64
 }
 
-fn reflector_config(nets: &[config::Lan]) -> proto_mdns::Config {
+/// The reflector's networks: IPv4 subnet, and with IPv6 the router's
+/// link-local (from the link's MAC), unique local and global addresses.
+fn reflector_config(nets: &[config::Lan], hosts: &[HostIf], links: &[usize]) -> proto_mdns::Config {
     proto_mdns::Config {
         nets: nets
             .iter()
-            .map(|n| Some(proto_mdns::Net { addr: n.addr, prefix_len: n.prefix }))
+            .enumerate()
+            .map(|(k, n)| {
+                let mut net = proto_mdns::Net::v4(n.addr, n.prefix);
+                if config::ipv6() && n.ula.is_some() {
+                    let ll = links.get(k).and_then(|&l| hosts.get(l)).and_then(|h| match h.iface.hardware_addr() {
+                        smoltcp::wire::HardwareAddress::Ethernet(e) => Some(fwd::wire::link_local(e.0)),
+                        #[allow(unreachable_patterns)]
+                        _ => None,
+                    });
+                    net.addrs6 = [ll, n.ula, n.gua];
+                }
+                Some(net)
+            })
             .collect(),
         rules: config::mdns_rules(),
+    }
+}
+
+fn leave(host: &mut HostIf, m: Member) {
+    let _ = host.iface.leave_multicast_group(IpAddress::Ipv4(GROUP_V4));
+    if m.v6 {
+        let _ = host.iface.leave_multicast_group(IpAddress::Ipv6(GROUP_V6));
     }
 }
 
@@ -100,9 +126,9 @@ impl Mdns {
         let nets = config::networks();
         let names: Vec<String> = nets.iter().map(|n| n.name.clone()).collect();
         if names == self.names {
-            self.refl.reconfigure(reflector_config(&nets));
+            self.refl.reconfigure(reflector_config(&nets, hosts, links));
         } else {
-            self.refl = Reflector::new(reflector_config(&nets));
+            self.refl = Reflector::new(reflector_config(&nets, hosts, links));
         }
         // Memberships: keep those unchanged, leave the others now (sent on
         // the tag still in effect), join new or retagged ones later
@@ -112,13 +138,13 @@ impl Mdns {
             .enumerate()
             .take(nets.len())
             .filter(|&(k, &link)| self.refl.takes_part(k) && link < hosts.len())
-            .map(|(k, &link)| Member { host: link, vid: nets[k].vid })
+            .map(|(k, &link)| Member { host: link, vid: nets[k].vid, v6: config::ipv6() && nets[k].ula.is_some() })
             .collect();
         for m in core::mem::take(&mut self.joined) {
             if want.contains(&m) {
                 self.joined.push(m);
             } else {
-                let _ = hosts[m.host].iface.leave_multicast_group(IpAddress::Ipv4(GROUP_V4));
+                leave(&mut hosts[m.host], m);
             }
         }
         self.pending = want.iter().copied().filter(|m| !self.joined.contains(m)).collect();
@@ -169,6 +195,11 @@ impl Mdns {
                 }
                 Err(e) => println!("  mdns            : cannot join {GROUP_V4} on link {}: {e}", m.host),
             }
+            if m.v6
+                && let Err(e) = hosts[m.host].iface.join_multicast_group(IpAddress::Ipv6(GROUP_V6))
+            {
+                println!("  mdns            : cannot join {GROUP_V6} on link {}: {e}", m.host);
+            }
         }
         for k in 0..self.socks.len() {
             let Some(s) = self.socks[k] else { continue };
@@ -177,15 +208,13 @@ impl Mdns {
                 let Ok((n, meta)) = sock.recv_slice(&mut self.buf) else {
                     break;
                 };
-                let IpAddr::V4(ip) = IpAddr::from(meta.endpoint.addr) else {
-                    continue;
-                };
-                let src = SocketAddrV4::new(ip, meta.endpoint.port);
+                let src = SocketAddr::new(IpAddr::from(meta.endpoint.addr), meta.endpoint.port);
                 for out in self.refl.handle(now_ms(), k, src, &self.buf[..n]) {
                     let Some(Some(t)) = self.socks.get(out.net).copied() else {
                         continue;
                     };
-                    let ep = IpEndpoint::new(IpAddress::Ipv4(GROUP_V4), PORT);
+                    let group = if out.v6 { IpAddress::Ipv6(GROUP_V6) } else { IpAddress::Ipv4(GROUP_V4) };
+                    let ep = IpEndpoint::new(group, PORT);
                     // A full TX buffer drops the copy (bounded, like any
                     // other router-local UDP).
                     let _ = hosts[t.host].sockets.get_mut::<udp::Socket>(t.handle).send_slice(&out.msg, ep);
