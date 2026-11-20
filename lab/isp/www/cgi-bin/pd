@@ -1,6 +1,7 @@
 #!/usr/bin/busybox sh
 # Prefix delegation (docs/ipv6.md step 3): ?change restarts Kea on the
-# 2001:db8:200::/48 pool, so the router's next renewal gets a new prefix.
+# 2001:db8:200::/48 pool, so the router's next renewal gets a new prefix
+# (over PPPoE on ppp0: lab-kea remembers the interface and the pool).
 bb=/usr/bin/busybox
 echo "Content-Type: text/plain"
 echo

@@ -562,7 +562,7 @@ if [ -n "$v6on" ]; then
       done
       w6=$(v6st | $bb grep -o '"wan_ipv6":{[^}]*}')
       if echo "$w6" | $bb grep -q '"source":"dhcpv6-pd"' && echo "$w6" | $bb grep -q '"prefix":"2001:db8:100::/56"' && echo "$w6" | $bb grep -q '"gateway":"fe80::'; then
-        pass "ipv6 pd: delegated 2001:db8:100::/56, default router from the ISP's RA"
+        pass "ipv6 pd: delegated 2001:db8:100::/56, default router $(echo "$w6" | $bb sed -n 's/.*"gateway":"\([^"]*\)".*/\1/p')"
       else
         fail "ipv6 pd: wan_ipv6 $w6"
       fi
@@ -1015,6 +1015,21 @@ if [ -n "$kick" ]; then
     pass "pppoe: reconnected after the ISP ended the session ($r; $before -> $after, ISP reachable after ~$((3 + back)) s)"
   else
     fail "pppoe: no reconnect after the ISP ended the session ($r; $before -> ${after:-?}, ping ${back:-never})"
+  fi
+  # IPv6 over the new session (step 4): IPv6CP and the delegation again.
+  if [ "$v6mode" = pd ]; then
+    back6=""
+    # (Without a route ping6 fails at once: one try a second.)
+    for i in $($bb seq 1 45); do
+      if $bb ping6 -c 1 -W 1 "$ISP6" >/dev/null 2>&1; then back6=$i; break; fi
+      $bb sleep 1
+    done
+    if [ -n "$back6" ]; then
+      pass "pppoe: IPv6 back after the reconnect (ping6 $ISP6 after ~$back6 s)"
+    else
+      fail "pppoe: no IPv6 after the reconnect"
+      { $bb ip -6 addr show dev eth0; $bb ip -6 route; $bb ping6 -c 1 -W 2 "$ISP6"; v6st | $bb grep -o '"wan_ipv6":{[^}]*}\|"drop_reasons":{[^}]*}'; } 2>&1 | $bb sed 's/^/    | /'
+    fi
   fi
 fi
 

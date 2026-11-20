@@ -100,7 +100,18 @@ fi
 # router's WAN link-local address.
 v6=$($bb sed -n 's/.*lab_ipv6=\([a-z]*\).*/\1/p' /proc/cmdline)
 pd=$($bb sed -n 's/.*lab_pd=\([0-9]*\).*/\1/p' /proc/cmdline)
-if [ -n "$v6" ]; then
+if [ -n "$v6" ] && [ -n "$pppoe" ]; then
+  # Over PPPoE (step 4): no RAs (pppd sends none: the router takes the
+  # session's peer as its default router); /etc/ppp/ipv6-up routes the
+  # prefixes over ppp0 and starts Kea there.
+  if $bb ip -6 addr add 2001:db8:ffff::1/128 dev lo; then
+    echo "LAB isp: IPv6 2001:db8:ffff::1 over PPPoE (prefixes and Kea from ipv6-up)"
+  else
+    echo "LAB FAIL: isp: IPv6 setup"
+  fi
+  $bb touch /tmp/kea.log /tmp/kea.out
+  $bb tail -F /tmp/kea.log /tmp/kea.out 2>/dev/null | while IFS= read -r l; do echo "isp-v6: $l"; done &
+elif [ -n "$v6" ]; then
   $bb ip link set "$IF" mtu 1400
   rll=fe80::5054:ff:fe00:1
   if $bb ip -6 addr add 2001:db8:ffff::1/64 dev "$IF" \

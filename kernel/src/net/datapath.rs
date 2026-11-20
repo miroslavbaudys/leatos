@@ -139,14 +139,14 @@ pub static PPPOE_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// What a PPPoE port does with a received frame.
 enum PppoeRx {
-    /// IPv4 of the session, now a plain Ethernet/IPv4 frame.
-    Ipv4,
+    /// IPv4 or IPv6 of the session, now a plain Ethernet frame.
+    Ip,
     /// For the PPPoE client.
     Control,
     Drop,
 }
 
-/// Decapsulate session IPv4 in place, or say where the frame goes.
+/// Decapsulate session IPv4/IPv6 in place, or say where the frame goes.
 fn pppoe_rx(pkt: &mut PacketBuf, session: Option<proto_pppoe::Session>) -> PppoeRx {
     use proto_pppoe::wire::{self as pw, SessionRx};
     match wire::ethertype(pkt.data()) {
@@ -156,7 +156,13 @@ fn pppoe_rx(pkt: &mut PacketBuf, session: Option<proto_pppoe::Session>) -> Pppoe
                 pw::decap_ipv4(pkt.data_mut());
                 pkt.pull_front(pw::SESSION_OVERHEAD);
                 pkt.set_len(pw::ETH_HDR + len);
-                PppoeRx::Ipv4
+                PppoeRx::Ip
+            }
+            SessionRx::Ipv6 { len } => {
+                pw::decap_ipv6(pkt.data_mut());
+                pkt.pull_front(pw::SESSION_OVERHEAD);
+                pkt.set_len(pw::ETH_HDR + len);
+                PppoeRx::Ip
             }
             SessionRx::Control => PppoeRx::Control,
         },
@@ -164,7 +170,7 @@ fn pppoe_rx(pkt: &mut PacketBuf, session: Option<proto_pppoe::Session>) -> Pppoe
     }
 }
 
-/// Encapsulate for a PPPoE port: IPv4 goes into the session (none: `false`,
+/// Encapsulate for a PPPoE port: IPv4 and IPv6 go into the session (none: `false`,
 /// drop it); the client's own PPPoE frames go as they are; anything else
 /// (no ARP on PPPoE) is dropped.
 fn pppoe_tx(pkt: &mut PacketBuf, session: Option<proto_pppoe::Session>, mac: wire::Mac) -> bool {
@@ -175,6 +181,14 @@ fn pppoe_tx(pkt: &mut PacketBuf, session: Option<proto_pppoe::Session>, mac: wir
             Some(s) => {
                 pkt.push_front(pw::SESSION_OVERHEAD);
                 pw::encap_ipv4(pkt.data_mut(), s, mac);
+                true
+            }
+            None => false,
+        },
+        Some(wire::ETHERTYPE_IPV6) => match session {
+            Some(s) => {
+                pkt.push_front(pw::SESSION_OVERHEAD);
+                pw::encap_ipv6(pkt.data_mut(), s, mac);
                 true
             }
             None => false,
@@ -466,6 +480,8 @@ impl Datapath {
             let mut f = s.lock();
             f.ipv6 = ipv6;
             f.set_gua6(WAN, wan6.and_then(|w| w.addr));
+            // PPPoE: IPv6CP's link-local address, not the MAC's.
+            f.set_ll6(WAN, crate::net::wan6::ppp_link().map(|l| l.0).filter(|_| self.sh.ports[0].is_pppoe()));
             f.set_default_route6(wan6.map(|w| (WAN, w.gateway)));
             f.set_static_routes(&n.routes);
             f.set_policy(Some(n.policy.clone()));
@@ -663,7 +679,7 @@ impl Datapath {
             }
             if pppoe {
                 match pppoe_rx(&mut pkt, session) {
-                    PppoeRx::Ipv4 => {}
+                    PppoeRx::Ip => {}
                     PppoeRx::Control => {
                         b.bypass(pkt.len());
                         let mut q = port.ctrl_rx.lock();
@@ -918,7 +934,13 @@ impl Datapath {
     fn to_next_hop6(&self, egress: IfIndex, next_hop: Ipv6Addr, pkt: PacketBuf, now: u64, touched: &mut Touched) {
         let out = &self.sh.ports[self.sh.links[egress as usize].port()];
         if out.is_pppoe() {
-            PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
+            // Point to point, as for IPv4: no neighbor discovery.
+            match out.pppoe_session() {
+                Some(s) => self.send_resolved(egress, s.peer, pkt, touched),
+                None => {
+                    PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             return;
         }
         let r = self.neigh6[egress as usize].lock().resolve(egress, next_hop, pkt, now);

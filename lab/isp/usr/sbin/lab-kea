@@ -6,6 +6,7 @@ bb=/usr/bin/busybox
 case "$1" in
   start)
     echo "$2" >/tmp/kea-if
+    echo "$3" >/tmp/kea-pool
     $bb mkdir -p /run/kea /var/lib/kea /run/lock/kea /var/run/kea
     $bb cat >/tmp/kea-dhcp6.conf <<EOF
 { "Dhcp6": {

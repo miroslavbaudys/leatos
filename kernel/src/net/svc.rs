@@ -684,6 +684,8 @@ pub async fn run(
     let mut pppoe = crate::config::pppoe().map(|c| Pppoe::new(c, &sh.ports[0]));
     // The WAN's IPv6 by prefix delegation (docs/ipv6.md step 3).
     let mut wan6 = crate::net::wan6::Wan6::new(&mut hosts[0], sh, now_ms());
+    // PPPoE: IPv6CP's state the loop last acted on (step 4).
+    let mut ppp6 = crate::net::wan6::ppp_link();
     if let crate::config::WanLink::Static(s) = crate::config::wan_link() {
         let c = configure_static(sh.ports[0].name, &mut hosts[0], &mut pinger, &s);
         publish_wan(&c, sh, &mut mgmt, &mut cli, services.as_mut());
@@ -724,6 +726,17 @@ pub async fn run(
         };
         if let Some(change) = change {
             publish_wan(&change, sh, &mut mgmt, &mut cli, services.as_mut());
+        }
+        let now6 = crate::net::wan6::ppp_link();
+        if now6 != ppp6 {
+            // IPv6CP came or went: prefix delegation over the session
+            // starts or stops, the WAN's addresses and route follow.
+            ppp6 = now6;
+            if let Some(old) = wan6.take() {
+                old.stop(&mut hosts[0]);
+            }
+            wan6 = crate::net::wan6::Wan6::new(&mut hosts[0], sh, now_ms());
+            reapply_networks(sh, &mut hosts, services.as_mut(), &mut mgmt, &mut slots, None);
         }
         pinger.step(&mut hosts[0].sockets);
         if let Some(w) = wan6.as_mut()

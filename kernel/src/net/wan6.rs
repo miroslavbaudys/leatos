@@ -14,8 +14,11 @@
 //!   global /64s, the RAs' router lifetime, status). [`Wan6::step`] says
 //!   when it changed; the services task then applies the networks again.
 //!
-//! Not on PPPoE (IPv6CP: step 4), not with the development boot arguments
-//! `wan6_*` / `lan6_prefix` (they win), not with `ipv6.dhcpv6_pd = false`.
+//! On PPPoE (step 4) it runs while IPv6CP is up ([`set_ppp_link`], from
+//! `net::pppoe`): from IPv6CP's link-local address, solicitations without
+//! a link-layer option; frames go through the session like IPv4. Not with
+//! the development boot arguments `wan6_*` / `lan6_prefix` (they win), not
+//! with `ipv6.dhcpv6_pd = false`.
 
 use crate::net::shared::Shared;
 use crate::net::svc::HostIf;
@@ -44,6 +47,25 @@ pub struct State {
 
 static STATE: spin::Mutex<Option<State>> = spin::Mutex::new(None);
 
+/// PPPoE: IPv6CP's link-local addresses (ours, the peer's) while IPv6 is
+/// up on the session.
+static PPP_LINK: spin::Mutex<Option<(Ipv6Addr, Option<Ipv6Addr>)>> = spin::Mutex::new(None);
+
+/// IPv6CP up (`Some`) or down, from `net::pppoe`.
+pub fn set_ppp_link(l: Option<(Ipv6Addr, Option<Ipv6Addr>)>) {
+    *PPP_LINK.lock() = l;
+}
+
+/// IPv6 on the PPPoE session: (our link-local address, the peer's).
+pub fn ppp_link() -> Option<(Ipv6Addr, Option<Ipv6Addr>)> {
+    *PPP_LINK.lock()
+}
+
+/// The WAN's link-local address: IPv6CP's on PPPoE, else the MAC's.
+pub fn wan_link_local(sh: &Shared) -> Option<Ipv6Addr> {
+    if sh.ports[0].is_pppoe() { ppp_link().map(|l| l.0) } else { Some(fwd::wire::link_local(sh.ports[0].mac)) }
+}
+
 /// The WAN's learned IPv6, if prefix delegation runs.
 pub fn state() -> Option<State> {
     STATE.lock().clone()
@@ -56,6 +78,10 @@ pub struct Wan6 {
     pd: Client,
     sock: SocketHandle,
     mac: [u8; 6],
+    /// Our link-local address (the RS source).
+    ll: Ipv6Addr,
+    /// Ethernet: solicitations carry the source link-layer option.
+    lla: bool,
     rs_sent: u8,
     next_rs: u64,
     /// The router and when its lifetime ends (ms).
@@ -64,13 +90,15 @@ pub struct Wan6 {
 }
 
 impl Wan6 {
-    /// Prefix delegation on the WAN, if it should run (IPv6 on, PD on, an
-    /// Ethernet WAN, no development override).
+    /// Prefix delegation on the WAN, if it should run (IPv6 on, PD on, no
+    /// development override; on PPPoE while IPv6CP is up).
     pub fn new(wan: &mut HostIf, sh: &Shared, now: u64) -> Option<Self> {
-        if !crate::config::pd_wanted() || sh.ports[0].is_pppoe() {
+        let ll = wan_link_local(sh);
+        let Some(ll) = ll.filter(|_| crate::config::pd_wanted()) else {
             *STATE.lock() = None;
             return None;
-        }
+        };
+        let lla = !sh.ports[0].is_pppoe();
         let mac = sh.ports[0].mac;
         let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4 * 1024]);
         let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4 * 1024]);
@@ -82,7 +110,7 @@ impl Wan6 {
         println!("  wan6            : DHCPv6 prefix delegation (asking for a /{hint}), router solicitations");
         let shown = State { pd_state: pd.state().name(), ..State::default() };
         *STATE.lock() = Some(shown.clone());
-        Some(Wan6 { pd, sock, mac, rs_sent: 0, next_rs: now, router: None, shown })
+        Some(Wan6 { pd, sock, mac, ll, lla, rs_sent: 0, next_rs: now, router: None, shown })
     }
 
     /// Stop (the WAN changes mode): its socket goes, nothing is learned.
@@ -105,8 +133,8 @@ impl Wan6 {
         }
         if self.router.is_none() && self.rs_sent < RS_TRIES && now >= self.next_rs {
             let mut rs = [0u8; fwd::wire::RS_LEN];
-            fwd::wire::build_rs(&mut rs, self.mac, fwd::wire::link_local(self.mac));
-            crate::net::services::send_frame(sh, 0, &rs);
+            let n = fwd::wire::build_rs(&mut rs, self.mac, self.ll, self.lla);
+            crate::net::services::send_frame(sh, 0, &rs[..n]);
             self.rs_sent += 1;
             self.next_rs = now + RS_INTERVAL_MS;
         }
@@ -136,7 +164,9 @@ impl Wan6 {
         }
         let d = self.pd.delegation();
         let now_state = State {
-            gateway: self.router.map(|(g, _)| g),
+            // PPPoE: the RA's router, else the IPv6CP peer (point to point:
+            // the session is the route).
+            gateway: self.router.map(|(g, _)| g).or_else(|| if self.lla { None } else { ppp_gateway() }),
             prefix: d.map(|d| (d.prefix, d.len)),
             preferred_secs: d.map_or(0, |d| d.preferred_secs),
             valid_secs: d.map_or(0, |d| d.valid_secs),
@@ -166,6 +196,13 @@ impl Wan6 {
         }
         t
     }
+}
+
+/// PPPoE: the default router while IPv6CP is up when no RA names one:
+/// the peer's link-local address (`fe80::1` if it sent no identifier; the
+/// datapath sends to the access concentrator either way).
+pub fn ppp_gateway() -> Option<Ipv6Addr> {
+    ppp_link().map(|(_, peer)| peer.unwrap_or(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)))
 }
 
 /// The `/api/status` `wan_ipv6` object for prefix delegation.

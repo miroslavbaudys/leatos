@@ -892,6 +892,7 @@ pub fn pppoe() -> Option<proto_pppoe::Config> {
         mtu: p.mtu,
         echo_interval_secs: p.lcp_echo_interval,
         echo_failures: p.lcp_echo_failure,
+        ipv6: c.ipv6.enabled,
     })
 }
 
@@ -1090,13 +1091,18 @@ fn wan6_static() -> Option<Wan6> {
 }
 
 /// The WAN's IPv6 default route, with `ipv6` on: the development boot
-/// arguments, else the ISP's router learned by prefix delegation
-/// (`net::wan6`: from its Router Advertisement). None on PPPoE (IPv6CP:
-/// step 4), so the networks' RAs offer no default route either (it would
+/// arguments, else the ISP's router learned by `net::wan6` (from its
+/// Router Advertisement; on PPPoE while IPv6CP is up, the peer without
+/// one). None: the networks' RAs offer no default route either (it would
 /// be a black hole).
 pub fn wan6() -> Option<Wan6> {
-    if !ipv6() || matches!(wan_link(), WanLink::Pppoe(_)) {
+    if !ipv6() {
         return None;
+    }
+    if matches!(wan_link(), WanLink::Pppoe(_)) {
+        crate::net::wan6::ppp_link()?;
+        let g = crate::net::wan6::state().and_then(|s| s.gateway).or_else(crate::net::wan6::ppp_gateway)?;
+        return Some(Wan6 { addr: None, gateway: g });
     }
     if let Some(s) = wan6_static() {
         return Some(s);
@@ -1105,13 +1111,12 @@ pub fn wan6() -> Option<Wan6> {
     Some(Wan6 { addr: None, gateway: g })
 }
 
-/// Prefix delegation runs on the WAN: IPv6 and `ipv6.dhcpv6_pd` on, an
-/// Ethernet WAN, no development override.
+/// Prefix delegation runs on the WAN: IPv6 and `ipv6.dhcpv6_pd` on, no
+/// development override (on PPPoE: once IPv6CP is up, `net::wan6`).
 pub fn pd_wanted() -> bool {
     let c = get();
     c.ipv6.enabled
         && c.ipv6.dhcpv6_pd
-        && !matches!(wan_link(), WanLink::Pppoe(_))
         && wan6_static().is_none()
         && arg(bootargs(), "lan6_prefix").is_none()
 }

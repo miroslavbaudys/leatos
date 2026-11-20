@@ -20,11 +20,22 @@ dev=$($bb ip route get "$addr" | $bb sed -n 's/.* dev \([^ ]*\).*/\1/p')
 ann=/proc/sys/net/ipv4/conf/$dev/arp_announce
 a0=$($bb cat "$ann")
 echo 2 >"$ann"
-$bb ip addr add "$src/32" dev "$dev" &&
-  $bb ip route add "$addr/32" dev "$dev" src "$src" &&
-  ok=1
+# Over PPPoE (ppp0) the peer already has a /32 route: replaced for the
+# probe, then restored with its own source.
+orig=$($bb ip route get "$addr" | $bb sed -n 's/.* src \([^ ]*\).*/\1/p')
+restore=""
+if $bb ip addr add "$src/32" dev "$dev"; then
+  if $bb ip route add "$addr/32" dev "$dev" src "$src" 2>/dev/null; then
+    ok=1; restore=del
+  elif $bb ip route replace "$addr/32" dev "$dev" src "$src"; then
+    ok=1; restore=back
+  fi
+fi
 $bb wget -q -T 3 -O /dev/null "http://$addr:${port:-8080}/" >/dev/null 2>&1
-$bb ip route del "$addr/32" dev "$dev" src "$src" 2>/dev/null
+case "$restore" in
+  del) $bb ip route del "$addr/32" dev "$dev" src "$src" 2>/dev/null ;;
+  back) $bb ip route replace "$addr/32" dev "$dev" scope link src "$orig" ;;
+esac
 $bb ip addr del "$src/32" dev "$dev" 2>/dev/null
 echo "$a0" >"$ann"
 if [ -n "$ok" ]; then echo "spoof=SENT from $src to $addr:$port on $dev"; else echo "spoof=FAILED on $dev"; fi

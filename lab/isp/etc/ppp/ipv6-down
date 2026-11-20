@@ -1,0 +1,5 @@
+#!/usr/bin/busybox sh
+# pppd: IPv6CP is down on $1 (see ipv6-up).
+bb=/usr/bin/busybox
+$bb grep -q 'lab_ipv6=pd' /proc/cmdline || exit 0
+{ echo "lab ipv6-down: $1"; /usr/sbin/lab-kea stop; } >>/tmp/pppd.log 2>&1

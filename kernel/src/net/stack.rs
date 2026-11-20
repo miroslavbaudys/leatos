@@ -524,18 +524,18 @@ pub fn port_macs(ports: &[PortShared]) -> Vec<[u8; 6]> {
 pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: &[usize], macs: &[[u8; 6]]) {
     if let Some(wan) = hosts.first_mut() {
         set_host_routes(&mut wan.iface, &crate::config::wan_routes());
-        // IPv6 on an Ethernet WAN (development: `wan6_ip=`): its
-        // link-local and global address, so it answers the ISP's
-        // solicitations; the IPv4 address stays the lease's.
-        // (Not on PPPoE: an IP-only interface, which has no hardware
-        // address to ask for; IPv6 over PPPoE is step 4.)
-        let ethernet = !matches!(crate::config::wan_link(), crate::config::WanLink::Pppoe(_));
-        if let (true, Some(&mac)) = (ethernet, macs.first()) {
-            // With IPv6 on, always the link-local address (the DHCPv6
-            // client and router solicitations use it); a static one too.
+        // IPv6 on the WAN: its link-local address (the MAC's on Ethernet,
+        // IPv6CP's on PPPoE while it is up), which the DHCPv6 client and
+        // router solicitations use, and a static global one (development:
+        // `wan6_ip=`); the IPv4 address stays the lease's.
+        let pppoe = matches!(crate::config::wan_link(), crate::config::WanLink::Pppoe(_));
+        let ll = if pppoe { crate::net::wan6::ppp_link().map(|l| l.0) } else { macs.first().map(|&m| fwd::wire::link_local(m)) };
+        if !pppoe || crate::config::ipv6() {
             let mut want: Vec<IpCidr> = Vec::new();
-            if crate::config::ipv6() {
-                want.push(IpCidr::Ipv6(Ipv6Cidr::new(fwd::wire::link_local(mac), 64)));
+            if crate::config::ipv6()
+                && let Some(ll) = ll
+            {
+                want.push(IpCidr::Ipv6(Ipv6Cidr::new(ll, 64)));
                 if let Some((ip, len)) = crate::config::wan6().and_then(|w| w.addr) {
                     want.push(IpCidr::Ipv6(Ipv6Cidr::new(ip, len)));
                 }

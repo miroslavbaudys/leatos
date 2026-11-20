@@ -6,6 +6,8 @@
 //!  Client frames ─────────────────────────► WAN qdisc (as they are) ─► datapath
 //!  Event::Session ─► PortShared::pppoe_session (datapath encapsulates IPv4)
 //!  Event::Up/Down ─► router stack address + route, LeaseChange (forwarder, DNS, status)
+//!  Event::Ipv6Up/Down ─► net::wan6::set_ppp_link (the services task starts
+//!                        prefix delegation and reapplies the networks)
 //! ```
 //!
 //! The protocol is in `crates/proto-pppoe`; this module only moves frames
@@ -42,7 +44,7 @@ pub struct Pppoe {
     last_down: Option<String>,
     sessions: u32,
     /// The state the status output last saw ([`Self::status_changed`]).
-    shown: Option<(proto_pppoe::State, u32)>,
+    shown: Option<(proto_pppoe::State, u32, bool)>,
 }
 
 impl Pppoe {
@@ -161,10 +163,22 @@ impl Pppoe {
                     self.last_down = Some(format!("{reason}"));
                 }
                 Event::PeerOffersIpv6 { options } => println!(
-                    "  pppoe {}     : the access concentrator offers IPv6 (IPv6CP{}); rejected until M7",
+                    "  pppoe {}     : the access concentrator offers IPv6 (IPv6CP{}); rejected (ipv6 off)",
                     port.name,
                     ipv6cp_options_text(&options)
                 ),
+                Event::Ipv6Up { local, remote } => {
+                    println!(
+                        "  pppoe {}     : IPv6CP up, {local} peer {}",
+                        port.name,
+                        remote.map_or(String::from("(no identifier)"), |r| format!("{r}"))
+                    );
+                    crate::net::wan6::set_ppp_link(Some((local, remote)));
+                }
+                Event::Ipv6Down => {
+                    println!("  pppoe {}     : IPv6CP down", port.name);
+                    crate::net::wan6::set_ppp_link(None);
+                }
             }
         }
         (change, self.transmit(port))
@@ -212,11 +226,11 @@ impl Pppoe {
 
     /// The state changed since the last call (status output is due).
     pub fn status_changed(&mut self) -> bool {
-        let now = Some((self.client.state(), self.client.ipv6cp_requests()));
+        let now = Some((self.client.state(), self.client.ipv6cp_requests(), self.client.ipv6().is_some()));
         core::mem::replace(&mut self.shown, now) != now
     }
 
-    /// `{"state":…,"session":…,"ac":…,"mtu":…,"sessions":…,"last_error":…,"rfc4638":…,"ipv6cp_offered":…}`
+    /// `{"state":…,"session":…,"ac":…,"mtu":…,"sessions":…,"last_error":…,"rfc4638":…,"ipv6cp_offered":…,"ipv6":{"local":…,"peer":…}|null}`
     pub fn status_json(&self) -> String {
         use proto_http::json_str;
         let (session, ac, mtu) = match &self.link {
@@ -228,7 +242,7 @@ impl Pppoe {
             None => ("null".into(), "null".into(), "null".into()),
         };
         format!(
-            "{{\"state\":{},\"session\":{session},\"ac\":{ac},\"mtu\":{mtu},\"sessions\":{},\"last_error\":{},\"rfc4638\":{},\"ipv6cp_offered\":{}}}",
+            "{{\"state\":{},\"session\":{session},\"ac\":{ac},\"mtu\":{mtu},\"sessions\":{},\"last_error\":{},\"rfc4638\":{},\"ipv6cp_offered\":{},\"ipv6\":{}}}",
             json_str(&format!("{}", self.client.state())),
             self.sessions,
             self.last_down
@@ -250,7 +264,14 @@ impl Pppoe {
                     (true, false, None) => "\"asked\"",
                 }
             },
-            self.client.ipv6cp_requests()
+            self.client.ipv6cp_requests(),
+            match self.client.ipv6() {
+                Some((l, p)) => format!(
+                    "{{\"local\":\"{l}\",\"peer\":{}}}",
+                    p.map_or(String::from("null"), |p| format!("\"{p}\""))
+                ),
+                None => String::from("null"),
+            }
         )
     }
 

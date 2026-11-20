@@ -1,0 +1,21 @@
+#!/usr/bin/busybox sh
+# pppd: IPv6CP is up on $1 ($4 ours, $5 the router's link-local address;
+# scripts/lab-test.sh LAB_PPPOE + LAB_IPV6, docs/ipv6.md step 4). The
+# delegated prefixes are routed over the session; Kea delegates on it
+# (unless lab_pd=0), from the pool cgi-bin/pd last chose.
+bb=/usr/bin/busybox
+$bb grep -q 'lab_ipv6=pd' /proc/cmdline || exit 0
+{
+  echo "lab ipv6-up: $1 $4 peer $5"
+  # pppd's address has the peer's as IFA_ADDRESS, which musl's
+  # getifaddrs reports as ours: Kea would bind to the router's address.
+  # The same address without a peer (fe80::/64 reaches it either way).
+  $bb ip -6 addr del "$4" peer "$5" dev "$1"
+  $bb ip -6 addr add "$4/64" dev "$1"
+  $bb ip -6 route replace 2001:db8:100::/48 dev "$1"
+  $bb ip -6 route replace 2001:db8:200::/48 dev "$1"
+  if ! $bb grep -q 'lab_pd=0' /proc/cmdline; then
+    /usr/sbin/lab-kea stop
+    /usr/sbin/lab-kea start "$1" "$($bb cat /tmp/kea-pool 2>/dev/null || echo 2001:db8:100::)"
+  fi
+} >>/tmp/pppd.log 2>&1

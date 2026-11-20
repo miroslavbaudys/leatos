@@ -8,8 +8,10 @@ mru 1492
 noccp
 novj
 nodefaultroute
-# Offer IPv6CP too: leatos logs the offer and answers with an LCP
-# Protocol-Reject (until M7). lab_pppoe_ipv6=0 removes this line.
+# Offer IPv6CP too: leatos negotiates it with ipv6 on (docs/ipv6.md step
+# 4; ipv6-up then routes the prefixes and starts Kea), else logs the offer
+# and answers with an LCP Protocol-Reject. lab_pppoe_ipv6=0 removes this
+# line.
 +ipv6
 debug
 logfile /tmp/pppd.log

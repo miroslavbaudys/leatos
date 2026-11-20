@@ -10,8 +10,9 @@
 //!
 //! On a PPPoE port the device is IP-only (`Medium::Ip`: no ARP, the
 //! session is point to point): RX hands smoltcp the IP packet of the
-//! decapsulated Ethernet frame, TX puts an Ethernet header in front, which
-//! the datapath turns into the session's headers (`datapath::flush_port`).
+//! decapsulated Ethernet frame, TX puts an Ethernet header in front (IPv4
+//! or IPv6 by the packet's version), which the datapath turns into the
+//! session's headers (`datapath::flush_port`).
 //!
 //! The device is used by the services task (`net::svc`); queue and qdisc
 //! are the port's shared, locked ones (`net::shared::PortShared`). Each
@@ -291,8 +292,9 @@ impl phy::TxToken for TxToken<'_> {
                 pkt.set_len(eth + len);
                 let d = pkt.data_mut();
                 d[..12].fill(0);
-                fwd::wire::put16(d, 12, fwd::wire::ETHERTYPE_IPV4);
                 let r = f(&mut d[eth..]);
+                let t = if d[eth] >> 4 == 6 { fwd::wire::ETHERTYPE_IPV6 } else { fwd::wire::ETHERTYPE_IPV4 };
+                fwd::wire::put16(d, 12, t);
                 self.enqueue(pkt);
                 r
             }
@@ -328,14 +330,19 @@ impl Device for PortDevice<'_> {
     fn receive(&mut self, _ts: Instant) -> Option<(RxToken, TxToken<'_>)> {
         let mut pkt = self.link.local_rx.lock().pop_front()?;
         if let Some(nd) = self.nd.as_deref_mut()
-            && !self.port.is_pppoe()
             && fwd::wire::ethertype(pkt.data()) == Some(fwd::wire::ETHERTYPE_IPV6)
         {
-            fwd::wire::ipv6_ns_to_solicited(pkt.data_mut());
             let d = pkt.data();
             if d.get(fwd::wire::ETH_HDR + 6) == Some(&fwd::wire::PROTO_ICMPV6) && d.get(fwd::wire::ETH_HDR + 40) == Some(&134) {
                 nd.last_ra = Some(d.to_vec());
             }
+        }
+        // Neighbor discovery help (Ethernet only: PPP has no link layer).
+        if let Some(nd) = self.nd.as_deref_mut()
+            && !self.port.is_pppoe()
+            && fwd::wire::ethertype(pkt.data()) == Some(fwd::wire::ETHERTYPE_IPV6)
+        {
+            fwd::wire::ipv6_ns_to_solicited(pkt.data_mut());
             let mut hint = [0u8; fwd::wire::NEIGHBOR_HINT_LEN];
             if let Some((ip, mac)) = fwd::wire::ipv6_neighbor_hint(pkt.data(), &mut hint)
                 && nd.due(ip, mac, self.now_ns)

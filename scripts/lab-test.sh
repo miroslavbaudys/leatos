@@ -78,8 +78,11 @@
 #                        LAB_PPPOE_ANON=1 (no user name against an ISP
 #                        requiring PAP: no session).
 #                        The ISP offers IPv6CP: the router logs the offer
-#                        (still rejected until M7); negative control
-#                        LAB_PPPOE_IPV6=0 (no offer, the check fails).
+#                        (rejected with its IPv6 off); with LAB_IPV6=1 it
+#                        negotiates it and runs IPv6 over the session
+#                        (docs/ipv6.md step 4). Negative control
+#                        LAB_PPPOE_IPV6=0 (no offer: the offer check, or
+#                        with LAB_IPV6=1 the IPv6CP and IPv6 checks, fail).
 #   LAB_WAN_STATIC=1     the ISP runs no DHCP server; the router gets
 #                        wan_mode=static wan_ip=203.0.113.60/24
 #                        wan_gw=203.0.113.1 wan_dns=203.0.113.1 (LAB_ROUTER_ARGS
@@ -307,17 +310,21 @@ IPV6_OPEN="${LAB_IPV6_OPEN:-}"
 [[ "$IPV6" == 1 ]] && IPV6=pd
 ISP_IPV6="$IPV6"
 ISP_PD="${LAB_IPV6_PD:-1}"
-if [[ -n "$IPV6" && -n "$ISP_PPPOE" ]]; then
-  echo "lab-test: LAB_IPV6 with LAB_PPPOE: IPv6 over PPPoE comes with docs/ipv6.md step 4" >&2
+if [[ "$IPV6" == static && -n "$ISP_PPPOE" ]]; then
+  echo "lab-test: LAB_IPV6=static is for an Ethernet WAN; with LAB_PPPOE use LAB_IPV6=1" >&2
   exit 2
 fi
 if [[ "$IPV6" == static ]]; then
   ROUTER_ARGS="$ROUTER_ARGS ipv6=1 wan6_ip=2001:db8:ffff::2/64 wan6_gw=2001:db8:ffff::1 lan6_prefix=2001:db8:100::/56 wan_mtu=1400"
+elif [[ -n "$IPV6" && -n "$ISP_PPPOE" ]]; then
+  # Over PPPoE (step 4): IPv6CP, the session's MTU (1492).
+  ROUTER_ARGS="$ROUTER_ARGS ipv6=1"
+  export LAB_INITRD_KEA=1
 elif [[ -n "$IPV6" ]]; then
   ROUTER_ARGS="$ROUTER_ARGS ipv6=1 wan_mtu=1400"
   export LAB_INITRD_KEA=1 # the ISP's prefix delegation server
 fi
-[[ -n "$IPV6" ]] && BIG_PING="${LAB_BIG_PING:-1372}"
+[[ -n "$IPV6" && -z "$ISP_PPPOE" ]] && BIG_PING="${LAB_BIG_PING:-1372}"
 GUEST="${LAB_GUEST:-}"
 GUEST_LIVE="${LAB_GUEST_LIVE:-}"
 [[ -n "$GUEST_LIVE" ]] && GUEST=1
@@ -680,13 +687,24 @@ if [[ -n "$ISP_PPPOE" ]]; then
     tr -d '\r' <"$WORK/router.log" | grep "pppoe " | tail -3 | sed 's/^/    | /'
     router_fails=$((router_fails + 1))
   fi
-  # The ISP's IPv6CP offer is logged (docs/ipv6.md step 0).
-  v6=$(tr -d '\r' <"$WORK/router.log" | grep "pppoe wan0 .*: the access concentrator offers IPv6 (IPv6CP, interface id " | head -1 || true)
-  if [[ -n "$v6" ]]; then
-    echo "  LAB PASS: pppoe ipv6 offer: ${v6##*: }"
+  if [[ -n "$IPV6" ]]; then
+    # IPv6CP negotiated (docs/ipv6.md step 4).
+    v6=$(tr -d '\r' <"$WORK/router.log" | grep "pppoe wan0 .*: IPv6CP up, fe80::" | head -1 || true)
+    if [[ -n "$v6" ]]; then
+      echo "  LAB PASS: pppoe ipv6: ${v6##*: }"
+    else
+      echo "  LAB FAIL: pppoe ipv6: no 'IPv6CP up' in the router log"
+      router_fails=$((router_fails + 1))
+    fi
   else
-    echo "  LAB FAIL: pppoe ipv6 offer: no IPv6CP offer in the router log"
-    router_fails=$((router_fails + 1))
+    # The ISP's IPv6CP offer is logged (docs/ipv6.md step 0).
+    v6=$(tr -d '\r' <"$WORK/router.log" | grep "pppoe wan0 .*: the access concentrator offers IPv6 (IPv6CP, interface id " | head -1 || true)
+    if [[ -n "$v6" ]]; then
+      echo "  LAB PASS: pppoe ipv6 offer: ${v6##*: }"
+    else
+      echo "  LAB FAIL: pppoe ipv6 offer: no IPv6CP offer in the router log"
+      router_fails=$((router_fails + 1))
+    fi
   fi
 fi
 
