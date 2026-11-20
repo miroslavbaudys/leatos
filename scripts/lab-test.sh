@@ -231,7 +231,8 @@
 #                        Too Big (ping6 -s 1452: route cache mtu 1400), a
 #                        forged source dropped (spoofed rises); with
 #                        LAB_GUEST=1 the guest's global address reaches the
-#                        ISP. Negative controls: LAB_IPV6_OPEN=1 (implies
+#                        ISP; fragments both ways (ping6 -s 3000, step 2c,
+#                        negative control LAB_ROUTER_ARGS=fw_frag=0). Negative controls: LAB_IPV6_OPEN=1 (implies
 #                        LAB_GUEST=1; a rule wan -> lan accept: inbound
 #                        reaches the client), LAB_ROUTER_ARGS=wan_mtu=1500
 #                        (no PTB), LAB_ROUTER_ARGS=lan_antispoof=0 (the

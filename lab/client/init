@@ -588,6 +588,10 @@ if [ -n "$v6on" ]; then
       $bb sleep 2
       e1=$(icmperr6)
       if [ "${e1:-0}" -gt "${e0:-0}" ]; then pass "ipv6 wan: Packet Too Big sent for a 1500 B packet (icmp errors $e0 -> $e1)"; else fail "ipv6 wan: no Packet Too Big (icmp errors $e0 -> $e1)"; fi
+      # Fragments both ways (docs/ipv6.md step 2c): the request leaves in
+      # fragments of the learned 1400, the ISP's answer comes back in
+      # fragments. Negative control: LAB_ROUTER_ARGS=fw_frag=0.
+      if $bb ping6 -c 2 -W 3 -s 3000 "$ISP6" >/tmp/p6f 2>&1; then pass "ipv6 wan: fragmented ping6 -s 3000 (both ways)"; else fail "ipv6 wan: fragmented ping6 -s 3000"; $bb tail -2 /tmp/p6f | $bb sed 's/^/    | /'; fi
       # A forged source (outside the network's /64s) is dropped.
       s0=$(spoofed6)
       $bb ip -6 addr add 2001:db8:999::5/128 dev eth0 || fail "ipv6 wan: cannot add the forged address"

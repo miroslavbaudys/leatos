@@ -326,6 +326,7 @@ fuzz_target!(|ops: Vec<Op>| {
     let mut now = 1_000u64;
     let mut last: Option<Last> = None;
     let mut last6: Option<(u8, Vec<u8>)> = None;
+    let mut frag6: Option<fwd::frag::Decision> = None;
     let mut frag = None;
     for op in ops.into_iter().take(200) {
         let (ifx, mut buf, clean) = match op {
@@ -443,8 +444,18 @@ fuzz_target!(|ops: Vec<Op>| {
                 let n = f.len();
                 let inp = f.clone();
                 f.resize(n + TAIL + 1300, 0);
+                // A later fragment goes the way of its first one (as the
+                // datapath does it: fwd::frag).
+                if let (fwd::frag::Kind::Later(_), Some(d)) = (fwd::frag::classify(&inp), frag6) {
+                    let v = fw.forward_fragment(now, ifx, &mut f, n, &d);
+                    check_forward6(&v, &inp, &f);
+                    continue;
+                }
                 let v = fw.process(now, ifx, &mut f, n);
                 assert!(!matches!(v, Verdict::Forward { .. }), "IPv6 as IPv4: {v:?}");
+                if let Some(d @ fwd::frag::Decision::V6(_)) = fw.take_fragment() {
+                    frag6 = Some(d);
+                }
                 if let Some((egress, len)) = check_forward6(&v, &inp, &f) {
                     last6 = Some((egress, f[..len].to_vec()));
                 }

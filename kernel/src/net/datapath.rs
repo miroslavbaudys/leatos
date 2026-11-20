@@ -712,7 +712,7 @@ impl Datapath {
                                 len,
                                 &decision,
                             );
-                            if matches!(v, Verdict::Forward { .. }) {
+                            if matches!(v, Verdict::Forward { .. } | Verdict::Forward6 { .. }) {
                                 FRAGS_FORWARDED.fetch_add(1, Ordering::Relaxed);
                             }
                             v
@@ -741,7 +741,7 @@ impl Datapath {
                         drop(shard);
                         let mut t = self.frags[port_ix].lock();
                         match decision {
-                            Some(d) if matches!(v, Verdict::Forward { .. }) => {
+                            Some(d) if matches!(v, Verdict::Forward { .. } | Verdict::Forward6 { .. }) => {
                                 if t.record_forward(key, k, d, now).is_err() {
                                     t.record_drop(key, now);
                                     v = Verdict::Drop(DropReason::Clash);
@@ -767,7 +767,7 @@ impl Datapath {
                             .forward_fragment(now, ifx, p.data_with_tailroom_mut(), len, &decision),
                         _ => Verdict::Drop(DropReason::Fragment),
                     };
-                    if matches!(v, Verdict::Forward { .. }) {
+                    if matches!(v, Verdict::Forward { .. } | Verdict::Forward6 { .. }) {
                         FRAGS_FORWARDED.fetch_add(1, Ordering::Relaxed);
                     }
                     self.deliver(v, p, ifx, port_ix, now, &mut b);

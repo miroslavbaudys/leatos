@@ -21,13 +21,20 @@
 //!
 //! One table per ingress port: a datagram's fragments arrive on one port,
 //! so each datapath direction owns its table without sharing it.
+//!
+//! IPv6 the same way (docs/ipv6.md step 2c): a datagram is (source,
+//! destination, Fragment header ID); the first fragment must hold the
+//! whole header chain and its upper-layer header (RFC 7112, RFC 8200
+//! §4.5), and is decided like a whole packet; later ones take its egress
+//! and next hop (no translation). Atomic fragments (offset 0, no more)
+//! are whole packets.
 
 use crate::IfIndex;
 use crate::conntrack::{ConnId, Dir, Tuple};
 use crate::forwarder::Classification;
-use crate::wire::{self, ETH_HDR, ETHERTYPE_IPV4, Ipv4View, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
+use crate::wire::{self, ETH_HDR, ETHERTYPE_IPV4, ETHERTYPE_IPV6, Ipv4View, Ipv6View, PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 use alloc::vec::Vec;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
 
 /// Datagrams whose decision is kept, per table. A full table forgets the
 /// entry closest to expiry.
@@ -40,13 +47,28 @@ pub const MAX_PARKED: usize = 16;
 /// How long such a fragment is held (ms) before it is dropped.
 pub const PARK_MS: u64 = 250;
 
-/// One datagram: the fields its fragments share (RFC 791).
+/// One IPv4 datagram: the fields its fragments share (RFC 791).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Key {
+pub struct Key4 {
     pub src: Ipv4Addr,
     pub dst: Ipv4Addr,
     pub proto: u8,
     pub id: u16,
+}
+
+/// One IPv6 datagram (RFC 8200 §4.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Key6 {
+    pub src: Ipv6Addr,
+    pub dst: Ipv6Addr,
+    pub id: u32,
+}
+
+/// A datagram of either family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    V4(Key4),
+    V6(Key6),
 }
 
 /// What a frame is, fragment-wise.
@@ -68,7 +90,7 @@ pub enum Kind {
 fn min_l4(proto: u8) -> usize {
     match proto {
         PROTO_TCP => 20,
-        PROTO_UDP | PROTO_ICMP => 8,
+        PROTO_UDP | PROTO_ICMP | PROTO_ICMPV6 => 8,
         _ => 0,
     }
 }
@@ -76,8 +98,10 @@ fn min_l4(proto: u8) -> usize {
 /// Classify an Ethernet frame. Cheap for the common case: a frame that is
 /// not an IPv4 fragment is decided from the flags field alone.
 pub fn classify(frame: &[u8]) -> Kind {
-    if wire::ethertype(frame) != Some(ETHERTYPE_IPV4) {
-        return Kind::Whole;
+    match wire::ethertype(frame) {
+        Some(ETHERTYPE_IPV4) => {}
+        Some(ETHERTYPE_IPV6) => return classify6(frame),
+        _ => return Kind::Whole,
     }
     // MF or a nonzero offset (DF alone is not a fragment).
     match frame.get(ETH_HDR + 6..ETH_HDR + 8) {
@@ -87,14 +111,36 @@ pub fn classify(frame: &[u8]) -> Kind {
     let Some(v) = Ipv4View::parse(frame, ETH_HDR) else {
         return Kind::Whole; // malformed: the forwarder counts it
     };
-    let key = Key {
+    let key = Key::V4(Key4 {
         src: v.src(frame),
         dst: v.dst(frame),
         proto: v.proto,
         id: v.id(frame),
-    };
+    });
     match v.frag_offset {
         0 if v.l4_len < min_l4(v.proto) => Kind::Bad,
+        0 => Kind::First(key),
+        1 if v.proto == PROTO_TCP => Kind::Bad,
+        _ => Kind::Later(key),
+    }
+}
+
+/// [`classify`] for IPv6: cheap unless an extension header follows the
+/// fixed one (a Fragment header may only sit behind those).
+fn classify6(frame: &[u8]) -> Kind {
+    if !frame.get(ETH_HDR + 6).is_some_and(|nh| matches!(nh, 0 | 43 | 44 | 60)) {
+        return Kind::Whole;
+    }
+    let Some(v) = Ipv6View::parse(frame, ETH_HDR) else {
+        return Kind::Whole; // malformed: the forwarder counts it
+    };
+    if !v.is_fragment {
+        return Kind::Whole; // none, or atomic
+    }
+    let key = Key::V6(Key6 { src: v.src(frame), dst: v.dst(frame), id: v.frag_id });
+    match v.frag_offset {
+        // The header chain ended at an upper-layer header; it must be whole.
+        0 if !matches!(v.proto, PROTO_TCP | PROTO_UDP | PROTO_ICMPV6) || v.l4_len < min_l4(v.proto) => Kind::Bad,
         0 => Kind::First(key),
         1 if v.proto == PROTO_TCP => Kind::Bad,
         _ => Kind::Later(key),
@@ -104,7 +150,25 @@ pub fn classify(frame: &[u8]) -> Kind {
 /// What forwarding the first fragment decided, as the later ones need it
 /// ([`crate::forwarder::Forwarder::take_fragment`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Decision {
+pub enum Decision {
+    V4(Decision4),
+    V6(Decision6),
+}
+
+/// An IPv6 first fragment's decision: no translation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Decision6 {
+    pub(crate) conn: ConnId,
+    pub(crate) dir: Dir,
+    pub(crate) orig: Tuple<Ipv6Addr>,
+    pub egress: IfIndex,
+    pub next_hop: Ipv6Addr,
+    pub class: Classification,
+}
+
+/// An IPv4 first fragment's decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Decision4 {
     /// The connection (checked again per fragment: it may have ended).
     pub(crate) conn: ConnId,
     pub(crate) dir: Dir,
@@ -187,12 +251,16 @@ impl<P> Table<P> {
     /// through `shard`. Refused when another datagram translates to the
     /// same one ([`Clash`]; record [`Self::record_drop`] then).
     pub fn record_forward(&mut self, key: Key, shard: usize, d: Decision, now: u64) -> Result<(), Clash> {
-        let clash = self.entries.iter().any(|(k, l, exp)| {
-            *exp > now
-                && *k != key
-                && matches!(l, Lookup::Forward { decision: o, .. }
-                    if o.src == d.src && o.dst == d.dst && k.proto == key.proto && k.id == key.id)
-        });
+        // Only IPv4 translates datagrams onto one another (NAT).
+        let clash = match (key, d) {
+            (Key::V4(key4), Decision::V4(d)) => self.entries.iter().any(|(k, l, exp)| {
+                *exp > now
+                    && *k != key
+                    && matches!((k, l), (Key::V4(k), Lookup::Forward { decision: Decision::V4(o), .. })
+                        if o.src == d.src && o.dst == d.dst && k.proto == key4.proto && k.id == key4.id)
+            }),
+            _ => false,
+        };
         if clash {
             self.stats.clashes += 1;
             return Err(Clash);
@@ -273,8 +341,8 @@ impl<P> Table<P> {
 mod tests {
     use super::*;
 
-    fn key(id: u16) -> Key {
-        Key {
+    fn key4(id: u16) -> Key4 {
+        Key4 {
             src: Ipv4Addr::new(192, 168, 1, 100),
             dst: Ipv4Addr::new(203, 0, 113, 1),
             proto: PROTO_UDP,
@@ -282,8 +350,12 @@ mod tests {
         }
     }
 
+    fn key(id: u16) -> Key {
+        Key::V4(key4(id))
+    }
+
     fn decision(src: Ipv4Addr) -> Decision {
-        Decision {
+        Decision::V4(Decision4 {
             conn: 0,
             dir: Dir::Original,
             orig: Tuple {
@@ -298,7 +370,7 @@ mod tests {
             src,
             dst: Ipv4Addr::new(203, 0, 113, 1),
             class: Classification::default(),
-        }
+        })
     }
 
     /// An Ethernet + IPv4 frame with the given flags/offset word and L4 bytes.
@@ -322,7 +394,7 @@ mod tests {
 
     #[test]
     fn classify_kinds() {
-        let k = Key { id: 0x1234, ..key(0) };
+        let k = key(0x1234);
         assert_eq!(classify(&frame(PROTO_UDP, 0, 8)), Kind::Whole);
         assert_eq!(classify(&frame(PROTO_UDP, 0x4000, 8)), Kind::Whole, "DF alone");
         assert_eq!(classify(&frame(PROTO_UDP, 0x2000, 8)), Kind::First(k));
@@ -370,14 +442,80 @@ mod tests {
         let wan = Ipv4Addr::new(198, 51, 100, 2);
         t.record_forward(key(7), 0, decision(wan), 0).unwrap();
         // Another inside host, same ID, same server, same WAN address.
-        let other = Key { src: Ipv4Addr::new(192, 168, 1, 101), ..key(7) };
+        let other = Key::V4(Key4 { src: Ipv4Addr::new(192, 168, 1, 101), ..key4(7) });
         assert_eq!(t.record_forward(other, 0, decision(wan), 1), Err(Clash));
         assert_eq!(t.stats.clashes, 1);
         // Another ID, or the first one again: fine.
-        t.record_forward(Key { id: 8, ..other }, 0, decision(wan), 1).unwrap();
+        t.record_forward(Key::V4(Key4 { src: Ipv4Addr::new(192, 168, 1, 101), ..key4(8) }), 0, decision(wan), 1).unwrap();
         t.record_forward(key(7), 0, decision(wan), 1).unwrap();
         // Once the first has expired, the ID is free again.
         t.record_forward(other, 0, decision(wan), ENTRY_MS + 1).unwrap();
+    }
+
+    /// An Ethernet + IPv6 frame: `hdrs` extension headers (kind, bytes,
+    /// first byte patched with the next header), then `proto` and `l4` bytes.
+    fn frame6(hdrs: &[(u8, alloc::vec::Vec<u8>)], proto: u8, l4: usize) -> alloc::vec::Vec<u8> {
+        let mut body = alloc::vec::Vec::new();
+        for (i, (_, h)) in hdrs.iter().enumerate() {
+            let mut h = h.clone();
+            h[0] = hdrs.get(i + 1).map_or(proto, |n| n.0);
+            body.extend_from_slice(&h);
+        }
+        body.resize(body.len() + l4, 0);
+        let mut f = alloc::vec![0u8; ETH_HDR];
+        f[12] = 0x86;
+        f[13] = 0xdd;
+        f.extend_from_slice(&[0x60, 0, 0, 0]);
+        f.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        f.push(hdrs.first().map_or(proto, |h| h.0));
+        f.push(64);
+        f.extend_from_slice(&"2001:db8:100::10".parse::<Ipv6Addr>().unwrap().octets());
+        f.extend_from_slice(&"2001:db8:9::1".parse::<Ipv6Addr>().unwrap().octets());
+        f.extend_from_slice(&body);
+        f
+    }
+
+    fn fh(off: u16, more: bool, id: u32) -> (u8, alloc::vec::Vec<u8>) {
+        let mut h = alloc::vec![0u8; 8];
+        h[2..4].copy_from_slice(&((off << 3) | u16::from(more)).to_be_bytes());
+        h[4..8].copy_from_slice(&id.to_be_bytes());
+        (44, h)
+    }
+
+    #[test]
+    fn classify_ipv6_kinds() {
+        let k = Key::V6(Key6 { src: "2001:db8:100::10".parse().unwrap(), dst: "2001:db8:9::1".parse().unwrap(), id: 0xabcd });
+        assert_eq!(classify(&frame6(&[], PROTO_UDP, 8)), Kind::Whole);
+        assert_eq!(classify(&frame6(&[fh(0, false, 0xabcd)], PROTO_UDP, 8)), Kind::Whole, "atomic");
+        assert_eq!(classify(&frame6(&[fh(0, true, 0xabcd)], PROTO_UDP, 8)), Kind::First(k));
+        assert_eq!(classify(&frame6(&[fh(181, true, 0xabcd)], PROTO_UDP, 8)), Kind::Later(k));
+        assert_eq!(classify(&frame6(&[fh(181, false, 0xabcd)], PROTO_UDP, 8)), Kind::Later(k));
+        // Behind a Destination Options header too.
+        let dest = (60u8, alloc::vec![0u8; 8]);
+        assert_eq!(classify(&frame6(&[dest, fh(0, true, 0xabcd)], PROTO_UDP, 8)), Kind::First(k));
+        // RFC 7112: the first fragment holds the upper-layer header whole.
+        assert_eq!(classify(&frame6(&[fh(0, true, 1)], PROTO_UDP, 4)), Kind::Bad);
+        assert_eq!(classify(&frame6(&[fh(0, true, 1)], PROTO_TCP, 16)), Kind::Bad);
+        assert_eq!(classify(&frame6(&[fh(0, true, 1)], 59, 0)), Kind::Bad, "no upper-layer header");
+        assert_eq!(classify(&frame6(&[fh(1, true, 1)], PROTO_TCP, 8)), Kind::Bad, "overlaps the TCP flags");
+    }
+
+    #[test]
+    fn ipv6_decisions_never_clash() {
+        let mut t: Table<u32> = Table::new();
+        let k = |id| Key::V6(Key6 { src: "2001:db8:100::10".parse().unwrap(), dst: "2001:db8:9::1".parse().unwrap(), id });
+        let d = Decision::V6(Decision6 {
+            conn: 0,
+            dir: Dir::Original,
+            orig: Tuple { proto: PROTO_UDP, src: "2001:db8:100::10".parse().unwrap(), sport: 1, dst: "2001:db8:9::1".parse().unwrap(), dport: 2 },
+            egress: 0,
+            next_hop: "fe80::1".parse().unwrap(),
+            class: Classification::default(),
+        });
+        t.record_forward(k(1), 2, d, 0).unwrap();
+        t.record_forward(k(2), 2, d, 0).unwrap();
+        assert_eq!(t.lookup(&k(1), 1), Some(Lookup::Forward { shard: 2, decision: d }));
+        assert_eq!(t.lookup(&key(1), 1), None, "families apart");
     }
 
     #[test]

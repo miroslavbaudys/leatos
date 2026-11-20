@@ -1295,17 +1295,13 @@ impl Forwarder {
         if link_local(src) || link_local(dst) || src.is_unspecified() || src.is_loopback() || src.is_multicast() || dst.is_loopback() {
             return self.drop(DropReason::Invalid);
         }
-        let spoofed = match iface.role {
-            // A source in one of our networks cannot come from outside.
-            Role::Wan => self.wan_antispoof && (0..self.ifs.len()).any(|i| self.ifs[i].role == Role::Lan && self.on6(i as IfIndex, src)),
-            // A network's own /64s only.
-            Role::Lan => self.lan_antispoof && !self.on6(ingress, src),
-        };
-        if spoofed {
+        if self.spoofed6(ingress, src) {
             return self.drop(DropReason::Spoofed);
         }
-        if !v.has_l4() {
-            return self.drop(DropReason::Fragment); // later fragments: step 2c
+        // A later fragment reaching here has no recorded first one (the
+        // datapath forwards the others: [`Self::forward_fragment`]).
+        if !v.has_l4() || (v.is_fragment && !self.fragments) {
+            return self.drop(DropReason::Fragment);
         }
         let key = key6(f, v);
         // Never an ICMPv6 error about an ICMPv6 error (RFC 4443 §2.4 e),
@@ -1403,11 +1399,32 @@ impl Forwarder {
             is_pure_ack,
         };
         self.stats.forwarded += 1;
+        let next_hop = route.gateway.unwrap_or(dst);
+        if v.is_fragment {
+            // A first fragment: its decision for the rest (frag).
+            self.frag = Some(frag::Decision::V6(frag::Decision6 {
+                conn: id,
+                dir,
+                orig: conn.orig,
+                egress: route.egress,
+                next_hop,
+                class: Classification { is_pure_ack: false, ..class },
+            }));
+        }
         Verdict::Forward6 {
             egress: route.egress,
-            next_hop: route.gateway.unwrap_or(dst),
+            next_hop,
             len,
             class,
+        }
+    }
+
+    /// An IPv6 source that cannot come from `ingress`: from the WAN one of
+    /// our networks', from a network one outside its /64s.
+    fn spoofed6(&self, ingress: IfIndex, src: Ipv6Addr) -> bool {
+        match self.ifs[ingress as usize].role {
+            Role::Wan => self.wan_antispoof && (0..self.ifs.len()).any(|i| self.ifs[i].role == Role::Lan && self.on6(i as IfIndex, src)),
+            Role::Lan => self.lan_antispoof && !self.on6(ingress, src),
         }
     }
 
@@ -1992,7 +2009,7 @@ impl Forwarder {
         };
         let next_hop = route.gateway.unwrap_or(out_dst);
         if v.is_fragment {
-            self.frag = Some(frag::Decision {
+            self.frag = Some(frag::Decision::V4(frag::Decision4 {
                 conn: id,
                 dir,
                 orig: conn.orig,
@@ -2001,7 +2018,7 @@ impl Forwarder {
                 src: v.src(f),
                 dst: v.dst(f),
                 class: Classification { is_pure_ack: false, ..class },
-            });
+            }));
         }
         Verdict::Forward {
             egress: route.egress,
@@ -2024,6 +2041,46 @@ impl Forwarder {
     /// fragments, RFC 792); too large for the egress: dropped (fragments
     /// are not split).
     pub fn forward_fragment(&mut self, now: u64, ingress: IfIndex, buf: &mut [u8], len: usize, d: &frag::Decision) -> Verdict {
+        match d {
+            frag::Decision::V4(d) => self.forward_fragment4(now, ingress, buf, len, d),
+            frag::Decision::V6(d) => self.forward_fragment6(now, ingress, buf, len, d),
+        }
+    }
+
+    /// A later IPv6 fragment with its first one's decision: the same
+    /// egress and next hop, one hop less, no rewrite (docs/ipv6.md 2c).
+    fn forward_fragment6(&mut self, now: u64, ingress: IfIndex, buf: &mut [u8], len: usize, d: &frag::Decision6) -> Verdict {
+        let iface = self.ifs[ingress as usize];
+        let f = &buf[..len];
+        if wire::ethertype(f) != Some(ETHERTYPE_IPV6) || !self.ipv6 {
+            return self.drop(DropReason::Malformed);
+        }
+        let dmac = wire::dst_mac(f);
+        if dmac != iface.mac {
+            return self.drop(DropReason::NotForUs);
+        }
+        let Some(v) = V6::parse(f, ETH_HDR) else {
+            return self.drop(DropReason::Malformed);
+        };
+        if self.spoofed6(ingress, v.src(f)) {
+            return self.drop(DropReason::Spoofed);
+        }
+        if !self.fragments || v.frag_offset == 0 || (v.proto == PROTO_TCP && v.frag_offset == 1) {
+            return self.drop(DropReason::Fragment);
+        }
+        if self.ct6.get(d.conn).is_none_or(|c| c.orig != d.orig) || v.hop_limit(f) <= 1 {
+            return self.drop(DropReason::Fragment);
+        }
+        if v.total_len() > self.mtus[d.egress as usize] as usize {
+            return self.drop(DropReason::TooBig);
+        }
+        v.dec_hop_limit(buf);
+        self.ct6.update(now, d.conn, d.dir, 0, v.total_len());
+        self.stats.forwarded += 1;
+        Verdict::Forward6 { egress: d.egress, next_hop: d.next_hop, len, class: d.class }
+    }
+
+    fn forward_fragment4(&mut self, now: u64, ingress: IfIndex, buf: &mut [u8], len: usize, d: &frag::Decision4) -> Verdict {
         let iface = self.ifs[ingress as usize];
         let f = &buf[..len];
         if wire::ethertype(f) != Some(ETHERTYPE_IPV4) {
@@ -4101,7 +4158,8 @@ mod tests {
                 }
             } else if let Some(d) = &decision {
                 let Verdict::Forward { len, egress, .. } = fw.forward_fragment(0, ifx, &mut f, len, d) else { panic!() };
-                assert_eq!(egress, d.egress);
+                let frag::Decision::V4(d4) = d else { panic!("IPv4 decision") };
+                assert_eq!(egress, d4.egress);
                 out.push((i, f, len));
             } else {
                 held.push((i, f));
@@ -4182,7 +4240,8 @@ mod tests {
         fw.split = true;
         fw.set_mtu(WAN, 1500);
         // The connection gone: its fragments go nowhere.
-        fw.ct.remove(d.conn);
+        let frag::Decision::V4(d4) = d else { panic!("IPv4 decision") };
+        fw.ct.remove(d4.conn);
         let mut f = frames[1].clone();
         assert_eq!(fw.forward_fragment(0, LAN, &mut f, len, &d), Verdict::Drop(DropReason::Fragment));
         // Tiny first fragment (no room for the ports): refused.
@@ -4650,5 +4709,38 @@ mod tests {
             .map(|i| shard_of(Role::Lan, &frame6(LAN_MAC, H6, S6, 64, PROTO_UDP, &udp6(H6, S6, 1000 + i, 53, b"")), 16, 42, &hints))
             .collect();
         assert!(spread.len() > 8, "spread over the shards: {spread:?}");
+    }
+
+    #[test]
+    fn ipv6_fragments_follow_the_first() {
+        let mut fw = router6f();
+        // First fragment of a UDP datagram out: forwarded and recorded.
+        let first_hdr = (44u8, vec![0u8, 0, 0, 1, 0, 0, 0x12, 0x34]); // offset 0, M, id 0x1234
+        let mut f = ipv6_frame(LAN_MAC, a6(H6), a6(S6), 64, &[first_hdr], PROTO_UDP, &udp6(H6, S6, 5000, 53, &[1u8; 64]));
+        let Verdict::Forward6 { egress, next_hop, .. } = run(&mut fw, 0, LAN, &mut f) else { panic!() };
+        assert_eq!((egress, next_hop), (WAN, a6(GW6)));
+        let Some(d @ frag::Decision::V6(_)) = fw.take_fragment() else { panic!("no decision") };
+        assert_eq!(fw.take_fragment(), None, "taken");
+        // A later one goes the same way, one hop less.
+        let later_hdr = (44u8, vec![0u8, 0, 0, 9 << 3, 0, 0, 0x12, 0x34]); // offset 9, last
+        let mut l = ipv6_frame(LAN_MAC, a6(H6), a6(S6), 64, core::slice::from_ref(&later_hdr), PROTO_UDP, &[2u8; 32]);
+        let n = l.len() - 64;
+        let Verdict::Forward6 { egress, len, .. } = fw.forward_fragment(1, LAN, &mut l, n, &d) else { panic!() };
+        assert_eq!(egress, WAN);
+        assert_eq!(V6::parse(&l[..len], ETH_HDR).unwrap().hop_limit(&l), 63);
+        // Without the connection (it ended), or with fragments off: dropped.
+        fw.ct6.remove(0);
+        let mut l2 = ipv6_frame(LAN_MAC, a6(H6), a6(S6), 64, &[later_hdr], PROTO_UDP, &[2u8; 32]);
+        assert_eq!(fw.forward_fragment(2, LAN, &mut l2, n, &d), dropped(DropReason::Fragment));
+        fw.fragments = false;
+        let first_hdr = (44u8, vec![0u8, 0, 0, 1, 0, 0, 0x12, 0x35]);
+        let mut f = ipv6_frame(LAN_MAC, a6(H6), a6(S6), 64, &[first_hdr], PROTO_UDP, &udp6(H6, S6, 5001, 53, &[1u8; 64]));
+        assert_eq!(run(&mut fw, 3, LAN, &mut f), dropped(DropReason::Fragment));
+        // An atomic fragment is a whole packet.
+        fw.fragments = true;
+        let atomic = (44u8, vec![0u8, 0, 0, 0, 0, 0, 0x12, 0x36]);
+        let mut f = ipv6_frame(LAN_MAC, a6(H6), a6(S6), 64, &[atomic], PROTO_UDP, &udp6(H6, S6, 5002, 53, b"q"));
+        assert!(matches!(run(&mut fw, 4, LAN, &mut f), Verdict::Forward6 { .. }));
+        assert_eq!(fw.take_fragment(), None);
     }
 }

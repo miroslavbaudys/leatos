@@ -230,6 +230,8 @@ pub struct Ipv6View {
     pub is_fragment: bool,
     /// Fragment offset in 8-byte units (0: no fragment, or the first).
     pub frag_offset: u16,
+    /// The Fragment header's identification (0 without one).
+    pub frag_id: u32,
 }
 
 impl Ipv6View {
@@ -249,7 +251,7 @@ impl Ipv6View {
             return None;
         }
         let (mut nh, mut off, mut count) = (h[6], ip + 40, 0);
-        let (mut is_fragment, mut frag_offset) = (false, 0);
+        let (mut is_fragment, mut frag_offset, mut frag_id) = (false, 0, 0);
         loop {
             let len = match nh {
                 0 if count == 0 => (*frame.get(off + 1).filter(|_| off + 2 <= end)? as usize + 1) * 8,
@@ -268,6 +270,7 @@ impl Ipv6View {
                     let fo = get16(frame, off + 2);
                     frag_offset = fo >> 3;
                     is_fragment = frag_offset != 0 || fo & 1 != 0;
+                    frag_id = u32::from_be_bytes([frame[off + 4], frame[off + 5], frame[off + 6], frame[off + 7]]);
                     8
                 }
                 _ => break,
@@ -292,6 +295,7 @@ impl Ipv6View {
             l4_len: end - off,
             is_fragment,
             frag_offset,
+            frag_id,
         })
     }
 
