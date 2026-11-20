@@ -14,7 +14,10 @@
 //! local zone for all of them. WAN `:<random high port>` (queries to
 //! upstream servers over UDP), or TCP connections to port 853 for DNS
 //! over TLS. `:5353` on networks taking part in mDNS reflection
-//! (`net::mdns`).
+//! (`net::mdns`). With IPv6 on, a Router Advertisement sender per network
+//! (`proto_dhcp::v6::ra`): its ULA /64 for SLAAC and the router's ULA as
+//! the DNS server; frames go straight into the port's qdisc, the way the
+//! router stack's own do (docs/ipv6.md step 1).
 
 use crate::config;
 use crate::config::schema::{HostName, LocalHost, NameVisibility};
@@ -22,6 +25,7 @@ use crate::net::dns_tcp;
 use crate::net::dot::Dot;
 use crate::net::mdns::Mdns;
 use crate::net::ntp::{self, Ntp};
+use crate::net::shared::Shared;
 use crate::net::svc::HostIf;
 use crate::{println, timer};
 use alloc::string::String;
@@ -31,6 +35,7 @@ use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use proto_dhcp::v4::packet::{CLIENT_PORT, SERVER_PORT};
 use proto_dhcp::v4::persist;
 use proto_dhcp::v4::server::{self as dhcp, Event as DhcpEvent};
+use proto_dhcp::v6::ra::{Advertiser, RaConfig};
 use proto_dns::resolver::{self, Action, Resolver};
 use proto_dns::zone::{Source, View, Zone};
 use smoltcp::iface::{SocketHandle, SocketSet};
@@ -53,6 +58,8 @@ struct Net {
     dns_sock: SocketHandle,
     /// TCP :53 (none with `dns_tcp=0`).
     dns_tcp: Option<dns_tcp::Listener>,
+    /// Router Advertisements (IPv6 on: `cfg.ula`).
+    ra: Option<Advertiser>,
 }
 
 pub struct LanServices {
@@ -81,6 +88,45 @@ pub struct LanServices {
     ntp: Option<Ntp>,
     /// mDNS across networks.
     mdns: Mdns,
+    /// Advertisers sending their last RA (network or IPv6 gone): (link,
+    /// advertiser).
+    retiring: Vec<(usize, Advertiser)>,
+}
+
+/// A network's RA settings: its ULA /64 and the router's ULA as DNS
+/// server, its domain to search, the MAC of its link's interface.
+fn ra_config(cfg: &config::Lan, host: &HostIf) -> Option<RaConfig> {
+    let ula = cfg.ula?;
+    let smoltcp::wire::HardwareAddress::Ethernet(mac) = host.iface.hardware_addr() else {
+        return None;
+    };
+    Some(RaConfig {
+        mac: mac.0,
+        prefix: ula,
+        mtu: 1500,
+        rdnss: vec![ula],
+        dnssl: vec![cfg.domain.clone()],
+    })
+}
+
+/// An RA into the qdisc of `link`'s port (with its VLAN tag).
+fn send_ra(sh: &Shared, link: usize, frame: &[u8]) {
+    let l = &sh.links[link];
+    let port = l.port();
+    let Some(mut pkt) = crate::net::packet::PacketBuf::alloc() else {
+        return; // pool empty: the next RA is a few minutes away at most
+    };
+    pkt.set_len(frame.len());
+    pkt.data_mut().copy_from_slice(frame);
+    if let Some(tci) = l.tci() {
+        pkt.push_vlan(tci);
+    }
+    let now = crate::net::datapath::now_ns();
+    pkt.meta.wire_len = pkt.len() as u32;
+    pkt.meta.enqueue_ts = now;
+    if qdisc::Qdisc::enqueue(&mut *sh.ports[port].qdisc.lock(), pkt, now).is_ok() {
+        sh.tx_kick[port].signal();
+    }
 }
 fn udp_socket(datagrams: usize, bytes: usize) -> udp::Socket<'static> {
     let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; datagrams], vec![0; bytes]);
@@ -141,6 +187,11 @@ fn build_zone<'a>(
         zone.add_subnet((n.addr, n.prefix));
     }
     for n in nets {
+        if let Some(ula) = n.ula {
+            zone.add_router6(&n.domain, ula);
+        }
+    }
+    for n in nets {
         for s in &n.statics {
             if let Some(h) = &s.hostname {
                 zone.add_in(&n.domain, h, s.ip, Source::Static, seen_by(names, s.ip));
@@ -185,12 +236,17 @@ fn open_net(cfg: config::Lan, host: usize, hosts: &mut [HostIf]) -> Net {
     let dns_sock = sockets.add(s);
     let dns_tcp = config::dns_tcp().then(|| dns_tcp::Listener::open(sockets));
     log_net(&cfg);
+    let ra = ra_config(&cfg, &hosts[host]).map(|c| {
+        println!("  lan services    : {}: ipv6 {}/64, router advertisements", cfg.name, c.prefix);
+        Advertiser::new(c, now_ms(), timer::ticks() ^ host as u64)
+    });
     Net {
         cfg,
         host,
         dhcp,
         dns_sock,
         dns_tcp,
+        ra,
     }
 }
 
@@ -261,6 +317,7 @@ impl LanServices {
             next_expire: 0,
             ntp,
             mdns,
+            retiring: Vec::new(),
         };
         me.apply_upstreams(hosts);
         Some(me)
@@ -361,6 +418,21 @@ impl LanServices {
                 (None, false) => {}
             }
             net.cfg = cfg.clone();
+            match (net.ra.take(), ra_config(cfg, &hosts[net.host])) {
+                (Some(mut ra), Some(c)) => {
+                    ra.set_config(c, now_ms());
+                    net.ra = Some(ra);
+                }
+                (Some(mut ra), None) => {
+                    ra.retire(now_ms());
+                    self.retiring.push((net.host, ra));
+                }
+                (None, Some(c)) => {
+                    println!("  lan services    : {}: ipv6 {}/64, router advertisements", cfg.name, c.prefix);
+                    net.ra = Some(Advertiser::new(c, now_ms(), timer::ticks() ^ net.host as u64));
+                }
+                (None, None) => {}
+            }
             self.nets.push(net);
         }
         // Networks that went away (or moved): their sockets go too.
@@ -373,6 +445,10 @@ impl LanServices {
             sockets.remove(net.dns_sock);
             if let Some(l) = net.dns_tcp {
                 l.close(sockets);
+            }
+            if let Some(mut ra) = net.ra {
+                ra.retire(now_ms());
+                self.retiring.push((net.host, ra));
             }
             println!("  lan services    : {}: removed", net.cfg.name);
         }
@@ -532,8 +608,14 @@ impl LanServices {
                     }
                 }
                 Action::Reply { to, data, tcp: false } => {
-                    let IpAddr::V4(ip) = to.ip() else { continue };
-                    let Some(net) = self.nets.iter().find(|n| n.cfg.contains(ip)) else {
+                    // The client's network: its IPv4 subnet, or its IPv6
+                    // address in the network's ULA /64 (a client asking the
+                    // router's ULA asks from its own ULA, RFC 6724).
+                    let mine = |n: &&Net| match to.ip() {
+                        IpAddr::V4(ip) => n.cfg.contains(ip),
+                        IpAddr::V6(ip) => n.cfg.ula.is_some_and(|u| u128::from(u) >> 64 == u128::from(ip) >> 64),
+                    };
+                    let Some(net) = self.nets.iter().find(mine) else {
                         continue;
                     };
                     let ep = IpEndpoint::new(to.ip().into(), to.port());
@@ -561,7 +643,26 @@ impl LanServices {
     /// Process received datagrams and timers. Called by the services task
     /// after polling the interfaces (`hosts` as in [`Self::new`];
     /// `links[i]` is `hosts[i]`'s link).
-    pub fn step(&mut self, hosts: &mut [HostIf], links: &[crate::net::shared::LinkShared]) {
+    pub fn step(&mut self, hosts: &mut [HostIf], sh: &Shared) {
+        let links = &sh.links;
+        // Router Advertisements: solicited, periodic, last ones.
+        let now = now_ms();
+        for net in &mut self.nets {
+            let Some(ra) = net.ra.as_mut() else { continue };
+            if links[net.host].rs_seen.swap(false, core::sync::atomic::Ordering::Relaxed) {
+                ra.solicited(now);
+            }
+            if let Some(f) = ra.poll(now) {
+                send_ra(sh, net.host, &f);
+            }
+        }
+        for (link, ra) in &mut self.retiring {
+            if let Some(f) = ra.poll(now) {
+                send_ra(sh, *link, &f);
+            }
+        }
+        self.retiring.retain(|(_, ra)| !ra.is_done());
+
         // DHCP servers.
         let mut buf = [0u8; 1500];
         let expire = now_secs() >= self.next_expire;
@@ -662,6 +763,14 @@ impl LanServices {
         self.mdns.step(hosts, links);
     }
 
+    /// IPv6 per network: (name, router ULA, RAs sent, solicitations seen).
+    pub fn ipv6_status(&self) -> Vec<(&str, Option<core::net::Ipv6Addr>, u64, u64)> {
+        self.nets
+            .iter()
+            .map(|n| (n.cfg.name.as_str(), n.cfg.ula, n.ra.as_ref().map_or(0, |r| r.sent), n.ra.as_ref().map_or(0, |r| r.solicits)))
+            .collect()
+    }
+
     /// DNS over TCP: connections accepted since boot, open now.
     pub fn dns_tcp_status(&self) -> (u64, usize) {
         let open = self.nets.iter().filter_map(|n| n.dns_tcp.as_ref()).map(dns_tcp::Listener::open_conns).sum();
@@ -685,6 +794,10 @@ impl LanServices {
         }
         if let Some(at) = self.dot.as_ref().and_then(Dot::next_deadline) {
             wait_ms = wait_ms.min(at.saturating_duration_since(timer::Instant::now()).as_millis() as u64);
+        }
+        let ras = self.nets.iter().filter_map(|n| n.ra.as_ref()).chain(self.retiring.iter().map(|(_, ra)| ra));
+        if let Some(at) = ras.filter_map(Advertiser::next_deadline).min() {
+            wait_ms = wait_ms.min(at.saturating_sub(ms_now));
         }
         timer::Instant::now()
             .checked_add(core::time::Duration::from_millis(wait_ms))

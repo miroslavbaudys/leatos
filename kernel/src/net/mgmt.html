@@ -232,6 +232,12 @@
         <span class="hint">The first network is the main LAN: edit it under <a href="#/lan">LAN &amp; DHCP</a>.</span></div>
       <p class="hint">Adding, removing or changing a network (VLAN, address, zone) applies at once, without a reboot; changing the address of the network you use for this page boots as a trial. A VLAN needs a switch or access point that tags it on the LAN cable.</p>
     </form>
+    <form class="card cfg" autocomplete="off"><h3>IPv6</h3>
+      <label class="check"><input data-path="ipv6.enabled" type="checkbox">IPv6 on the networks: a unique local /64 each (SLAAC), router advertisements, DNS and this page over IPv6. Nothing is forwarded over IPv6 yet.</label>
+      <div class="form">
+        <label>Unique local /48 (empty = derived from the WAN MAC)<input data-path="ipv6.ula_prefix" data-opt placeholder="e.g. fd12:3456:789a::/48"></label>
+      </div>
+    </form>
   </section>
 
   <!-- ================= Routes ================= -->
@@ -963,7 +969,7 @@ async function refresh() {
   showLeases();
   const nets = st.networks ?? [];
   $("ifnets").innerHTML = nets.length ? "<tr><th>Network</th><th>Port</th><th>VLAN</th><th>Address</th><th>Zone</th><th class=num>Clients</th></tr>" +
-    nets.map((n) => `<tr><td>${esc(n.name)}</td><td>${esc(n.port ?? "lan0")}</td><td>${n.vlan || "untagged"}</td><td>${esc(n.ipv4)}</td><td>${esc(n.zone)}</td><td class=num>${n.dhcp ? n.leases : "no DHCP"}</td></tr>`).join("")
+    nets.map((n) => `<tr><td>${esc(n.name)}</td><td>${esc(n.port ?? "lan0")}</td><td>${n.vlan || "untagged"}</td><td>${esc(n.ipv4)}${n.ipv6 ? `<br><span class="muted">${esc(n.ipv6)}${n.ra ? ` · ${n.ra.sent} RAs` : ""}</span>` : ""}</td><td>${esc(n.zone)}</td><td class=num>${n.dhcp ? n.leases : "no DHCP"}</td></tr>`).join("")
     : rows([["Networks", "none"]]);
   renderNetStatus();
   renderRuleHits();
@@ -1130,7 +1136,10 @@ function readForm() {
     if (e.type === "checkbox") v = e.checked;
     else if (e.type === "number") v = e.value.trim() === "" ? (e.hasAttribute("data-opt") ? undefined : NaN) : Number(e.value);
     else if (e.hasAttribute("data-secret")) v = e.value === "" ? undefined : e.value; // left out: the router keeps it
-    else v = e.value.trim();
+    else {
+      v = e.value.trim();
+      if (v === "" && e.hasAttribute("data-opt")) v = undefined; // optional: left out
+    }
     setp(c, e.dataset.path, v);
   }
   const lo = $("rlo").value.trim(), hi = $("rhi").value.trim();

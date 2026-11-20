@@ -427,6 +427,7 @@ impl Datapath {
                 f.set_addr(i as IfIndex, addr);
                 f.set_zone(i as IfIndex, want.map_or(1, |x| x.zone));
                 f.set_mac(i as IfIndex, self.sh.ports[port].mac);
+                f.set_ula6(i as IfIndex, want.and_then(|x| x.ula));
             }
             *self.addrs[i].lock() = addr;
             link.set(want.is_some(), port, vid);
@@ -435,8 +436,10 @@ impl Datapath {
             }
         }
         let mut revoked = 0;
+        let ipv6 = crate::config::ipv6();
         for s in &self.shards {
             let mut f = s.lock();
+            f.ipv6 = ipv6;
             f.set_static_routes(&n.routes);
             f.set_policy(Some(n.policy.clone()));
             if crate::config::fw_recheck() {

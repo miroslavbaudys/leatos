@@ -1302,15 +1302,22 @@ fn status_json(
     s.push(']');
     // The networks: router interfaces on the LAN ports (docs/config-v2.md).
     s.push_str(",\"networks\":[");
+    let v6 = services.map(LanServices::ipv6_status).unwrap_or_default();
     for (n, net) in config::networks().iter().enumerate() {
         let leases = services.map_or(0, |svc| {
             svc.leases_by_network()
                 .filter(|(name, l)| *name == net.name && l.state == proto_dhcp::v4::server::LeaseState::Bound)
                 .count()
         });
+        // IPv6 (docs/ipv6.md step 1): the router's ULA and its RAs.
+        let (ipv6, ra) = match (net.ula, v6.iter().find(|x| x.0 == net.name)) {
+            (Some(u), Some(&(_, _, sent, rs))) => (json_str(&format!("{u}/64")), format!("{{\"sent\":{sent},\"solicits\":{rs}}}")),
+            (Some(u), None) => (json_str(&format!("{u}/64")), String::from("null")),
+            (None, _) => (String::from("null"), String::from("null")),
+        };
         let _ = write!(
             s,
-            "{}{{\"name\":{},\"port\":{},\"vlan\":{},\"ipv4\":{},\"zone\":{},\"dhcp\":{},\"mgmt\":{},\"leases\":{leases}}}",
+            "{}{{\"name\":{},\"port\":{},\"vlan\":{},\"ipv4\":{},\"ipv6\":{ipv6},\"ra\":{ra},\"zone\":{},\"dhcp\":{},\"mgmt\":{},\"leases\":{leases}}}",
             if n > 0 { "," } else { "" },
             json_str(&net.name),
             json_str(config::PORTS[net.port]),

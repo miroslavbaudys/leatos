@@ -47,6 +47,8 @@ const PING_INTERVAL: Duration = Duration::from_millis(200);
 pub struct HostIf {
     pub iface: Interface,
     pub sockets: SocketSet<'static>,
+    /// IPv6 neighbors recently made known to smoltcp (`net::device`).
+    pub nd: crate::net::device::NdHints,
 }
 
 struct Pinger {
@@ -470,6 +472,7 @@ fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
             port,
             now_ns,
             queued: &mut queued,
+            nd: Some(&mut host.nd),
         };
         host.iface.poll(t, &mut dev, &mut host.sockets);
         if queued > 0 {
@@ -681,7 +684,7 @@ pub async fn run(
         }
         pinger.step(&mut hosts[0].sockets);
         if let Some(svc) = services.as_mut() {
-            svc.step(&mut hosts, &sh.links);
+            svc.step(&mut hosts, sh);
         }
         let action = mgmt.step(&mut hosts, sh, services.as_ref());
         if let Some((conn, op)) = mgmt.take_op()

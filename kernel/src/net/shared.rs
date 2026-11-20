@@ -132,6 +132,9 @@ pub struct LinkShared {
     active: AtomicBool,
     /// Frames for the router stack, filled by the datapath.
     pub local_rx: Mutex<VecDeque<PacketBuf>>,
+    /// A Router Solicitation came in (set as the router stack reads it,
+    /// `net::device`; the network's RA advertiser answers, `net::services`).
+    pub rs_seen: AtomicBool,
 }
 
 impl LinkShared {
@@ -141,6 +144,7 @@ impl LinkShared {
             vid: AtomicU16::new(0),
             active: AtomicBool::new(active),
             local_rx: Mutex::new(VecDeque::with_capacity(LOCAL_RX_MAX)),
+            rs_seen: AtomicBool::new(false),
         }
     }
 
@@ -152,6 +156,7 @@ impl LinkShared {
             vid: AtomicU16::new(0),
             active: AtomicBool::new(false),
             local_rx: Mutex::new(VecDeque::new()),
+            rs_seen: AtomicBool::new(false),
         }
     }
 
@@ -191,6 +196,8 @@ pub struct NetSlot {
     pub vid: u16,
     pub addr: (Ipv4Addr, u8),
     pub zone: u8,
+    /// The router's ULA on it (IPv6 on).
+    pub ula: Option<core::net::Ipv6Addr>,
 }
 
 /// The networks and the firewall, as the datapath applies them together

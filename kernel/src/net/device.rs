@@ -180,12 +180,64 @@ impl Qdisc<PacketBuf> for Aqm {
     }
 }
 
+/// An ICMPv6 Router Solicitation in an untagged Ethernet frame (the
+/// datapath removed the VLAN tag; the forwarder checked the hop limit and
+/// the extension headers: an RS behind one is not answered at once, only
+/// by the periodic RAs).
+fn is_router_solicitation(f: &[u8]) -> bool {
+    let ip = fwd::wire::ETH_HDR;
+    fwd::wire::ethertype(f) == Some(fwd::wire::ETHERTYPE_IPV6)
+        && f.get(ip + 6) == Some(&fwd::wire::PROTO_ICMPV6)
+        && f.get(ip + 40) == Some(&fwd::wire::ICMPV6_ROUTER_SOLICIT)
+}
+
 pub struct PortDevice<'a> {
     pub link: &'a LinkShared,
     pub port: &'a PortShared,
     pub now_ns: u64,
     /// Frames put into the qdisc (the datapath must be woken to send them).
     pub queued: &'a mut u32,
+    /// The link's IPv6 neighbor hints (`None`: only making the interface).
+    pub nd: Option<&'a mut NdHints>,
+}
+
+/// smoltcp (0.14) learns IPv6 neighbors only from neighbor discovery and
+/// drops the packet that makes it resolve one. A client that knows our
+/// MAC from the Router Advertisement never solicits us, so the first
+/// answer to it after a quiet minute (smoltcp's entry lifetime) was lost.
+/// Before such a client's frame, smoltcp gets a neighbor solicitation
+/// from it ([`fwd::wire::ipv6_neighbor_hint`]: to our unicast address,
+/// so recorded, not answered), at most every [`Self::EVERY_NS`] per
+/// neighbor. And unicast solicitations (reachability probes), which
+/// smoltcp ignores, go to the solicited-node group instead
+/// ([`fwd::wire::ipv6_ns_to_solicited`]), so it answers them.
+#[derive(Default)]
+pub struct NdHints {
+    recent: alloc::vec::Vec<(core::net::Ipv6Addr, [u8; 6], u64)>,
+}
+
+impl NdHints {
+    /// Within smoltcp's 60 s neighbor lifetime.
+    const EVERY_NS: u64 = 20_000_000_000;
+    const MAX: usize = 32;
+
+    /// `ip` at `mac` should be told (again) at `now_ns`.
+    fn due(&mut self, ip: core::net::Ipv6Addr, mac: [u8; 6], now_ns: u64) -> bool {
+        if let Some(e) = self.recent.iter_mut().find(|e| e.0 == ip) {
+            if e.1 == mac && now_ns.saturating_sub(e.2) < Self::EVERY_NS {
+                return false;
+            }
+            (e.1, e.2) = (mac, now_ns);
+            return true;
+        }
+        if self.recent.len() >= Self::MAX
+            && let Some(i) = (0..self.recent.len()).min_by_key(|&i| self.recent[i].2)
+        {
+            self.recent.swap_remove(i);
+        }
+        self.recent.push((ip, mac, now_ns));
+        true
+    }
 }
 
 /// A received frame; `skip` = 14 on an IP-only port (the Ethernet header).
@@ -261,7 +313,28 @@ impl Device for PortDevice<'_> {
         Self: 'a;
 
     fn receive(&mut self, _ts: Instant) -> Option<(RxToken, TxToken<'_>)> {
-        let pkt = self.link.local_rx.lock().pop_front()?;
+        let mut pkt = self.link.local_rx.lock().pop_front()?;
+        if let Some(nd) = self.nd.as_deref_mut()
+            && !self.port.is_pppoe()
+            && fwd::wire::ethertype(pkt.data()) == Some(fwd::wire::ETHERTYPE_IPV6)
+        {
+            fwd::wire::ipv6_ns_to_solicited(pkt.data_mut());
+            let mut hint = [0u8; fwd::wire::NEIGHBOR_HINT_LEN];
+            if let Some((ip, mac)) = fwd::wire::ipv6_neighbor_hint(pkt.data(), &mut hint)
+                && nd.due(ip, mac, self.now_ns)
+                && let Some(mut h) = PacketBuf::alloc()
+            {
+                h.set_len(hint.len());
+                h.data_mut().copy_from_slice(&hint);
+                // The frame itself comes next.
+                self.link.local_rx.lock().push_front(pkt);
+                pkt = h;
+            }
+        }
+        if is_router_solicitation(pkt.data()) {
+            // smoltcp ignores it (a host); the network's advertiser answers.
+            self.link.rs_seen.store(true, Ordering::Relaxed);
+        }
         let skip = if self.port.is_pppoe() {
             fwd::wire::ETH_HDR
         } else {

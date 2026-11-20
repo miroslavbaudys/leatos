@@ -16,7 +16,7 @@ use crate::println;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
 use proto_dhcp::v4::server::StaticLease;
 
 /// The `config` crate (`crates/config`): schema, defaults, validation.
@@ -37,9 +37,45 @@ pub fn port_index(name: &str) -> Option<usize> {
     PORTS.iter().position(|p| *p == name)
 }
 
-/// Bring-up found `n` NICs (ports `PORTS[..n]`).
-pub fn set_ports(n: usize) {
+/// Bring-up found `n` NICs (ports `PORTS[..n]`); `wan_mac` seeds the
+/// derived ULA prefix ([`ula_prefix`]).
+pub fn set_ports(n: usize, wan_mac: [u8; 6]) {
     PORTS_PRESENT.store(n, core::sync::atomic::Ordering::Relaxed);
+    WAN_MAC.call_once(|| wan_mac);
+}
+
+/// The WAN port's MAC (from bring-up): the seed of the derived ULA.
+static WAN_MAC: spin::Once<[u8; 6]> = spin::Once::new();
+
+/// IPv6 on the networks (`[ipv6] enabled`, boot argument `ipv6=0|1`).
+pub fn ipv6() -> bool {
+    get().ipv6.enabled
+}
+
+/// The networks' unique local /48 (RFC 4193 §3.2): `ipv6.ula_prefix`, else
+/// `fd` + 40 bits of SHA-256 over a label and the WAN MAC, so it stays the
+/// same across reboots without being stored. Network `i` (config order)
+/// gets `<prefix>:<i>::/64`, the router `::1` in it.
+pub fn ula_prefix() -> Ipv6Addr {
+    if let Some(p) = get().ipv6.ula_prefix {
+        return p.network();
+    }
+    let mac = WAN_MAC.get().copied().unwrap_or_default();
+    let mut seed = [0u8; 16];
+    seed[..10].copy_from_slice(b"leatos ULA");
+    seed[10..].copy_from_slice(&mac);
+    let mut id = [0u8; 5];
+    auth::Pool::new(&seed).fill(&mut id);
+    let mut a = [0u8; 16];
+    a[0] = 0xfd;
+    a[1..6].copy_from_slice(&id);
+    Ipv6Addr::from(a)
+}
+
+/// The router's address in network `index`'s ULA /64.
+pub fn ula_router(index: usize) -> Ipv6Addr {
+    let p = u128::from(ula_prefix());
+    Ipv6Addr::from(p | ((index as u128 & 0xffff) << 64) | 1)
 }
 
 fn port_present(i: usize) -> bool {
@@ -275,6 +311,7 @@ pub fn overrides() -> Vec<(String, &'static str)> {
         ("dns_tls", "dns.tls"),
         ("dns_prefetch", "dns.prefetch"),
         ("dns_stale", "dns.stale_secs"),
+        ("ipv6", "ipv6.enabled"),
     ];
     let args = bootargs();
     let mut v = Vec::new();
@@ -397,6 +434,9 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
     if let Some(v) = arg_u64(args, "ack_filter") {
         s.ack_filter = v != 0;
     }
+    if let Some(v) = arg_u64(args, "ipv6") {
+        c.ipv6.enabled = v != 0;
+    }
     if let Some(v) = arg_u64(args, "ecn_up").or(arg_u64(args, "ecn")) {
         s.ecn_up = v != 0;
     }
@@ -515,6 +555,9 @@ pub struct Lan {
     /// Enabled `[[route]]`s through a router on this network: (subnet,
     /// prefix length, router), for DHCP option 121 and the router stack.
     pub routes: Vec<(Ipv4Addr, u8, Ipv4Addr)>,
+    /// With IPv6 on: the router's address in the network's ULA /64
+    /// ([`ula_router`] of its index in the config).
+    pub ula: Option<Ipv6Addr>,
 }
 
 impl Lan {
@@ -558,10 +601,13 @@ fn network_port(n: &schema::Network) -> Option<usize> {
 pub fn networks() -> Vec<Lan> {
     let c = get();
     let names = zone_names(&c);
+    let v6 = c.ipv6.enabled;
     c.networks
         .iter()
-        .filter_map(|n| Some((n, network_port(n)?)))
-        .map(|(n, port)| Lan {
+        .enumerate()
+        .filter_map(|(i, n)| Some((i, n, network_port(n)?)))
+        .map(|(i, n, port)| Lan {
+            ula: v6.then(|| ula_router(i)),
             name: n.name.clone(),
             port,
             vid: n.vlan,

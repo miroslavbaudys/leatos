@@ -33,7 +33,7 @@ use core::time::Duration;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::dhcpv4;
 use smoltcp::time::Instant as NetInstant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Cidr};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Cidr, Ipv6Cidr};
 use spin::Mutex;
 
 /// Qdisc hard limits, per port egress and for the WAN ingress stage
@@ -217,7 +217,7 @@ pub fn bring_up(
             if crate::config::wan_link() == crate::config::WanLink::Dhcp {
                 sockets.add(dhcpv4::Socket::new());
             }
-            hosts.push(HostIf { iface, sockets });
+            hosts.push(HostIf { iface, sockets, nd: Default::default() });
             links.push(link);
         } else if i == shared::FIRST_LAN_PORT {
             // Every network slot, with an interface without addresses (on
@@ -228,6 +228,7 @@ pub fn bring_up(
                 hosts.push(HostIf {
                     iface: new_iface(&port),
                     sockets: SocketSet::new(Vec::new()),
+                    nd: Default::default(),
                 });
             }
         }
@@ -274,7 +275,7 @@ pub fn bring_up(
         return None;
     }
     // Networks on ports this machine lacks are left out from here on.
-    crate::config::set_ports(shared_ports.len());
+    crate::config::set_ports(shared_ports.len(), shared_ports.first().map_or([0; 6], |p| p.mac));
     let nets = crate::config::networks();
     let (_, placed, _) = place_networks(&[]);
     set_host_addrs(&mut hosts, &nets, &placed, &port_macs(&shared_ports));
@@ -338,6 +339,7 @@ pub fn new_iface(port: &PortShared) -> Interface {
         port,
         now_ns: datapath::now_ns(),
         queued: &mut queued,
+        nd: None,
     };
     Interface::new(config, &mut device, now())
 }
@@ -499,6 +501,7 @@ pub fn place_networks(
                 vid: n.vid,
                 addr: (n.addr, n.prefix),
                 zone: n.zone,
+                ula: n.ula,
             })
             .collect(),
         policy: crate::config::firewall(),
@@ -512,10 +515,11 @@ pub fn port_macs(ports: &[PortShared]) -> Vec<[u8; 6]> {
     ports.iter().map(|p| p.mac).collect()
 }
 
-/// The router stack's addresses: each network's on its slot's interface,
-/// none on the others; the MAC of the network's port; and its
-/// `[[route]]`s (the WAN's: those through a router on the WAN's subnet),
-/// so the router answers hosts behind them.
+/// The router stack's addresses: each network's on its slot's interface
+/// (IPv4; with IPv6 on also the link-local address of the port's MAC and
+/// the network's ULA /64), none on the others; the MAC of the network's
+/// port; and its `[[route]]`s (the WAN's: those through a router on the
+/// WAN's subnet), so the router answers hosts behind them.
 pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: &[usize], macs: &[[u8; 6]]) {
     if let Some(wan) = hosts.first_mut() {
         set_host_routes(&mut wan.iface, &crate::config::wan_routes());
@@ -529,13 +533,20 @@ pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: 
             }
         }
         set_host_routes(&mut host.iface, k.map_or(&[][..], |k| &nets[k].routes));
-        let want = k.map(|k| cidr(&nets[k]));
-        let have = host.iface.ip_addrs().first().copied();
-        if have != want.map(IpCidr::Ipv4) {
+        let mut want: Vec<IpCidr> = Vec::new();
+        if let Some(k) = k {
+            want.push(IpCidr::Ipv4(cidr(&nets[k])));
+            if let (Some(ula), Some(&mac)) = (nets[k].ula, macs.get(nets[k].port)) {
+                want.push(IpCidr::Ipv6(Ipv6Cidr::new(fwd::wire::link_local(mac), 64)));
+                want.push(IpCidr::Ipv6(Ipv6Cidr::new(ula, 64)));
+            }
+        }
+        if host.iface.ip_addrs() != want.as_slice() {
             host.iface.update_ip_addrs(|a| {
                 a.clear();
-                if let Some(c) = want {
-                    let _ = a.push(IpCidr::Ipv4(c));
+                for c in &want {
+                    // iface-max-addr-count-4 (kernel/Cargo.toml) holds them.
+                    let _ = a.push(*c);
                 }
             });
         }

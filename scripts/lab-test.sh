@@ -206,6 +206,18 @@
 #                        route, the ISP forging 10.30.0.5 is dropped as
 #                        spoofed. Negative control: LAB_ROUTES=0 (the route
 #                        disabled: every check fails).
+#   LAB_IPV6=1           IPv6 on the router's networks (docs/ipv6.md step
+#                        1; router ipv6=1): the client gets a SLAAC
+#                        address from the main LAN's ULA /64, no default
+#                        route (router lifetime 0), pings the router's ULA
+#                        and link-local address, resolves router.lan AAAA
+#                        over IPv6 and opens the web interface on the ULA;
+#                        the router's RA counters. With LAB_GUEST=1 also
+#                        the guest network: its own ULA, DNS over IPv6
+#                        allowed, the web interface refused (zone input).
+#                        Negative controls: LAB_ROUTER_ARGS=ipv6=0 (every
+#                        IPv6 check fails), LAB_GUEST_ZONE=lan (the guest's
+#                        web-refused check fails).
 #   LAB_PORTS=1          (implies LAB_GUEST=1) a second LAN port: the router
 #                        gets a third NIC (lan1), network "wired"
 #                        10.40.0.1/24 untagged on it (zone lan); the client
@@ -258,6 +270,8 @@ if [[ -n "$ISP_PPPOE" ]]; then
 fi
 ISP_STATIC="${LAB_WAN_STATIC:-}"
 [[ -n "$ISP_STATIC" ]] && ROUTER_ARGS="$ROUTER_ARGS wan_mode=static wan_ip=203.0.113.60/24 wan_gw=203.0.113.1 wan_dns=203.0.113.1"
+IPV6="${LAB_IPV6:-}"
+[[ -n "$IPV6" ]] && ROUTER_ARGS="$ROUTER_ARGS ipv6=1"
 GUEST="${LAB_GUEST:-}"
 GUEST_LIVE="${LAB_GUEST_LIVE:-}"
 [[ -n "$GUEST_LIVE" ]] && GUEST=1
@@ -506,7 +520,7 @@ PIDS+=($!)
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
   VM_NIC2="${PORTS:+52:54:00:00:00:11 $((LAN1_PORT + 1)) $LAN1_PORT}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${ACK:+ lab_ack=1} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${ACK:+ lab_ack=1} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=1}"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so
