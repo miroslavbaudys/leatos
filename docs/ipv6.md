@@ -1,6 +1,6 @@
 # IPv6 (M7, plan)
 
-Status (2026-11-20): steps 0 and 1 done in QEMU (step 0: AAAA rebind protection, Kea for the lab, smoltcp limits, IPv6CP offer logged; step 1: IPv6 on the router's networks, below). Steps 2a (conntrack generic over the address family) and 2b (IPv6 forwarding with a static WAN prefix) done too. The apu4 check of the IPv6CP offer waits for the soak run to end. Step 2c (IPv6 fragments) and step 3 (DHCPv6-PD on a DHCP WAN) done too. Next: step 4 (IPv6 over PPPoE). First plan 2026-11-15 (checked at
+Status (2026-11-20): steps 0 and 1 done in QEMU (step 0: AAAA rebind protection, Kea for the lab, smoltcp limits, IPv6CP offer logged; step 1: IPv6 on the router's networks, below). Steps 2a (conntrack generic over the address family) and 2b (IPv6 forwarding with a static WAN prefix) done too. The apu4 check of the IPv6CP offer waits for the soak run to end. Step 2c (IPv6 fragments), step 3 (DHCPv6-PD on a DHCP WAN) and step 4 (IPv6 over PPPoE: IPv6CP, PD over the session) done too. Next: the apu4 against the home ISP (after the soak run), then step 5. First plan 2026-11-15 (checked at
 2712911); **revised 2026-11-20 against 74cb3d1**, after 135 commits that
 added routed LAN ports and live link slots, the WAN ingress stage, IPv4
 fragments, anti-spoofing, redirects, static routes, DNS views, DoT, the
@@ -466,6 +466,46 @@ The plan as written before:
   the ULA only).
 
 ### Step 4: IPv6 over PPPoE
+✅ in QEMU (2026-11-20). As built:
+- **`proto-pppoe`:** with `Config::ipv6` (= `ipv6.enabled`), IPv6CP
+  (RFC 5072) starts with IPCP.
+  - Our interface identifier is the MAC's modified EUI-64. A peer
+    identifier that is zero or ours is NAKed with a suggestion; a NAK's
+    suggestion is taken.
+  - A rejected, Protocol-Rejected, unanswered or nak-looping IPv6CP means
+    no IPv6; IPv4 stays up.
+  - `Event::Ipv6Up { local, remote }` comes after `Up`; `Ipv6Down` also
+    comes before `Down`. A peer's Terminate-Request is acknowledged, and
+    its next request starts IPv6CP again.
+  - With IPv6 off, IPv6CP is Protocol-Rejected and logged as before.
+  - Fuzz target `pppoe`: IPv6CP and IPv6 frames, the event order
+    checked.
+- **Wire and datapath:** `SessionRx::Ipv6`, `decap_ipv6`/`encap_ipv6`. IPv6
+  to the WAN goes to the access concentrator like IPv4 (no neighbor
+  discovery on the session).
+- **Router stack:** the IP-only interface writes 0x86DD for IPv6, and the
+  WAN keeps the last RA on PPPoE too.
+- **Addresses:** the WAN's link-local address is IPv6CP's (`net::wan6`
+  `set_ppp_link`/`ppp_link`): smoltcp's WAN interface and
+  `Forwarder::set_ll6` (`is_mine6`, ICMPv6 error source).
+- **Default router:** the RA's router, else the IPv6CP peer. Many ISPs
+  send RAs; pppd does not.
+- **Prefix delegation:** `net::wan6` runs while IPv6CP is up (started and
+  stopped by `svc`, the networks reapplied). Router Solicitations carry
+  no link-layer option on PPP.
+- **Status:** `/api/status` `pppoe.ipv6` (`local`, `peer`).
+- **Lab:** `LAB_PPPOE=pap|chap|none LAB_IPV6=1`.
+  - The ISP's pppd `ipv6-up` routes 2001:db8:100::/48 and
+    2001:db8:200::/48 over `ppp0` and starts Kea there. It first gives
+    pppd's link-local address no peer: musl's `getifaddrs` would report
+    the peer's address as ours, and Kea would bind to the router's.
+  - Checks: the router's IPv6CP line, the delegation and every WAN check
+    over the session (Packet Too Big at the session's 1492), the prefix
+    change, and IPv6 back after the ISP ends the session.
+  - Negative controls: `LAB_PPPOE_IPV6=0` (pppd `noipv6`),
+    `LAB_IPV6_PD=0`.
+
+The plan as written before:
 - `proto-pppoe`: IPv6CP (interface identifier negotiation, link-local),
   no more Protocol-Reject for it. `Session` carries the IPv6 state.
 - `wire`/datapath: classify/decap/encap for PPP 0x0057 ↔ EtherType 0x86DD.

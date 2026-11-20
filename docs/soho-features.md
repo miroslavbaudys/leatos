@@ -11,18 +11,21 @@ Relay-Session-Id echo, PADS errors, PADT both ways (sent at shutdown and
 when a session is torn down); LCP (RFC 1661 automaton shared with IPCP:
 MRU 1492, magic numbers with loopback check, auth protocol: PAP or
 CHAP-MD5, other methods naked to CHAP; PFC/ACFC and unknown options
-rejected; Protocol-Reject for IPv6CP and other unsupported protocols;
+rejected; Protocol-Reject for unsupported protocols (IPv6CP too while
+`ipv6` is off);
 echo keepalive, `lcp_echo_interval` / `lcp_echo_failure`); PAP and CHAP-MD5
 (`md-5`, RustCrypto); IPCP with DNS (RFC 1877), DNS servers feed the
-forwarder. Reconnect with exponential backoff (1 s doubling to 64 s, at
+forwarder. With `ipv6` on: IPv6CP (interface identifiers, link-local
+addresses; failure leaves IPv4 up), IPv6 in the session, DHCPv6 prefix
+delegation over it (docs/ipv6.md step 4). Reconnect with exponential backoff (1 s doubling to 64 s, at
 least 10 s after an authentication failure, reset once a session is up).
 Kernel: `net::pppoe` (svc) + the datapath hooks (architecture.md). MSS
 clamping and ICMP "fragmentation needed" in `crates/fwd`. Lab:
 `LAB_PPPOE=pap|chap scripts/lab-test.sh` (rp-pppoe's `pppoe-server` in the
 ISP VM, also with `LAB_VLAN=848`), `scripts/pppoe-test.sh` (live switch
 between DHCP and PPPoE). PPPoE runs on the apu4 against the developer's ISP (VLAN 848, no
-authentication, since 2026-11-15). Open: IPv6CP + DHCPv6-PD over the
-session (M7), RFC 4638 on hardware (implemented, see below; not usable on
+authentication, since 2026-11-15). Open: IPv6 on the real line (done in
+QEMU), RFC 4638 on hardware (implemented, see below; not usable on
 the developer's line), long-run stability (forced daily disconnects).
 Non-DF packets above the session's MTU are split (2026-11-18).
 
