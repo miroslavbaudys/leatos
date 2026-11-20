@@ -5,9 +5,9 @@
 //! An [`Advertiser`] per network sends unsolicited RAs (the first three at
 //! most 16 s apart, then every 200–600 s) and answers Router Solicitations
 //! ([`Advertiser::solicited`]) with a multicast RA, at most one per 3 s
-//! (§6.2.6). Router lifetime is 0 until the router forwards IPv6 (docs/
-//! ipv6.md step 2): clients take the prefix and DNS server but no default
-//! route through us. [`Advertiser::retire`] sends a last RA that
+//! (§6.2.6). [`RaConfig::router_lifetime`] is 0 while the router has no
+//! IPv6 default route (clients take the prefixes and DNS server but no
+//! default route through us), else [`ROUTER_SECS`]. [`Advertiser::retire`] sends a last RA that
 //! deprecates the prefix, when the network or IPv6 goes away.
 //!
 //! [`Advertiser::poll`] returns a whole Ethernet frame to ff02::1 from the
@@ -35,6 +35,9 @@ pub const DNS_SECS: u32 = 1_800;
 /// A retired prefix stays valid this long (hosts never shorten the valid
 /// lifetime below 2 h on an unauthenticated RA: RFC 4862 §5.5.3 e).
 pub const RETIRED_VALID_SECS: u32 = 7_200;
+/// Router lifetime while the router forwards IPv6 to a default route
+/// (RFC 4861 §6.2.1 default: 3 × the maximum interval).
+pub const ROUTER_SECS: u16 = 1_800;
 
 const ICMPV6_RA: u8 = 134;
 const OPT_SLLA: u8 = 1;
@@ -48,9 +51,11 @@ pub struct RaConfig {
     /// The interface's MAC: the RA's source link-layer address and, as
     /// EUI-64, its source address.
     pub mac: [u8; 6],
-    /// The network's /64 (host bits ignored), advertised on-link and for
-    /// SLAAC.
-    pub prefix: Ipv6Addr,
+    /// The network's /64s (host bits ignored; its ULA, its global one),
+    /// advertised on-link and for SLAAC.
+    pub prefixes: Vec<Ipv6Addr>,
+    /// 0: not a default router.
+    pub router_lifetime: u16,
     /// The link MTU (option 5).
     pub mtu: u32,
     /// DNS servers (the router's own address on the network).
@@ -179,17 +184,20 @@ impl Advertiser {
         icmp.extend_from_slice(&[ICMPV6_RA, 0, 0, 0]);
         icmp.push(64); // current hop limit for the clients
         icmp.push(0); // M = O = 0: SLAAC, no DHCPv6
-        icmp.extend_from_slice(&0u16.to_be_bytes()); // router lifetime: not a default router (yet)
+        let lifetime = if self.retiring { 0 } else { c.router_lifetime };
+        icmp.extend_from_slice(&lifetime.to_be_bytes());
         icmp.extend_from_slice(&[0; 8]); // reachable time, retrans timer: unspecified
         icmp.extend_from_slice(&[OPT_SLLA, 1]);
         icmp.extend_from_slice(&c.mac);
         icmp.extend_from_slice(&[OPT_MTU, 1, 0, 0]);
         icmp.extend_from_slice(&c.mtu.to_be_bytes());
-        icmp.extend_from_slice(&[OPT_PREFIX, 4, 64, 0xc0]); // /64, on-link + autonomous
-        icmp.extend_from_slice(&valid.to_be_bytes());
-        icmp.extend_from_slice(&preferred.to_be_bytes());
-        icmp.extend_from_slice(&[0; 4]);
-        icmp.extend_from_slice(&prefix64(c.prefix).octets());
+        for &p in c.prefixes.iter().take(4) {
+            icmp.extend_from_slice(&[OPT_PREFIX, 4, 64, 0xc0]); // /64, on-link + autonomous
+            icmp.extend_from_slice(&valid.to_be_bytes());
+            icmp.extend_from_slice(&preferred.to_be_bytes());
+            icmp.extend_from_slice(&[0; 4]);
+            icmp.extend_from_slice(&prefix64(p).octets());
+        }
         if !c.rdnss.is_empty() {
             let n = c.rdnss.len().min(8);
             icmp.extend_from_slice(&[OPT_RDNSS, (1 + 2 * n) as u8, 0, 0]);

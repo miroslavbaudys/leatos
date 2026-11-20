@@ -102,7 +102,8 @@ fn ra_config(cfg: &config::Lan, host: &HostIf) -> Option<RaConfig> {
     };
     Some(RaConfig {
         mac: mac.0,
-        prefix: ula,
+        prefixes: vec![ula],
+        router_lifetime: 0,
         mtu: 1500,
         rdnss: vec![ula],
         dnssl: vec![cfg.domain.clone()],
@@ -237,7 +238,7 @@ fn open_net(cfg: config::Lan, host: usize, hosts: &mut [HostIf]) -> Net {
     let dns_tcp = config::dns_tcp().then(|| dns_tcp::Listener::open(sockets));
     log_net(&cfg);
     let ra = ra_config(&cfg, &hosts[host]).map(|c| {
-        println!("  lan services    : {}: ipv6 {}/64, router advertisements", cfg.name, c.prefix);
+        println!("  lan services    : {}: ipv6 {}/64, router advertisements", cfg.name, c.prefixes[0]);
         Advertiser::new(c, now_ms(), timer::ticks() ^ host as u64)
     });
     Net {
@@ -428,7 +429,7 @@ impl LanServices {
                     self.retiring.push((net.host, ra));
                 }
                 (None, Some(c)) => {
-                    println!("  lan services    : {}: ipv6 {}/64, router advertisements", cfg.name, c.prefix);
+                    println!("  lan services    : {}: ipv6 {}/64, router advertisements", cfg.name, c.prefixes[0]);
                     net.ra = Some(Advertiser::new(c, now_ms(), timer::ticks() ^ net.host as u64));
                 }
                 (None, None) => {}

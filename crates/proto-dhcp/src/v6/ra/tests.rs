@@ -13,7 +13,8 @@ const ULA: Ipv6Addr = Ipv6Addr::new(0xfd12, 0x3456, 0x789a, 0, 0, 0, 0, 1);
 fn cfg() -> RaConfig {
     RaConfig {
         mac: MAC,
-        prefix: ULA,
+        prefixes: vec![ULA],
+        router_lifetime: 0,
         mtu: 1500,
         rdnss: vec![ULA],
         dnssl: vec!["home.arpa".to_string()],
@@ -157,6 +158,29 @@ fn new_config_is_advertised_soon() {
     assert_eq!(a.next_deadline(), Some(t));
     a.set_config(c, t + 1); // the same again: nothing new
     assert_eq!(a.next_deadline(), Some(t));
+}
+
+#[test]
+fn global_prefix_and_router_lifetime() {
+    let gua: Ipv6Addr = "2001:db8:100::1".parse().unwrap();
+    let mut c = cfg();
+    c.prefixes.push(gua);
+    c.router_lifetime = ROUTER_SECS;
+    let mut a = Advertiser::new(c, 0, 7);
+    let f = a.poll(0).unwrap();
+    let eth = EthernetFrame::new_checked(&f[..]).unwrap();
+    let ip = Ipv6Packet::new_checked(eth.payload()).unwrap();
+    let icmp = Icmpv6Packet::new_checked(ip.payload()).unwrap();
+    let repr = Icmpv6Repr::parse(&ip.src_addr(), &ip.dst_addr(), &icmp, &ChecksumCapabilities::default()).unwrap();
+    let Icmpv6Repr::Ndisc(NdiscRepr::RouterAdvert { router_lifetime, .. }) = repr else { panic!() };
+    assert_eq!(router_lifetime.secs(), u64::from(ROUTER_SECS));
+    let prefixes: Vec<Vec<u8>> = options(ip.payload()).into_iter().filter(|o| o.0 == OPT_PREFIX).map(|o| o.1[14..30].to_vec()).collect();
+    assert_eq!(prefixes, vec![ULA.octets()[..8].iter().chain(&[0u8; 8]).copied().collect::<Vec<u8>>(), prefix64(gua).octets().to_vec()]);
+    // The last RA: no longer a default router.
+    a.retire(1);
+    let f = a.poll(1).unwrap();
+    let ip = Ipv6Packet::new_checked(&f[14..]).unwrap();
+    assert_eq!(u16::from_be_bytes([ip.payload()[6], ip.payload()[7]]), 0);
 }
 
 #[test]
