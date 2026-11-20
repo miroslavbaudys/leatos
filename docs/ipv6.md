@@ -1,6 +1,6 @@
 # IPv6 (M7, plan)
 
-Status (2026-11-20): steps 0 and 1 done in QEMU (step 0: AAAA rebind protection, Kea for the lab, smoltcp limits, IPv6CP offer logged; step 1: IPv6 on the router's networks, below). Step 2a (conntrack generic over the address family) done too. The apu4 check of the IPv6CP offer waits for the soak run to end. Next: step 2b. First plan 2026-11-15 (checked at
+Status (2026-11-20): steps 0 and 1 done in QEMU (step 0: AAAA rebind protection, Kea for the lab, smoltcp limits, IPv6CP offer logged; step 1: IPv6 on the router's networks, below). Steps 2a (conntrack generic over the address family) and 2b (IPv6 forwarding with a static WAN prefix) done too. The apu4 check of the IPv6CP offer waits for the soak run to end. Next: step 2c (fragments), then step 3. First plan 2026-11-15 (checked at
 2712911); **revised 2026-11-20 against 74cb3d1**, after 135 commits that
 added routed LAN ports and live link slots, the WAN ingress stage, IPv4
 fragments, anti-spoofing, redirects, static routes, DNS views, DoT, the
@@ -336,6 +336,34 @@ both families; the per-host limit by /64; hashes over the whole address.
     unchanged.
 
 ### Step 2b: IPv6 forwarding with a static WAN prefix
+✅ in QEMU (2026-11-20). As built:
+- **Forwarder:** `Verdict::Forward6`; `ct6`, `routes6`, `addrs6` per shard.
+- **Generic tables:** `NeighTable<P, A>` (a cap of 64 entries being
+  resolved per link for IPv6) and `RouteTable<A>`.
+- **Datapath:** `neigh6`, NS sending, ND snooping. `PacketMeta::next_hop`
+  is a `u128`.
+- **CAKE:** `mark_ce` and the ACK filter for IPv6; RAs carry the global
+  /64 and a router lifetime of 1800 s once the WAN has an IPv6 default
+  route.
+- **Development boot arguments:** `wan6_ip=`, `wan6_gw=`, `lan6_prefix=`,
+  `wan_mtu=` and `lan_antispoof=0`.
+- **Status:** `/api/status` `wan_ipv6`, `networks[].ipv6_global`,
+  `icmp_errors`.
+
+Fragments moved to step 2c: later fragments are dropped as `fragment`.
+
+Two things the lab found that host tests could not:
+- **The NA Router flag.** smoltcp, a host stack, sends Neighbor
+  Advertisements without the Router flag. A client that sees its default
+  router's NA without it removes the router (RFC 4861 §7.2.5), so the
+  client's default route vanished seconds after the RA installed it.
+  `net::device` sets the flag on the router stack's NAs
+  (`fwd::wire::ipv6_na_set_router`).
+- **ICMPv6 errors about errors.** An ICMPv6 error is never answered with
+  one (RFC 4443 §2.4 e), also when its quote is not understood. The first
+  version keyed this on "related to a tracked flow".
+
+The plan as written before:
 - `crates/fwd`: `wire::Ipv6View` (extension-header walk, §2), IPv6 LPM
   routes, `Neigh6` with NS/NA and the RFC 6583 bound, `Conntrack6`
   (stateful, inbound blocked), hop limit, ICMPv6 errors (Time Exceeded,
@@ -361,6 +389,14 @@ both families; the per-host limit by /64; hashes over the whole address.
 - Host tests and fuzzing: header walk (`fwd` fuzz target with IPv6
   operations), conntrack6, ICMPv6 errors, PTB, fragments, spoofing. CPU
   cost of the IPv4 path measured before and after: it must not regress.
+
+### Step 2c: IPv6 fragments
+- Forward fragments, don't reassemble: the first fragment must carry the
+  header chain through L4 (RFC 7112) and is decided like a whole packet;
+  later fragments follow it via `frag`, generalised to IPv6 (32-bit ID +
+  the address pair), with the same limits.
+- Lab: a fragmented `ping6 -s 3000` both ways; negative control
+  `LAB_ROUTER_ARGS=fw_frag=0`.
 
 ### Step 3: DHCPv6-PD on a DHCP WAN
 - WAN RA (sans-IO parser in `v6::ra`): default route from the ISP's RA
