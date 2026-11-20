@@ -114,8 +114,11 @@ all until the kernel is confirmed (409, and refused on the console).
 
 ### Leases (`leases` area)
 The bound DHCP leases of every network, as a snapshot: network name, then
-MAC, address and hostname per lease (`proto_dhcp::v4::persist`, record
-version 1). No expiry is stored: at boot every saved lease gets a full
+MAC, address and hostname per lease (`proto_dhcp::v4::persist`). Since
+2026-11-20 record version 2: the same plus the WAN's last delegated IPv6
+prefix, asked for again after a restart (docs/ipv6.md step 5a). A kernel
+that reads only version 1 takes the other slot's older record, or starts
+without leases once both slots hold version 2. No expiry is stored: at boot every saved lease gets a full
 lease time again (`Server::restore`). A client's lease never outlives its
 last renewal plus the lease time, so the router may hold an address too
 long but never hands out one still in use, and renewals need not be

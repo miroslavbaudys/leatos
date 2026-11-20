@@ -516,6 +516,38 @@ The plan as written before:
 - apu4 (after step 0's answer): real ISP, PD, a client on each home
   network, IoT zone without internet over IPv6 too.
 
+### Step 5a: the home line's needs (done in QEMU 2026-11-20)
+After step 4 ran on the apu4 against the home ISP (2026-11-20: IPv6CP up
+at once, a /60 delegated, no RA seen yet), these were added:
+- **The WAN's own global address:** `::1` in the delegated prefix's last
+  /64 (`config::wan_address6`; no network gets that /64, so a /60 leaves
+  15 for networks). It is a /128 in the forwarder and smoltcp, with a
+  default IPv6 route in smoltcp, so the router can send its own IPv6
+  traffic. Many ISPs give no IA_NA.
+- **The ISP's IPv6 DNS servers** (from the delegation's reply) come after
+  the lease's IPv4 ones while the WAN has that address. The resolver's
+  upstreams are `IpAddr`; queries start with the first server and rotate
+  on timeouts, so IPv6 is the fallback. `dns.upstreams` and DoT stay
+  IPv4.
+- **The prefix across reboots:** the lease record (version 2,
+  `persist::encode_v2`) keeps the last delegated prefix; the Solicit asks
+  for it again (`PdConfig::last`). A kernel that reads only version 1
+  takes the other slot's older record. Boot argument `pd_keep=0`: not
+  asked for (the lab's negative control).
+- **Status:** `wan_ipv6` `router_from` (`ra` or `ipv6cp`), `addr`, `dns`;
+  WAN page row, CLI `status` line `wan ipv6`.
+- The boot line "under QEMU" only on virtual machines.
+- **Lab (`LAB_IPV6=1`):**
+  - WAN address and router source checked in status.
+  - `v6dns.isp.example` resolved through the ISP's IPv6-only resolver
+    (2001:db8:ffff::53, handed out by Kea) with its IPv4 DNS stopped;
+    negative control `LAB_IPV6_DNS6=0`.
+  - With a store (`LAB_GUEST=1`): the router reboots while Kea forgets
+    every lease and allocates at random (`cgi-bin/pd?fresh`), and the
+    same prefix comes back; negative control
+    `LAB_ROUTER_ARGS=pd_keep=0`.
+  - The router-side checks read its log up to that reboot.
+
 ### Step 5: the rest
 - Firewall page: IPv6 rules, pinholes by interface identifier, the
   redirect caveat.
