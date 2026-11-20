@@ -17,6 +17,12 @@ author's home router (PC Engines apu4, PPPoE over VLAN). Expect breaking changes
   leases kept across reboots, static routes (option 121)
 - **Forwarding:** NAT (NAPT), zone firewall with rules, port forwards, redirects,
   hairpin, IP fragments, MSS clamping, WAN anti-spoofing
+- **IPv6** (in progress, off by default: `[ipv6] enabled`): DHCPv6 prefix
+  delegation on DHCP and PPPoE (IPv6CP) WANs, prefix kept across reboots, a
+  ULA and a global /64 per network with RAs (SLAAC, RDNSS, DNSSL), stateful
+  firewall with pinholes by interface identifier, anti-spoofing, ICMPv6 errors
+  incl. Packet Too Big, fragments, CAKE for both families, DNS/NTP/DoT over
+  IPv6, AAAA names for DHCP clients, mDNS over `ff02::fb`
 - **Queueing:** CAKE (default), FQ-CoDel or CoDel; shaped upload and a shaped
   download stage, ECN
 - **DNS:** caching forwarder with prefetch and serve-stale, DNS over TCP,
@@ -25,7 +31,7 @@ author's home router (PC Engines apu4, PPPoE over VLAN). Expect breaking changes
 - **Management:** web interface, serial CLI, config in TOML with trial
   changes that revert unless confirmed, kernel upgrades over HTTP with rollback
 
-IPv6 (M7) and a WireGuard server (M12) are planned: see [docs/roadmap.md](docs/roadmap.md).
+IPv6 (M7) is being finished on real hardware; a WireGuard server (M12) is planned: see [docs/roadmap.md](docs/roadmap.md).
 
 ## Platforms
 
