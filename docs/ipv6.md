@@ -3,8 +3,7 @@
 Status (2026-11-20): steps 0–5b done in QEMU (§3). On the apu4 against
 the home ISP (IPv6 over PPPoE): IPv6CP up at once, a /60 delegated, the
 ISP's RA seen, clients online over IPv6 and AAAA names for them; b3079ef
-persisted there with `[ipv6] enabled` in the stored config. Left: the
-measurements in step 5 (IPv6 bufferbloat run, soak), whether IPv6 becomes
+persisted there with `[ipv6] enabled` in the stored config. IPv6 bufferbloat run there: A+/A+, like IPv4. Left: the soak, whether IPv6 becomes
 the default, optional stateful DHCPv6. First plan 2026-11-15 (checked at
 2712911); **revised 2026-11-20 against 74cb3d1**, after 135 commits that
 added routed LAN ports and live link slots, the WAN ingress stage, IPv4
@@ -583,9 +582,18 @@ at once, a /60 delegated, no RA seen yet), these were added:
 ### Step 5: what is left
 The rest of the step 5 plan (firewall page, mDNS on `ff02::fb`, IPv6
 SNTP/DNS/DoT/routes, AAAA names) was built in 5a and 5b. Still open:
-- apu4: bufferbloat run with IPv6 traffic, `mac-internet.sh` without
-  `--ipv4-only`, 72 h soak with IPv6 on (also shows whether IPv6
-  multicast puts pressure on `local_rx` and the packet pool, §4).
+- ✅ apu4 bufferbloat run with IPv6 traffic (2026-11-20, b3079ef, PPPoE,
+  CAKE at 98/18 Mbit/s, `scripts/bufferbloat.sh --ipv6` from a Mac on the
+  LAN, interleaved with IPv4 runs): IPv6 A+/A+ in all 3 runs, added
+  latency 0.4–0.5 ms down and 0.3–0.4 ms up, 88.2–88.4 / 15.2–16.3
+  Mbit/s; IPv4 0.5 / 0.5–0.7 ms, 88.7–89.7 / 15.6–16.6 Mbit/s (one
+  earlier IPv4 run: 15.2 ms down, A). The ~1 % less IPv6 throughput is the
+  20 B larger header. Download max 37–43 ms in both families (slow
+  start). Valid: shaper drops in both directions (WAN egress ~500,
+  ingress 1300–2200 per run), no pool failures.
+- apu4: `mac-internet.sh` without `--ipv4-only`, 72 h soak with IPv6 on
+  (also shows whether IPv6 multicast puts pressure on `local_rx` and the
+  packet pool, §4).
 - IPv6 on by default (`[ipv6] enabled`): §2 says on once step 4 runs on
   the apu4, which it has; not switched yet.
 - Optional: stateful DHCPv6 server on the LAN (M flag).

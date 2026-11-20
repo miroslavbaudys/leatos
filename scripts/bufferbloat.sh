@@ -2,7 +2,8 @@
 # Bufferbloat test: latency idle vs. under saturating download / upload load.
 #
 # Runs three phases against public endpoints (Cloudflare speed test, ping to
-# 1.1.1.1), each with a ping stream every 0.2 s:
+# 1.1.1.1, or 2606:4700:4700::1111 with --ipv6), each with a ping stream
+# every 0.2 s:
 #   idle      10 s, no load
 #   download  15 s, N parallel downloads
 #   upload    15 s, N parallel uploads
@@ -14,12 +15,17 @@
 # by path: "direct", "leatos-debug", "leatos-release" (from the
 # mac-internet state file), or --label NAME.
 #
-# Usage: scripts/bufferbloat.sh [--label NAME] [--streams N] [--no-upload] [--duration S]
+# Pings and loads use one address family: IPv4 by default, IPv6 with --ipv6
+# (curl -4 / -6, so a dual-stack host does not mix them); the label gets
+# "-ipv6".
+#
+# Usage: scripts/bufferbloat.sh [--label NAME] [--streams N] [--no-upload] [--duration S] [--ipv6]
 # No sudo needed. Uses roughly 100-500 MB of traffic, depending on your line.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PING_TARGET=1.1.1.1
+FAMILY=4
 # Cloudflare refuses single downloads above ~50 MB (HTTP 403), so each stream
 # fetches 25 MB chunks back to back until the phase ends.
 CHUNK=25000000
@@ -46,7 +52,8 @@ while [[ $# -gt 0 ]]; do
     --streams) STREAMS="${2:?}"; shift 2 ;;
     --duration) DURATION="${2:?}"; shift 2 ;;
     --no-upload) UPLOAD=0; shift ;;
-    -h | --help) sed -n '2,19p' "$0"; exit 0 ;;
+    --ipv6) FAMILY=6; PING_TARGET=2606:4700:4700::1111; shift ;;
+    -h | --help) sed -n '2,23p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -55,7 +62,11 @@ WORK=$(mktemp -d -t leatos-bloat)
 trap 'rm -rf "$WORK"; jobs -p | xargs kill 2>/dev/null || true' EXIT
 
 # ---- which path are we measuring? ---------------------------------------------------------
-gw=$(route -n get "$PING_TARGET" 2>/dev/null | awk '/gateway:/{print $2}')
+if [[ "$FAMILY" == 6 ]]; then
+  gw=$(route -n get -inet6 "$PING_TARGET" 2>/dev/null | awk '/gateway:/{print $2}')
+else
+  gw=$(route -n get "$PING_TARGET" 2>/dev/null | awk '/gateway:/{print $2}')
+fi
 if [[ -z "$LABEL" ]]; then
   if [[ "$gw" == 192.168.1.1 ]]; then
     build=$(sed -n 's/^BUILD=//p' lab/cache/mac-internet.state 2>/dev/null || true)
@@ -65,12 +76,18 @@ if [[ -z "$LABEL" ]]; then
   else
     LABEL=direct
   fi
+  [[ "$FAMILY" == 6 ]] && LABEL+=-ipv6
 fi
 echo "== bufferbloat test: path '$LABEL' (gateway $gw), $STREAMS streams, ${DURATION}s per load phase"
 
 # ---- helpers -------------------------------------------------------------------------------------
 pinger() { # seconds outfile
-  ping -i 0.2 -c $(($1 * 5)) -t $(($1 + 3)) "$PING_TARGET" >"$2" 2>&1 || true
+  if [[ "$FAMILY" == 6 ]]; then
+    # ping6 has no -t: the count ends it (lost replies only add the last wait).
+    ping6 -i 0.2 -c $(($1 * 5)) "$PING_TARGET" >"$2" 2>&1 || true
+  else
+    ping -i 0.2 -c $(($1 * 5)) -t $(($1 + 3)) "$PING_TARGET" >"$2" 2>&1 || true
+  fi
 }
 
 # RTT samples (ms, one per line) from ping output.
@@ -111,9 +128,9 @@ load() { # download|upload
         left=$(( end - $(date +%s) ))
         [[ $left -gt 0 ]] || break
         if [[ "$1" == download ]]; then
-          out=$(curl -s -o /dev/null -m "$left" -r "0-$((CHUNK - 1))" -w '%{http_code} %{size_download}' "${DL_URLS[$src]}" 2>/dev/null || true)
+          out=$(curl -"$FAMILY" -s -o /dev/null -m "$left" -r "0-$((CHUNK - 1))" -w '%{http_code} %{size_download}' "${DL_URLS[$src]}" 2>/dev/null || true)
         else
-          out=$(curl -s -o /dev/null -m "$left" -X POST -H 'Content-Type: application/octet-stream' \
+          out=$(curl -"$FAMILY" -s -o /dev/null -m "$left" -X POST -H 'Content-Type: application/octet-stream' \
             --data-binary @"$WORK/chunk" -w '%{http_code} %{size_upload}' "$UL_URL" 2>/dev/null || true)
         fi
         code=${out%% *}
