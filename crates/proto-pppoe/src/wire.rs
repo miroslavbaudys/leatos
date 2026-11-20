@@ -15,6 +15,7 @@ pub type Mac = [u8; 6];
 
 pub const ETH_HDR: usize = 14;
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
+pub const ETHERTYPE_IPV6: u16 = 0x86dd;
 pub const ETHERTYPE_DISCOVERY: u16 = 0x8863;
 pub const ETHERTYPE_SESSION: u16 = 0x8864;
 /// Version/type byte: version 1, type 1.
@@ -158,6 +159,8 @@ pub enum SessionRx {
     /// IPv4 in the current session: `len` bytes of IP packet after the
     /// 22 bytes of headers ([`decap_ipv4`]).
     Ipv4 { len: usize },
+    /// IPv6 (PPP 0x0057) in the current session ([`decap_ipv6`]).
+    Ipv6 { len: usize },
     /// Anything else (LCP, authentication, NCPs, another session, a
     /// malformed frame): for the control plane, which checks it.
     Control,
@@ -175,10 +178,13 @@ pub fn classify_session(frame: &[u8], session: Option<Session>) -> SessionRx {
                 && p.session == s.id
                 && p.src == s.peer
                 && p.payload.len() >= 2
-                && get16(p.payload, 0) == PPP_IPV4 =>
+                && matches!(get16(p.payload, 0), PPP_IPV4 | PPP_IPV6) =>
         {
-            SessionRx::Ipv4 {
-                len: p.payload.len() - 2,
+            let len = p.payload.len() - 2;
+            if get16(p.payload, 0) == PPP_IPV4 {
+                SessionRx::Ipv4 { len }
+            } else {
+                SessionRx::Ipv6 { len }
             }
         }
         _ => SessionRx::Control,
@@ -191,8 +197,17 @@ pub fn classify_session(frame: &[u8], session: Option<Session>) -> SessionRx {
 /// frame starts at offset [`SESSION_OVERHEAD`] and is `ETH_HDR + len`
 /// bytes long.
 pub fn decap_ipv4(frame: &mut [u8]) {
+    decap(frame, ETHERTYPE_IPV4);
+}
+
+/// [`decap_ipv4`] for [`SessionRx::Ipv6`]: EtherType 0x86DD.
+pub fn decap_ipv6(frame: &mut [u8]) {
+    decap(frame, ETHERTYPE_IPV6);
+}
+
+fn decap(frame: &mut [u8], ethertype: u16) {
     frame.copy_within(0..12, SESSION_OVERHEAD);
-    put16(frame, SESSION_OVERHEAD + 12, ETHERTYPE_IPV4);
+    put16(frame, SESSION_OVERHEAD + 12, ethertype);
 }
 
 /// Encapsulate an Ethernet/IPv4 frame for session `s`: `frame` is the
@@ -202,6 +217,15 @@ pub fn decap_ipv4(frame: &mut [u8]) {
 /// PPP protocol field over the first 22 bytes; the old EtherType's place
 /// becomes the protocol field.
 pub fn encap_ipv4(frame: &mut [u8], s: Session, src: Mac) {
+    encap(frame, s, src, PPP_IPV4);
+}
+
+/// [`encap_ipv4`] for an Ethernet/IPv6 frame (PPP protocol 0x0057).
+pub fn encap_ipv6(frame: &mut [u8], s: Session, src: Mac) {
+    encap(frame, s, src, PPP_IPV6);
+}
+
+fn encap(frame: &mut [u8], s: Session, src: Mac, proto: u16) {
     let ip_len = frame.len() - SESSION_OVERHEAD - ETH_HDR;
     frame[0..6].copy_from_slice(&s.peer);
     frame[6..12].copy_from_slice(&src);
@@ -210,7 +234,7 @@ pub fn encap_ipv4(frame: &mut [u8], s: Session, src: Mac) {
     frame[15] = 0;
     put16(frame, 16, s.id);
     put16(frame, 18, (ip_len + 2) as u16);
-    put16(frame, 20, PPP_IPV4);
+    put16(frame, 20, proto);
 }
 
 /// A PADT for session `s` into `buf` (at least [`MIN_FRAME`] bytes, zeroed

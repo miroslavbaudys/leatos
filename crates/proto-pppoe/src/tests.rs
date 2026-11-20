@@ -31,6 +31,16 @@ struct Ac {
     answer_echo: bool,
     reject_dns: bool,
     offer_ipv6cp: bool,
+    /// IPv6CP: the AC's interface identifier (it takes a NAK's suggestion).
+    ac_ifid: [u8; 8],
+    /// Answer the client's IPv6CP with a Protocol-Reject (pppd noipv6).
+    v6_proto_reject: bool,
+    /// NAK the client's first IPv6CP request with this identifier.
+    nak_our_ifid: Option<[u8; 8]>,
+    v6_ours_acked: bool,
+    v6_theirs_acked: bool,
+    /// IPv6CP frames the client sent.
+    ipv6cp_frames: u32,
     /// Second DNS server handed out (pppd with one `ms-dns` repeats it).
     dns2: Ipv4Addr,
     /// Send no PADS (lost).
@@ -77,6 +87,12 @@ impl Ac {
             answer_echo: true,
             reject_dns: false,
             offer_ipv6cp: false,
+            ac_ifid: [0, 0, 0, 0, 0, 0, 0, 1],
+            v6_proto_reject: false,
+            nak_our_ifid: None,
+            v6_ours_acked: false,
+            v6_theirs_acked: false,
+            ipv6cp_frames: 0,
             dns2: DNS2,
             drop_padr: false,
             rfc4638: false,
@@ -153,7 +169,7 @@ impl Ac {
             out.push(self.ppp(PPP_IPCP, &ctrl(CONF_REQ, 1, &o)));
             if self.offer_ipv6cp {
                 let mut o = Vec::new();
-                put_option(&mut o, 1, &[0, 0, 0, 0, 0, 0, 0, 1]);
+                put_option(&mut o, 1, &self.ac_ifid);
                 out.push(self.ppp(PPP_IPV6CP, &ctrl(CONF_REQ, 1, &o)));
             }
         }
@@ -224,7 +240,38 @@ impl Ac {
         assert_eq!((p.session, p.dst), (self.session, self.mac));
         let proto = get16(p.payload, 0);
         let c = parse_ctrl(&p.payload[2..]).expect("control packet");
+        if proto == PPP_IPV6CP {
+            self.ipv6cp_frames += 1;
+        }
         match proto {
+            PPP_IPV6CP if self.v6_proto_reject => {
+                let mut d = PPP_IPV6CP.to_be_bytes().to_vec();
+                d.extend_from_slice(&p.payload[2..]);
+                out.push(self.ppp(PPP_LCP, &ctrl(PROTO_REJ, 99, &d)));
+            }
+            PPP_IPV6CP if self.offer_ipv6cp => match c.code {
+                CONF_REQ => {
+                    let opts = options(c.data).unwrap();
+                    assert!(opts.iter().all(|o| o.0 == 1 && o.1.len() == 8), "only an interface identifier");
+                    if let Some(n) = self.nak_our_ifid.take() {
+                        let mut o = Vec::new();
+                        put_option(&mut o, 1, &n);
+                        out.push(self.ppp(PPP_IPV6CP, &ctrl(CONF_NAK, c.id, &o)));
+                    } else {
+                        out.push(self.ppp(PPP_IPV6CP, &ctrl(CONF_ACK, c.id, c.data)));
+                        self.v6_theirs_acked = true;
+                    }
+                }
+                CONF_NAK => {
+                    let opts = options(c.data).unwrap();
+                    self.ac_ifid = opts[0].1.try_into().unwrap();
+                    let mut o = Vec::new();
+                    put_option(&mut o, 1, &self.ac_ifid);
+                    out.push(self.ppp(PPP_IPV6CP, &ctrl(CONF_REQ, 2, &o)));
+                }
+                CONF_ACK => self.v6_ours_acked = true,
+                _ => {}
+            },
             PPP_LCP => match c.code {
                 CONF_REQ => {
                     let opts = options(c.data).unwrap();
@@ -1138,4 +1185,185 @@ fn rfc4638_ac_asking_1492_is_asked_for_1500() {
     assert!(r.c.jumbo_failed());
     assert_eq!(r.up(), Some(&expected_link(1492)));
     assert_eq!(r.c.rfc4638_trace().unwrap().our_mru, Some(1492));
+}
+
+fn v6_run() -> Run {
+    Run::new(Config {
+        username: "alice@isp".into(),
+        password: "s3cret".into(),
+        ipv6: true,
+        ..Config::default()
+    })
+}
+
+fn ll(iid: [u8; 8]) -> Ipv6Addr {
+    link_local(iid)
+}
+
+fn ipv6_events(r: &Run) -> Vec<&Event> {
+    r.events.iter().filter(|e| matches!(e, Event::Ipv6Up { .. } | Event::Ipv6Down)).collect()
+}
+
+#[test]
+fn ipv6cp_comes_up_with_link_local_addresses() {
+    let mut ac = Ac::new(SimAuth::Pap);
+    ac.offer_ipv6cp = true;
+    let mut r = v6_run();
+    r.run(&mut [&mut ac], 1000);
+    assert!(r.up().is_some());
+    assert!(ac.v6_ours_acked && ac.v6_theirs_acked);
+    assert!(ac.proto_rejects.is_empty());
+    let local = ll([0, 0, 0, 0xff, 0xfe, 0, 0, 1]); // modified EUI-64 of 02:00:00:00:00:01
+    let remote = Some(ll([0, 0, 0, 0, 0, 0, 0, 1]));
+    assert_eq!(ipv6_events(&r), vec![&Event::Ipv6Up { local, remote }]);
+    assert_eq!(r.c.ipv6(), Some((local, remote)));
+    // After Up: IPv4 first, then IPv6 (the kernel keys IPv6 on the link).
+    let up = r.events.iter().position(|e| matches!(e, Event::Up(_))).unwrap();
+    let v6 = r.events.iter().position(|e| matches!(e, Event::Ipv6Up { .. })).unwrap();
+    assert!(up < v6);
+    assert!(!r.events.iter().any(|e| matches!(e, Event::PeerOffersIpv6 { .. })));
+    assert_eq!(r.c.ipv6cp_requests(), 1, "still counted");
+}
+
+#[test]
+fn ipv6cp_peer_with_our_identifier_is_naked() {
+    let mut ac = Ac::new(SimAuth::Pap);
+    ac.offer_ipv6cp = true;
+    ac.ac_ifid = [0, 0, 0, 0xff, 0xfe, 0, 0, 1]; // ours
+    let mut r = v6_run();
+    r.run(&mut [&mut ac], 1000);
+    assert_eq!(ac.ac_ifid, [0, 0, 0, 0xff, 0xfe, 0, 0, 0], "took our suggestion");
+    assert_eq!(
+        ipv6_events(&r),
+        vec![&Event::Ipv6Up {
+            local: ll([0, 0, 0, 0xff, 0xfe, 0, 0, 1]),
+            remote: Some(ll([0, 0, 0, 0xff, 0xfe, 0, 0, 0]))
+        }]
+    );
+}
+
+#[test]
+fn ipv6cp_zero_identifier_from_the_peer_is_naked() {
+    let mut ac = Ac::new(SimAuth::Pap);
+    ac.offer_ipv6cp = true;
+    ac.ac_ifid = [0; 8];
+    let mut r = v6_run();
+    r.run(&mut [&mut ac], 1000);
+    assert_ne!(ac.ac_ifid, [0; 8]);
+    assert!(r.c.ipv6().is_some_and(|(_, p)| p == Some(ll(ac.ac_ifid))));
+}
+
+#[test]
+fn ipv6cp_takes_the_peers_suggestion() {
+    let mut ac = Ac::new(SimAuth::Pap);
+    ac.offer_ipv6cp = true;
+    ac.nak_our_ifid = Some([0x12, 0x34, 0, 0, 0, 0, 0, 0x56]);
+    let mut r = v6_run();
+    r.run(&mut [&mut ac], 1000);
+    assert_eq!(r.c.ipv6().map(|(l, _)| l), Some(ll([0x12, 0x34, 0, 0, 0, 0, 0, 0x56])));
+}
+
+#[test]
+fn ipv6cp_protocol_rejected_keeps_ipv4() {
+    // pppd with noipv6.
+    let mut ac = Ac::new(SimAuth::Pap);
+    ac.v6_proto_reject = true;
+    let mut r = v6_run();
+    r.run(&mut [&mut ac], 30_000);
+    assert!(r.up().is_some());
+    assert!(r.downs().is_empty());
+    assert!(ipv6_events(&r).is_empty());
+    assert_eq!(r.c.ipv6(), None);
+    assert_eq!(ac.ipv6cp_frames, 1, "no retries after the reject");
+}
+
+#[test]
+fn ipv6cp_unanswered_gives_up_keeps_ipv4() {
+    let mut ac = Ac::new(SimAuth::Pap); // ignores IPv6CP
+    let mut r = v6_run();
+    r.run(&mut [&mut ac], 120_000);
+    assert!(r.up().is_some());
+    assert!(r.downs().is_empty());
+    assert!(ipv6_events(&r).is_empty());
+    let n = ac.ipv6cp_frames;
+    assert!((2..=10).contains(&n), "bounded retries ({n})");
+    r.run(&mut [&mut ac], 60_000);
+    assert_eq!(ac.ipv6cp_frames, n, "stopped");
+}
+
+#[test]
+fn ipv6_off_still_rejects_ipv6cp() {
+    let mut ac = Ac::new(SimAuth::Pap);
+    ac.offer_ipv6cp = true;
+    let mut r = Run::pap();
+    r.run(&mut [&mut ac], 1000);
+    assert_eq!(ac.proto_rejects, vec![PPP_IPV6CP]);
+    assert!(ipv6_events(&r).is_empty());
+}
+
+#[test]
+fn ipv6_goes_down_before_the_session() {
+    let mut ac = Ac::new(SimAuth::Pap);
+    ac.offer_ipv6cp = true;
+    let mut r = v6_run();
+    r.run(&mut [&mut ac], 1000);
+    r.c.handle_frame(r.now, &discovery(CLIENT, AC_MAC, PADT, 0x1234, &[]));
+    r.run(&mut [], 0);
+    let n = r.events.len();
+    assert!(matches!(r.events[n - 2], Event::Ipv6Down), "{:?}", &r.events[n - 2..]);
+    assert!(matches!(r.events[n - 1], Event::Down { was_up: true, .. }));
+    assert_eq!(r.c.ipv6(), None);
+}
+
+#[test]
+fn ipv6cp_terminated_and_restarted_by_the_peer() {
+    let mut ac = Ac::new(SimAuth::Pap);
+    ac.offer_ipv6cp = true;
+    let mut r = v6_run();
+    r.run(&mut [&mut ac], 1000);
+    r.c.handle_frame(r.now, &ac.ppp(PPP_IPV6CP, &ctrl(TERM_REQ, 5, b"")));
+    let f = r.c.poll_transmit().unwrap();
+    let p = parse(&f).unwrap();
+    assert_eq!(get16(p.payload, 0), PPP_IPV6CP);
+    assert_eq!(parse_ctrl(&p.payload[2..]).unwrap().code, TERM_ACK);
+    r.run(&mut [&mut ac], 0);
+    assert!(matches!(ipv6_events(&r)[..], [Event::Ipv6Up { .. }, Event::Ipv6Down]));
+    assert!(r.downs().is_empty(), "IPv4 stays");
+    // The peer starts again: a new request brings IPv6 back.
+    let mut o = Vec::new();
+    put_option(&mut o, 1, &ac.ac_ifid);
+    r.c.handle_frame(r.now, &ac.ppp(PPP_IPV6CP, &ctrl(CONF_REQ, 7, &o)));
+    r.run(&mut [&mut ac], 1000);
+    assert!(matches!(ipv6_events(&r)[..], [Event::Ipv6Up { .. }, Event::Ipv6Down, Event::Ipv6Up { .. }]));
+}
+
+#[test]
+fn ipv6_data_before_ipv6cp_is_discarded() {
+    let mut ac = Ac::new(SimAuth::Pap);
+    let mut r = v6_run();
+    r.run(&mut [&mut ac], 1000);
+    r.c.handle_frame(r.now, &ac.ppp(PPP_IPV6, &[0x60; 40]));
+    while let Some(f) = r.c.poll_transmit() {
+        let p = parse(&f).unwrap();
+        assert_ne!(get16(p.payload, 0), PPP_LCP, "no Protocol-Reject of IPv6 data");
+    }
+}
+
+#[test]
+fn encap_decap_ipv6_roundtrip() {
+    let s = Session { id: 7, peer: AC_MAC };
+    let mut plain = ip_frame(30);
+    plain[12..14].copy_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
+    let mut buf = vec![0u8; SESSION_OVERHEAD];
+    buf.extend_from_slice(&plain);
+    encap_ipv6(&mut buf, s, CLIENT);
+    let p = parse(&buf).unwrap();
+    assert_eq!(get16(p.payload, 0), PPP_IPV6);
+    let from = Session { id: 7, peer: CLIENT };
+    let SessionRx::Ipv6 { len } = classify_session(&buf, Some(from)) else {
+        panic!()
+    };
+    decap_ipv6(&mut buf);
+    let out = &buf[SESSION_OVERHEAD..SESSION_OVERHEAD + ETH_HDR + len];
+    assert_eq!(&out[12..], &plain[12..]);
 }

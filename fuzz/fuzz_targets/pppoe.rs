@@ -4,18 +4,19 @@
 //! its configure requests, PAP/CHAP, IPCP), so sequences reach LCP, the
 //! authentication and IPCP; any frame may be damaged or replaced by raw
 //! bytes. Checks: everything the client sends parses as PPPoE from its own
-//! MAC; its transmit queue stays bounded.
+//! MAC; its transmit queue stays bounded; with IPv6 (IPv6CP) on, IPv6 is
+//! reported up only while the link is up, and down once per up.
 #![no_main]
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use proto_pppoe::wire::{self, *};
-use proto_pppoe::{Client, Config};
+use proto_pppoe::{Client, Config, Event};
 use leatos_fuzz::damage;
 
 const CLIENT: [u8; 6] = [2, 0, 0, 0, 0, 1];
 const AC: [u8; 6] = [2, 0xac, 0, 0, 0, 1];
-const PROTOS: [u16; 6] = [PPP_LCP, PPP_PAP, PPP_CHAP, PPP_IPCP, PPP_IPV6CP, PPP_IPV4];
+const PROTOS: [u16; 7] = [PPP_LCP, PPP_PAP, PPP_CHAP, PPP_IPCP, PPP_IPV6CP, PPP_IPV4, PPP_IPV6];
 
 #[derive(Arbitrary, Debug)]
 enum Op {
@@ -58,12 +59,44 @@ impl Ac {
     }
 }
 
-fuzz_target!(|input: (u64, bool, Vec<Op>)| {
-    let (seed, auth, ops) = input;
+/// Link and IPv6 state from the events, checked as they come.
+#[derive(Default)]
+struct Seen {
+    up: bool,
+    v6: bool,
+}
+
+impl Seen {
+    fn take(&mut self, c: &mut Client) {
+        while let Some(e) = c.poll_event() {
+            match e {
+                Event::Up(_) => self.up = true,
+                Event::Down { .. } => {
+                    assert!(!self.v6, "session down while IPv6 is reported up");
+                    self.up = false;
+                }
+                Event::Ipv6Up { .. } => {
+                    assert!(self.up && !self.v6, "IPv6 up without the link, or twice");
+                    self.v6 = true;
+                }
+                Event::Ipv6Down => {
+                    assert!(self.v6, "IPv6 down without up");
+                    self.v6 = false;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(c.ipv6().is_some(), self.v6);
+    }
+}
+
+fuzz_target!(|input: (u64, bool, bool, Vec<Op>)| {
+    let (seed, auth, ipv6, ops) = input;
     let cfg = Config {
         username: if auth { "user".into() } else { String::new() },
         password: "secret".into(),
         mtu: 1500,
+        ipv6,
         ..Config::default()
     };
     let mut c = Client::new(cfg, CLIENT, seed);
@@ -71,11 +104,12 @@ fuzz_target!(|input: (u64, bool, Vec<Op>)| {
     let mut now = 0u64;
     c.start(now);
     let mut pending_damage: Option<Vec<u8>> = None;
+    let mut seen = Seen::default();
     for op in ops.into_iter().take(150) {
         while let Some(f) = c.poll_transmit() {
             ac.observe(&f);
         }
-        while c.poll_event().is_some() {}
+        seen.take(&mut c);
         let uniq = find_tag(&ac.discovery, TAG_HOST_UNIQ).unwrap_or(b"").to_vec();
         let mut frame = match op {
             Op::Pado { cookie, ac_name, max_payload, error_tag, keep_uniq } => {
@@ -103,7 +137,7 @@ fuzz_target!(|input: (u64, bool, Vec<Op>)| {
             }
             Op::Padt => discovery(CLIENT, AC, PADT, ac.session, &[]),
             Op::Answer { proto, code } => {
-                let proto = PROTOS[proto as usize % 4];
+                let proto = PROTOS[proto as usize % 5];
                 let Some((_, id, data)) = ac.last_ctrl.iter().find(|(p, ..)| *p == proto).cloned() else { continue };
                 let code = [CONF_ACK, CONF_ACK, CONF_NAK, CONF_REJ, ECHO_REQ + 1][code as usize % 5];
                 let body = match proto {
@@ -127,6 +161,7 @@ fuzz_target!(|input: (u64, bool, Vec<Op>)| {
             Op::Tick(ms) => {
                 now += u64::from(ms) * 20;
                 c.poll(now);
+                seen.take(&mut c);
                 continue;
             }
             Op::Damage(noise) => {

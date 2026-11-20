@@ -1,6 +1,8 @@
 //! PPPoE client (RFC 2516) with the PPP it carries (RFC 1661): discovery
 //! (PADI/PADO/PADR/PADS/PADT), LCP with echo keepalive, PAP (RFC 1334) or
-//! CHAP-MD5 (RFC 1994), and IPCP with DNS servers (RFC 1332, RFC 1877).
+//! CHAP-MD5 (RFC 1994), IPCP with DNS servers (RFC 1332, RFC 1877) and,
+//! with [`Config::ipv6`], IPv6CP (RFC 5072: interface identifiers, so
+//! link-local addresses; prefixes come by DHCPv6 over the session).
 //! See `docs/soho-features.md#pppoe`.
 //!
 //! ```text
@@ -15,8 +17,8 @@
 //! ([`Client::poll`]), and takes frames to send
 //! ([`Client::poll_transmit`]) and [`Event`]s. IPv4 data never passes
 //! through it: the datapath encapsulates and decapsulates that itself
-//! ([`wire::encap_ipv4`], [`wire::decap_ipv4`]) for the [`Session`] the
-//! client reports.
+//! ([`wire::encap_ipv4`], [`wire::decap_ipv4`], and the IPv6 ones) for
+//! the [`Session`] the client reports.
 //!
 //! RFC 4638 (MTU above 1492, "baby jumbo" frames): with [`Config::mtu`]
 //! above 1492 the PADI and PADR carry PPP-Max-Payload; only if the AC echoes
@@ -42,7 +44,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
 use fsm::{Change, Fsm, Judge, Options, Verdict};
 use wire::*;
 pub use wire::{Mac, Session};
@@ -88,6 +90,11 @@ pub struct Config {
     pub echo_interval_secs: u32,
     /// Unanswered echo requests before the link counts as dead.
     pub echo_failures: u32,
+    /// Negotiate IPv6CP beside IPCP (our interface identifier: the
+    /// modified EUI-64 of the MAC). Off: the peer's IPv6CP is
+    /// Protocol-Rejected ([`Event::PeerOffersIpv6`]). IPv6CP failing never
+    /// takes the session down.
+    pub ipv6: bool,
 }
 
 impl Default for Config {
@@ -100,6 +107,7 @@ impl Default for Config {
             mtu: MAX_MTU,
             echo_interval_secs: 10,
             echo_failures: 5,
+            ipv6: false,
         }
     }
 }
@@ -166,11 +174,18 @@ pub enum Event {
     Up(Link),
     /// The session attempt or the session ended; `was_up` = after [`Event::Up`].
     Down { reason: Reason, was_up: bool },
-    /// The peer's first IPv6CP Configure-Request in this session: it
-    /// offers IPv6. We still answer with a Protocol-Reject (IPv6 is M7);
-    /// `options` are the request's raw options (RFC 5072: type 1 =
-    /// Interface-Identifier), for the log.
+    /// Without [`Config::ipv6`]: the peer's first IPv6CP
+    /// Configure-Request in this session. It offers IPv6; we answer with
+    /// a Protocol-Reject. `options` are the request's raw options
+    /// (RFC 5072: type 1 = Interface-Identifier), for the log.
     PeerOffersIpv6 { options: Vec<u8> },
+    /// IPv6CP opened while the link is up (after [`Event::Up`]): IPv6 can
+    /// flow. `local`/`remote` are the link-local addresses from the
+    /// interface identifiers (`remote` None: the peer sent none).
+    Ipv6Up { local: Ipv6Addr, remote: Option<Ipv6Addr> },
+    /// IPv6 stopped (IPv6CP renegotiated, terminated or rejected, or the
+    /// session went down: then before [`Event::Down`]).
+    Ipv6Down,
 }
 
 /// Where the client is, for status output.
@@ -404,6 +419,85 @@ impl Options for Ipcp {
     }
 }
 
+const IPV6CP_IFID: u8 = 1;
+
+/// The modified EUI-64 interface identifier of `mac` (RFC 4291).
+fn eui64(mac: Mac) -> [u8; 8] {
+    [mac[0] ^ 2, mac[1], mac[2], 0xff, 0xfe, mac[3], mac[4], mac[5]]
+}
+
+fn link_local(iid: [u8; 8]) -> Ipv6Addr {
+    let mut a = [0u8; 16];
+    a[0] = 0xfe;
+    a[1] = 0x80;
+    a[8..].copy_from_slice(&iid);
+    Ipv6Addr::from(a)
+}
+
+struct Ipv6cp {
+    local: [u8; 8],
+    remote: Option<[u8; 8]>,
+    /// The peer rejected the option: we keep ours (RFC 5072 §4.1).
+    rejected: bool,
+}
+
+impl Ipv6cp {
+    fn new(mac: Mac) -> Self {
+        Ipv6cp { local: eui64(mac), remote: None, rejected: false }
+    }
+
+    /// For a peer whose identifier is zero or ours: one that is neither.
+    fn suggestion(&self) -> [u8; 8] {
+        let mut x = self.local;
+        x[7] ^= 1;
+        if x == [0; 8] {
+            x[7] = 2;
+        }
+        x
+    }
+}
+
+impl Options for Ipv6cp {
+    fn request(&self) -> Vec<u8> {
+        let mut o = Vec::new();
+        if !self.rejected {
+            put_option(&mut o, IPV6CP_IFID, &self.local);
+        }
+        o
+    }
+
+    fn on_nak(&mut self, opts: &[(u8, &[u8])]) {
+        for &(k, v) in opts {
+            if k == IPV6CP_IFID
+                && let Ok(id) = <[u8; 8]>::try_from(v)
+                && id != [0; 8]
+                && Some(id) != self.remote
+            {
+                self.local = id;
+            }
+        }
+    }
+
+    fn on_reject(&mut self, opts: &[(u8, &[u8])]) {
+        if opts.iter().any(|o| o.0 == IPV6CP_IFID) {
+            self.rejected = true;
+        }
+    }
+
+    fn check(&mut self, opts: &[(u8, &[u8])]) -> Verdict {
+        let mut j = Judge::default();
+        for &(k, v) in opts {
+            match (k, <[u8; 8]>::try_from(v)) {
+                (IPV6CP_IFID, Ok(id)) if id == [0; 8] || id == self.local => j.nak(k, &self.suggestion()),
+                (IPV6CP_IFID, Ok(id)) => self.remote = Some(id),
+                // Header compression, anything else: not supported.
+                _ => j.reject(k, v),
+            }
+        }
+        j.verdict()
+    }
+}
+
 enum AuthPhase {
     Pap { id: u8, next: u64, tries: u32 },
     Chap { deadline: u64 },
@@ -417,6 +511,12 @@ struct Sess {
     auth: Option<AuthPhase>,
     /// Auth done (or not required): IPCP runs.
     ipcp: Option<(Fsm, Ipcp)>,
+    /// With [`Config::ipv6`], from auth done; None again once it failed,
+    /// was rejected or terminated (a later request from the peer starts
+    /// it again).
+    ipv6cp: Option<(Fsm, Ipv6cp)>,
+    /// [`Event::Ipv6Up`] reported, not yet [`Event::Ipv6Down`].
+    ipv6_reported: bool,
     up: bool,
     next_echo: u64,
     echo_id: u8,
@@ -626,6 +726,7 @@ impl Client {
                     None => None,
                 });
                 min(s.ipcp.as_ref().and_then(|(f, _)| f.deadline()));
+                min(s.ipv6cp.as_ref().and_then(|(f, _)| f.deadline()));
                 if s.up && self.cfg.echo_interval_secs > 0 {
                     min(Some(s.next_echo));
                 }
@@ -683,6 +784,12 @@ impl Client {
 
     /// Give up on this attempt (or session): wait, then discover again.
     fn fail(&mut self, now: u64, reason: Reason, padt: bool) {
+        if let Phase::Session(s) = &mut self.phase
+            && s.ipv6_reported
+        {
+            s.ipv6_reported = false;
+            self.events.push_back(Event::Ipv6Down);
+        }
         let was_up = match &self.phase {
             Phase::Session(s) => {
                 let (sess, up) = (s.s, s.up);
@@ -775,6 +882,13 @@ impl Client {
                 failed = failed.or(Some(Reason::Negotiation("IPCP: no answer")));
             }
             out.extend(f.out.drain(..).map(|b| (PPP_IPCP, b)));
+        }
+        if let Some((f, o)) = &mut s.ipv6cp {
+            let gave_up = f.poll(now, o) == Change::Failed;
+            out.extend(f.out.drain(..).map(|b| (PPP_IPV6CP, b)));
+            if gave_up {
+                s.ipv6cp = None; // no answer: no IPv6, the session stays
+            }
         }
         if let Some(j) = &mut s.jumbo_check
             && now >= j.next
@@ -936,6 +1050,8 @@ impl Client {
             lcp,
             auth: None,
             ipcp: None,
+            ipv6cp: None,
+            ipv6_reported: false,
             up: false,
             next_echo: 0,
             echo_id: 0,
@@ -958,6 +1074,9 @@ impl Client {
         if let Some((f, _)) = &mut s.ipcp {
             out.extend(f.out.drain(..).map(|b| (PPP_IPCP, b)));
         }
+        if let Some((f, _)) = &mut s.ipv6cp {
+            out.extend(f.out.drain(..).map(|b| (PPP_IPV6CP, b)));
+        }
         for (p, b) in out {
             self.send_ppp(sess, p, &b);
         }
@@ -969,10 +1088,16 @@ impl Client {
             PPP_PAP => self.pap_input(now, body),
             PPP_CHAP => self.chap_input(now, body),
             PPP_IPCP => self.ipcp_input(now, body),
+            PPP_IPV6CP if self.cfg.ipv6 => {
+                self.note_ipv6cp(body);
+                self.ipv6cp_input(now, body);
+            }
             PPP_IPV6CP => {
                 self.note_ipv6cp(body);
                 self.protocol_reject(proto, body);
             }
+            // IPv6 before IPv6CP is open: discarded (RFC 5072 §3).
+            PPP_IPV6 if self.cfg.ipv6 => {}
             _ => self.protocol_reject(proto, body),
         }
         self.flush_session_out();
@@ -989,7 +1114,7 @@ impl Client {
             return;
         }
         self.ipv6cp_requests = self.ipv6cp_requests.saturating_add(1);
-        if !core::mem::replace(&mut s.ipv6cp_seen, true) {
+        if !core::mem::replace(&mut s.ipv6cp_seen, true) && !self.cfg.ipv6 {
             let options = p.data[..p.data.len().min(64)].to_vec();
             self.events.push_back(Event::PeerOffersIpv6 { options });
         }
@@ -1043,7 +1168,7 @@ impl Client {
                             None => None,
                         };
                         if s.auth.is_none() {
-                            Self::start_ipcp(s, now);
+                            Self::start_ipcp(s, now, self.cfg.ipv6.then_some(self.mac));
                         } else {
                             self.poll_session(now);
                         }
@@ -1099,6 +1224,10 @@ impl Client {
             PROTO_REJ => {
                 if p.data.len() >= 2 && get16(p.data, 0) == PPP_IPCP {
                     self.fail(now, Reason::Negotiation("peer rejected IPCP"), true);
+                } else if p.data.len() >= 2 && get16(p.data, 0) == PPP_IPV6CP {
+                    // No IPv6 on this link; IPv4 stays.
+                    s.ipv6cp = None;
+                    Self::sync_ipv6(s, &mut self.events);
                 }
             }
             TERM_ACK | CODE_REJ | DISCARD_REQ | ECHO_REQ => {}
@@ -1111,7 +1240,13 @@ impl Client {
         }
     }
 
-    fn start_ipcp(s: &mut Sess, now: u64) {
+    /// Auth done: IPCP starts, and IPv6CP with our MAC's identifier if
+    /// `v6`.
+    fn start_ipcp(s: &mut Sess, now: u64, v6: Option<Mac>) {
+        if let Some(mac) = v6 {
+            let o = Ipv6cp::new(mac);
+            s.ipv6cp = Some((Fsm::start(now, &o, 1), o));
+        }
         let o = Ipcp {
             addr: Ipv4Addr::UNSPECIFIED,
             dns1: Some(Ipv4Addr::UNSPECIFIED),
@@ -1132,7 +1267,7 @@ impl Client {
             return; // repeated answer (CHAP re-challenge)
         }
         match ok {
-            Ok(()) => Self::start_ipcp(s, now),
+            Ok(()) => Self::start_ipcp(s, now, self.cfg.ipv6.then_some(self.mac)),
             Err(m) => self.fail(now, Reason::AuthFailed(m), true),
         }
     }
@@ -1268,6 +1403,73 @@ impl Client {
         s.next_echo = now + u64::from(self.cfg.echo_interval_secs) * 1000;
         self.backoff = BACKOFF_FIRST_MS;
         self.events.push_back(Event::Up(link));
+        Self::sync_ipv6(s, &mut self.events);
+    }
+
+    /// IPv6 is usable while the link is up and IPv6CP open: report the
+    /// edges.
+    fn sync_ipv6(s: &mut Sess, events: &mut VecDeque<Event>) {
+        let open = s.up && s.ipv6cp.as_ref().is_some_and(|(f, _)| f.is_open());
+        if open == s.ipv6_reported {
+            return;
+        }
+        s.ipv6_reported = open;
+        events.push_back(match &s.ipv6cp {
+            Some((_, o)) if open => Event::Ipv6Up {
+                local: link_local(o.local),
+                remote: o.remote.map(link_local),
+            },
+            _ => Event::Ipv6Down,
+        });
+    }
+
+    fn ipv6cp_input(&mut self, now: u64, body: &[u8]) {
+        let Some(p) = parse_ctrl(body) else { return };
+        let Phase::Session(s) = &mut self.phase else {
+            return;
+        };
+        let sess = s.s;
+        // Before auth is done, IPv6CP is not ours to run yet (RFC 1661
+        // §3.2: discarded); after a failure the peer may start it again.
+        if s.ipcp.is_none() {
+            return;
+        }
+        if s.ipv6cp.is_none() {
+            if p.code != CONF_REQ {
+                return;
+            }
+            let o = Ipv6cp::new(self.mac);
+            s.ipv6cp = Some((Fsm::start(now, &o, 1), o));
+        }
+        let Some((f, o)) = &mut s.ipv6cp else { return };
+        match p.code {
+            CONF_REQ | CONF_ACK | CONF_NAK | CONF_REJ => {
+                if f.input(now, &p, o) == Change::Failed {
+                    s.ipv6cp = None; // nak loop: no IPv6
+                }
+            }
+            TERM_REQ => {
+                s.ipv6cp = None;
+                self.send_ppp(sess, PPP_IPV6CP, &ctrl(TERM_ACK, p.id, b""));
+                let Phase::Session(s) = &mut self.phase else {
+                    return;
+                };
+                Self::sync_ipv6(s, &mut self.events);
+                return;
+            }
+            _ => {}
+        }
+        Self::sync_ipv6(s, &mut self.events);
+    }
+
+    /// The link-local addresses while IPv6 is up (local, peer).
+    pub fn ipv6(&self) -> Option<(Ipv6Addr, Option<Ipv6Addr>)> {
+        match &self.phase {
+            Phase::Session(s) if s.ipv6_reported => {
+                s.ipv6cp.as_ref().map(|(_, o)| (link_local(o.local), o.remote.map(link_local)))
+            }
+            _ => None,
+        }
     }
 }
 
