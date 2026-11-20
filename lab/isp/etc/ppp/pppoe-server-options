@@ -8,7 +8,8 @@ mru 1492
 noccp
 novj
 nodefaultroute
-# Offer IPv6CP too: leatos answers with an LCP Protocol-Reject.
+# Offer IPv6CP too: leatos logs the offer and answers with an LCP
+# Protocol-Reject (until M7). lab_pppoe_ipv6=0 removes this line.
 +ipv6
 debug
 logfile /tmp/pppd.log

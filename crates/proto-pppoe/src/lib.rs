@@ -166,6 +166,11 @@ pub enum Event {
     Up(Link),
     /// The session attempt or the session ended; `was_up` = after [`Event::Up`].
     Down { reason: Reason, was_up: bool },
+    /// The peer's first IPv6CP Configure-Request in this session: it
+    /// offers IPv6. We still answer with a Protocol-Reject (IPv6 is M7);
+    /// `options` are the request's raw options (RFC 5072: type 1 =
+    /// Interface-Identifier), for the log.
+    PeerOffersIpv6 { options: Vec<u8> },
 }
 
 /// Where the client is, for status output.
@@ -421,6 +426,9 @@ struct Sess {
     /// RFC 4638: IPCP is up, waiting for the full-size echo to come back
     /// before reporting `link`.
     jumbo_check: Option<JumboCheck>,
+    /// An IPv6CP Configure-Request came in this session
+    /// ([`Event::PeerOffersIpv6`] once).
+    ipv6cp_seen: bool,
 }
 
 struct JumboCheck {
@@ -468,6 +476,8 @@ pub struct Client {
     /// The last RFC 4638 path check's echo reply: LCP length, and what
     /// was sent.
     jumbo_reply: Option<(usize, u16)>,
+    /// IPv6CP Configure-Requests from peers (all sessions).
+    ipv6cp_requests: u32,
 }
 
 /// What each RFC 4638 step said, for the log ([`Client::rfc4638_trace`]).
@@ -504,6 +514,7 @@ impl Client {
             jumbo_failed: false,
             pads_max_payload: None,
             jumbo_reply: None,
+            ipv6cp_requests: 0,
         }
     }
 
@@ -931,6 +942,7 @@ impl Client {
             echo_outstanding: 0,
             lcp_id: first_id.wrapping_add(128),
             jumbo_check: None,
+            ipv6cp_seen: false,
         }));
         self.events.push_back(Event::Session(s));
         self.flush_session_out();
@@ -957,9 +969,36 @@ impl Client {
             PPP_PAP => self.pap_input(now, body),
             PPP_CHAP => self.chap_input(now, body),
             PPP_IPCP => self.ipcp_input(now, body),
+            PPP_IPV6CP => {
+                self.note_ipv6cp(body);
+                self.protocol_reject(proto, body);
+            }
             _ => self.protocol_reject(proto, body),
         }
         self.flush_session_out();
+    }
+
+    /// Count an IPv6CP Configure-Request; the first one of a session
+    /// becomes [`Event::PeerOffersIpv6`].
+    fn note_ipv6cp(&mut self, body: &[u8]) {
+        let Some(p) = parse_ctrl(body) else { return };
+        let Phase::Session(s) = &mut self.phase else {
+            return;
+        };
+        if p.code != CONF_REQ || !s.lcp.is_open() {
+            return;
+        }
+        self.ipv6cp_requests = self.ipv6cp_requests.saturating_add(1);
+        if !core::mem::replace(&mut s.ipv6cp_seen, true) {
+            let options = p.data[..p.data.len().min(64)].to_vec();
+            self.events.push_back(Event::PeerOffersIpv6 { options });
+        }
+    }
+
+    /// IPv6CP Configure-Requests peers sent (all sessions): whether the
+    /// ISP offers IPv6.
+    pub fn ipv6cp_requests(&self) -> u32 {
+        self.ipv6cp_requests
     }
 
     /// LCP Protocol-Reject for protocols we do not run (IPv6CP, CCP, …),

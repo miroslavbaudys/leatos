@@ -904,7 +904,8 @@ async function refresh() {
   $("wan").innerHTML = rows([["Port", wan ? esc(wan.name) + (wan.link ? (wan.link.up ? ` · up ${wan.link.mbps} Mbit/s` : " · link down") : "") : "–"], ...vl,
     ...(l ? [["Address", esc(l.addr)], ["Gateway", esc(l.gateway ?? "–")], ["DNS servers", l.dns.map(esc).join(", ") || "–"],
       ...(l.via ? [["Link", `${esc(l.via)}, MTU ${l.mtu}`]] : [])] : [["Lease", "none"]]), ...ppp,
-    ...(st.pppoe_drops ? [["PPPoE drops", n(st.pppoe_drops)]] : [])]);
+    ...(st.pppoe_drops ? [["PPPoE drops", n(st.pppoe_drops)]] : []),
+    ...(p?.ipv6cp_offered ? [["IPv6", `offered by the access concentrator (${n(p.ipv6cp_offered)} IPv6CP request(s)), not used yet`]] : [])]);
   const d = st.dns;
   const ups = d ? (d.upstreams.length ? d.upstreams.map(esc).join(", ") + ` <span class=hint>(${esc(d.source)})</span>` : "none" + (d.source === "WAN lease" ? " (no WAN lease)" : ""))
     : (l?.dns?.length ? l.dns.map(esc).join(", ") : "none (no WAN lease)");

@@ -765,6 +765,23 @@ fn ipv6cp_is_protocol_rejected() {
     r.run(&mut [&mut ac], 1000);
     assert_eq!(ac.proto_rejects, vec![PPP_IPV6CP]);
     assert!(r.up().is_some());
+    // Noted for the log once, with the interface identifier the AC offered.
+    let offers: Vec<_> = r.events.iter().filter(|e| matches!(e, Event::PeerOffersIpv6 { .. })).collect();
+    assert_eq!(
+        offers,
+        vec![&Event::PeerOffersIpv6 { options: vec![1, 10, 0, 0, 0, 0, 0, 0, 0, 1] }]
+    );
+    assert_eq!(r.c.ipv6cp_requests(), 1);
+}
+
+#[test]
+fn no_ipv6cp_offer_no_event() {
+    let mut ac = Ac::new(SimAuth::Pap);
+    let mut r = Run::pap();
+    r.run(&mut [&mut ac], 1000);
+    assert!(r.up().is_some());
+    assert!(!r.events.iter().any(|e| matches!(e, Event::PeerOffersIpv6 { .. })));
+    assert_eq!(r.c.ipv6cp_requests(), 0);
 }
 
 #[test]

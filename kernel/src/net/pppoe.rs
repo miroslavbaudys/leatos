@@ -42,7 +42,7 @@ pub struct Pppoe {
     last_down: Option<String>,
     sessions: u32,
     /// The state the status output last saw ([`Self::status_changed`]).
-    shown: Option<proto_pppoe::State>,
+    shown: Option<(proto_pppoe::State, u32)>,
 }
 
 impl Pppoe {
@@ -160,6 +160,11 @@ impl Pppoe {
                     self.link = None;
                     self.last_down = Some(format!("{reason}"));
                 }
+                Event::PeerOffersIpv6 { options } => println!(
+                    "  pppoe {}     : the access concentrator offers IPv6 (IPv6CP{}); rejected until M7",
+                    port.name,
+                    ipv6cp_options_text(&options)
+                ),
             }
         }
         (change, self.transmit(port))
@@ -207,11 +212,11 @@ impl Pppoe {
 
     /// The state changed since the last call (status output is due).
     pub fn status_changed(&mut self) -> bool {
-        let now = Some(self.client.state());
+        let now = Some((self.client.state(), self.client.ipv6cp_requests()));
         core::mem::replace(&mut self.shown, now) != now
     }
 
-    /// `{"state":…,"session":…,"ac":…,"mtu":…,"sessions":…,"last_error":…}`
+    /// `{"state":…,"session":…,"ac":…,"mtu":…,"sessions":…,"last_error":…,"rfc4638":…,"ipv6cp_offered":…}`
     pub fn status_json(&self) -> String {
         use proto_http::json_str;
         let (session, ac, mtu) = match &self.link {
@@ -223,7 +228,7 @@ impl Pppoe {
             None => ("null".into(), "null".into(), "null".into()),
         };
         format!(
-            "{{\"state\":{},\"session\":{session},\"ac\":{ac},\"mtu\":{mtu},\"sessions\":{},\"last_error\":{},\"rfc4638\":{}}}",
+            "{{\"state\":{},\"session\":{session},\"ac\":{ac},\"mtu\":{mtu},\"sessions\":{},\"last_error\":{},\"rfc4638\":{},\"ipv6cp_offered\":{}}}",
             json_str(&format!("{}", self.client.state())),
             self.sessions,
             self.last_down
@@ -244,7 +249,8 @@ impl Pppoe {
                     (true, false, Some(_)) => "\"not offered by the access concentrator\"",
                     (true, false, None) => "\"asked\"",
                 }
-            }
+            },
+            self.client.ipv6cp_requests()
         )
     }
 
@@ -255,4 +261,31 @@ impl Pppoe {
             None => format!("PPPoE {}", self.client.state()),
         }
     }
+}
+
+/// IPv6CP options for the log: the Interface-Identifier (RFC 5072 type 1)
+/// as `, interface id 0000:0000:0000:0001`, other option types by number.
+fn ipv6cp_options_text(opts: &[u8]) -> String {
+    let mut out = String::new();
+    let mut rest = opts;
+    while let [t, l, ..] = *rest {
+        let l = usize::from(l);
+        if l < 2 || l > rest.len() {
+            out.push_str(", malformed options");
+            break;
+        }
+        let v = &rest[2..l];
+        match (t, v) {
+            (1, [a, b, c, d, e, f, g, h]) => out.push_str(&format!(
+                ", interface id {:04x}:{:04x}:{:04x}:{:04x}",
+                u16::from_be_bytes([*a, *b]),
+                u16::from_be_bytes([*c, *d]),
+                u16::from_be_bytes([*e, *f]),
+                u16::from_be_bytes([*g, *h])
+            )),
+            _ => out.push_str(&format!(", option {t} ({} B)", v.len())),
+        }
+        rest = &rest[l..];
+    }
+    out
 }

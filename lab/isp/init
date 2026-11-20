@@ -39,6 +39,7 @@ $bb ifconfig lo 127.0.0.1 up
 IF=eth0
 vlan=$($bb sed -n 's/.*lab_vlan=\([0-9]*\).*/\1/p' /proc/cmdline)
 pppoe=$($bb sed -n 's/.*lab_pppoe=\([a-z]*\).*/\1/p' /proc/cmdline)
+pppoe_ipv6=$($bb sed -n 's/.*lab_pppoe_ipv6=\([0-9]*\).*/\1/p' /proc/cmdline)
 static=$($bb sed -n 's/.*lab_static=\([0-9]*\).*/\1/p' /proc/cmdline)
 if [ -n "$vlan" ] || [ -n "$pppoe" ]; then
   for m in virtio_blk squashfs; do modprobe "$m" 2>/dev/null || $bb modprobe "$m" 2>/dev/null; done
@@ -74,7 +75,11 @@ if [ -n "$pppoe" ]; then
   $bb syslogd -O /tmp/messages
   $bb tail -F /tmp/pppd.log /tmp/messages 2>/dev/null | while IFS= read -r l; do echo "isp-ppp: $l"; done &
   # none: no authentication (ISPs such as O2 CZ); the router has no user name.
-  { $bb cat /etc/ppp/pppoe-server-options; if [ "$pppoe" = none ]; then echo noauth; else echo "require-$pppoe"; fi; } >/tmp/pppoe-server-options
+  # lab_pppoe_ipv6=0: no IPv6CP offer (the router's IPv6 offer check fails;
+  # pppd 2.5 runs IPv6CP without +ipv6 too, so say noipv6).
+  { if [ "$pppoe_ipv6" = 0 ]; then $bb grep -v '^+ipv6' /etc/ppp/pppoe-server-options; echo noipv6; else $bb cat /etc/ppp/pppoe-server-options; fi
+    if [ "$pppoe" = none ]; then echo noauth; else echo "require-$pppoe"; fi; } >/tmp/pppoe-server-options
+  [ "$pppoe_ipv6" = 0 ] && echo "LAB isp: PPPoE without IPv6CP (noipv6)"
   # The session's ISP end shares eth0's address (point to point: the
   # peer gets a /32 route over ppp0).
   /usr/sbin/pppoe-server -I "$IF" -q /usr/sbin/lab-pppd -L 203.0.113.1 -R 203.0.113.50 -N 4 \

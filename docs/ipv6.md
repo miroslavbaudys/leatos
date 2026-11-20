@@ -1,6 +1,6 @@
 # IPv6 (M7, plan)
 
-Status (2026-11-20): step 0 started (AAAA rebind protection done). First plan 2026-11-15 (checked at
+Status (2026-11-20): step 0 done in QEMU (AAAA rebind protection, Kea for the lab, smoltcp limits, IPv6CP offer logged); the apu4 check of the offer waits for the soak run to end. First plan 2026-11-15 (checked at
 2712911); **revised 2026-11-20 against 74cb3d1**, after 135 commits that
 added routed LAN ports and live link slots, the WAN ingress stage, IPv4
 fragments, anti-spoofing, redirects, static routes, DNS views, DoT, the
@@ -213,12 +213,17 @@ New or changed (2026-11-20):
   (REFUSED + EDE 15, not cached). Host test with a negative control (the
   test fails with the IPv6 check off); the `dns` fuzz target builds AAAA
   answers (5 min clean). The delegated prefix joins the list in step 3.
-- **Ask the real ISP:** IPv6 over PPPoE is confirmed. Still useful:
-  `proto-pppoe` counts IPv6CP Configure-Requests from the peer and logs the
-  first one (options seen), still rejecting it (`/api/status`
-  `pppoe.ipv6cp_offered`). **Deploy on the apu4 only after the soak run
-  ends (2026-11-22).** The prefix size is only learned in step 4 (PD over
-  the session).
+- ✅ **IPv6CP offer logged** (2026-11-20, QEMU): `proto-pppoe` counts the
+  peer's IPv6CP Configure-Requests (`Client::ipv6cp_requests`) and reports
+  the first of a session as `Event::PeerOffersIpv6` (raw options), still
+  answering with a Protocol-Reject. The kernel logs `the access
+  concentrator offers IPv6 (IPv6CP, interface id …); rejected until M7`;
+  `/api/status` `pppoe.ipv6cp_offered`, a WAN page row. Lab: `LAB_PPPOE=pap`
+  checks the log line; negative control `LAB_PPPOE_IPV6=0` (the ISP's pppd
+  gets `noipv6`: pppd 2.5 runs IPv6CP even without `+ipv6`). **On the apu4
+  after the soak run ends (2026-11-22)**: it shows the real AC's interface
+  identifier. The prefix size is only learned in step 4 (PD over the
+  session).
 - ✅ **Lab PD server** (2026-11-20): Kea 3.0.3, pinned
   (`fetch-alpine.sh kea`). Checked in a throwaway VM (Alpine virt kernel,
   veth pair across two network namespaces, dhcpcd 10.5.2 as the client):
