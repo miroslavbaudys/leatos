@@ -5,7 +5,7 @@
 //! upload; once the upload is busy they queue, and only the newest of
 //! them carries information the sender still needs.
 //!
-//! [`supersedes`] decides on the packets' bytes (IPv4 header onward; the
+//! [`supersedes`] decides on the packets' bytes (IP header onward; the
 //! qdisc gets them from [`crate::Packet::pure_ack`]). The older ACK is
 //! redundant only if everything it tells the sender is also in the newer
 //! one:
@@ -20,13 +20,17 @@
 //! - every SACK block of the older one, as far as it lies above the newer
 //!   ACK number, is covered by a SACK block of the newer one.
 //!
-//! IPv4 without IP options only (IPv6 comes with M7). Anything that does
-//! not parse is never filtered.
+//! IPv4 without IP options, or IPv6 without extension headers (TCP right
+//! behind the fixed header). Anything that does not parse is never
+//! filtered.
 
 /// Pure-ACK fields of one packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Ack {
-    addrs: [u8; 8],
+    /// Source and destination (IPv4: the first 8 bytes, the rest zero;
+    /// `v6` tells the families apart).
+    addrs: [u8; 32],
+    v6: bool,
     ports: [u8; 4],
     ecn: u8,
     flags: u8,
@@ -55,12 +59,28 @@ fn after(a: u32, b: u32) -> bool {
 }
 
 fn parse(b: &[u8]) -> Option<Ack> {
-    // IPv4, no options, not a fragment, TCP.
-    if *b.first()? != 0x45 || *b.get(9)? != 6 || be16(b, 6)? & 0x3fff != 0 {
-        return None;
-    }
-    let total = be16(b, 2)? as usize;
-    let tcp = b.get(20..total)?;
+    let mut addrs = [0u8; 32];
+    let (tcp, ecn, v6) = match *b.first()? >> 4 {
+        // IPv4, no options, not a fragment, TCP.
+        4 => {
+            if b[0] != 0x45 || *b.get(9)? != 6 || be16(b, 6)? & 0x3fff != 0 {
+                return None;
+            }
+            let total = be16(b, 2)? as usize;
+            addrs[..8].copy_from_slice(b.get(12..20)?);
+            (b.get(20..total)?, b[1] & 3, false)
+        }
+        // IPv6, TCP right behind the fixed header.
+        6 => {
+            if *b.get(6)? != 6 {
+                return None;
+            }
+            let plen = be16(b, 4)? as usize;
+            addrs.copy_from_slice(b.get(8..40)?);
+            (b.get(40..40 + plen)?, (b[1] >> 4) & 3, true)
+        }
+        _ => return None,
+    };
     let doff = (*tcp.get(12)? >> 4) as usize * 4;
     // Header only: no payload. The low bit of byte 12 is AE (AccECN).
     if doff < 20 || doff != tcp.len() || tcp[12] & 0x0f != 0 {
@@ -71,9 +91,10 @@ fn parse(b: &[u8]) -> Option<Ack> {
         return None;
     }
     let mut a = Ack {
-        addrs: b.get(12..20)?.try_into().ok()?,
+        addrs,
+        v6,
         ports: tcp.get(0..4)?.try_into().ok()?,
-        ecn: b[1] & 3,
+        ecn,
         flags,
         ack: be32(tcp, 8)?,
         ts: None,
@@ -112,12 +133,12 @@ fn parse(b: &[u8]) -> Option<Ack> {
 }
 
 /// Does the pure ACK `new` make the older queued ACK `old` redundant?
-/// Both are IPv4 packets (header onward). See the module docs.
+/// Both are IP packets (header onward). See the module docs.
 pub fn supersedes(new: &[u8], old: &[u8]) -> bool {
     let (Some(n), Some(o)) = (parse(new), parse(old)) else {
         return false;
     };
-    if n.addrs != o.addrs || n.ports != o.ports || n.flags != o.flags {
+    if n.v6 != o.v6 || n.addrs != o.addrs || n.ports != o.ports || n.flags != o.flags {
         return false;
     }
     if n.ecn != o.ecn || o.ecn == 3 {
@@ -197,11 +218,56 @@ pub fn build_ack(
     b
 }
 
+/// Test and fuzz helper: the same segment over IPv6 (2001:db8::1 →
+/// 2001:db8::2), the traffic class's ECN bits from the IPv4 header's.
+#[doc(hidden)]
+pub fn to_ipv6(v4: &[u8]) -> alloc::vec::Vec<u8> {
+    let tcp = &v4[20..];
+    let mut b = alloc::vec![0u8; 40];
+    b[0] = 0x60;
+    b[1] = (v4[1] & 3) << 4;
+    b[4..6].copy_from_slice(&(tcp.len() as u16).to_be_bytes());
+    b[6] = 6;
+    b[7] = 64;
+    b[8..10].copy_from_slice(&[0x20, 0x01]);
+    b[10..12].copy_from_slice(&[0x0d, 0xb8]);
+    b[23] = 1;
+    b[24..26].copy_from_slice(&[0x20, 0x01]);
+    b[26..28].copy_from_slice(&[0x0d, 0xb8]);
+    b[39] = 2;
+    b.extend_from_slice(tcp);
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const ACK: u8 = TCP_ACK;
+
+    #[test]
+    fn ipv6_acks_are_filtered_like_ipv4() {
+        let a6 = |ack| to_ipv6(&a(ack));
+        assert!(supersedes(&a6(2000), &a6(1000)));
+        assert!(!supersedes(&a6(1000), &a6(1000)), "duplicate ACK kept");
+        assert!(!supersedes(&a6(1000), &a6(2000)));
+        // One family never supersedes the other.
+        assert!(!supersedes(&a6(2000), &a(1000)) && !supersedes(&a(2000), &a6(1000)));
+        // A CE mark on the older one must reach the receiver.
+        let mut ce = a6(1000);
+        ce[1] |= 3 << 4;
+        let mut ce_new = a6(2000);
+        ce_new[1] |= 3 << 4;
+        assert!(!supersedes(&ce_new, &ce));
+        // Behind an extension header: not understood, never filtered.
+        let mut ext = a6(1000);
+        ext[6] = 0;
+        assert!(!supersedes(&a6(2000), &ext));
+        // With timestamps and SACK as for IPv4.
+        let s = |ack, r| to_ipv6(&build_ack(5000, ack, ACK, Some((ack, 1)), &[(3000, r)]));
+        assert!(supersedes(&s(2000, 4000), &s(1000, 4000)));
+        assert!(!supersedes(&s(2000, 3500), &s(1000, 4000)), "SACK not covered");
+    }
 
     fn a(ack: u32) -> alloc::vec::Vec<u8> {
         build_ack(5000, ack, ACK, None, &[])
