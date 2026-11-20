@@ -45,7 +45,7 @@ fn client_id(m: &[u8]) -> Option<Vec<u8>> {
 }
 
 fuzz_target!(|ops: Vec<Op>| {
-    let mut c = Client::new(PdConfig { mac: [2, 0, 0, 0, 0, 1], iaid: 1, hint_len: 56 }, 0, 0x5eed);
+    let mut c = Client::new(PdConfig { mac: [2, 0, 0, 0, 0, 1], iaid: 1, hint_len: 56, last: None }, 0, 0x5eed);
     let mut now = 0u64;
     let mut last: Option<Vec<u8>> = None;
     for op in ops.into_iter().take(100) {

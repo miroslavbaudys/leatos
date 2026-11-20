@@ -5,7 +5,20 @@ const MAC: [u8; 6] = [0x52, 0x54, 0, 0, 0, 1];
 const SRV: &[u8] = &[0, 3, 0, 1, 2, 0, 0, 0, 0, 0x99];
 
 fn cfg() -> PdConfig {
-    PdConfig { mac: MAC, iaid: 1, hint_len: 56 }
+    PdConfig { mac: MAC, iaid: 1, hint_len: 56, last: None }
+}
+
+#[test]
+fn solicit_asks_for_the_last_prefix_again() {
+    let last: Ipv6Addr = "2001:db8:910::".parse().unwrap();
+    let mut c = Client::new(PdConfig { last: Some((last, 60)), ..cfg() }, 0, 42);
+    let t = c.next_deadline();
+    let sol = c.poll(t).unwrap();
+    let (_, _, opts) = sent(&sol);
+    let ia = has(&opts, OPT_IA_PD).unwrap();
+    let (code, iap) = options(&ia[12..]).next().unwrap();
+    assert_eq!((code, iap[8]), (OPT_IAPREFIX, 60));
+    assert_eq!(&iap[9..25], &last.octets());
 }
 
 fn pfx() -> Ipv6Addr {

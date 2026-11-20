@@ -58,6 +58,10 @@ pub struct PdConfig {
     pub iaid: u32,
     /// The prefix length asked for (a hint; the server decides).
     pub hint_len: u8,
+    /// The prefix held before (kept across a restart): asked for again in
+    /// the Solicit (RFC 8415 §18.2.1), so the networks keep their
+    /// addresses if the server agrees.
+    pub last: Option<(Ipv6Addr, u8)>,
 }
 
 /// A delegated prefix.
@@ -318,9 +322,9 @@ impl Client {
         opt(&mut b, OPT_ELAPSED, &elapsed.to_be_bytes());
         opt(&mut b, OPT_ORO, &OPT_DNS.to_be_bytes());
         // IA_PD: our IAID, T1/T2 0 (the server decides), one IAPREFIX: the
-        // hint (::/len) or the prefix asked for / held.
+        // hint (the last prefix, else ::/len) or the prefix asked for / held.
         let (prefix, len) = match (self.state, self.offer) {
-            (State::Solicit, _) | (_, None) => (Ipv6Addr::UNSPECIFIED, self.cfg.hint_len),
+            (State::Solicit, _) | (_, None) => self.cfg.last.unwrap_or((Ipv6Addr::UNSPECIFIED, self.cfg.hint_len)),
             (_, Some(o)) => o,
         };
         let mut iap = Vec::with_capacity(25);

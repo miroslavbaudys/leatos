@@ -6,6 +6,11 @@
 //! `u8 networks`, then per network `u8 name length, name, u16 leases`, then
 //! per lease `mac[6], ipv4[4], u8 hostname length (0 = none), hostname`.
 //!
+//! Version [`FORMAT_V2`]: the same, then `u8 1, prefix[16], u8 length`
+//! (the WAN's last delegated IPv6 prefix, asked for again after a
+//! restart) or `u8 0`. A kernel that reads only version 1 takes the other
+//! slot's older record.
+//!
 //! No expiry is stored: [`super::server::Server::restore`] gives every
 //! restored lease a full lease time again. A client's lease never outlives
 //! its last renewal plus the lease time, so the router may hold an address
@@ -15,10 +20,12 @@
 use super::server::Mac;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
 
 /// Version of the payload, for the store record header.
 pub const FORMAT: u32 = 1;
+/// With the WAN's last delegated prefix ([`encode_v2`]).
+pub const FORMAT_V2: u32 = 2;
 
 /// Upper bounds, so a damaged record cannot ask for much memory.
 pub const MAX_NETWORKS: usize = 64;
@@ -107,9 +114,57 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// [`encode`] plus the WAN's last delegated prefix (version [`FORMAT_V2`]).
+pub fn encode_v2(nets: &[Network], prefix: Option<(Ipv6Addr, u8)>) -> Vec<u8> {
+    let mut out = encode(nets);
+    match prefix {
+        Some((p, l)) => {
+            out.push(1);
+            out.extend_from_slice(&p.octets());
+            out.push(l.min(128));
+        }
+        None => out.push(0),
+    }
+    out
+}
+
+/// A record's leases and the WAN's last delegated prefix ([`decode_version`]).
+pub type Decoded = (Vec<Network>, Option<(Ipv6Addr, u8)>);
+
+/// Decode a record of schema `version` (1 or 2): the leases and, from
+/// version 2, the last delegated prefix.
+pub fn decode_version(version: u32, data: &[u8]) -> Result<Decoded, Error> {
+    if version < FORMAT_V2 {
+        return decode(data).map(|n| (n, None));
+    }
+    let mut r = Reader(data);
+    let nets = networks(&mut r)?;
+    let prefix = match r.u8()? {
+        0 => None,
+        _ => {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(r.take(16)?);
+            let l = r.u8()?;
+            (l <= 128).then_some((Ipv6Addr::from(a), l))
+        }
+    };
+    if !r.0.is_empty() {
+        return Err(Error::TrailingBytes);
+    }
+    Ok((nets, prefix))
+}
+
 /// Decode a snapshot written by [`encode`].
 pub fn decode(data: &[u8]) -> Result<Vec<Network>, Error> {
     let mut r = Reader(data);
+    let nets = networks(&mut r)?;
+    if !r.0.is_empty() {
+        return Err(Error::TrailingBytes);
+    }
+    Ok(nets)
+}
+
+fn networks(r: &mut Reader<'_>) -> Result<Vec<Network>, Error> {
     let count = r.u8()? as usize;
     if count > MAX_NETWORKS {
         return Err(Error::TooMany);
@@ -138,9 +193,6 @@ pub fn decode(data: &[u8]) -> Result<Vec<Network>, Error> {
             });
         }
         nets.push(Network { name, leases });
-    }
-    if !r.0.is_empty() {
-        return Err(Error::TrailingBytes);
     }
     Ok(nets)
 }
@@ -200,5 +252,20 @@ mod tests {
         let big = vec![Network { name: "a".into(), leases: vec![lease; MAX_LEASES + 5] }; 2];
         let d = decode(&encode(&big)).unwrap();
         assert_eq!(d.iter().map(|n| n.leases.len()).sum::<usize>(), MAX_LEASES);
+    }
+
+    #[test]
+    fn v2_keeps_the_wan_prefix() {
+        let nets = vec![Network { name: "lan".into(), leases: vec![Saved { mac: [2, 0, 0, 0, 0, 9], ip: Ipv4Addr::new(192, 168, 1, 9), hostname: None }] }];
+        let p: Ipv6Addr = "2a03:ab00:1000:910::".parse().unwrap();
+        let b = encode_v2(&nets, Some((p, 60)));
+        assert_eq!(decode_version(FORMAT_V2, &b), Ok((nets.clone(), Some((p, 60)))));
+        assert_eq!(decode(&b), Err(Error::TrailingBytes), "not a version 1 record");
+        let b = encode_v2(&nets, None);
+        assert_eq!(decode_version(FORMAT_V2, &b), Ok((nets.clone(), None)));
+        assert_eq!(decode_version(FORMAT, &encode(&nets)), Ok((nets.clone(), None)));
+        for n in 0..b.len() {
+            assert!(decode_version(FORMAT_V2, &b[..n]).is_err(), "cut at {n}");
+        }
     }
 }
