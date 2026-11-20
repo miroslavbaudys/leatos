@@ -37,12 +37,19 @@
 //!   [`HOST_BUCKETS`] keyed buckets: hosts sharing a bucket share a limit.
 //! - TCP state is tracked loosely (enough for timeouts): SYN → established
 //!   on the initiator's ACK after the reply SYN+ACK, FIN/RST → closing.
+//! - One table type for both address families ([`Addr`]):
+//!   `Conntrack<Ipv4Addr>` (the default) adds NAPT and DNAT; IPv6
+//!   connections (`Conntrack<Ipv6Addr>`) are only tracked
+//!   ([`Conntrack::create_routed`]), with the same early drop, expiry and
+//!   [`Budget`] (one budget may span both families: the limit is memory).
+//!   The per-host limit counts an IPv6 host by its /64, so privacy
+//!   addresses do not multiply it; CAKE's host hash stays per address.
 
 use crate::wire::{PROTO_ICMP, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// Buckets of the per-host connection counts (16 KiB of counters).
@@ -93,21 +100,25 @@ impl Budget {
         self.per_host
     }
 
-    fn bucket(&self, host: Ipv4Addr) -> Option<&AtomicU32> {
+    fn bucket(&self, host: u64) -> Option<&AtomicU32> {
         let n = self.hosts.len();
-        (n > 0).then(|| &self.hosts[mix(self.key ^ 0x6a09_e667, u32::from(host) as u64) as usize % n])
+        (n > 0).then(|| &self.hosts[mix(self.key ^ 0x6a09_e667, host) as usize % n])
     }
 
     /// Connections counted for `host`'s bucket (0 without a host limit).
-    pub fn host_used(&self, host: Ipv4Addr) -> usize {
+    pub fn host_used<A: Addr>(&self, host: A) -> usize {
+        self.bucket_used(A::host_key(host))
+    }
+
+    fn bucket_used(&self, host: u64) -> usize {
         self.bucket(host).map_or(0, |b| b.load(Ordering::Relaxed) as usize)
     }
 
-    fn host_at_limit(&self, host: Ipv4Addr) -> bool {
-        self.per_host > 0 && self.host_used(host) >= self.per_host
+    fn host_at_limit(&self, host: u64) -> bool {
+        self.per_host > 0 && self.bucket_used(host) >= self.per_host
     }
 
-    fn count(&self, host: Ipv4Addr, add: bool) {
+    fn count(&self, host: u64, add: bool) {
         if add {
             self.used.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -142,18 +153,63 @@ pub mod timeout {
     pub const ICMP: u64 = 30_000;
 }
 
+/// An address family conntrack tracks: what it hashes and counts by.
+pub trait Addr: Copy + Ord + Eq + core::fmt::Debug {
+    /// The flow hash of a tuple (CAKE's flow queues, pre-NAT).
+    fn tuple_hash(key: u64, t: &Tuple<Self>) -> u32;
+    /// A host's hash for CAKE's host isolation: the whole address.
+    fn host_hash(key: u64, a: Self) -> u16;
+    /// What the per-host limit counts by ([`Budget::with_host_limit`]).
+    fn host_key(a: Self) -> u64;
+}
+
+impl Addr for Ipv4Addr {
+    fn tuple_hash(key: u64, t: &Tuple<Self>) -> u32 {
+        let a = (u32::from(t.src) as u64) << 32 | u32::from(t.dst) as u64;
+        let b = (t.sport as u64) << 32 | (t.dport as u64) << 8 | t.proto as u64;
+        mix(key, mix(key, a) ^ b) as u32
+    }
+    fn host_hash(key: u64, a: Self) -> u16 {
+        mix(key ^ 0x5bd1_e995, u32::from(a) as u64) as u16
+    }
+    fn host_key(a: Self) -> u64 {
+        u32::from(a) as u64
+    }
+}
+
+/// An IPv6 address as one keyed 64-bit value.
+fn fold6(key: u64, a: Ipv6Addr) -> u64 {
+    let v = u128::from(a);
+    mix(key, v as u64) ^ mix(key ^ 0x243f_6a88_85a3_08d3, (v >> 64) as u64)
+}
+
+impl Addr for Ipv6Addr {
+    fn tuple_hash(key: u64, t: &Tuple<Self>) -> u32 {
+        let a = fold6(key, t.src) ^ fold6(key, t.dst).rotate_left(32);
+        let b = (t.sport as u64) << 32 | (t.dport as u64) << 8 | t.proto as u64;
+        mix(key, mix(key, a) ^ b) as u32
+    }
+    fn host_hash(key: u64, a: Self) -> u16 {
+        mix(key ^ 0x5bd1_e995, fold6(key, a)) as u16
+    }
+    /// The /64: a host's privacy addresses share one limit.
+    fn host_key(a: Self) -> u64 {
+        (u128::from(a) >> 64) as u64
+    }
+}
+
 /// Protocol + addresses + ports. For ICMP echo, both ports hold the identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Tuple {
+pub struct Tuple<A = Ipv4Addr> {
     pub proto: u8,
-    pub src: Ipv4Addr,
+    pub src: A,
     pub sport: u16,
-    pub dst: Ipv4Addr,
+    pub dst: A,
     pub dport: u16,
 }
 
-impl Tuple {
-    pub fn inverse(&self) -> Tuple {
+impl<A: Copy> Tuple<A> {
+    pub fn inverse(&self) -> Tuple<A> {
         Tuple {
             proto: self.proto,
             src: self.dst,
@@ -179,9 +235,9 @@ pub enum TcpState {
 }
 
 #[derive(Clone, Debug)]
-pub struct Conn {
-    pub orig: Tuple,
-    pub reply: Tuple,
+pub struct Conn<A = Ipv4Addr> {
+    pub orig: Tuple<A>,
+    pub reply: Tuple<A>,
     /// Translated in some way (packets are rewritten to [`Conn::translated`]).
     pub nat: bool,
     /// Holds a reference on the endpoint-independent mapping of
@@ -202,7 +258,7 @@ pub struct Conn {
     pub orig_dst_hash: u16,
 }
 
-impl Conn {
+impl<A: Copy> Conn<A> {
     /// Both sides have spoken: TCP established (a reply, then the
     /// initiator's ACK), UDP/ICMP replied. Others are early-drop candidates.
     pub fn assured(&self) -> bool {
@@ -213,7 +269,7 @@ impl Conn {
     }
 
     /// The tuple a packet in `dir` must be rewritten to (for NAT).
-    pub fn translated(&self, dir: Dir) -> Tuple {
+    pub fn translated(&self, dir: Dir) -> Tuple<A> {
         match dir {
             Dir::Original => self.reply.inverse(),
             Dir::Reply => self.orig.inverse(),
@@ -246,12 +302,12 @@ struct Mapping {
     refs: u32,
 }
 
-pub struct Conntrack {
-    conns: Vec<Option<Conn>>,
+pub struct Conntrack<A = Ipv4Addr> {
+    conns: Vec<Option<Conn<A>>>,
     free: Vec<ConnId>,
-    index: BTreeMap<Tuple, (ConnId, Dir)>,
-    /// (proto, internal ip, internal port) → mapping
-    mappings: BTreeMap<(u8, Ipv4Addr, u16), Mapping>,
+    index: BTreeMap<Tuple<A>, (ConnId, Dir)>,
+    /// (proto, internal ip, internal port) → mapping (NAPT: IPv4 only)
+    mappings: BTreeMap<(u8, A, u16), Mapping>,
     /// (proto, external port) in use
     used_ports: BTreeMap<(u8, u16), ()>,
     /// (proto, lo, hi): ports never allocated (port forwards).
@@ -280,17 +336,7 @@ pub fn mix(key: u64, v: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn tuple_hash(key: u64, t: &Tuple) -> u32 {
-    let a = (u32::from(t.src) as u64) << 32 | u32::from(t.dst) as u64;
-    let b = (t.sport as u64) << 32 | (t.dport as u64) << 8 | t.proto as u64;
-    mix(key, mix(key, a) ^ b) as u32
-}
-
-fn host_hash(key: u64, a: Ipv4Addr) -> u16 {
-    mix(key ^ 0x5bd1_e995, u32::from(a) as u64) as u16
-}
-
-impl Conntrack {
+impl<A: Addr> Conntrack<A> {
     pub fn new(max_conns: usize, hash_key: u64) -> Self {
         Self::new_shard(max_conns, hash_key, 1, 0)
     }
@@ -329,8 +375,9 @@ impl Conntrack {
     /// No room for another connection initiated by `host`: at its limit
     /// even after early-dropping one of its own (counted as host-limit), or
     /// the table full even after an early drop (counted as table-full).
-    fn no_room(&mut self, now: u64, host: Ipv4Addr) -> bool {
-        let at_limit = |ct: &Self| ct.budget.as_ref().is_some_and(|b| b.host_at_limit(host));
+    fn no_room(&mut self, now: u64, host: A) -> bool {
+        let key = A::host_key(host);
+        let at_limit = |ct: &Self| ct.budget.as_ref().is_some_and(|b| b.host_at_limit(key));
         if at_limit(self) && !(self.evict_where(now, |_, c| c.orig.src == host) && !at_limit(self)) {
             self.stats.host_limit += 1;
             return true;
@@ -342,31 +389,16 @@ impl Conntrack {
     /// as table-full).
     fn full(&mut self, now: u64) -> bool {
         let at_max = |ct: &Self| ct.len() >= ct.max_conns || ct.budget.as_ref().is_some_and(|b| b.used() >= b.max);
-        if !at_max(self) || (self.evict_one(now, None) && !at_max(self)) {
+        if !at_max(self) || (self.evict_where(now, |_, _| true) && !at_max(self)) {
             return false;
         }
         self.stats.table_full += 1;
         true
     }
 
-    /// Early drop: of the [`EVICT_SCAN`] slots from the cursor, remove the
-    /// connection that is not assured (or expired) and expires first. With `nat_proto`,
-    /// only one whose removal frees an external port of that protocol (the
-    /// last connection of its mapping). False if the sample has none.
-    fn evict_one(&mut self, now: u64, nat_proto: Option<u8>) -> bool {
-        match nat_proto {
-            None => self.evict_where(now, |_, _| true),
-            Some(proto) => self.evict_where(now, |ct, c| {
-                c.mapped
-                    && c.orig.proto == proto
-                    && ct.mappings.get(&(c.orig.proto, c.orig.src, c.orig.sport)).is_some_and(|m| m.refs == 1)
-            }),
-        }
-    }
-
     /// Early drop among the sampled connections that are not assured (or
     /// have expired) and pass `pick`: the one that expires first.
-    fn evict_where(&mut self, now: u64, pick: impl Fn(&Self, &Conn) -> bool) -> bool {
+    fn evict_where(&mut self, now: u64, pick: impl Fn(&Self, &Conn<A>) -> bool) -> bool {
         let n = self.conns.len();
         if n == 0 {
             return false;
@@ -403,13 +435,13 @@ impl Conntrack {
         self.index.is_empty()
     }
 
-    pub fn lookup(&self, t: &Tuple) -> Option<(ConnId, Dir)> {
+    pub fn lookup(&self, t: &Tuple<A>) -> Option<(ConnId, Dir)> {
         self.index.get(t).copied()
     }
 
     /// [`Conntrack::lookup`], but a connection that has expired (and the
     /// bounded expiry has not reached yet) is removed and not found.
-    pub fn lookup_live(&mut self, now: u64, t: &Tuple) -> Option<(ConnId, Dir)> {
+    pub fn lookup_live(&mut self, now: u64, t: &Tuple<A>) -> Option<(ConnId, Dir)> {
         let (id, dir) = self.lookup(t)?;
         if self.conns[id].as_ref().is_some_and(|c| c.expires <= now) {
             self.remove(id);
@@ -419,17 +451,206 @@ impl Conntrack {
         Some((id, dir))
     }
 
-    pub fn get(&self, id: ConnId) -> Option<&Conn> {
+    pub fn get(&self, id: ConnId) -> Option<&Conn<A>> {
         self.conns.get(id).and_then(Option::as_ref)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Conn> {
+    pub fn iter(&self) -> impl Iterator<Item = &Conn<A>> {
         self.conns.iter().flatten()
     }
 
     /// Every connection with its id (for [`Conntrack::remove`]).
-    pub fn iter_ids(&self) -> impl Iterator<Item = (ConnId, &Conn)> {
+    pub fn iter_ids(&self) -> impl Iterator<Item = (ConnId, &Conn<A>)> {
         self.conns.iter().enumerate().filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
+    }
+
+    fn insert(&mut self, now: u64, orig: Tuple<A>, reply: Tuple<A>, nat: bool, mapped: bool, tcp_flags: u8) -> Option<ConnId> {
+        if self.index.contains_key(&orig) || self.index.contains_key(&reply) {
+            self.stats.clashes += 1;
+            return None; // clash (e.g. two internal hosts, same remote, same EIM port race)
+        }
+        if mapped {
+            let key = (orig.proto, orig.src, orig.sport);
+            let m = self.mappings.entry(key).or_insert(Mapping {
+                port: reply.dport,
+                refs: 0,
+            });
+            m.refs += 1;
+            self.used_ports.insert((orig.proto, reply.dport), ());
+        }
+        let conn = Conn {
+            orig,
+            reply,
+            nat,
+            mapped,
+            tcp: (orig.proto == PROTO_TCP).then_some(TcpState::SynSent),
+            synack_from: None,
+            replied: false,
+            expires: now + initial_timeout(orig.proto, tcp_flags),
+            packets: [0; 2],
+            bytes: [0; 2],
+            flow_hash: A::tuple_hash(self.hash_key, &orig),
+            orig_src_hash: A::host_hash(self.hash_key, orig.src),
+            orig_dst_hash: A::host_hash(self.hash_key, orig.dst),
+        };
+        let id = match self.free.pop() {
+            Some(id) => {
+                self.conns[id] = Some(conn);
+                id
+            }
+            None => {
+                self.conns.push(Some(conn));
+                self.conns.len() - 1
+            }
+        };
+        self.index.insert(orig, (id, Dir::Original));
+        self.index.insert(reply, (id, Dir::Reply));
+        if let Some(b) = &self.budget {
+            b.count(A::host_key(orig.src), true);
+        }
+        self.stats.created += 1;
+        Some(id)
+    }
+
+    /// Track a new connection whose first packet is `orig`, untranslated
+    /// (routed: IPv6, or IPv4 between the networks).
+    pub fn create_routed(&mut self, now: u64, orig: Tuple<A>, tcp_flags: u8) -> Option<ConnId> {
+        if self.no_room(now, orig.src) {
+            return None;
+        }
+        self.insert(now, orig, orig.inverse(), false, false, tcp_flags)
+    }
+
+    /// Account a packet and advance state/timeouts.
+    pub fn update(&mut self, now: u64, id: ConnId, dir: Dir, tcp_flags: u8, bytes: usize) {
+        let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else {
+            return;
+        };
+        let d = dir as usize;
+        c.packets[d] += 1;
+        c.bytes[d] += bytes as u64;
+        if dir == Dir::Reply {
+            c.replied = true;
+        }
+        let t = match c.orig.proto {
+            PROTO_TCP => {
+                let st = c.tcp.get_or_insert(TcpState::SynSent);
+                if tcp_flags & (TCP_SYN | TCP_ACK | TCP_RST) == TCP_SYN
+                    && matches!(*st, TcpState::Closing | TcpState::Closed)
+                {
+                    // The tuple reused by a new connection (a peer
+                    // reconnecting from the same port): start over, else
+                    // it lives on the closing timeout and its packets are
+                    // invalid once that runs out while it idles.
+                    *st = TcpState::SynSent;
+                    c.replied = dir == Dir::Reply;
+                    c.synack_from = None;
+                }
+                if tcp_flags & TCP_RST != 0 {
+                    *st = TcpState::Closed;
+                } else if tcp_flags & TCP_FIN != 0 {
+                    *st = TcpState::Closing;
+                } else if *st == TcpState::SynSent {
+                    let syn_ack = tcp_flags & (TCP_SYN | TCP_ACK);
+                    if syn_ack == (TCP_SYN | TCP_ACK) {
+                        c.synack_from = Some(dir);
+                    } else if syn_ack == TCP_ACK && c.synack_from.is_some_and(|d| d != dir) {
+                        // The initiator's ACK after the SYN+ACK: the
+                        // handshake is complete. Not the SYN+ACK alone, else
+                        // a spoofed SYN flood to an answering port forward
+                        // would pin entries for the established timeout.
+                        *st = TcpState::Established;
+                    }
+                }
+                match *st {
+                    TcpState::SynSent => timeout::TCP_SYN,
+                    TcpState::Established => timeout::TCP_ESTABLISHED,
+                    TcpState::Closing => timeout::TCP_CLOSING,
+                    TcpState::Closed => timeout::TCP_CLOSED,
+                }
+            }
+            PROTO_UDP if c.replied => timeout::UDP_ASSURED,
+            PROTO_UDP => timeout::UDP_UNREPLIED,
+            _ => timeout::ICMP,
+        };
+        c.expires = now + t;
+    }
+
+    /// Forget a connection (and release its NAT mapping reference).
+    pub fn remove(&mut self, id: ConnId) {
+        let Some(c) = self.conns.get_mut(id).and_then(Option::take) else {
+            return;
+        };
+        self.index.remove(&c.orig);
+        self.index.remove(&c.reply);
+        if let Some(b) = &self.budget {
+            b.count(A::host_key(c.orig.src), false);
+        }
+        if c.mapped {
+            let key = (c.orig.proto, c.orig.src, c.orig.sport);
+            if let Some(m) = self.mappings.get_mut(&key) {
+                m.refs -= 1;
+                if m.refs == 0 {
+                    self.used_ports.remove(&(c.orig.proto, m.port));
+                    self.mappings.remove(&key);
+                }
+            }
+        }
+        self.free.push(id);
+    }
+
+    /// Remove expired connections; returns how many. O(n): call about once a second.
+    pub fn expire(&mut self, now: u64) -> usize {
+        self.expire_some(now, usize::MAX)
+    }
+
+    /// Remove at most `max` expired connections, continuing where the last
+    /// pass stopped; returns how many. Scans the whole table at most once
+    /// (cheap); removals are what cost, so `max` bounds the lock hold.
+    pub fn expire_some(&mut self, now: u64, max: usize) -> usize {
+        let len = self.conns.len();
+        let mut n = 0;
+        let mut i = 0;
+        while i < len && n < max {
+            let id = (self.expire_cursor + i) % len;
+            if self.conns[id].as_ref().is_some_and(|c| c.expires <= now) {
+                self.remove(id);
+                n += 1;
+            }
+            i += 1;
+        }
+        if len > 0 {
+            self.expire_cursor = (self.expire_cursor + i) % len;
+        }
+        self.stats.expired += n as u64;
+        n
+    }
+
+    /// Drop all NAT state for an external address (e.g. the WAN lease changed).
+    pub fn flush_nat(&mut self) {
+        for id in 0..self.conns.len() {
+            if self.conns[id].as_ref().is_some_and(|c| c.nat) {
+                self.remove(id);
+            }
+        }
+    }
+}
+
+/// NAPT and DNAT: IPv4 only.
+impl Conntrack<Ipv4Addr> {
+    /// Early drop: of the [`EVICT_SCAN`] slots from the cursor, remove the
+    /// connection that is not assured (or expired) and expires first. With `nat_proto`,
+    /// only one whose removal frees an external port of that protocol (the
+    /// last connection of its mapping). False if the sample has none.
+    fn evict_one(&mut self, now: u64, nat_proto: Option<u8>) -> bool {
+        match nat_proto {
+            None => self.evict_where(now, |_, _| true),
+            Some(proto) => self.evict_where(now, |ct, c| {
+                c.mapped
+                    && c.orig.proto == proto
+                    && ct.mappings.get(&(c.orig.proto, c.orig.src, c.orig.sport)).is_some_and(|m| m.refs == 1)
+            }),
+        }
     }
 
     fn alloc_port(&mut self, proto: u8, preferred: u16) -> Option<u16> {
@@ -475,54 +696,6 @@ impl Conntrack {
             Some(m) => Some(m.port),
             None => self.alloc_port_or_evict(now, orig.proto, orig.sport),
         }
-    }
-
-    fn insert(&mut self, now: u64, orig: Tuple, reply: Tuple, nat: bool, mapped: bool, tcp_flags: u8) -> Option<ConnId> {
-        if self.index.contains_key(&orig) || self.index.contains_key(&reply) {
-            self.stats.clashes += 1;
-            return None; // clash (e.g. two internal hosts, same remote, same EIM port race)
-        }
-        if mapped {
-            let key = (orig.proto, orig.src, orig.sport);
-            let m = self.mappings.entry(key).or_insert(Mapping {
-                port: reply.dport,
-                refs: 0,
-            });
-            m.refs += 1;
-            self.used_ports.insert((orig.proto, reply.dport), ());
-        }
-        let conn = Conn {
-            orig,
-            reply,
-            nat,
-            mapped,
-            tcp: (orig.proto == PROTO_TCP).then_some(TcpState::SynSent),
-            synack_from: None,
-            replied: false,
-            expires: now + initial_timeout(orig.proto, tcp_flags),
-            packets: [0; 2],
-            bytes: [0; 2],
-            flow_hash: tuple_hash(self.hash_key, &orig),
-            orig_src_hash: host_hash(self.hash_key, orig.src),
-            orig_dst_hash: host_hash(self.hash_key, orig.dst),
-        };
-        let id = match self.free.pop() {
-            Some(id) => {
-                self.conns[id] = Some(conn);
-                id
-            }
-            None => {
-                self.conns.push(Some(conn));
-                self.conns.len() - 1
-            }
-        };
-        self.index.insert(orig, (id, Dir::Original));
-        self.index.insert(reply, (id, Dir::Reply));
-        if let Some(b) = &self.budget {
-            b.count(orig.src, true);
-        }
-        self.stats.created += 1;
-        Some(id)
     }
 
     /// Track a new connection to a port forward: `orig` (to the router's
@@ -617,120 +790,6 @@ impl Conntrack {
             None => (orig.inverse(), false),
         };
         self.insert(now, orig, reply, nat, nat, tcp_flags)
-    }
-
-    /// Account a packet and advance state/timeouts.
-    pub fn update(&mut self, now: u64, id: ConnId, dir: Dir, tcp_flags: u8, bytes: usize) {
-        let Some(c) = self.conns.get_mut(id).and_then(Option::as_mut) else {
-            return;
-        };
-        let d = dir as usize;
-        c.packets[d] += 1;
-        c.bytes[d] += bytes as u64;
-        if dir == Dir::Reply {
-            c.replied = true;
-        }
-        let t = match c.orig.proto {
-            PROTO_TCP => {
-                let st = c.tcp.get_or_insert(TcpState::SynSent);
-                if tcp_flags & (TCP_SYN | TCP_ACK | TCP_RST) == TCP_SYN
-                    && matches!(*st, TcpState::Closing | TcpState::Closed)
-                {
-                    // The tuple reused by a new connection (a peer
-                    // reconnecting from the same port): start over, else
-                    // it lives on the closing timeout and its packets are
-                    // invalid once that runs out while it idles.
-                    *st = TcpState::SynSent;
-                    c.replied = dir == Dir::Reply;
-                    c.synack_from = None;
-                }
-                if tcp_flags & TCP_RST != 0 {
-                    *st = TcpState::Closed;
-                } else if tcp_flags & TCP_FIN != 0 {
-                    *st = TcpState::Closing;
-                } else if *st == TcpState::SynSent {
-                    let syn_ack = tcp_flags & (TCP_SYN | TCP_ACK);
-                    if syn_ack == (TCP_SYN | TCP_ACK) {
-                        c.synack_from = Some(dir);
-                    } else if syn_ack == TCP_ACK && c.synack_from.is_some_and(|d| d != dir) {
-                        // The initiator's ACK after the SYN+ACK: the
-                        // handshake is complete. Not the SYN+ACK alone, else
-                        // a spoofed SYN flood to an answering port forward
-                        // would pin entries for the established timeout.
-                        *st = TcpState::Established;
-                    }
-                }
-                match *st {
-                    TcpState::SynSent => timeout::TCP_SYN,
-                    TcpState::Established => timeout::TCP_ESTABLISHED,
-                    TcpState::Closing => timeout::TCP_CLOSING,
-                    TcpState::Closed => timeout::TCP_CLOSED,
-                }
-            }
-            PROTO_UDP if c.replied => timeout::UDP_ASSURED,
-            PROTO_UDP => timeout::UDP_UNREPLIED,
-            _ => timeout::ICMP,
-        };
-        c.expires = now + t;
-    }
-
-    /// Forget a connection (and release its NAT mapping reference).
-    pub fn remove(&mut self, id: ConnId) {
-        let Some(c) = self.conns.get_mut(id).and_then(Option::take) else {
-            return;
-        };
-        self.index.remove(&c.orig);
-        self.index.remove(&c.reply);
-        if let Some(b) = &self.budget {
-            b.count(c.orig.src, false);
-        }
-        if c.mapped {
-            let key = (c.orig.proto, c.orig.src, c.orig.sport);
-            if let Some(m) = self.mappings.get_mut(&key) {
-                m.refs -= 1;
-                if m.refs == 0 {
-                    self.used_ports.remove(&(c.orig.proto, m.port));
-                    self.mappings.remove(&key);
-                }
-            }
-        }
-        self.free.push(id);
-    }
-
-    /// Remove expired connections; returns how many. O(n): call about once a second.
-    pub fn expire(&mut self, now: u64) -> usize {
-        self.expire_some(now, usize::MAX)
-    }
-
-    /// Remove at most `max` expired connections, continuing where the last
-    /// pass stopped; returns how many. Scans the whole table at most once
-    /// (cheap); removals are what cost, so `max` bounds the lock hold.
-    pub fn expire_some(&mut self, now: u64, max: usize) -> usize {
-        let len = self.conns.len();
-        let mut n = 0;
-        let mut i = 0;
-        while i < len && n < max {
-            let id = (self.expire_cursor + i) % len;
-            if self.conns[id].as_ref().is_some_and(|c| c.expires <= now) {
-                self.remove(id);
-                n += 1;
-            }
-            i += 1;
-        }
-        if len > 0 {
-            self.expire_cursor = (self.expire_cursor + i) % len;
-        }
-        self.stats.expired += n as u64;
-        n
-    }
-
-    /// Drop all NAT state for an external address (e.g. the WAN lease changed).
-    pub fn flush_nat(&mut self) {
-        for id in 0..self.conns.len() {
-            if self.conns[id].as_ref().is_some_and(|c| c.nat) {
-                self.remove(id);
-            }
-        }
     }
 }
 
@@ -954,7 +1013,7 @@ mod tests {
         if b.per_host() == 0 {
             return;
         }
-        let bucket = |ip: Ipv4Addr| b.bucket(ip).unwrap() as *const AtomicU32 as usize;
+        let bucket = |ip: Ipv4Addr| b.bucket(Ipv4Addr::host_key(ip)).unwrap() as *const AtomicU32 as usize;
         let mut per_bucket: BTreeMap<usize, usize> = BTreeMap::new();
         for c in shards.iter().flat_map(|s| s.iter()) {
             *per_bucket.entry(bucket(c.orig.src)).or_default() += 1;
@@ -1310,5 +1369,97 @@ mod tests {
         let ia = a.create(0, o, None, 0).unwrap();
         let ib = b.create(0, o, None, 0).unwrap();
         assert_ne!(a.get(ia).unwrap().flow_hash, b.get(ib).unwrap().flow_hash);
+    }
+
+    // ---- IPv6: the same table, routed only ------------------------------
+
+    fn t6(proto: u8, src: &str, sport: u16, dst: &str, dport: u16) -> Tuple<Ipv6Addr> {
+        Tuple { proto, src: src.parse().unwrap(), sport, dst: dst.parse().unwrap(), dport }
+    }
+
+    #[test]
+    fn ipv6_routed_connection_both_ways_and_tcp_states() {
+        let mut ct: Conntrack<Ipv6Addr> = Conntrack::new(100, 42);
+        let o = t6(PROTO_TCP, "2001:db8:1::10", 40000, "2001:db8:9::1", 443);
+        let id = ct.create_routed(0, o, TCP_SYN).unwrap();
+        assert_eq!(ct.lookup(&o), Some((id, Dir::Original)));
+        assert_eq!(ct.lookup(&o.inverse()), Some((id, Dir::Reply)));
+        let c = ct.get(id).unwrap();
+        assert!(!c.nat && !c.mapped && c.translated(Dir::Original) == o);
+        ct.update(1, id, Dir::Reply, TCP_SYN | TCP_ACK, 60);
+        assert!(!ct.get(id).unwrap().assured(), "SYN+ACK alone");
+        ct.update(2, id, Dir::Original, TCP_ACK, 60);
+        assert_eq!(ct.get(id).unwrap().tcp, Some(TcpState::Established));
+        // The same tuple again: a clash; expired: gone on lookup.
+        assert!(ct.create_routed(3, o, TCP_SYN).is_none());
+        assert_eq!(ct.stats.clashes, 1);
+        assert_eq!(ct.lookup_live(2 + timeout::TCP_ESTABLISHED, &o), None);
+        assert!(ct.is_empty());
+    }
+
+    #[test]
+    fn ipv6_host_limit_counts_the_slash64_and_shares_the_budget_with_ipv4() {
+        let b = Budget::with_host_limit(100, 3, 7);
+        let mut v4: Conntrack = Conntrack::new(100, 42);
+        let mut v6: Conntrack<Ipv6Addr> = Conntrack::new(100, 42);
+        v4.set_budget(b.clone());
+        v6.set_budget(b.clone());
+        v4.create(0, t(PROTO_UDP, LAN_A, 1000, REMOTE, 53), Some(WAN), 0).unwrap();
+        // Three privacy addresses of one /64: one host for the limit.
+        for (i, a) in ["2001:db8:1::a", "2001:db8:1::b", "2001:db8:1::c"].iter().enumerate() {
+            v6.create_routed(0, t6(PROTO_UDP, a, 1000 + i as u16, "2001:db8:9::1", 53), 0).unwrap();
+            // Answered, so not early-droppable.
+            let id = v6.lookup(&t6(PROTO_UDP, a, 1000 + i as u16, "2001:db8:9::1", 53)).unwrap().0;
+            v6.update(0, id, Dir::Reply, 0, 10);
+        }
+        assert_eq!(b.used(), 4, "one budget for both families");
+        assert_eq!(b.host_used("2001:db8:1::ffff".parse::<Ipv6Addr>().unwrap()), 3);
+        assert!(v6.create_routed(0, t6(PROTO_UDP, "2001:db8:1::d", 2000, "2001:db8:9::1", 53), 0).is_none());
+        assert_eq!(v6.stats.host_limit, 1);
+        // Another /64 is another host.
+        assert!(v6.create_routed(0, t6(PROTO_UDP, "2001:db8:2::a", 2000, "2001:db8:9::1", 53), 0).is_some());
+        v6.expire(u64::MAX);
+        v4.expire(u64::MAX);
+        assert_eq!(b.used(), 0);
+    }
+
+    #[test]
+    fn ipv6_full_table_early_drops_unassured() {
+        let mut ct: Conntrack<Ipv6Addr> = Conntrack::new(8, 42);
+        for i in 0..8u16 {
+            ct.create_routed(0, t6(PROTO_TCP, "2001:db8:1::10", 40000 + i, "2001:db8:9::1", 443), TCP_SYN).unwrap();
+        }
+        assert!(ct.create_routed(1, t6(PROTO_TCP, "2001:db8:1::11", 40000, "2001:db8:9::1", 443), TCP_SYN).is_some());
+        assert_eq!((ct.len(), ct.stats.early_drops), (8, 1));
+    }
+
+    #[test]
+    fn ipv6_hashes_cover_the_whole_address() {
+        let key = 0x1234_5678;
+        let a: Ipv6Addr = "2001:db8:1::a".parse().unwrap();
+        let b: Ipv6Addr = "2001:db8:1::b".parse().unwrap();
+        let c: Ipv6Addr = "2001:db8:2::a".parse().unwrap();
+        // CAKE: hosts are whole addresses (the /64 only for the limit).
+        assert_ne!(Ipv6Addr::host_hash(key, a), Ipv6Addr::host_hash(key, b));
+        assert_ne!(Ipv6Addr::host_hash(key, a), Ipv6Addr::host_hash(key, c));
+        assert_eq!(Ipv6Addr::host_key(a), Ipv6Addr::host_key(b));
+        assert_ne!(Ipv6Addr::host_key(a), Ipv6Addr::host_key(c));
+        let f = |src: &str, sport| Ipv6Addr::tuple_hash(key, &t6(PROTO_TCP, src, sport, "2001:db8:9::1", 443));
+        assert_ne!(f("2001:db8:1::a", 1), f("2001:db8:1::b", 1));
+        assert_ne!(f("2001:db8:1::a", 1), f("2001:db8:1::a", 2));
+        assert_ne!(f("2001:db8:1::a", 1), f("2001:db9:1::a", 1), "the upper half counts too");
+    }
+
+    #[test]
+    fn ipv4_hashes_are_unchanged_by_the_generic_table() {
+        // The values the IPv4-only table computed (CAKE flows, shards and
+        // host buckets must not move with the refactor).
+        let key = 0x1234_5678;
+        let tu = t(PROTO_TCP, LAN_A, 40000, REMOTE, 443);
+        let a = (u32::from(tu.src) as u64) << 32 | u32::from(tu.dst) as u64;
+        let b2 = (tu.sport as u64) << 32 | (tu.dport as u64) << 8 | tu.proto as u64;
+        assert_eq!(Ipv4Addr::tuple_hash(key, &tu), mix(key, mix(key, a) ^ b2) as u32);
+        assert_eq!(Ipv4Addr::host_hash(key, LAN_A), mix(key ^ 0x5bd1_e995, u32::from(LAN_A) as u64) as u16);
+        assert_eq!(Ipv4Addr::host_key(LAN_A), u32::from(LAN_A) as u64);
     }
 }

@@ -1,6 +1,6 @@
 # IPv6 (M7, plan)
 
-Status (2026-11-20): steps 0 and 1 done in QEMU (step 0: AAAA rebind protection, Kea for the lab, smoltcp limits, IPv6CP offer logged; step 1: IPv6 on the router's networks, below). The apu4 check of the IPv6CP offer waits for the soak run to end. Next: step 2a. First plan 2026-11-15 (checked at
+Status (2026-11-20): steps 0 and 1 done in QEMU (step 0: AAAA rebind protection, Kea for the lab, smoltcp limits, IPv6CP offer logged; step 1: IPv6 on the router's networks, below). Step 2a (conntrack generic over the address family) done too. The apu4 check of the IPv6CP offer waits for the soak run to end. Next: step 2b. First plan 2026-11-15 (checked at
 2712911); **revised 2026-11-20 against 74cb3d1**, after 135 commits that
 added routed LAN ports and live link slots, the WAN ingress stage, IPv4
 fragments, anti-spoofing, redirects, static routes, DNS views, DoT, the
@@ -135,10 +135,12 @@ New or changed (2026-11-20):
 - **One conntrack core, two front ends.** Duplicating the M9 work (early
   drop, bounded expiry, budget, per-host limit, `lookup_live`) in a
   `Conntrack6` would mean two copies to keep correct and to fuzz. Instead
-  step 2a moves the table machinery into a generic core (`ct::Table<T>`
-  over a tuple type with its own hash), monomorphised, with no dynamic
-  dispatch. IPv4 `Conntrack` = core + NAPT mappings. `Conntrack6` = core
-  only: no mappings, DNAT or port search. The IPv4 tests, the fuzz target
+  step 2a made the table generic over the address family (as built,
+  2026-11-20: `Conntrack<A: Addr = Ipv4Addr>`, `Tuple<A>`, `Conn<A>`; the
+  `Addr` trait gives the flow hash, the CAKE host hash and the per-host
+  key), monomorphised, with no dynamic dispatch. NAPT and DNAT live in
+  `impl Conntrack<Ipv4Addr>`; IPv6 uses the core only
+  (`Conntrack<Ipv6Addr>::create_routed`). The IPv4 tests, the fuzz target
   and `ct_bench` must show no change in behaviour or cost before IPv6
   uses it. Both families share one `Budget`: the table limit is a memory
   limit.
@@ -315,10 +317,23 @@ fail while its SLAAC address is still tentative (the lab waits for DAD).
   `wire.rs`).
 
 ### Step 2a: conntrack core refactor (no IPv6 yet)
-- `ct::Table<T>` as in §2; IPv4 `Conntrack` on top, no behaviour change.
-- Proof: all `crates/fwd` tests unchanged, `fwd` fuzz target 10 min clean,
-  `ct_bench=1` numbers within noise of before (release, HVF), lab
-  per-task CPU split unchanged.
+✅ (2026-11-20). `Conntrack<A: Addr = Ipv4Addr>` as in §2; IPv4 code
+paths and hash values unchanged (a test pins the IPv4 formulas). New
+host tests for IPv6 on the same table: routed connection both ways, TCP
+states, clash, `lookup_live`; early drop when full; one `Budget` for
+both families; the per-host limit by /64; hashes over the whole address.
+- Proof:
+  - all 102 `crates/fwd` tests pass unchanged; `fwd` fuzz target 10 min clean
+  - `ct_bench=1` (release, HVF), 6 interleaved pairs of the kernels
+    before and after, medians before → after: fill 684 → 691 ns/conn,
+    scan 15 → 13 µs, 256-entry pass 73 → 75 µs, refuse 54 → 56 ns, early
+    drop 909 → 904 ns; all within the pairs' spread (±10 %), except
+    removing all 16 128 at once: 4599 → 4748 µs, higher in all six pairs
+    (+0.3–6 %). That bulk removal never runs on the datapath (passes are
+    bounded to 256), so it is recorded, not chased.
+  - lab per-task CPU split, 3 interleaved pairs (debug kernel, as the lab
+    builds it): dp_down 231–238 → 231–233 ms, dp_up 211–216 → 212–214 ms:
+    unchanged.
 
 ### Step 2b: IPv6 forwarding with a static WAN prefix
 - `crates/fwd`: `wire::Ipv6View` (extension-header walk, §2), IPv6 LPM
