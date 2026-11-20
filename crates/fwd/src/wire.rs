@@ -472,6 +472,34 @@ pub fn build_ns(out: &mut [u8; NS_LEN], src_mac: Mac, src_ip: Ipv6Addr, target: 
     put16(out, m + 2, c);
 }
 
+/// Bytes of a router solicitation frame ([`build_rs`]).
+pub const RS_LEN: usize = ETH_HDR + 40 + 16;
+
+/// A Router Solicitation from `src_ip` (the WAN's link-local address) at
+/// `src_mac` to all routers (RFC 4861 §6.3.7), with the source
+/// link-layer option.
+pub fn build_rs(out: &mut [u8; RS_LEN], src_mac: Mac, src_ip: Ipv6Addr) {
+    let dst = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
+    out.fill(0);
+    out[0..6].copy_from_slice(&[0x33, 0x33, 0, 0, 0, 2]);
+    out[6..12].copy_from_slice(&src_mac);
+    put16(out, 12, ETHERTYPE_IPV6);
+    let ip = ETH_HDR;
+    out[ip] = 0x60;
+    put16(out, ip + 4, 16);
+    out[ip + 6] = PROTO_ICMPV6;
+    out[ip + 7] = 255;
+    out[ip + 8..ip + 24].copy_from_slice(&src_ip.octets());
+    out[ip + 24..ip + 40].copy_from_slice(&dst.octets());
+    let m = ip + 40;
+    out[m] = ICMPV6_ROUTER_SOLICIT;
+    out[m + 8] = 1;
+    out[m + 9] = 1;
+    out[m + 10..m + 16].copy_from_slice(&src_mac);
+    let c = icmpv6_checksum(src_ip, dst, &out[m..m + 16]);
+    put16(out, m + 2, c);
+}
+
 /// What a neighbor discovery message tells about a neighbor (RFC 4861
 /// §7.2.5, §7.2.3, §6.3.4): a Neighbor Advertisement its target's MAC (the
 /// target link-layer option), a Solicitation or a Router Advertisement
@@ -1146,6 +1174,17 @@ mod tests {
         assert!(!ipv6_na_set_router(&mut f), "already set");
         let mut ns = v6_frame(CMAC, RMAC, me, c, PROTO_ICMPV6, &[135, 0, 0, 0, 0, 0, 0, 0]);
         assert!(!ipv6_na_set_router(&mut ns), "not an NA");
+    }
+
+    #[test]
+    fn rs_is_valid() {
+        let me: Ipv6Addr = "fe80::5054:ff:fe00:1".parse().unwrap();
+        let mut rs = [0u8; RS_LEN];
+        build_rs(&mut rs, RMAC, me);
+        let v = Ipv6View::parse(&rs, ETH_HDR).unwrap();
+        assert_eq!((v.proto, v.hop_limit(&rs), rs[v.l4]), (PROTO_ICMPV6, 255, 133));
+        assert_eq!(icmpv6_checksum(me, v.dst(&rs), &rs[v.l4..]), 0);
+        assert_eq!(&rs[0..6], &[0x33, 0x33, 0, 0, 0, 2]);
     }
 
     #[test]

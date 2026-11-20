@@ -917,6 +917,18 @@ impl Forwarder {
         }
         if let Some((a, l)) = old {
             self.routes6.remove(a, l);
+            // A prefix gone (a new delegation): its connections cannot go on.
+            use crate::route::RouteAddr;
+            let net = a.masked(l);
+            let dead: Vec<_> = self
+                .ct6
+                .iter_ids()
+                .filter(|(_, c)| c.orig.src.masked(l) == net || c.orig.dst.masked(l) == net)
+                .map(|(id, _)| id)
+                .collect();
+            for id in dead {
+                self.ct6.remove(id);
+            }
         }
         if let Some((a, l)) = addr {
             self.routes6.set(Route { prefix: a, len: l, egress: ifx, gateway: None, kind: RouteKind::Connected });
@@ -1503,7 +1515,8 @@ impl Forwarder {
             }
         }
         let dport = (matches!(v.proto, PROTO_TCP | PROTO_UDP) && l4(4)).then(|| wire::get16(f, v.l4 + 2));
-        if v.proto == PROTO_UDP && dport.is_some_and(|d| d >= ROUTER_CLIENT_PORTS) {
+        // Replies to the router's UDP clients; 546: its DHCPv6 client.
+        if v.proto == PROTO_UDP && dport.is_some_and(|d| d >= ROUTER_CLIENT_PORTS || d == 546) {
             return self.local();
         }
         if let Some((i, action)) = self
@@ -4742,5 +4755,25 @@ mod tests {
         let mut f = ipv6_frame(LAN_MAC, a6(H6), a6(S6), 64, &[atomic], PROTO_UDP, &udp6(H6, S6, 5002, 53, b"q"));
         assert!(matches!(run(&mut fw, 4, LAN, &mut f), Verdict::Forward6 { .. }));
         assert_eq!(fw.take_fragment(), None);
+    }
+
+    #[test]
+    fn ipv6_wan_dhcpv6_client_and_prefix_change() {
+        let mut fw = router6f();
+        // The DHCPv6 server answers the router's client on port 546.
+        let isp_ll = "fe80::99";
+        let wan_ll = alloc::format!("{}", wire::link_local(WAN_MAC));
+        let mut f = frame6(WAN_MAC, isp_ll, &wan_ll, 255, PROTO_UDP, &udp6(isp_ll, &wan_ll, 547, 546, b"reply"));
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), LOCAL);
+        let mut f = frame6(WAN_MAC, isp_ll, &wan_ll, 255, PROTO_UDP, &udp6(isp_ll, &wan_ll, 547, 545, b"no"));
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), dropped(DropReason::Input));
+        // A connection in the LAN's global /64, then a new prefix there: gone.
+        let mut f = frame6(LAN_MAC, H6, S6, 64, PROTO_UDP, &udp6(H6, S6, 5000, 53, b"q"));
+        run(&mut fw, 0, LAN, &mut f);
+        let mut u = frame6(LAN_MAC, "fd00:1:2::77", S6, 64, PROTO_UDP, &udp6("fd00:1:2::77", S6, 5000, 53, b"q"));
+        run(&mut fw, 0, LAN, &mut u);
+        assert_eq!(fw.ct6.len(), 2);
+        fw.set_gua6(LAN, Some((a6("2001:db8:200::1"), 64)));
+        assert_eq!(fw.ct6.len(), 1, "only the ULA one stays");
     }
 }
