@@ -507,6 +507,7 @@ pub fn place_networks(
             .collect(),
         policy: crate::config::firewall(),
         routes: crate::config::static_routes(),
+        routes6: crate::config::static_routes6(),
     };
     (slots, links, msg)
 }
@@ -569,7 +570,15 @@ pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: 
                 host.iface.set_hardware_addr(hw);
             }
         }
-        set_host_routes(&mut host.iface, k.map_or(&[][..], |k| &nets[k].routes));
+        // IPv6 [[route]]s through a router in this network's ULA /64.
+        let routes6: Vec<(core::net::Ipv6Addr, u8, core::net::Ipv6Addr)> = match k.and_then(|k| nets[k].ula) {
+            Some(ula) => crate::config::static_routes6()
+                .into_iter()
+                .filter(|&(_, _, via)| u128::from(via) >> 64 == u128::from(ula) >> 64)
+                .collect(),
+            None => Vec::new(),
+        };
+        set_host_routes46(&mut host.iface, k.map_or(&[][..], |k| &nets[k].routes), &routes6);
         let mut want: Vec<IpCidr> = Vec::new();
         if let Some(k) = k {
             want.push(IpCidr::Ipv4(cidr(&nets[k])));
@@ -597,6 +606,15 @@ pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: 
 /// WAN's, from the lease or PPPoE). smoltcp holds at most
 /// `iface-max-route-count` (Cargo feature) of them.
 pub fn set_host_routes(iface: &mut Interface, routes: &[(core::net::Ipv4Addr, u8, core::net::Ipv4Addr)]) {
+    set_host_routes46(iface, routes, &[]);
+}
+
+/// [`set_host_routes`] with IPv6 routes too (a network's `[[route]]`s).
+pub fn set_host_routes46(
+    iface: &mut Interface,
+    routes: &[(core::net::Ipv4Addr, u8, core::net::Ipv4Addr)],
+    routes6: &[(core::net::Ipv6Addr, u8, core::net::Ipv6Addr)],
+) {
     use smoltcp::iface::Route;
     use smoltcp::wire::IpAddress;
     iface.routes_mut().update(|table| {
@@ -605,6 +623,17 @@ pub fn set_host_routes(iface: &mut Interface, routes: &[(core::net::Ipv4Addr, u8
             let route = Route {
                 cidr: IpCidr::Ipv4(Ipv4Cidr::new(dst, len)),
                 via_router: IpAddress::Ipv4(via),
+                preferred_until: None,
+                expires_at: None,
+            };
+            if table.push(route).is_err() {
+                println!("  routes          : table full, {dst}/{len} via {via} left out");
+            }
+        }
+        for &(dst, len, via) in routes6 {
+            let route = Route {
+                cidr: IpCidr::Ipv6(Ipv6Cidr::new(dst, len)),
+                via_router: IpAddress::Ipv6(via),
                 preferred_until: None,
                 expires_at: None,
             };

@@ -577,6 +577,24 @@ if [ -n "$v6on" ]; then
       if $bb ip -6 route show default 2>/dev/null | $bb grep -q .; then fail "ipv6: a default route appeared (router lifetime must be 0)"; else pass "ipv6: no default route (router lifetime 0)"; fi
     fi
     if $bb ping6 -c 2 -W 2 "$r6" >/tmp/p6 2>&1; then pass "ipv6: ping router $r6"; else fail "ipv6: ping $r6"; $bb tail -2 /tmp/p6 | $bb sed 's/^/    | /'; fi
+    # An IPv6 [[route]] (step 5b, LAB_ROUTES=1): fd00:30::/64 via our ULA;
+    # the router answers fd00:30::5 on our loopback through it. Negative
+    # control LAB_ROUTES=0.
+    if $bb grep -q 'lab_routes=' /proc/cmdline; then
+      $bb ip -6 addr add fd00:30::5/128 dev lo
+      if $bb ping6 -c 2 -W 2 -I fd00:30::5 "$r6" >/tmp/p6r 2>&1; then
+        pass "routes6: the router answers fd00:30::5 (behind $a6) through lab-behind6"
+      else
+        fail "routes6: ping6 $r6 from fd00:30::5"; $bb tail -2 /tmp/p6r | $bb sed 's/^/    | /'
+      fi
+      r6s=$(v6st | $bb sed -n 's/.*"routes6":\[\([^]]*\)\].*/\1/p')
+      if echo "$r6s" | $bb grep -q '"name":"lab-behind6","dst":"fd00:30::/64","via":"fd13:34ac:fcc9:0:5054:ff:fe00:10","active":true'; then
+        pass "routes6: /api/status lists lab-behind6 active"
+      else
+        fail "routes6: /api/status routes6: $r6s"
+      fi
+      $bb ip -6 addr del fd00:30::5/128 dev lo
+    fi
     ll=$(v6st | $bb sed 's/.*"name":"lan0"//' | $bb grep -o 'fe80::[0-9a-f:]*' | $bb head -1)
     if [ -n "$ll" ] && $bb ping6 -c 1 -W 2 "$ll%eth0" >/tmp/p6 2>&1; then pass "ipv6: ping router link-local $ll%eth0"; else fail "ipv6: ping router link-local '$ll%eth0'"; $bb tail -2 /tmp/p6 | $bb sed 's/^/    | /'; fi
     out=$($bb nslookup -type=AAAA router.lan "$r6" 2>&1)
@@ -665,7 +683,7 @@ if [ -n "$v6on" ]; then
       # stopped, v6dns.isp.example (known only to the ISP's IPv6-only
       # resolver, which DHCPv6 handed out) resolves through the WAN's
       # global address. Negative control LAB_IPV6_DNS6=0.
-      if [ "$v6mode" = pd ]; then
+      if [ "$v6mode" = pd ] && ! $bb grep -q 'lab_dot=1' /proc/cmdline; then
         stopped=$(isp_dns stop)
         out=$($bb nslookup -type=a v6dns.isp.example 192.168.1.1 2>&1)
         started=$(isp_dns start)

@@ -33,7 +33,7 @@ const LOG_STEP_NS: u64 = 100_000_000;
 
 struct Server {
     name: String,
-    addr: Option<Ipv4Addr>,
+    addr: Option<IpAddr>,
     /// The id of our lookup in flight, if any.
     lookup: Option<u16>,
     next_lookup_ms: u64,
@@ -41,7 +41,7 @@ struct Server {
 
 pub struct Ntp {
     servers: Vec<Server>,
-    client: Client<Ipv4Addr>,
+    client: Client<IpAddr>,
     sock: SocketHandle,
     wan_up: bool,
     next_id: u16,
@@ -51,7 +51,7 @@ pub struct Ntp {
 /// What the status page shows.
 pub struct Status {
     pub servers: Vec<String>,
-    pub server: Option<Ipv4Addr>,
+    pub server: Option<IpAddr>,
     pub synced: Option<Sample>,
     pub interval_s: u64,
 }
@@ -135,7 +135,7 @@ impl Ntp {
             let s = &self.servers[i];
             // A lookup still in flight at its deadline is given up on and
             // replaced (the reply would be ignored: unknown id).
-            if now_ms < s.next_lookup_ms || s.name.parse::<Ipv4Addr>().is_ok() {
+            if now_ms < s.next_lookup_ms || s.name.parse::<IpAddr>().is_ok() {
                 continue;
             }
             let id = self.next_id;
@@ -156,10 +156,10 @@ impl Ntp {
         };
         s.lookup = None;
         let recs = wire::records(data).unwrap_or_default();
-        let addr = wire::answer_ipv4s(data, &recs).first().copied();
+        let addr = wire::answer_ipv4s(data, &recs).first().copied().map(IpAddr::V4);
         if h.rcode() == wire::RCODE_NOERROR && addr.is_some() {
             if s.addr != addr {
-                println!("  ntp             : {} is {}", s.name, addr.unwrap_or(Ipv4Addr::UNSPECIFIED));
+                println!("  ntp             : {} is {}", s.name, addr.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
             }
             s.addr = addr;
             s.next_lookup_ms = now_ms + RESOLVE_EVERY_MS;
@@ -173,17 +173,17 @@ impl Ntp {
         if !self.wan_up {
             return;
         }
-        let addrs: Vec<Ipv4Addr> = self.servers.iter().filter_map(|s| s.addr).collect();
+        let addrs: Vec<IpAddr> = self.servers.iter().filter_map(|s| s.addr).collect();
         self.client.set_servers(&addrs);
         let sock = wan.get_mut::<udp::Socket>(self.sock);
         let mut buf = [0u8; 128];
         while let Ok((n, meta)) = sock.recv_slice(&mut buf) {
-            if let (IpAddr::V4(from), PORT) = (IpAddr::from(meta.endpoint.addr), meta.endpoint.port) {
-                self.client.handle(from, &buf[..n], now_ns());
+            if meta.endpoint.port == PORT {
+                self.client.handle(IpAddr::from(meta.endpoint.addr), &buf[..n], now_ns());
             }
         }
         while let Some(req) = self.client.poll(now_ns()) {
-            let ep = IpEndpoint::new(IpAddr::V4(req.server).into(), PORT);
+            let ep = IpEndpoint::new(req.server.into(), PORT);
             let _ = sock.send_slice(&req.data[..LEN], ep);
         }
         if let Some(s) = self.client.take_update() {
@@ -193,7 +193,7 @@ impl Ntp {
             if shown {
                 println!(
                     "  ntp             : synced to {} stratum {}, delay {} ms{}: {}",
-                    self.client.status().server.unwrap_or(Ipv4Addr::UNSPECIFIED),
+                    self.client.status().server.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
                     s.stratum,
                     s.delay / 1_000_000,
                     step.map(|d| alloc::format!(", stepped {} ms", -d / 1_000_000))
@@ -214,7 +214,7 @@ impl Ntp {
         let lookup = self
             .servers
             .iter()
-            .filter(|s| s.name.parse::<Ipv4Addr>().is_err())
+            .filter(|s| s.name.parse::<IpAddr>().is_err())
             .map(|s| s.next_lookup_ms)
             .min();
         match (client, lookup) {

@@ -484,6 +484,7 @@ impl Datapath {
             f.set_ll6(WAN, crate::net::wan6::ppp_link().map(|l| l.0).filter(|_| self.sh.ports[0].is_pppoe()));
             f.set_default_route6(wan6.map(|w| (WAN, w.gateway)));
             f.set_static_routes(&n.routes);
+            f.set_static_routes6(&n.routes6);
             f.set_policy(Some(n.policy.clone()));
             if crate::config::fw_recheck() {
                 revoked += f.recheck();

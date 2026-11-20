@@ -182,6 +182,10 @@
 #                        server has it) but not plain.isp.example (only the
 #                        plain dnsd has it), the router's connection came
 #                        up (log), the ISP's DoT server saw the queries.
+#                        With LAB_IPV6=1 the router's only upstream is
+#                        [2001:db8:ffff::1]:853 (DoT over IPv6; negative
+#                        control LAB_DOT_V6=0: the ISP's stunnel on IPv4
+#                        only).
 #                        Negative controls: LAB_DOT_NAME=wrong.example (name
 #                        mismatch), LAB_DOT_CA=0 (lab CA not trusted: only
 #                        Mozilla's roots) and LAB_ROUTER_ARGS=dns_tls=0
@@ -208,7 +212,10 @@
 #                        NAT and the router itself, /api/status lists the
 #                        route, the ISP forging 10.30.0.5 is dropped as
 #                        spoofed. Negative control: LAB_ROUTES=0 (the route
-#                        disabled: every check fails).
+#                        disabled: every check fails). With LAB_IPV6=1 also
+#                        lab-behind6 = fd00:30::/64 via the client's ULA:
+#                        the router answers fd00:30::5 on the client's
+#                        loopback, /api/status routes6 lists it active.
 #   LAB_IPV6=1           (or pd; LAB_IPV6=static: step 2b's boot arguments
 #                        instead) the ISP VM sends RAs (dnsmasq, ra-only)
 #                        and delegates prefixes (Kea, 2001:db8:100::/48 →
@@ -332,6 +339,7 @@ IPV6_OPEN="${LAB_IPV6_OPEN:-}"
 ISP_IPV6="$IPV6"
 ISP_PD="${LAB_IPV6_PD:-1}"
 ISP_DNS6="${LAB_IPV6_DNS6:-1}"
+ISP_DOT6="${LAB_DOT_V6:-1}"
 if [[ "$IPV6" == static && -n "$ISP_PPPOE" ]]; then
   echo "lab-test: LAB_IPV6=static is for an Ethernet WAN; with LAB_PPPOE use LAB_IPV6=1" >&2
   exit 2
@@ -419,7 +427,13 @@ dns_toml() {
   [[ -n "$DOT$DNS_VIEWS" ]] || return 0
   printf '\n[dns]\n'
   if [[ -n "$DOT" ]]; then
-    printf 'tls = true\nupstreams = ["203.0.113.1#%s"]\n' "$DOT_NAME"
+    # With LAB_IPV6: the ISP's IPv6 address only (step 5b: DoT over IPv6;
+    # negative control LAB_DOT_V6=0, the ISP listening on IPv4 only).
+    if [[ -n "$IPV6" ]]; then
+      printf 'tls = true\nupstreams = ["[2001:db8:ffff::1]:853#%s"]\n' "$DOT_NAME"
+    else
+      printf 'tls = true\nupstreams = ["203.0.113.1#%s"]\n' "$DOT_NAME"
+    fi
     if [[ "$DOT_CA" == 1 ]]; then printf 'tls_ca = """\n'; cat "$WORK/dot/ca.pem"; printf '"""\n'; fi
   fi
   [[ "$DNS_VIEWS" == 1 ]] && printf 'views = "firewall"\n'
@@ -560,6 +574,17 @@ name = "lab-behind"
 enabled = $([[ "$ROUTES" == 1 ]] && echo true || echo false)
 dst = "10.30.0.0/24"
 via = "192.168.1.100"
+CFG
+  # IPv6 (docs/ipv6.md step 5b): fd00:30::/64 via the client's ULA. The
+  # lab router's ULA /48 is derived from its WAN MAC 52:54:00:00:00:01:
+  # fd13:34ac:fcc9::/48 (config::ula_prefix), on both architectures.
+  [[ -n "$ROUTES" && -n "$IPV6" ]] && cat >>"$WORK/config.toml" <<CFG
+
+[[route]]
+name = "lab-behind6"
+enabled = $([[ "$ROUTES" == 1 ]] && echo true || echo false)
+dst = "fd00:30::/64"
+via = "fd13:34ac:fcc9::5054:ff:fe00:10"
 CFG
   dns_toml >>"$WORK/config.toml"
   cargo build -q -p leatstore --release
@@ -764,10 +789,12 @@ fi
 # DNS over TLS: the router's connection came up, and the ISP's DoT server
 # (dnsmasq behind stunnel) answered queries.
 if [[ -n "$DOT" ]]; then
-  up=$(cat "$RLOG" | grep "dns-over-tls    : 203.0.113.1#.* up:" | head -1 || true)
+  # The ISP's IPv4 address, or with LAB_IPV6 its IPv6 one.
+  srv="203.0.113.1#"; [[ -n "$IPV6" ]] && srv="[2001:db8:ffff::1]:853#"
+  up=$(cat "$RLOG" | grep -F "dns-over-tls    : $srv" | grep " up:" | head -1 || true)
   n=$(tr -d '\r' <"$WORK/isp.log" | grep -c "isp-dot: .*query\[" || true)
   if [[ -n "$up" && "$n" -gt 0 ]]; then
-    echo "  LAB PASS: dns over tls: ${up##*: 203.0.113.1#} ($n queries at the ISP's DoT server)"
+    echo "  LAB PASS: dns over tls: ${up##*: $srv} ($n queries at the ISP's DoT server)"
     want=${LAB_EXPECT_DATES:-$([[ "$ARCH" == x86_64 ]] && echo rtc || echo issue)}
     case "$want" in
       rtc) pat="dates checked against the RTC" ;;

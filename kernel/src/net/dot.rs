@@ -25,7 +25,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::net::{IpAddr, Ipv4Addr};
+use core::net::IpAddr;
 use core::time::Duration;
 use proto_dot::rustls::crypto::{GetRandomFailed, SecureRandom};
 use proto_dot::{Clock, Conn, ServerName, State, UnixTime};
@@ -250,7 +250,7 @@ impl Dot {
     }
 
     /// Queue `query` for the upstream at `ip`, connecting if needed.
-    pub fn send(&mut self, wan: &mut HostIf, ip: Ipv4Addr, query: &[u8]) {
+    pub fn send(&mut self, wan: &mut HostIf, ip: IpAddr, query: &[u8]) {
         let Some(i) = self.links.iter().position(|l| l.up.ip == ip) else {
             return;
         };
@@ -285,7 +285,7 @@ impl Dot {
         let mut s = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; TCP_BUF]), tcp::SocketBuffer::new(vec![0; TCP_BUF]));
         // Unacknowledged data for this long ends the connection.
         s.set_timeout(Some(smoltcp::time::Duration::from_secs(10)));
-        let remote = IpEndpoint::new(IpAddr::V4(l.up.ip).into(), l.port);
+        let remote = IpEndpoint::new(l.up.ip.into(), l.port);
         if let Err(e) = s.connect(wan.iface.context(), remote, port) {
             return self.fail(i, alloc::format!("connect: {e:?} (no WAN address?)"));
         }
@@ -330,7 +330,7 @@ impl Dot {
 
     /// Move bytes between the TCP sockets and the TLS connections; returns
     /// the answers (server, DNS message).
-    pub fn step(&mut self, wan: &mut HostIf) -> Vec<(Ipv4Addr, Vec<u8>)> {
+    pub fn step(&mut self, wan: &mut HostIf) -> Vec<(IpAddr, Vec<u8>)> {
         let mut out = Vec::new();
         let mut buf = [0u8; 4096];
         let now = timer::Instant::now();

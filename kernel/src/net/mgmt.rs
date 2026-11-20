@@ -1360,6 +1360,17 @@ fn status_json(
         );
     }
     s.push(']');
+    // IPv6 [[route]]s: active while their router's /48 is this boot's ULA.
+    s.push_str(",\"routes6\":[");
+    for (n, (name, dst, len, via, on)) in config::named_routes6().iter().enumerate() {
+        let _ = write!(
+            s,
+            "{}{{\"name\":{},\"dst\":\"{dst}/{len}\",\"via\":\"{via}\",\"active\":{on}}}",
+            if n > 0 { "," } else { "" },
+            json_str(name)
+        );
+    }
+    s.push(']');
     // Firewall rules in effect (enabled ones) and the packets they decided.
     s.push_str(",\"rules\":[");
     let hits = sh.rule_hits.lock().clone();

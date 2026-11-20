@@ -79,7 +79,7 @@ pub struct LanServices {
     /// while the WAN has a global address to ask them from.
     lease_dns6: Vec<Ipv6Addr>,
     /// UDP port per configured upstream (53 unless given).
-    udp_ports: Vec<(Ipv4Addr, u16)>,
+    udp_ports: Vec<(IpAddr, u16)>,
     /// `dns.tls`: upstream queries only through `dot`; if that is `None`
     /// (trust anchors failed to load), none at all.
     tls: bool,
@@ -354,7 +354,7 @@ impl LanServices {
     fn apply_upstreams(&mut self, hosts: &mut [HostIf]) {
         let d = config::dns();
         let own = !d.upstreams.is_empty() || d.tls;
-        let ips: Vec<IpAddr> = if own { d.upstreams.iter().map(|u| IpAddr::V4(u.ip)).collect() } else { self.lease_upstreams() };
+        let ips: Vec<IpAddr> = if own { d.upstreams.iter().map(|u| u.ip).collect() } else { self.lease_upstreams() };
         self.dns.set_upstreams(&ips);
         self.udp_ports = d.upstreams.iter().map(|u| (u.ip, u.port(false))).collect();
         self.tls = d.tls;
@@ -682,7 +682,7 @@ impl LanServices {
 
     /// The UDP port of an upstream: as configured, else 53.
     fn udp_port(&self, server: IpAddr) -> u16 {
-        self.udp_ports.iter().find(|(ip, _)| IpAddr::V4(*ip) == server).map_or(DNS_PORT, |&(_, p)| p)
+        self.udp_ports.iter().find(|(ip, _)| *ip == server).map_or(DNS_PORT, |&(_, p)| p)
     }
 
     /// Send resolver output: answers to clients go out on the socket of
@@ -723,7 +723,7 @@ impl LanServices {
                 }
                 // Strict: with `dns.tls` never UDP, also when TLS is unavailable.
                 Action::Upstream { server, data } if self.tls => {
-                    if let (Some(dot), IpAddr::V4(server)) = (self.dot.as_mut(), server) {
+                    if let Some(dot) = self.dot.as_mut() {
                         dot.send(&mut hosts[0], server, &data);
                     }
                 }

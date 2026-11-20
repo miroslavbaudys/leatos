@@ -664,7 +664,41 @@ pub fn static_routes() -> Vec<(Ipv4Addr, u8, Ipv4Addr)> {
     c.routes
         .iter()
         .filter(|r| r.enabled)
-        .map(|r| (r.dst.0.network(), r.dst.0.prefix, r.via))
+        .filter_map(schema::Route::v4)
+        .map(|(d, via)| (d.network(), d.prefix, via))
+        .collect()
+}
+
+/// The enabled IPv6 `[[route]]`s whose router is in this boot's unique
+/// local /48 (with IPv6 on): (prefix, length, router).
+pub fn static_routes6() -> Vec<(Ipv6Addr, u8, Ipv6Addr)> {
+    if !ipv6() {
+        return Vec::new();
+    }
+    let ula = ula_prefix();
+    let c = get();
+    c.routes
+        .iter()
+        .filter(|r| r.enabled)
+        .filter_map(schema::Route::v6)
+        .filter(|(_, via)| schema::Cidr6::new(*via, 48).network() == ula)
+        .map(|(d, via)| (d.network(), d.prefix, via))
+        .collect()
+}
+
+/// The enabled IPv6 `[[route]]`s with their names and whether they are in
+/// use ([`static_routes6`]): (name, prefix, length, router, active).
+pub fn named_routes6() -> Vec<(String, Ipv6Addr, u8, Ipv6Addr, bool)> {
+    let active = static_routes6();
+    let c = get();
+    c.routes
+        .iter()
+        .filter(|r| r.enabled)
+        .filter_map(|r| r.v6().map(|(d, via)| (r.name.clone(), d.network(), d.prefix, via)))
+        .map(|(n, d, l, via)| {
+            let on = active.contains(&(d, l, via));
+            (n, d, l, via, on)
+        })
         .collect()
 }
 
@@ -675,7 +709,7 @@ pub fn named_routes() -> Vec<(String, Ipv4Addr, u8, Ipv4Addr)> {
     c.routes
         .iter()
         .filter(|r| r.enabled)
-        .map(|r| (r.name.clone(), r.dst.0.network(), r.dst.0.prefix, r.via))
+        .filter_map(|r| r.v4().map(|(d, via)| (r.name.clone(), d.network(), d.prefix, via)))
         .collect()
 }
 
@@ -685,7 +719,8 @@ pub fn wan_routes() -> Vec<(Ipv4Addr, u8, Ipv4Addr)> {
     c.routes
         .iter()
         .filter(|r| r.enabled && c.route_via(r) == schema::RouteVia::Wan)
-        .map(|r| (r.dst.0.network(), r.dst.0.prefix, r.via))
+        .filter_map(schema::Route::v4)
+        .map(|(d, via)| (d.network(), d.prefix, via))
         .collect()
 }
 
@@ -804,10 +839,20 @@ pub fn firewall() -> fwd::forwarder::Policy {
         })
         .collect();
     // Replies from the DNS-over-TLS servers to the router's connections.
-    let router_tcp_peers = if c.dns.tls {
-        c.dns.upstream_list().iter().map(|u| (u.ip, u.port(true))).collect()
+    let (router_tcp_peers, router_tcp_peers6) = if c.dns.tls {
+        let ups = c.dns.upstream_list();
+        (
+            ups.iter().filter_map(|u| match u.ip {
+                core::net::IpAddr::V4(a) => Some((a, u.port(true))),
+                core::net::IpAddr::V6(_) => None,
+            }).collect(),
+            ups.iter().filter_map(|u| match u.ip {
+                core::net::IpAddr::V6(a) => Some((a, u.port(true))),
+                core::net::IpAddr::V4(_) => None,
+            }).collect(),
+        )
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     fwd::forwarder::Policy {
         forward,
@@ -817,6 +862,7 @@ pub fn firewall() -> fwd::forwarder::Policy {
         forwards,
         redirects,
         router_tcp_peers,
+        router_tcp_peers6,
     }
 }
 

@@ -239,6 +239,8 @@ pub struct Networks {
     pub policy: fwd::forwarder::Policy,
     /// `[[route]]`s: (subnet, prefix length, router).
     pub routes: Vec<(Ipv4Addr, u8, Ipv4Addr)>,
+    /// IPv6 `[[route]]`s (`config::static_routes6`).
+    pub routes6: Vec<(Ipv6Addr, u8, Ipv6Addr)>,
 }
 
 /// Which network each slot holds (`slots[i]` = link `1 + i`), keeping a
