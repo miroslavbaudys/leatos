@@ -11,7 +11,13 @@
 //! deprecates the prefix, when the network or IPv6 goes away.
 //!
 //! [`Advertiser::poll`] returns a whole Ethernet frame to ff02::1 from the
-//! router's link-local address (EUI-64 of `mac`).
+//! router's link-local address (EUI-64 of `mac`). A prefix that leaves the
+//! config (a new delegated prefix, a lost one) is still advertised as
+//! deprecated for [`DEPRECATED_MS`] (preferred 0, valid 2 h), so clients
+//! stop using their addresses in it (RFC 7084 L-13).
+//!
+//! [`parse_frame`] reads the RA of an upstream router (the ISP's, on the
+//! WAN): default router lifetime, M/O flags, MTU, prefixes, DNS servers.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -35,6 +41,8 @@ pub const DNS_SECS: u32 = 1_800;
 /// A retired prefix stays valid this long (hosts never shorten the valid
 /// lifetime below 2 h on an unauthenticated RA: RFC 4862 §5.5.3 e).
 pub const RETIRED_VALID_SECS: u32 = 7_200;
+/// How long a prefix that left the config is advertised as deprecated.
+pub const DEPRECATED_MS: u64 = RETIRED_VALID_SECS as u64 * 1000;
 /// Router lifetime while the router forwards IPv6 to a default route
 /// (RFC 4861 §6.2.1 default: 3 × the maximum interval).
 pub const ROUTER_SECS: u16 = 1_800;
@@ -72,6 +80,9 @@ pub struct Advertiser {
     rng: u64,
     retiring: bool,
     done: bool,
+    /// Prefixes no longer in the config, advertised as deprecated until
+    /// the time given.
+    deprecated: Vec<(Ipv6Addr, u64)>,
     /// RAs sent.
     pub sent: u64,
     /// Router Solicitations seen.
@@ -89,6 +100,7 @@ impl Advertiser {
             rng: seed | 1,
             retiring: false,
             done: false,
+            deprecated: Vec::new(),
             sent: 0,
             solicits: 0,
         }
@@ -104,6 +116,14 @@ impl Advertiser {
         if cfg == self.cfg || self.retiring {
             return;
         }
+        let same = |a: Ipv6Addr, b: Ipv6Addr| prefix64(a) == prefix64(b);
+        for &old in &self.cfg.prefixes {
+            if !cfg.prefixes.iter().any(|&n| same(n, old)) && !self.deprecated.iter().any(|&(d, _)| same(d, old)) {
+                self.deprecated.push((old, now + DEPRECATED_MS));
+            }
+        }
+        // Back in the config: no longer deprecated.
+        self.deprecated.retain(|&(d, _)| !cfg.prefixes.iter().any(|&n| same(n, d)));
         self.cfg = cfg;
         self.initial_left = MAX_INITIAL_ADVERTS;
         self.next = self.next.min(self.earliest(now));
@@ -143,6 +163,7 @@ impl Advertiser {
         if self.done || now < self.next {
             return None;
         }
+        self.deprecated.retain(|&(_, until)| until > now);
         let frame = self.frame();
         self.sent += 1;
         self.last_sent = Some(now);
@@ -198,6 +219,13 @@ impl Advertiser {
             icmp.extend_from_slice(&[0; 4]);
             icmp.extend_from_slice(&prefix64(p).octets());
         }
+        for &(p, _) in self.deprecated.iter().take(4) {
+            icmp.extend_from_slice(&[OPT_PREFIX, 4, 64, 0xc0]);
+            icmp.extend_from_slice(&RETIRED_VALID_SECS.to_be_bytes());
+            icmp.extend_from_slice(&0u32.to_be_bytes());
+            icmp.extend_from_slice(&[0; 4]);
+            icmp.extend_from_slice(&prefix64(p).octets());
+        }
         if !c.rdnss.is_empty() {
             let n = c.rdnss.len().min(8);
             icmp.extend_from_slice(&[OPT_RDNSS, (1 + 2 * n) as u8, 0, 0]);
@@ -231,6 +259,96 @@ impl Advertiser {
         f.extend_from_slice(&icmp);
         f
     }
+}
+
+/// A prefix an upstream router advertises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefixInfo {
+    pub prefix: Ipv6Addr,
+    pub len: u8,
+    pub on_link: bool,
+    pub autonomous: bool,
+    pub valid_secs: u32,
+    pub preferred_secs: u32,
+}
+
+/// What an upstream router's RA says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouterInfo {
+    /// Its link-local address (the default route's next hop).
+    pub router: Ipv6Addr,
+    /// As a default router (0: not one).
+    pub lifetime_secs: u16,
+    /// M: addresses by DHCPv6. O: other configuration by DHCPv6.
+    pub managed: bool,
+    pub other: bool,
+    pub mtu: Option<u32>,
+    pub prefixes: Vec<PrefixInfo>,
+    pub rdnss: Vec<Ipv6Addr>,
+}
+
+/// An RA in an Ethernet frame (untagged): from a link-local address with
+/// hop limit 255 (RFC 4861 §6.1.2), right behind the fixed header, valid
+/// checksum. `None` for anything else.
+pub fn parse_frame(f: &[u8]) -> Option<RouterInfo> {
+    let ip = 14;
+    if f.get(12..14)? != [0x86, 0xdd] || f.get(ip)? >> 4 != 6 || *f.get(ip + 6)? != 58 || *f.get(ip + 7)? != 255 {
+        return None;
+    }
+    let plen = usize::from(u16::from_be_bytes([f[ip + 4], f[ip + 5]]));
+    let msg = f.get(ip + 40..ip + 40 + plen)?;
+    let addr = |at: usize| -> Option<Ipv6Addr> {
+        let b: [u8; 16] = f.get(at..at + 16)?.try_into().ok()?;
+        Some(Ipv6Addr::from(b))
+    };
+    let (src, dst) = (addr(ip + 8)?, addr(ip + 24)?);
+    if src.segments()[0] & 0xffc0 != 0xfe80 || msg.len() < 16 || msg[0] != ICMPV6_RA || msg[1] != 0 {
+        return None;
+    }
+    if icmpv6_checksum(src, dst, msg) != 0 {
+        return None;
+    }
+    let mut r = RouterInfo {
+        router: src,
+        lifetime_secs: u16::from_be_bytes([msg[6], msg[7]]),
+        managed: msg[5] & 0x80 != 0,
+        other: msg[5] & 0x40 != 0,
+        mtu: None,
+        prefixes: Vec::new(),
+        rdnss: Vec::new(),
+    };
+    let be32 = |b: &[u8], i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    let mut o = &msg[16..];
+    while o.len() >= 2 {
+        let len = usize::from(o[1]) * 8;
+        if len == 0 || len > o.len() {
+            return None;
+        }
+        let body = &o[..len];
+        match (o[0], len) {
+            (OPT_MTU, 8) => r.mtu = Some(be32(body, 4)),
+            (OPT_PREFIX, 32) if r.prefixes.len() < 16 => {
+                let b: [u8; 16] = body[16..32].try_into().ok()?;
+                r.prefixes.push(PrefixInfo {
+                    prefix: Ipv6Addr::from(b),
+                    len: body[2],
+                    on_link: body[3] & 0x80 != 0,
+                    autonomous: body[3] & 0x40 != 0,
+                    valid_secs: be32(body, 4),
+                    preferred_secs: be32(body, 8),
+                });
+            }
+            (OPT_RDNSS, l) if l >= 24 && (l - 8) % 16 == 0 && be32(body, 4) > 0 => {
+                for a in body[8..].chunks(16).take(8) {
+                    let b: [u8; 16] = a.try_into().ok()?;
+                    r.rdnss.push(Ipv6Addr::from(b));
+                }
+            }
+            _ => {}
+        }
+        o = &o[len..];
+    }
+    Some(r)
 }
 
 /// The /64 of `a`.

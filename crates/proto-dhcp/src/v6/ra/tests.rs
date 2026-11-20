@@ -188,3 +188,69 @@ fn link_local_and_prefix() {
     assert_eq!(link_local([0x52, 0x54, 0, 0x12, 0x34, 0x56]), "fe80::5054:ff:fe12:3456".parse::<Ipv6Addr>().unwrap());
     assert_eq!(prefix64("fd12:3456:789a:1::1".parse().unwrap()), "fd12:3456:789a:1::".parse::<Ipv6Addr>().unwrap());
 }
+
+#[test]
+fn a_prefix_that_leaves_is_deprecated_for_two_hours() {
+    let gua: Ipv6Addr = "2001:db8:100::1".parse().unwrap();
+    let new_gua: Ipv6Addr = "2001:db8:200::1".parse().unwrap();
+    let mut c = cfg();
+    c.prefixes.push(gua);
+    let mut a = Advertiser::new(c.clone(), 0, 7);
+    a.poll(0).unwrap();
+    // The delegated prefix changes.
+    c.prefixes[1] = new_gua;
+    a.set_config(c.clone(), 1000);
+    let t = a.next_deadline().unwrap();
+    let f = a.poll(t).unwrap();
+    let pio: Vec<(Vec<u8>, u32, u32)> = options(&f[54..])
+        .into_iter()
+        .filter(|o| o.0 == OPT_PREFIX)
+        .map(|o| (o.1[14..30].to_vec(), u32::from_be_bytes(o.1[2..6].try_into().unwrap()), u32::from_be_bytes(o.1[6..10].try_into().unwrap())))
+        .collect();
+    let old = prefix64(gua).octets().to_vec();
+    let new = prefix64(new_gua).octets().to_vec();
+    assert!(pio.contains(&(new.clone(), VALID_SECS, PREFERRED_SECS)), "{pio:?}");
+    assert!(pio.contains(&(old.clone(), RETIRED_VALID_SECS, 0)), "old one deprecated: {pio:?}");
+    // Two hours on, it is gone.
+    let later = 1000 + DEPRECATED_MS + 1;
+    a.solicited(later);
+    let f = a.poll(a.next_deadline().unwrap().max(later)).unwrap();
+    assert!(!options(&f[54..]).iter().any(|o| o.0 == OPT_PREFIX && o.1[14..30] == old[..]));
+    // Coming back ends the deprecation at once.
+    c.prefixes[1] = gua;
+    a.set_config(c.clone(), later + 1);
+    c.prefixes[1] = new_gua;
+    a.set_config(c, later + 2);
+    c = cfg();
+    c.prefixes.push(new_gua);
+    a.set_config(c, later + 3);
+}
+
+#[test]
+fn upstream_ra_is_parsed() {
+    // The ISP's RA: built by our own advertiser, as a router would send it.
+    let isp = RaConfig {
+        mac: [2, 0, 0, 0, 0, 0x99],
+        prefixes: vec!["2001:db8:ffff::".parse().unwrap()],
+        router_lifetime: 1800,
+        mtu: 1492,
+        rdnss: vec!["2001:db8:ffff::53".parse().unwrap()],
+        dnssl: vec![],
+    };
+    let f = Advertiser::new(isp, 0, 1).poll(0).unwrap();
+    let r = parse_frame(&f).unwrap();
+    assert_eq!(r.router, link_local([2, 0, 0, 0, 0, 0x99]));
+    assert_eq!((r.lifetime_secs, r.managed, r.other, r.mtu), (1800, false, false, Some(1492)));
+    assert_eq!(r.prefixes.len(), 1);
+    let p = r.prefixes[0];
+    assert_eq!((p.len, p.on_link, p.autonomous, p.valid_secs), (64, true, true, VALID_SECS));
+    assert_eq!(r.rdnss, vec!["2001:db8:ffff::53".parse::<Ipv6Addr>().unwrap()]);
+    // Broken checksum, another hop limit, a global source: not an RA to use.
+    let mut bad = f.clone();
+    bad[60] ^= 1;
+    assert_eq!(parse_frame(&bad), None);
+    let mut hop = f.clone();
+    hop[21] = 64;
+    assert_eq!(parse_frame(&hop), None);
+    assert_eq!(parse_frame(&f[..50]), None);
+}

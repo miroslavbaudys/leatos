@@ -101,3 +101,10 @@ path = "fuzz_targets/ack_filter.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dhcp6"
+path = "fuzz_targets/dhcp6.rs"
+test = false
+doc = false
+bench = false

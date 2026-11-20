@@ -1,4 +1,5 @@
-//! IPv6: Router Advertisements on the router's networks ([`ra`]).
-//! DHCPv6-PD (the WAN's prefix) comes with docs/ipv6.md step 3.
+//! IPv6: Router Advertisements on the router's networks and from the
+//! ISP ([`ra`]), DHCPv6 prefix delegation for the WAN ([`pd`]).
 
+pub mod pd;
 pub mod ra;
