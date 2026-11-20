@@ -558,6 +558,8 @@ pub struct Lan {
     /// With IPv6 on: the router's address in the network's ULA /64
     /// ([`ula_router`] of its index in the config).
     pub ula: Option<Ipv6Addr>,
+    /// Its global address in the delegated prefix ([`gua_router`]).
+    pub gua: Option<Ipv6Addr>,
 }
 
 impl Lan {
@@ -608,6 +610,7 @@ pub fn networks() -> Vec<Lan> {
         .filter_map(|(i, n)| Some((i, n, network_port(n)?)))
         .map(|(i, n, port)| Lan {
             ula: v6.then(|| ula_router(i)),
+            gua: gua_router(i),
             name: n.name.clone(),
             port,
             vid: n.vlan,
@@ -1062,6 +1065,55 @@ fn arg<'a>(bootargs: &'a str, key: &str) -> Option<&'a str> {
 /// (`Forwarder::recheck` skipped): the negative control of the lab check.
 pub fn fw_recheck() -> bool {
     arg_u64(bootargs(), "fw_recheck") != Some(0)
+}
+
+/// IPv6 on the WAN for development (docs/ipv6.md step 2b; DHCPv6-PD
+/// replaces it in step 3): `wan6_ip=addr/len` (the WAN's address) and
+/// `wan6_gw=addr` (the default router, global or link-local). Both, with
+/// `ipv6` on, or nothing.
+pub fn wan6() -> Option<((Ipv6Addr, u8), Ipv6Addr)> {
+    // Not on PPPoE yet (IPv6CP: step 4): no default route, so the networks'
+    // RAs do not offer one either (it would be a black hole).
+    if !ipv6() || matches!(wan_link(), WanLink::Pppoe(_)) {
+        return None;
+    }
+    let args = bootargs();
+    let ip = arg(args, "wan6_ip")?.parse::<schema::Cidr6>().ok()?;
+    let gw = arg(args, "wan6_gw")?.parse::<Ipv6Addr>().ok()?;
+    Some(((ip.addr, ip.prefix), gw))
+}
+
+/// `lan6_prefix=addr/len` (development, with `ipv6` on): the delegated
+/// prefix; network `i` (config order) gets `<prefix>:<i>::/64`, if it
+/// fits (a /56 holds 256).
+fn lan6_prefix() -> Option<schema::Cidr6> {
+    if !ipv6() {
+        return None;
+    }
+    arg(bootargs(), "lan6_prefix")?.parse::<schema::Cidr6>().ok().filter(|p| p.prefix <= 64)
+}
+
+/// The router's global address in network `index`'s /64 of
+/// `lan6_prefix`, if there is one.
+pub fn gua_router(index: usize) -> Option<Ipv6Addr> {
+    let p = lan6_prefix()?;
+    let bits = 64 - u32::from(p.prefix);
+    if bits < 64 && index as u64 >= 1u64 << bits {
+        return None;
+    }
+    Some(Ipv6Addr::from(u128::from(p.network()) | ((index as u128) << 64) | 1))
+}
+
+/// `wan_mtu=N`: the Ethernet WAN's MTU (both families), instead of the
+/// lease's; not for PPPoE, which negotiates its own.
+pub fn wan_mtu() -> Option<u16> {
+    arg_u64(bootargs(), "wan_mtu").filter(|m| (1280..=9000).contains(m)).map(|m| m as u16)
+}
+
+/// `lan_antispoof=0`: IPv6 from a network with a source outside its /64s
+/// is not dropped: the negative control of the lab check.
+pub fn lan_antispoof() -> bool {
+    arg_u64(bootargs(), "lan_antispoof") != Some(0)
 }
 
 /// `wan_antispoof=0`: WAN packets with a source in our own networks (or

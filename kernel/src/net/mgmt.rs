@@ -1150,7 +1150,7 @@ fn status_json(
     };
     let _ = write!(
         s,
-        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"vlan_drops\":{},\"conntrack\":{},\"early_drops\":{},\"conntrack_pass_us\":{{\"last\":{},\"max\":{}}},\"revoked\":{},\"rejected\":{},\
+        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"vlan_drops\":{},\"conntrack\":{},\"early_drops\":{},\"conntrack_pass_us\":{{\"last\":{},\"max\":{}}},\"revoked\":{},\"rejected\":{},\"icmp_errors\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"temp\":{temp},\"memory\":{memory},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
          \"fragments\":{{\"forwarded\":{},\"parked\":{},\"park_drops\":{},\"split\":{},\"split_drops\":{}}},\"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
@@ -1185,6 +1185,7 @@ fn status_json(
         datapath::EXPIRE_MAX_US.load(Ordering::Relaxed),
         datapath::REVOKED.load(Ordering::Relaxed),
         datapath::REJECTED.load(Ordering::Relaxed),
+        datapath::ICMP_ERRORS.load(Ordering::Relaxed),
         mgmt.wan_pppoe.as_deref().unwrap_or("null"),
         datapath::PPPOE_DROPS.load(Ordering::Relaxed),
         datapath::FRAGS_FORWARDED.load(Ordering::Relaxed),
@@ -1315,9 +1316,10 @@ fn status_json(
             (Some(u), None) => (json_str(&format!("{u}/64")), String::from("null")),
             (None, _) => (String::from("null"), String::from("null")),
         };
+        let gua = net.gua.map_or_else(|| String::from("null"), |g| json_str(&format!("{g}/64")));
         let _ = write!(
             s,
-            "{}{{\"name\":{},\"port\":{},\"vlan\":{},\"ipv4\":{},\"ipv6\":{ipv6},\"ra\":{ra},\"zone\":{},\"dhcp\":{},\"mgmt\":{},\"leases\":{leases}}}",
+            "{}{{\"name\":{},\"port\":{},\"vlan\":{},\"ipv4\":{},\"ipv6\":{ipv6},\"ipv6_global\":{gua},\"ra\":{ra},\"zone\":{},\"dhcp\":{},\"mgmt\":{},\"leases\":{leases}}}",
             if n > 0 { "," } else { "" },
             json_str(&net.name),
             json_str(config::PORTS[net.port]),
@@ -1329,6 +1331,13 @@ fn status_json(
         );
     }
     s.push(']');
+    // The WAN's IPv6 (development boot arguments, docs/ipv6.md step 2b).
+    match config::wan6() {
+        Some(((ip, len), gw)) => {
+            let _ = write!(s, ",\"wan_ipv6\":{{\"addr\":{},\"gateway\":{}}}", json_str(&format!("{ip}/{len}")), json_str(&format!("{gw}")));
+        }
+        None => s.push_str(",\"wan_ipv6\":null"),
+    }
     // The routing table, then configured routes not in use.
     s.push_str(",\"routes\":[");
     for (n, r) in sh.route_rows().iter().enumerate() {

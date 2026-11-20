@@ -165,7 +165,7 @@ fn handle_dhcp(name: &str, host: &mut HostIf, pinger: &mut Pinger) -> Option<Lea
     match event {
         Some(dhcpv4::Event::Configured(cfg)) => {
             host.iface.update_ip_addrs(|a| {
-                a.clear();
+                a.retain(|c| !matches!(c, IpCidr::Ipv4(_))); // IPv6 stays
                 a.push(IpCidr::Ipv4(cfg.address)).expect("wan addr");
             });
             match cfg.router {
@@ -208,7 +208,7 @@ fn handle_dhcp(name: &str, host: &mut HostIf, pinger: &mut Pinger) -> Option<Lea
             if DHCP_OK.load(Ordering::Acquire) {
                 println!("  net {}         : dhcp lease lost", name);
             }
-            host.iface.update_ip_addrs(|a| a.clear());
+            host.iface.update_ip_addrs(|a| a.retain(|c| !matches!(c, IpCidr::Ipv4(_))));
             host.iface.routes_mut().remove_default_ipv4_route();
             DHCP_OK.store(false, Ordering::Release);
             pinger.retarget(None);
@@ -245,7 +245,7 @@ fn configure_static(
 ) -> LeaseChange {
     let cidr = smoltcp::wire::Ipv4Cidr::new(s.addr, s.prefix);
     host.iface.update_ip_addrs(|a| {
-        a.clear();
+        a.retain(|c| !matches!(c, IpCidr::Ipv4(_))); // IPv6 stays
         a.push(IpCidr::Ipv4(cidr)).expect("wan addr");
     });
     host.iface
@@ -366,7 +366,7 @@ fn restart_wan(
         }
         _ => {}
     }
-    wan.iface.update_ip_addrs(|a| a.clear());
+    wan.iface.update_ip_addrs(|a| a.retain(|c| !matches!(c, IpCidr::Ipv4(_))));
     wan.iface.routes_mut().remove_default_ipv4_route();
     DHCP_OK.store(false, Ordering::Release);
     pinger.retarget(None);

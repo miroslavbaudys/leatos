@@ -91,6 +91,17 @@ elif [ -n "$static" ]; then
 else
   $bx udhcpd -S /tmp/udhcpd.conf
 fi
+# IPv6 (scripts/lab-test.sh LAB_IPV6=1, docs/ipv6.md step 2b): the WAN
+# link's 2001:db8:ffff::/64, the router's delegated 2001:db8:100::/56
+# through it, MTU 1400 (the router's Packet Too Big check).
+if $bb grep -q 'lab_ipv6=1' /proc/cmdline; then
+  $bb ip link set "$IF" mtu 1400
+  if $bb ip -6 addr add 2001:db8:ffff::1/64 dev "$IF" && $bb ip -6 route add 2001:db8:100::/56 via 2001:db8:ffff::2 dev "$IF"; then
+    echo "LAB isp: IPv6 2001:db8:ffff::1/64, 2001:db8:100::/56 via 2001:db8:ffff::2, MTU 1400"
+  else
+    echo "LAB FAIL: isp: IPv6 setup"
+  fi
+fi
 $bx httpd -p 80 -h /www
 # Long single-connection upload sink (ECN/AQM check): replies with the byte count.
 $bx tcpsvd -E 0.0.0.0 5001 $bb wc -c &

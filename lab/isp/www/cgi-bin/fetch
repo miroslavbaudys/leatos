@@ -7,5 +7,7 @@ addr=${REMOTE_ADDR#\[}; addr=${addr%\]}; addr=${addr#::ffff:}
 port=$(echo "$QUERY_STRING" | $bb tr -cd '0-9')
 echo "Content-Type: text/plain"
 echo
-body=$($bb wget -q -T 4 -O - "http://$addr:${port:-8080}/" 2>/dev/null)
+host=$addr
+case "$addr" in *:*) host="[$addr]" ;; esac # IPv6: not translated, the caller itself
+body=$($bb wget -q -T 4 -O - "http://$host:${port:-8080}/" 2>/dev/null)
 if [ -n "$body" ]; then echo "fetch=OK via $addr:$port: $(echo "$body" | $bb head -c 60)"; else echo "fetch=FAILED via $addr:$port"; fi

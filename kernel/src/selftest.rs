@@ -83,7 +83,28 @@ fn ecn_self_test() {
     );
     let mut not_ect = frame(0xb8);
     assert!(!not_ect.mark_ce(), "Not-ECT must not be marked");
-    println!("  ecn self-test   : ok (ECT(0) -> CE, checksum valid; Not-ECT refused)");
+    // IPv6: the traffic class spans the first two bytes (version 6, TC,
+    // flow label); no checksum.
+    let frame6 = |tc: u8| {
+        let mut p = crate::net::packet::PacketBuf::alloc().expect("pool");
+        p.set_len(wire::ETH_HDR + 40);
+        let f = p.data_mut();
+        f.fill(0);
+        wire::put16(f, 12, wire::ETHERTYPE_IPV6);
+        let ip = &mut f[wire::ETH_HDR..];
+        ip[0] = 0x60 | tc >> 4;
+        ip[1] = (tc << 4) | 0x0a; // flow label bits must survive
+        ip[6] = wire::PROTO_UDP;
+        ip[7] = 64;
+        p
+    };
+    let mut ect6 = frame6(0xb8 | 0b01); // DSCP EF + ECT(1)
+    assert!(ect6.mark_ce(), "ECT IPv6 packet must be markable");
+    let v = wire::Ipv6View::parse(ect6.data(), wire::ETH_HDR).expect("still IPv6");
+    assert_eq!(v.traffic_class(ect6.data()), 0xb8 | 0b11, "CE set, DSCP preserved");
+    assert_eq!(ect6.data()[wire::ETH_HDR + 1] & 0x0f, 0x0a, "flow label untouched");
+    assert!(!frame6(0xb8).mark_ce(), "Not-ECT IPv6 must not be marked");
+    println!("  ecn self-test   : ok (IPv4 ECT(0) and IPv6 ECT(1) -> CE, checksum and flow label kept; Not-ECT refused)");
 }
 
 /// Deliberate faults, compiled in only with the matching feature.

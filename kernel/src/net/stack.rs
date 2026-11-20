@@ -502,6 +502,7 @@ pub fn place_networks(
                 addr: (n.addr, n.prefix),
                 zone: n.zone,
                 ula: n.ula,
+                gua: n.gua,
             })
             .collect(),
         policy: crate::config::firewall(),
@@ -523,6 +524,30 @@ pub fn port_macs(ports: &[PortShared]) -> Vec<[u8; 6]> {
 pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: &[usize], macs: &[[u8; 6]]) {
     if let Some(wan) = hosts.first_mut() {
         set_host_routes(&mut wan.iface, &crate::config::wan_routes());
+        // IPv6 on an Ethernet WAN (development: `wan6_ip=`): its
+        // link-local and global address, so it answers the ISP's
+        // solicitations; the IPv4 address stays the lease's.
+        // (Not on PPPoE: an IP-only interface, which has no hardware
+        // address to ask for; IPv6 over PPPoE is step 4.)
+        let ethernet = !matches!(crate::config::wan_link(), crate::config::WanLink::Pppoe(_));
+        if let (true, Some(&mac)) = (ethernet, macs.first()) {
+            let want: Vec<IpCidr> = match crate::config::wan6() {
+                Some(((ip, len), _)) => alloc::vec![
+                    IpCidr::Ipv6(Ipv6Cidr::new(fwd::wire::link_local(mac), 64)),
+                    IpCidr::Ipv6(Ipv6Cidr::new(ip, len)),
+                ],
+                None => Vec::new(),
+            };
+            let have: Vec<IpCidr> = wan.iface.ip_addrs().iter().filter(|c| matches!(c, IpCidr::Ipv6(_))).copied().collect();
+            if have != want {
+                wan.iface.update_ip_addrs(|a| {
+                    a.retain(|c| matches!(c, IpCidr::Ipv4(_)));
+                    for c in &want {
+                        let _ = a.push(*c);
+                    }
+                });
+            }
+        }
     }
     for (i, host) in hosts.iter_mut().enumerate().skip(1) {
         let k = links.iter().position(|&l| l == i);
@@ -539,6 +564,9 @@ pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: 
             if let (Some(ula), Some(&mac)) = (nets[k].ula, macs.get(nets[k].port)) {
                 want.push(IpCidr::Ipv6(Ipv6Cidr::new(fwd::wire::link_local(mac), 64)));
                 want.push(IpCidr::Ipv6(Ipv6Cidr::new(ula, 64)));
+                if let Some(gua) = nets[k].gua {
+                    want.push(IpCidr::Ipv6(Ipv6Cidr::new(gua, 64)));
+                }
             }
         }
         if host.iface.ip_addrs() != want.as_slice() {

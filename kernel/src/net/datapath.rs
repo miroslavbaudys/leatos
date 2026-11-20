@@ -60,7 +60,7 @@ use crate::net::device::PortQdisc;
 use crate::net::shared::{CTRL_RX_MAX, LOCAL_RX_MAX, MAX_PORTS, Shared};
 use crate::timer;
 use alloc::vec::Vec;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
 use core::sync::atomic::{AtomicU64, Ordering};
 use fwd::forwarder::{
     Classification, DropReason, Forwarder, Interface, PortForward, Redirect, Role, ShardHints, Verdict,
@@ -108,6 +108,10 @@ pub static REVOKED: AtomicU64 = AtomicU64::new(0);
 /// Refused packets answered with a RST / port unreachable (`reject`),
 /// summed over the shards once a second (not in `DROP_REASONS`).
 pub static REJECTED: AtomicU64 = AtomicU64::new(0);
+/// ICMP and ICMPv6 errors the router sent (time exceeded, fragmentation
+/// needed, packet too big, port unreachable), summed over the shards once
+/// a second.
+pub static ICMP_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Connections that were not assured, removed to make room for new ones
 /// (full table or a shard's NAT ports taken), summed over the shards once
 /// a second.
@@ -227,12 +231,19 @@ fn fwd_inside((a, l): (Ipv4Addr, u8), ip: Ipv4Addr) -> bool {
     u32::from(a) & m == u32::from(ip) & m
 }
 
+/// IPv6 neighbors being resolved at once, per link (RFC 6583: a scan of
+/// a /64 must not fill the table).
+const NEIGH6_INCOMPLETE: usize = 64;
+
 pub struct Datapath {
     sh: &'static Shared,
     hash_key: u64,
     shards: Vec<Mutex<Forwarder>>,
     /// Per link: neighbors on that link.
     neigh: Vec<Mutex<NeighTable<PacketBuf>>>,
+    /// Per link: IPv6 neighbors (neighbor discovery), at most
+    /// [`NEIGH6_INCOMPLETE`] being resolved at once (RFC 6583).
+    neigh6: Vec<Mutex<NeighTable<PacketBuf, Ipv6Addr>>>,
     /// Per link: the interface address (the WAN one changes with the lease).
     addrs: Vec<Mutex<Option<(Ipv4Addr, u8)>>>,
     /// Which link a frame belongs to and what `shard_of` needs: replaced
@@ -352,6 +363,7 @@ impl Datapath {
                     f.add_interface(*iface);
                 }
                 f.wan_antispoof = crate::config::wan_antispoof();
+                f.lan_antispoof = crate::config::lan_antispoof();
                 f.fragments = crate::config::fw_fragments();
                 f.split = crate::config::fw_split();
                 Mutex::new(f)
@@ -365,6 +377,10 @@ impl Datapath {
             neigh: ifaces
                 .iter()
                 .map(|_| Mutex::new(NeighTable::new()))
+                .collect(),
+            neigh6: ifaces
+                .iter()
+                .map(|_| Mutex::new(NeighTable::with_incomplete_cap(NEIGH6_INCOMPLETE)))
                 .collect(),
             addrs: ifaces.iter().map(|i| Mutex::new(i.addr)).collect(),
             topo: Mutex::new(alloc::sync::Arc::new(Topo::default())),
@@ -388,6 +404,11 @@ impl Datapath {
 
     /// The WAN lease changed: every shard, and the WAN address copy.
     pub fn set_wan(&self, addr: Option<(Ipv4Addr, u8)>, gateway: Option<Ipv4Addr>, mtu: u16) {
+        // `wan_mtu=` replaces the lease's (Ethernet only: PPPoE negotiates).
+        let mtu = match crate::config::wan_mtu() {
+            Some(m) if !self.sh.ports[WAN as usize].is_pppoe() => m,
+            _ => mtu,
+        };
         for s in &self.shards {
             let mut f = s.lock();
             f.set_addr(WAN, addr);
@@ -428,18 +449,24 @@ impl Datapath {
                 f.set_zone(i as IfIndex, want.map_or(1, |x| x.zone));
                 f.set_mac(i as IfIndex, self.sh.ports[port].mac);
                 f.set_ula6(i as IfIndex, want.and_then(|x| x.ula));
+                f.set_gua6(i as IfIndex, want.and_then(|x| x.gua).map(|a| (a, 64)));
             }
             *self.addrs[i].lock() = addr;
             link.set(want.is_some(), port, vid);
             if changed {
                 *self.neigh[i].lock() = NeighTable::new();
+                *self.neigh6[i].lock() = NeighTable::with_incomplete_cap(NEIGH6_INCOMPLETE);
             }
         }
         let mut revoked = 0;
         let ipv6 = crate::config::ipv6();
+        // The WAN's IPv6 (development: `wan6_ip=`, `wan6_gw=`).
+        let wan6 = crate::config::wan6();
         for s in &self.shards {
             let mut f = s.lock();
             f.ipv6 = ipv6;
+            f.set_gua6(WAN, wan6.map(|(ip, _)| ip));
+            f.set_default_route6(wan6.map(|(_, gw)| (WAN, gw)));
             f.set_static_routes(&n.routes);
             f.set_policy(Some(n.policy.clone()));
             if crate::config::fw_recheck() {
@@ -531,12 +558,16 @@ impl Datapath {
         if i >= self.ecn_seen.len() {
             return;
         }
-        let Some(v) = wire::Ipv4View::parse(frame, wire::ETH_HDR) else {
-            return;
+        let (ecn, proto, l4, l4_len) = match wire::Ipv4View::parse(frame, wire::ETH_HDR) {
+            Some(v) => (v.tos(frame) & 3, v.proto, v.l4, v.l4_len),
+            None => match wire::Ipv6View::parse(frame, wire::ETH_HDR) {
+                Some(v) => (v.traffic_class(frame) & 3, v.proto, v.l4, v.l4_len),
+                None => return,
+            },
         };
-        self.ecn_seen[i][(v.tos(frame) & 3) as usize].fetch_add(1, Ordering::Relaxed);
-        if v.proto == wire::PROTO_TCP && v.l4_len >= 14 {
-            let flags = frame[v.l4 + 13];
+        self.ecn_seen[i][ecn as usize].fetch_add(1, Ordering::Relaxed);
+        if proto == wire::PROTO_TCP && l4_len >= 14 {
+            let flags = frame[l4 + 13];
             if flags & 0x40 != 0 {
                 self.tcp_ece[i].fetch_add(1, Ordering::Relaxed);
             }
@@ -651,8 +682,16 @@ impl Datapath {
                     }
                 }
             }
-            if wire::ethertype(pkt.data()) == Some(wire::ETHERTYPE_ARP) {
-                self.snoop_arp(ifx, pkt.data(), now, b.touched);
+            match wire::ethertype(pkt.data()) {
+                Some(wire::ETHERTYPE_ARP) => self.snoop_arp(ifx, pkt.data(), now, b.touched),
+                // Only RA, NS, NA (a cheap look before the parse).
+                Some(wire::ETHERTYPE_IPV6)
+                    if pkt.data().get(wire::ETH_HDR + 6) == Some(&wire::PROTO_ICMPV6)
+                        && pkt.data().get(wire::ETH_HDR + 40).is_some_and(|t| (134..=136).contains(t)) =>
+                {
+                    self.snoop_nd(ifx, pkt.data(), now, b.touched)
+                }
+                _ => {}
             }
             let len = pkt.len();
             let kind = if self.fragments && port_ix < self.frags.len() {
@@ -746,7 +785,7 @@ impl Datapath {
     /// Act on the forwarder's verdict for a received frame: to the router
     /// stack, out through the neighbor table into the qdisc, or dropped.
     fn deliver(&self, verdict: Verdict, mut pkt: PacketBuf, ifx: IfIndex, port_ix: usize, now: u64, b: &mut Batch) {
-        if !matches!(verdict, Verdict::Forward { .. }) {
+        if !matches!(verdict, Verdict::Forward { .. } | Verdict::Forward6 { .. }) {
             b.bypass(pkt.len());
         }
         match verdict {
@@ -804,11 +843,16 @@ impl Datapath {
                     self.send_out(egress, next_hop, &class, ifx, p, now, b);
                 }
             }
-            // IPv6 forwarding reaches the datapath with docs/ipv6.md step
-            // 2b's kernel part; until then as before (not forwarded).
-            Verdict::Forward6 { .. } => {
-                DROPPED.fetch_add(1, Ordering::Relaxed);
-                DROP_REASONS[DropReason::Unsupported.index()].fetch_add(1, Ordering::Relaxed);
+            Verdict::Forward6 {
+                egress,
+                next_hop,
+                len,
+                class,
+            } => {
+                pkt.set_len(len);
+                self.observe_ecn(port_ix, pkt.data());
+                FORWARDED.fetch_add(1, Ordering::Relaxed);
+                self.send_out6(egress, next_hop, &class, ifx, pkt, now, b);
             }
             Verdict::Drop(r) => {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -834,7 +878,7 @@ impl Datapath {
         pkt.meta = meta_from(class, ifx, pkt.len(), t);
         if b.ingress {
             pkt.meta.egress_if = egress;
-            pkt.meta.next_hop = u32::from(next_hop);
+            pkt.meta.next_hop = u128::from(u32::from(next_hop));
             // An overflow drop is charged by the shaper itself.
             if self.sh.ingress.lock().enqueue(pkt, t).is_err() {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -842,6 +886,73 @@ impl Datapath {
             return;
         }
         self.to_next_hop(egress, next_hop, pkt, now, b.touched);
+    }
+
+    /// [`Self::send_out`] for IPv6.
+    #[allow(clippy::too_many_arguments)]
+    fn send_out6(
+        &self,
+        egress: IfIndex,
+        next_hop: Ipv6Addr,
+        class: &Classification,
+        ifx: IfIndex,
+        mut pkt: PacketBuf,
+        now: u64,
+        b: &mut Batch,
+    ) {
+        let t = now_ns();
+        pkt.meta = meta_from(class, ifx, pkt.len(), t);
+        if b.ingress {
+            pkt.meta.egress_if = egress;
+            pkt.meta.next_hop = u128::from(next_hop);
+            if self.sh.ingress.lock().enqueue(pkt, t).is_err() {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        self.to_next_hop6(egress, next_hop, pkt, now, b.touched);
+    }
+
+    /// [`Self::to_next_hop`] for IPv6: neighbor discovery. Not over PPPoE
+    /// yet (IPv6CP: docs/ipv6.md step 4).
+    fn to_next_hop6(&self, egress: IfIndex, next_hop: Ipv6Addr, pkt: PacketBuf, now: u64, touched: &mut Touched) {
+        let out = &self.sh.ports[self.sh.links[egress as usize].port()];
+        if out.is_pppoe() {
+            PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let r = self.neigh6[egress as usize].lock().resolve(egress, next_hop, pkt, now);
+        match r {
+            Resolve::Ready(mac, pkt) => self.send_resolved(egress, mac, pkt, touched),
+            Resolve::Queued { send_arp: true } => self.send_ns(egress, next_hop, touched),
+            Resolve::Queued { send_arp: false } => {}
+        }
+    }
+
+    /// A neighbor solicitation for `target` from our link-local address.
+    fn send_ns(&self, ifx: IfIndex, target: Ipv6Addr, touched: &mut Touched) {
+        let Some(mut pkt) = PacketBuf::alloc() else {
+            return;
+        };
+        let mac = self.sh.ports[self.sh.links[ifx as usize].port()].mac;
+        let mut ns = [0u8; wire::NS_LEN];
+        wire::build_ns(&mut ns, mac, wire::link_local(mac), target);
+        pkt.set_len(ns.len());
+        pkt.data_mut().copy_from_slice(&ns);
+        pkt.meta.wire_len = ns.len() as u32;
+        self.enqueue(ifx, pkt, touched);
+    }
+
+    /// Learn IPv6 neighbors from neighbor discovery (NA, NS, RA with a
+    /// link-layer option) and release packets waiting for them.
+    fn snoop_nd(&self, ifx: IfIndex, frame: &[u8], now: u64, touched: &mut Touched) {
+        let Some((ip, mac)) = wire::parse_nd(frame) else {
+            return;
+        };
+        let waiting = self.neigh6[ifx as usize].lock().learn(ifx, ip, mac, now);
+        for pkt in waiting {
+            self.send_resolved(ifx, mac, pkt, touched);
+        }
     }
 
     /// To the next hop: the PPPoE AC, or through the neighbor table, into
@@ -881,8 +992,13 @@ impl Datapath {
             match d {
                 Dequeue::Packet(p) => {
                     let egress = p.meta.egress_if;
-                    let next_hop = Ipv4Addr::from(p.meta.next_hop);
-                    self.to_next_hop(egress, next_hop, p, ms, touched);
+                    if wire::ethertype(p.data()) == Some(wire::ETHERTYPE_IPV6) {
+                        let next_hop = Ipv6Addr::from(p.meta.next_hop);
+                        self.to_next_hop6(egress, next_hop, p, ms, touched);
+                    } else {
+                        let next_hop = Ipv4Addr::from(p.meta.next_hop as u32);
+                        self.to_next_hop(egress, next_hop, p, ms, touched);
+                    }
                 }
                 Dequeue::WaitUntil(t) => return Some(t),
                 Dequeue::Empty => return None,
@@ -911,6 +1027,7 @@ impl Datapath {
         let mut fhits: Vec<u64> = Vec::new();
         let mut rhits: Vec<u64> = Vec::new();
         let mut rejected = 0;
+        let mut icmp_errors = 0;
         let mut early_drops = 0;
         let add = |into: &mut Vec<u64>, from: &[u64]| {
             into.resize(into.len().max(from.len()), 0);
@@ -931,6 +1048,7 @@ impl Datapath {
             add(&mut fhits, &f.forward_hits);
             add(&mut rhits, &f.redirect_hits);
             rejected += f.stats.rejected;
+            icmp_errors += f.stats.icmp_errors_sent;
             early_drops += f.ct.stats.early_drops;
             drop(f);
             longest = longest.max(held.elapsed().as_micros() as u64);
@@ -938,6 +1056,7 @@ impl Datapath {
         EXPIRE_LAST_US.store(longest, Ordering::Relaxed);
         EXPIRE_MAX_US.fetch_max(longest, Ordering::Relaxed);
         REJECTED.store(rejected, Ordering::Relaxed);
+        ICMP_ERRORS.store(icmp_errors, Ordering::Relaxed);
         EARLY_DROPS.store(early_drops, Ordering::Relaxed);
         self.sh.conntrack.store(conns, Ordering::Relaxed);
         *self.sh.rule_hits.lock() = hits;
@@ -958,6 +1077,12 @@ impl Datapath {
             for (ifx, ip) in retries {
                 debug_assert_eq!(ifx as usize, i);
                 self.send_arp_request(ifx, ip, touched);
+            }
+        }
+        for n in &self.neigh6 {
+            let retries = n.lock().poll(now);
+            for (ifx, ip) in retries {
+                self.send_ns(ifx, ip, touched);
             }
         }
         if print {

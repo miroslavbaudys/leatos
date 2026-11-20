@@ -218,6 +218,24 @@
 #                        Negative controls: LAB_ROUTER_ARGS=ipv6=0 (every
 #                        IPv6 check fails), LAB_GUEST_ZONE=lan (the guest's
 #                        web-refused check fails).
+#                        The WAN side (step 2b): the ISP VM gets
+#                        2001:db8:ffff::1/64 and routes 2001:db8:100::/56 to
+#                        the router (wan6_ip=2001:db8:ffff::2/64
+#                        wan6_gw=2001:db8:ffff::1 lan6_prefix=...::/56
+#                        wan_mtu=1400; the IPv4 big ping becomes 1372). The
+#                        client: a global SLAAC address and a default
+#                        route, ping6 and HTTP to the ISP, the ISP sees the
+#                        client's own address (no NAT), traceroute6 through
+#                        the router, inbound refused (cgi-bin/fetch back to
+#                        the client's [::]:8086; firewall drops rise), Packet
+#                        Too Big (ping6 -s 1452: route cache mtu 1400), a
+#                        forged source dropped (spoofed rises); with
+#                        LAB_GUEST=1 the guest's global address reaches the
+#                        ISP. Negative controls: LAB_IPV6_OPEN=1 (implies
+#                        LAB_GUEST=1; a rule wan -> lan accept: inbound
+#                        reaches the client), LAB_ROUTER_ARGS=wan_mtu=1500
+#                        (no PTB), LAB_ROUTER_ARGS=lan_antispoof=0 (the
+#                        forged source passes).
 #   LAB_PORTS=1          (implies LAB_GUEST=1) a second LAN port: the router
 #                        gets a third NIC (lan1), network "wired"
 #                        10.40.0.1/24 untagged on it (zone lan); the client
@@ -271,7 +289,17 @@ fi
 ISP_STATIC="${LAB_WAN_STATIC:-}"
 [[ -n "$ISP_STATIC" ]] && ROUTER_ARGS="$ROUTER_ARGS wan_mode=static wan_ip=203.0.113.60/24 wan_gw=203.0.113.1 wan_dns=203.0.113.1"
 IPV6="${LAB_IPV6:-}"
-[[ -n "$IPV6" ]] && ROUTER_ARGS="$ROUTER_ARGS ipv6=1"
+IPV6_OPEN="${LAB_IPV6_OPEN:-}"
+[[ -n "$IPV6_OPEN" ]] && IPV6=1
+ISP_IPV6="$IPV6"
+if [[ -n "$IPV6" && -n "$ISP_PPPOE" ]]; then
+  echo "lab-test: LAB_IPV6 with LAB_PPPOE: IPv6 over PPPoE comes with docs/ipv6.md step 4" >&2
+  exit 2
+fi
+if [[ -n "$IPV6" ]]; then
+  ROUTER_ARGS="$ROUTER_ARGS ipv6=1 wan6_ip=2001:db8:ffff::2/64 wan6_gw=2001:db8:ffff::1 lan6_prefix=2001:db8:100::/56 wan_mtu=1400"
+  BIG_PING="${LAB_BIG_PING:-1372}"
+fi
 GUEST="${LAB_GUEST:-}"
 GUEST_LIVE="${LAB_GUEST_LIVE:-}"
 [[ -n "$GUEST_LIVE" ]] && GUEST=1
@@ -288,6 +316,7 @@ PORTS_NET="${LAB_PORTS_NET:-lan1}"
 DNS_HOSTS="${LAB_DNS_HOSTS:-1}"
 [[ -n "$DNS_VIEWS" ]] && GUEST=1
 [[ -n "$WAN_OPEN" ]] && GUEST=1
+[[ -n "$IPV6_OPEN" ]] && GUEST=1
 GUEST_ZONE="${LAB_GUEST_ZONE:-guest}"
 GUEST_RULES="${LAB_GUEST_RULES:-1}"
 GUEST_REJECT="${LAB_GUEST_REJECT:-reject}"
@@ -434,6 +463,14 @@ CFG
 name = "wan-open"
 from = "wan"
 to = "router"
+action = "accept"
+CFG
+  [[ -n "$IPV6_OPEN" ]] && cat >>"$WORK/config.toml" <<'CFG'
+
+[[firewall.rule]]
+name = "v6-open"
+from = "wan"
+to = "lan"
 action = "accept"
 CFG
   [[ "$FORWARD" == 1 ]] && cat >>"$WORK/config.toml" <<'CFG'

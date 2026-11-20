@@ -525,8 +525,14 @@ fi
 v6on=""
 $bb grep -q 'lab_ipv6=1' /proc/cmdline && v6on=1
 v6st() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null; }
+fwdrops6() { v6st | $bb grep -o '"firewall":[0-9]*' | $bb head -1 | $bb cut -d: -f2; }
+spoofed6() { v6st | $bb grep -o '"spoofed":[0-9]*' | $bb head -1 | $bb cut -d: -f2; }
+icmperr6() { v6st | $bb grep -o '"icmp_errors":[0-9]*' | $bb head -1 | $bb cut -d: -f2; }
 # The router's ULA on network $1 (1 = main, 2 = guest), from status.
 v6router() { v6st | $bb grep -o '"ipv6":"[^"]*"' | $bb sed -n "${1}s/\"ipv6\":\"\([^\"/]*\)\/64\"/\1/p"; }
+# Its global address there (the WAN side: docs/ipv6.md step 2b).
+v6global() { v6st | $bb grep -o '"ipv6_global":"[^"]*"' | $bb sed -n "${1}s/\"ipv6_global\":\"\([^\"/]*\)\/64\"/\1/p"; }
+ISP6=2001:db8:ffff::1
 # Wait for a SLAAC address under prefix $2 on interface $1, past duplicate
 # address detection (a tentative address is no source yet).
 v6slaac() {
@@ -545,15 +551,57 @@ if [ -n "$v6on" ]; then
     pass "ipv6: router ULA $r6"
     pfx=${r6%::1}
     if a6=$(v6slaac eth0 "$pfx"); then pass "ipv6: slaac address $a6 (router advertisement)"; else fail "ipv6: no slaac address under $pfx::/64"; $bb ip -6 addr show dev eth0 | $bb sed 's/^/    | /'; fi
-    if $bb ip -6 route show default 2>/dev/null | $bb grep -q .; then fail "ipv6: a default route appeared (router lifetime must be 0)"; else pass "ipv6: no default route (router lifetime 0)"; fi
+    gr=$(v6global 1)
+    if [ -z "$gr" ]; then
+      if $bb ip -6 route show default 2>/dev/null | $bb grep -q .; then fail "ipv6: a default route appeared (router lifetime must be 0)"; else pass "ipv6: no default route (router lifetime 0)"; fi
+    fi
     if $bb ping6 -c 2 -W 2 "$r6" >/tmp/p6 2>&1; then pass "ipv6: ping router $r6"; else fail "ipv6: ping $r6"; $bb tail -2 /tmp/p6 | $bb sed 's/^/    | /'; fi
-    ll=$(v6st | $bb grep -o 'fe80::[0-9a-f:]*' | $bb head -1)
+    ll=$(v6st | $bb sed 's/.*"name":"lan0"//' | $bb grep -o 'fe80::[0-9a-f:]*' | $bb head -1)
     if [ -n "$ll" ] && $bb ping6 -c 1 -W 2 "$ll%eth0" >/tmp/p6 2>&1; then pass "ipv6: ping router link-local $ll%eth0"; else fail "ipv6: ping router link-local '$ll%eth0'"; $bb tail -2 /tmp/p6 | $bb sed 's/^/    | /'; fi
     out=$($bb nslookup -type=AAAA router.lan "$r6" 2>&1)
     if echo "$out" | $bb grep -v "^Server" | $bb grep -q "$r6"; then pass "ipv6: dns over ipv6: router.lan AAAA $r6"; else fail "ipv6: dns router.lan AAAA via $r6"; echo "$out" | $bb sed 's/^/    | /'; fi
     if $bb wget -q -T 5 -O - "http://[$r6]/api/info" 2>/dev/null | $bb grep -q '"auth"'; then pass "ipv6: web interface on http://[$r6]/"; else fail "ipv6: web interface on http://[$r6]/"; fi
-    ra=$(v6st | $bb sed -n 's/.*"ipv6":"[^"]*","ra":{"sent":\([0-9]*\),"solicits":\([0-9]*\)}.*/\1 \2/p' | $bb head -1)
+    ra=$(v6st | $bb grep -o '"ra":{"sent":[0-9]*,"solicits":[0-9]*}' | $bb sed -n '1s/.*"sent":\([0-9]*\),"solicits":\([0-9]*\)}/\1 \2/p')
     if [ "${ra%% *}" -gt 0 ] 2>/dev/null; then pass "ipv6: router sent ${ra%% *} RAs, ${ra##* } solicitations seen"; else fail "ipv6: router RA counters '$ra'"; fi
+    # --- through the router to the ISP (docs/ipv6.md step 2b) ---
+    if [ -n "$gr" ]; then
+      if ag=$(v6slaac eth0 "${gr%::1}"); then pass "ipv6 wan: global slaac address $ag"; else fail "ipv6 wan: no global address under ${gr%::1}::/64"; fi
+      if $bb ip -6 route show default dev eth0 2>/dev/null | $bb grep -q 'via fe80::'; then pass "ipv6 wan: default route via the router"; else fail "ipv6 wan: no default route"; $bb ip -6 route | $bb sed 's/^/    | /'; fi
+      if $bb ping6 -c 2 -W 2 "$ISP6" >/tmp/p6 2>&1; then pass "ipv6 wan: ping6 $ISP6"; else fail "ipv6 wan: ping6 $ISP6"; $bb tail -2 /tmp/p6 | $bb sed 's/^/    | /'; fi
+      if body=$($bb wget -q -T 5 -O - "http://[$ISP6]/" 2>/tmp/w6) && [ -n "$body" ]; then pass "ipv6 wan: http://[$ISP6]/"; else fail "ipv6 wan: http://[$ISP6]/ ($($bb cat /tmp/w6))"; fi
+      seen=$($bb wget -q -T 5 -O - "http://[$ISP6]/cgi-bin/ip" 2>&1)
+      if [ -n "$ag" ] && echo "$seen" | $bb grep -q "$ag"; then pass "ipv6 wan: the ISP sees $ag (no NAT)"; else fail "ipv6 wan: the ISP sees '$seen', expected $ag"; fi
+      hop=$($bb traceroute6 -n -m 3 -w 2 -q 1 "$ISP6" 2>/dev/null | $bb sed -n '1,2p' | $bb grep -o '2001:db8:100::1\|fd[0-9a-f:]*::1' | $bb head -1)
+      if [ -n "$hop" ]; then pass "ipv6 wan: traceroute6: first hop $hop (Time Exceeded from the router)"; else fail "ipv6 wan: traceroute6 shows no router hop"; $bb traceroute6 -n -m 3 -w 2 -q 1 "$ISP6" 2>&1 | $bb head -3 | $bb sed 's/^/    | /'; fi
+      # Inbound: the ISP connects back to our own address (cgi-bin/fetch).
+      $bb mkdir -p /tmp/www6 && echo v6-inbound >/tmp/www6/index.html
+      $bx httpd -p "[::]:8086" -h /tmp/www6
+      d0=$(fwdrops6)
+      in=$($bb wget -q -T 8 -O - "http://[$ISP6]/cgi-bin/fetch?8086" 2>&1)
+      d1=$(fwdrops6)
+      if echo "$in" | $bb grep -q 'fetch=FAILED' && [ "${d1:-0}" -gt "${d0:-0}" ]; then pass "ipv6 wan: inbound refused (router firewall drops $d0 -> $d1)"; else fail "ipv6 wan: inbound: $in (firewall drops $d0 -> $d1)"; fi
+      # Packet Too Big: the WAN takes 1400 (wan_mtu=1400).
+      # (busybox shows no path MTU cache: the router's ICMP error count,
+      # read after its once-a-second sum.)
+      e0=$(icmperr6)
+      $bb ping6 -c 1 -W 2 -s 1452 "$ISP6" >/dev/null 2>&1
+      $bb sleep 2
+      e1=$(icmperr6)
+      if [ "${e1:-0}" -gt "${e0:-0}" ]; then pass "ipv6 wan: Packet Too Big sent for a 1500 B packet (icmp errors $e0 -> $e1)"; else fail "ipv6 wan: no Packet Too Big (icmp errors $e0 -> $e1)"; fi
+      # A forged source (outside the network's /64s) is dropped.
+      s0=$(spoofed6)
+      $bb ip -6 addr add 2001:db8:999::5/128 dev eth0 || fail "ipv6 wan: cannot add the forged address"
+      # Past duplicate address detection, else ping cannot use it.
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        $bb ip -6 addr show dev eth0 | $bb grep '2001:db8:999::5' | $bb grep -qv tentative && break
+        $bb sleep 1
+      done
+      $bb ping6 -c 2 -W 1 -I 2001:db8:999::5 "$ISP6" >/dev/null 2>&1
+      $bb sleep 1
+      $bb ip -6 addr del 2001:db8:999::5/128 dev eth0 2>/dev/null
+      s1=$(spoofed6)
+      if [ "${s1:-0}" -gt "${s0:-0}" ]; then pass "ipv6 wan: forged source 2001:db8:999::5 dropped (spoofed $s0 -> $s1)"; else fail "ipv6 wan: forged source not dropped (spoofed $s0 -> $s1)"; fi
+    fi
   fi
 fi
 
@@ -609,8 +657,16 @@ if [ -n "$guest" ]; then
         out=$($bb nslookup -type=AAAA router.guest.lan "$g6" 2>&1)
         if echo "$out" | $bb grep -v "^Server" | $bb grep -q "$g6"; then pass "guest ipv6: dns over ipv6 (allowed): router.guest.lan AAAA $g6"; else fail "guest ipv6: dns via $g6"; echo "$out" | $bb sed 's/^/    | /'; fi
         if $bb wget -q -T 3 -O /dev/null "http://[$g6]/api/info" 2>/dev/null; then fail "guest ipv6: web interface reachable on http://[$g6]/ (zone input)"; else pass "guest ipv6: web interface refused on http://[$g6]/"; fi
+        gg=$(v6global 2)
+        if [ -n "$gg" ]; then
+          if agg=$(v6slaac eth0.20 "${gg%::1}"); then
+            if $bb ping6 -c 2 -W 2 -I eth0.20 "$ISP6" >/dev/null 2>&1; then pass "guest ipv6: $agg reaches the ISP"; else fail "guest ipv6: ping6 $ISP6 from $agg"; fi
+          else
+            fail "guest ipv6: no global address under ${gg%::1}::/64"
+          fi
+        fi
         # eth0.20 came up after the router: Linux sent Router Solicitations.
-        gra=$(v6st | $bb grep -o '"ipv6":"[^"]*","ra":{"sent":[0-9]*,"solicits":[0-9]*}' | $bb sed -n '2s/.*"sent":\([0-9]*\),"solicits":\([0-9]*\)}/\1 \2/p')
+        gra=$(v6st | $bb grep -o '"ra":{"sent":[0-9]*,"solicits":[0-9]*}' | $bb sed -n '2s/.*"sent":\([0-9]*\),"solicits":\([0-9]*\)}/\1 \2/p')
         if [ "${gra##* }" -gt 0 ] 2>/dev/null; then pass "guest ipv6: router solicitations answered (${gra##* } seen, ${gra%% *} RAs sent)"; else fail "guest ipv6: no router solicitation seen ('$gra')"; fi
       fi
     fi

@@ -198,6 +198,8 @@ pub struct NetSlot {
     pub zone: u8,
     /// The router's ULA on it (IPv6 on).
     pub ula: Option<core::net::Ipv6Addr>,
+    /// Its global address (`lan6_prefix`).
+    pub gua: Option<core::net::Ipv6Addr>,
 }
 
 /// The networks and the firewall, as the datapath applies them together

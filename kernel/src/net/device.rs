@@ -289,6 +289,9 @@ impl phy::TxToken for TxToken<'_> {
             Some(mut pkt) => {
                 pkt.set_len(len);
                 let r = f(pkt.data_mut());
+                // smoltcp is a host: its NAs say "not a router", which
+                // makes clients drop us as their default router.
+                fwd::wire::ipv6_na_set_router(pkt.data_mut());
                 self.enqueue(pkt);
                 r
             }

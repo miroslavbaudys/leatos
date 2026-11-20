@@ -55,9 +55,10 @@ pub struct PacketMeta {
     /// Interface the packet arrived on.
     pub ingress_if: u8,
     /// In the WAN ingress stage: the forwarder's egress link and next hop
-    /// (IPv4 as `u32`), for the neighbor lookup once the shaper releases it.
+    /// (an IPv4 or IPv6 address as `u128`: the frame's EtherType tells
+    /// which), for the neighbor lookup once the shaper releases it.
     pub egress_if: u8,
-    pub next_hop: u32,
+    pub next_hop: u128,
 }
 
 /// Preallocate `count` buffers. Call once at boot.
@@ -243,6 +244,16 @@ impl qdisc::Packet for PacketBuf {
     fn mark_ce(&mut self) -> bool {
         use fwd::wire;
         let f = self.data_mut();
+        // IPv6: the traffic class's ECN bits (the low two of TC = bits 4-5
+        // of the second byte); no header checksum.
+        if wire::ethertype(f) == Some(wire::ETHERTYPE_IPV6) {
+            let ip = wire::ETH_HDR;
+            if f.len() < ip + 40 || f[ip] >> 4 != 6 || (f[ip + 1] >> 4) & 0b11 == 0 {
+                return false; // Not-ECT
+            }
+            f[ip + 1] |= 0b11 << 4;
+            return true;
+        }
         if wire::ethertype(f) != Some(wire::ETHERTYPE_IPV4)
             || wire::Ipv4View::parse(f, wire::ETH_HDR).is_none()
         {

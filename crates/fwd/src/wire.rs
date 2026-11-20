@@ -508,6 +508,31 @@ pub fn parse_nd(frame: &[u8]) -> Option<(Ipv6Addr, Mac)> {
     None
 }
 
+/// A Neighbor Advertisement the router's own (host) stack sends, with the
+/// Router flag set (RFC 4861 §4.4): smoltcp sends it cleared, and a client
+/// that sees its default router's NA without it removes the router from
+/// its default router list (§7.2.5), losing its IPv6 default route.
+/// Returns whether it changed the frame.
+pub fn ipv6_na_set_router(frame: &mut [u8]) -> bool {
+    let ip = ETH_HDR;
+    let m = ip + 40;
+    if ethertype(frame) != Some(ETHERTYPE_IPV6)
+        || frame.len() < m + 24
+        || frame[ip] >> 4 != 6
+        || frame[ip + 6] != PROTO_ICMPV6
+        || frame[m] != 136
+        || frame[m + 4] & 0x80 != 0
+    {
+        return false;
+    }
+    let old = get16(frame, m + 4);
+    frame[m + 4] |= 0x80;
+    let new = get16(frame, m + 4);
+    let c = csum_update16(get16(frame, m + 2), old, new);
+    put16(frame, m + 2, c);
+    true
+}
+
 /// `ff02::1:ffXX:XXXX` (RFC 4291 §2.7.1).
 pub fn is_solicited_node(a: Ipv6Addr) -> bool {
     let o = a.octets();
@@ -1099,6 +1124,24 @@ mod tests {
         let c = icmpv6_checksum(gw, me, &bare);
         put16(&mut bare, 2, c);
         assert_eq!(parse_nd(&v6_frame(RMAC, CMAC, gw, me, PROTO_ICMPV6, &bare)), None);
+    }
+
+    #[test]
+    fn na_gets_the_router_flag() {
+        let me: Ipv6Addr = "fe80::5054:ff:fe00:2".parse().unwrap();
+        let c: Ipv6Addr = "fe80::5054:ff:fe00:10".parse().unwrap();
+        let mut na = alloc::vec![136u8, 0, 0, 0, 0x40, 0, 0, 0]; // Solicited
+        na.extend_from_slice(&me.octets());
+        na.extend_from_slice(&[2, 1, 0x52, 0x54, 0, 0, 0, 2]);
+        let k = icmpv6_checksum(me, c, &na);
+        put16(&mut na, 2, k);
+        let mut f = v6_frame(CMAC, RMAC, me, c, PROTO_ICMPV6, &na);
+        assert!(ipv6_na_set_router(&mut f));
+        assert_eq!(f[ETH_HDR + 40 + 4], 0xc0, "Router + Solicited");
+        assert_eq!(icmpv6_checksum(me, c, &f[ETH_HDR + 40..]), 0, "checksum");
+        assert!(!ipv6_na_set_router(&mut f), "already set");
+        let mut ns = v6_frame(CMAC, RMAC, me, c, PROTO_ICMPV6, &[135, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(!ipv6_na_set_router(&mut ns), "not an NA");
     }
 
     #[test]

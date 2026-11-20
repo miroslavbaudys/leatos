@@ -93,17 +93,21 @@ pub struct LanServices {
     retiring: Vec<(usize, Advertiser)>,
 }
 
-/// A network's RA settings: its ULA /64 and the router's ULA as DNS
-/// server, its domain to search, the MAC of its link's interface.
+/// A network's RA settings: its ULA /64 (and global /64), the router's
+/// ULA as DNS server, its domain to search, the MAC of its link's
+/// interface; a default router only with an IPv6 default route.
 fn ra_config(cfg: &config::Lan, host: &HostIf) -> Option<RaConfig> {
     let ula = cfg.ula?;
     let smoltcp::wire::HardwareAddress::Ethernet(mac) = host.iface.hardware_addr() else {
         return None;
     };
+    // A default router while the WAN has an IPv6 default route
+    // (development: `wan6_gw=`; docs/ipv6.md step 2b).
+    let default = config::wan6().is_some();
     Some(RaConfig {
         mac: mac.0,
-        prefixes: vec![ula],
-        router_lifetime: 0,
+        prefixes: [Some(ula), cfg.gua].into_iter().flatten().collect(),
+        router_lifetime: if default { proto_dhcp::v6::ra::ROUTER_SECS } else { 0 },
         mtu: 1500,
         rdnss: vec![ula],
         dnssl: vec![cfg.domain.clone()],
