@@ -1398,7 +1398,7 @@ function renderRules(list) {
       sel("action", ["accept", "drop", "reject"], r.action ?? "accept"), el("td", { className: "num", dataset: { hits: r.name ?? "" } }),
       el("td", {}, [el("button", { type: "button", className: "plain", textContent: "↑", title: "Move up", onclick: move(-1) }),
         el("button", { type: "button", className: "plain", textContent: "↓", title: "Move down", onclick: move(1) }),
-        el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); updatePending(); } })]));
+        el("button", { type: "button", className: "plain", textContent: "✕", title: "Remove", onclick: () => { tr.remove(); updatePending(); } })]));
     t.append(tr);
   });
   rulePaths();
