@@ -17,6 +17,12 @@ upstreams = ["1.1.1.1#cloudflare-dns.com", "1.0.0.1#cloudflare-dns.com"]
 | Quad9      | `9.9.9.9#dns.quad9.net`, `149.112.112.112#dns.quad9.net` |
 | Google     | `8.8.8.8#dns.google`, `8.8.4.4#dns.google` |
 
+IPv6 servers are written `[2606:4700:4700::1111]:853#cloudflare-dns.com`
+or, without a port, `2606:4700:4700::1111#cloudflare-dns.com` (docs/ipv6.md
+step 5b). They need the WAN's own IPv6 address (from the delegated prefix);
+until it has one, connections to them fail and are retried with backoff,
+so mixing IPv4 and IPv6 servers keeps DNS working either way.
+
 Any DoT server works whose certificate chains to a root in Mozilla's
 bundle (built in, `webpki-roots`) and carries the name after `#` (a host
 name, or the address itself for servers with IP certificates). A private

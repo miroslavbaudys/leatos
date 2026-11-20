@@ -187,9 +187,25 @@ new flows are checked.
 | `from` | required | zone name or `any` |
 | `to` | required | zone name, `router` (input) or `any` |
 | `proto` | `"any"` | `tcp`, `udp`, `tcp+udp`, `icmp`, `any` |
-| `src`, `dst` | any | address or CIDR |
+| `src`, `dst` | any | IPv4 or IPv6 address or prefix (`10.10.0.20`, `2001:db8::/48`; a bare IPv6 address is /128); one family per rule |
+| `dst_iid` | any | IPv6 only: the destination's interface identifier (`::5054:ff:fe00:10`, the low 64 bits) under any prefix, so a pinhole survives the ISP renumbering; not for `to = "router"` |
 | `dst_port` | any | `"443"` or `"8000-8100"`; only with tcp/udp |
 | `action` | required | `accept`, `drop`, `reject` |
+
+A rule with IPv4 addresses applies to IPv4 only, one with IPv6 addresses or
+`dst_iid` to IPv6 only, one with neither to both. An IPv6 pinhole for a
+device (docs/ipv6.md step 5b):
+
+```toml
+[[firewall.rule]]
+name = "qbittorrent6"
+from = "wan"
+to = "lan"
+proto = "tcp+udp"
+dst_iid = "::5054:ff:fe00:10"
+dst_port = 9524
+action = "accept"
+```
 
 ### `[[firewall.forward]]`
 Port forwarding (DNAT) from the WAN address.
@@ -311,8 +327,14 @@ via = "192.168.1.2"     # the next router
 |---|---|---|
 | `name` | required | key; unique |
 | `enabled` | `true` | |
-| `dst` | required | not `0.0.0.0/0` (the WAN's), not inside a network's subnet (around one is fine: the subnet is the longer match), not loopback, link-local or multicast; unique |
-| `via` | required | a host on one of the networks (not the router), or else on the WAN's subnet (not with PPPoE; with a DHCP WAN the route is used while the lease's subnet holds it); not inside `dst` for a WAN route |
+| `dst` | required | not `0.0.0.0/0` (the WAN's), not inside a network's subnet (around one is fine: the subnet is the longer match), not loopback, link-local or multicast; unique. IPv6: a global or unique local prefix, not `::/0` |
+| `via` | required | a host on one of the networks (not the router), or else on the WAN's subnet (not with PPPoE; with a DHCP WAN the route is used while the lease's subnet holds it); not inside `dst` for a WAN route. IPv6: a host in a network's unique local /64 (`<ula>:<i>::/64` = network `i`, stable when the ISP renumbers; in `ipv6.ula_prefix` if set) |
+
+IPv6 routes (docs/ipv6.md step 5b) are in use while IPv6 is on and `via`
+is in this boot's ULA /48; DHCP option 121 is IPv4 only, so the router
+forwards a network's packets for an IPv6 route back out to its router
+(the IPv4 rule against that, `hairpin`, does not apply); `/api/status`
+`routes6` lists them.
 
 At most 16. The route leaves through the network whose subnet holds `via`
 (`Config::route_via`):

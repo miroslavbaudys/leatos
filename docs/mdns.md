@@ -32,7 +32,10 @@ The starting point; §3–§5 describe what changed (smoltcp `multicast`,
 - One smoltcp `Interface` + `SocketSet` per link (`net/svc.rs` `HostIf`),
   per-network service state in `net/services.rs` (`Net`): an mDNS socket
   per network fits the existing pattern.
-- No IPv6 in the kernel yet (M7): `ff02::fb` waits for it.
+- IPv6 (since 2026-11-20, docs/ipv6.md step 5b): with `ipv6` on the router
+  also joins `ff02::fb`; a message reflects in the family it came in on, from
+  the router's link-local address; IPv6 sources must be link-local or in the
+  network's /64s.
 - `crates/proto-dns::wire` cannot be reused for names: its `read_name`
   rejects non-ASCII bytes and dots inside labels, and DNS-SD instance
   names (`Living Room._airplay._tcp.local`) need both. `proto-mdns` keeps
@@ -171,7 +174,7 @@ services = ["_airplay._tcp", "_raop._tcp", "_googlecast._tcp", "_ipp._tcp"]
 3. **Size**: mDNS allows up to 9000 B; without IPv4 reassembly in smoltcp
    fragmented messages are lost. Accepted (≤ MTU), counted as malformed.
 4. **Link-local addresses** in answers are useless on another link; the
-   rebuild removes them (IPv6 transport for `ff02::fb` still waits for M7).
+   rebuild removes them (IPv6 transport: `ff02::fb`, docs/ipv6.md step 5b).
 5. **Name conflicts**: probes reflected across networks make names unique
    across them, so a host may rename itself (`Name (2)`) once. Known
    reflector behaviour.
@@ -203,4 +206,4 @@ services = ["_airplay._tcp", "_raop._tcp", "_googlecast._tcp", "_ipp._tcp"]
 4. ✅ Web page section (reflect entries, warnings, counters). Open: a
    browse test with avahi (§7).
 5. On the apu4 with a real IoT VLAN.
-6. Later: IPv6 (`ff02::fb`, with M7), caching proxy, legacy unicast.
+6. Later: caching proxy, legacy unicast (IPv6 `ff02::fb` done with M7 step 5b).

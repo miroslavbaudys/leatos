@@ -548,7 +548,36 @@ at once, a /60 delegated, no RA seen yet), these were added:
     `LAB_ROUTER_ARGS=pd_keep=0`.
   - The router-side checks read its log up to that reboot.
 
-### Step 5: the rest
+### Step 5b: IPv6 in the rest of the config (done in QEMU 2026-11-20)
+- **Firewall rules:** `src`/`dst` take IPv6 prefixes; `dst_iid` matches an
+  interface identifier under any prefix (a pinhole that survives
+  renumbering). A rule with IPv4 addresses is IPv4-only, one with IPv6
+  ones IPv6-only, one with neither for both (`fwd::Rule6`). The web
+  firewall page has an "IPv6 host ID" column. Lab: `v6-pinhole` (ISP →
+  the client's :8087 open, another identifier closed, open again under
+  the new prefix); negative control `LAB_IPV6_PINHOLE=0`.
+- **AAAA names:** the datapath notes global/ULA neighbors from neighbor
+  discovery per link (`LinkShared::neigh6`, 128, no allocation per
+  packet). The services join them by MAC with leases and reservations
+  (`Zone::add_host6_in`, AAAA + ip6.arpa PTR, the A record's view;
+  forgotten after 30 min unseen). Lab: `labclient.lan` AAAA global + ULA,
+  PTR; hidden from the guest with views. Negative control
+  `dns_aaaa=0`.
+- **Config addresses:** `dns.upstreams` take IPv6 servers (UDP and DoT;
+  `Policy::router_tcp_peers6`); `time.ntp_servers` IPv6 literals;
+  `[[route]]` with an IPv6 `dst` via a host in a network's ULA /64
+  (`Forwarder::set_static_routes6`; forwarded back out to that router,
+  no option 121 in IPv6; `/api/status` `routes6`). Lab: DoT to
+  `[2001:db8:ffff::1]:853` (control `LAB_DOT_V6=0`), NTP from
+  `2001:db8:ffff::1`, `lab-behind6` (control `LAB_ROUTES=0`).
+- **mDNS:** the reflector takes IPv6 sources (link-local or the network's
+  /64s) and reflects each message in its own family (`Output::v6`, to
+  ff02::fb from the router's link-local address). Lab: `LAB_MDNS=1
+  LAB_IPV6=1` (the copy on the LAN capture; control `LAB_MDNS_RULES=0`).
+- Still open: stateful DHCPv6 on the LAN, the apu4 bufferbloat run with
+  IPv6 traffic, `mac-internet.sh` without `--ipv4-only`.
+
+### Step 5: the rest (plan)
 - Firewall page: IPv6 rules, pinholes by interface identifier, the
   redirect caveat.
 - mDNS reflector on `ff02::fb` (link-local AAAA removed as for IPv4
