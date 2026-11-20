@@ -433,11 +433,15 @@ impl Datapath {
         self.publish_routes();
     }
 
-    /// The routing table for status pages (every shard has the same).
+    /// The routing tables for status pages (every shard has the same).
     fn publish_routes(&self) {
         if let Some(s) = self.shards.first() {
-            let table = s.lock().routes.iter().copied().collect();
-            *self.sh.routes.lock() = table;
+            let (v4, v6) = {
+                let f = s.lock();
+                (f.routes.iter().copied().collect(), f.routes6.iter().copied().collect())
+            };
+            *self.sh.routes.lock() = v4;
+            *self.sh.routes6.lock() = v6;
         }
     }
 

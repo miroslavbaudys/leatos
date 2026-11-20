@@ -576,7 +576,11 @@ fn routes(ctx: &Ctx) {
             r.dev,
             r.kind,
             r.name.map(|n| alloc::format!(" {n}")).unwrap_or_default(),
-            if r.active { "" } else { " (inactive: no network holds its router)" }
+            match (r.active, r.dst.0.is_ipv6()) {
+                (true, _) => "",
+                (false, false) => " (inactive: no network holds its router)",
+                (false, true) => " (inactive: its router is in no network's unique local /64)",
+            }
         );
     }
 }

@@ -255,7 +255,10 @@
 #                        route (router lifetime 0), pings the router's ULA
 #                        and link-local address, resolves router.lan AAAA
 #                        over IPv6 and opens the web interface on the ULA;
-#                        the router's RA counters. With LAB_GUEST=1 also
+#                        the router's RA counters; /api/status routes
+#                        lists the ULA /64 (with a global prefix also that
+#                        /64), ::/0 via the WAN's IPv6 router if it has
+#                        one. With LAB_GUEST=1 also
 #                        the guest network: its own ULA, DNS over IPv6
 #                        allowed, the web interface refused (zone input).
 #                        Negative controls: LAB_ROUTER_ARGS=ipv6=0 (every

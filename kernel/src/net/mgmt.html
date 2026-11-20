@@ -248,7 +248,7 @@
     <h2>Routes</h2>
     <p class="lead">Where the router sends packets: its networks, the WAN's gateway, and subnets behind other routers.</p>
     <div class="card"><h3>Routing table</h3><div class="tw"><table id="rtab"></table></div>
-      <p class="hint">The most specific matching route wins. <b>connected</b>: a network's own subnet; <b>default</b>: everything else, to the WAN's gateway; <b>static</b>: configured below.</p></div>
+      <p class="hint">The most specific matching route wins. <b>connected</b>: a network's own subnet (with IPv6, also its /64s); <b>default</b>: everything else, to the WAN's gateway (IPv4 and, with IPv6, the ISP's router); <b>static</b>: configured below.</p></div>
     <form class="card cfg" autocomplete="off" id="routesform"><h3>Static routes</h3>
       <div class="tw"><table id="routes"></table></div>
       <div class="row"><button type="button" id="addroute" class="plain">Add route</button>
@@ -1531,13 +1531,15 @@ function renderRouteTable() {
   const rs = st?.routes ?? [];
   $("rtab").innerHTML = rs.length
     ? "<tr><th>Destination</th><th>Via</th><th>Interface</th><th>Type</th><th>Route</th></tr>" +
-      rs.map((r) => `<tr${r.active ? "" : " class=muted"}><td>${esc(r.dst === "0.0.0.0/0" ? "default (0.0.0.0/0)" : r.dst)}</td><td>${esc(r.via ?? "direct")}</td><td>${esc(r.dev)}</td>` +
+      rs.map((r) => `<tr${r.active ? "" : " class=muted"}><td>${esc(r.dst === "0.0.0.0/0" || r.dst === "::/0" ? `default (${r.dst})` : r.dst)}</td><td>${esc(r.via ?? "direct")}</td><td>${esc(r.dev)}</td>` +
         `<td>${esc(r.kind)}${r.active ? "" : " (not in use)"}</td><td>${esc(r.name ?? "")}</td></tr>`).join("")
     : rows([["Routes", st ? "none (no address yet)" : "–"]]);
   const by = Object.fromEntries(rs.filter((r) => r.name).map((r) => [r.name, r]));
   for (const td of document.querySelectorAll("#routes [data-rstate]")) {
     const r = by[td.dataset.rstate];
-    td.textContent = !r ? "–" : r.active ? `in use, via ${r.dev}` : "not in use: no network or WAN subnet holds the router";
+    td.textContent = !r ? "–" : r.active ? `in use, via ${r.dev}`
+      : r.dst.includes(":") ? "not in use: the router is in no network's unique local /64 (or IPv6 is off)"
+      : "not in use: no network or WAN subnet holds the router";
   }
 }
 $("addroute").onclick = () => {

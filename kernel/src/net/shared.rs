@@ -30,7 +30,7 @@ use crate::net::packet::PacketBuf;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::net::{Ipv4Addr, Ipv6Addr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
@@ -309,6 +309,8 @@ pub struct Shared {
     pub redirect_hits: Mutex<Vec<u64>>,
     /// The forwarder's routing table (published by the datapath).
     pub routes: Mutex<Vec<fwd::route::Route>>,
+    /// Its IPv6 routing table (connected /64s, `::/0`, `[[route]]`s).
+    pub routes6: Mutex<Vec<fwd::route::Route<Ipv6Addr>>>,
     /// The WAN ingress stage (docs/bufferbloat-cake.md §3.4): forwarded
     /// packets that came from the WAN wait here, shaped at the download
     /// rate, before their neighbor lookup and egress qdisc. Owned by the
@@ -320,9 +322,9 @@ pub struct Shared {
 /// One line of the routing table as shown (`/api/status` `routes`, CLI
 /// `routes`).
 pub struct RouteRow {
-    pub dst: (Ipv4Addr, u8),
+    pub dst: (IpAddr, u8),
     /// The next router; `None` = connected.
-    pub via: Option<Ipv4Addr>,
+    pub via: Option<IpAddr>,
     /// `wan`, a network's name, or `-` (a configured route not in use).
     pub dev: alloc::string::String,
     /// `connected`, `default` or `static`.
@@ -352,6 +354,7 @@ pub fn init(ports: Vec<PortShared>, links: Vec<LinkShared>, ingress: PortQdisc) 
             forward_hits: Mutex::new(Vec::new()),
             redirect_hits: Mutex::new(Vec::new()),
             routes: Mutex::new(Vec::new()),
+            routes6: Mutex::new(Vec::new()),
             ingress: Mutex::new(ingress),
         }))
     })
@@ -379,48 +382,74 @@ impl Shared {
     }
 
     /// The routing table in use (longest prefix first), then the
-    /// configured routes that are not in it.
+    /// configured routes that are not in it; IPv4, then IPv6.
     pub fn route_rows(&self) -> Vec<RouteRow> {
         use fwd::route::RouteKind;
-        let table = self.routes.lock().clone();
         let nets = crate::config::networks();
+        let mut rows = Vec::new();
+        // IPv4: the network whose subnet holds the router, or is the route.
+        let table = self.routes.lock().clone();
         let named = crate::config::named_routes();
-        let dev = |r: &fwd::route::Route| -> alloc::string::String {
-            if r.egress == 0 {
-                return "wan".into();
-            }
-            // The network whose subnet holds the router, or is the route.
+        for r in &table {
             let ip = r.gateway.unwrap_or(r.prefix);
-            nets.iter()
-                .find(|n| n.contains(ip) && (r.gateway.is_some() || n.prefix == r.len))
-                .map_or_else(|| "-".into(), |n| n.name.clone())
-        };
-        let mut rows: Vec<RouteRow> = table
-            .iter()
-            .map(|r| RouteRow {
-                dst: (r.prefix, r.len),
-                via: r.gateway,
-                dev: dev(r),
-                kind: r.kind.as_str(),
-                name: (r.kind == RouteKind::Static)
-                    .then(|| named.iter().find(|n| (n.1, n.2) == (r.prefix, r.len)).map(|n| n.0.clone()))
-                    .flatten(),
-                active: true,
-            })
-            .collect();
+            let dev = (r.egress != 0)
+                .then(|| nets.iter().find(|n| n.contains(ip) && (r.gateway.is_some() || n.prefix == r.len)))
+                .map(|n| n.map(|n| n.name.as_str()));
+            let name = (r.kind == RouteKind::Static)
+                .then(|| named.iter().find(|n| (n.1, n.2) == (r.prefix, r.len)).map(|n| n.0.clone()))
+                .flatten();
+            rows.push(row((r.prefix.into(), r.len), r.gateway.map(Into::into), dev, r.kind, name, true));
+        }
         for (name, dst, len, via) in named {
-            let used = table.iter().any(|r| r.kind == RouteKind::Static && (r.prefix, r.len) == (dst, len));
-            if !used {
-                rows.push(RouteRow {
-                    dst: (dst, len),
-                    via: Some(via),
-                    dev: "-".into(),
-                    kind: RouteKind::Static.as_str(),
-                    name: Some(name),
-                    active: false,
-                });
+            if !table.iter().any(|r| r.kind == RouteKind::Static && (r.prefix, r.len) == (dst, len)) {
+                rows.push(row((dst.into(), len), Some(via.into()), Some(None), RouteKind::Static, Some(name), false));
+            }
+        }
+        // IPv6: the network one of whose /64s (unique local, global)
+        // holds the router, or is the route.
+        let table = self.routes6.lock().clone();
+        let named = crate::config::named_routes6();
+        let on_net = |n: &crate::config::Lan, a: Ipv6Addr| {
+            [n.ula, n.gua].into_iter().flatten().any(|m| (u128::from(m) ^ u128::from(a)) >> 64 == 0)
+        };
+        for r in &table {
+            let ip = r.gateway.unwrap_or(r.prefix);
+            let dev = (r.egress != 0)
+                .then(|| nets.iter().find(|n| on_net(n, ip) && (r.gateway.is_some() || r.len == 64)))
+                .map(|n| n.map(|n| n.name.as_str()));
+            let name = (r.kind == RouteKind::Static)
+                .then(|| named.iter().find(|n| (n.1, n.2) == (r.prefix, r.len)).map(|n| n.0.clone()))
+                .flatten();
+            rows.push(row((r.prefix.into(), r.len), r.gateway.map(Into::into), dev, r.kind, name, true));
+        }
+        for (name, dst, len, via, _) in named {
+            if !table.iter().any(|r| r.kind == RouteKind::Static && (r.prefix, r.len) == (dst, len)) {
+                rows.push(row((dst.into(), len), Some(via.into()), Some(None), RouteKind::Static, Some(name), false));
             }
         }
         rows
+    }
+}
+
+/// A [`RouteRow`]; `dev`: `None` = the WAN, `Some(None)` = no network.
+fn row(
+    dst: (IpAddr, u8),
+    via: Option<IpAddr>,
+    dev: Option<Option<&str>>,
+    kind: fwd::route::RouteKind,
+    name: Option<alloc::string::String>,
+    active: bool,
+) -> RouteRow {
+    RouteRow {
+        dst,
+        via,
+        dev: match dev {
+            None => "wan".into(),
+            Some(Some(n)) => n.into(),
+            Some(None) => "-".into(),
+        },
+        kind: kind.as_str(),
+        name,
+        active,
     }
 }

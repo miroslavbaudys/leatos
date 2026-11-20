@@ -602,6 +602,31 @@ if [ -n "$v6on" ]; then
     if $bb wget -q -T 5 -O - "http://[$r6]/api/info" 2>/dev/null | $bb grep -q '"auth"'; then pass "ipv6: web interface on http://[$r6]/"; else fail "ipv6: web interface on http://[$r6]/"; fi
     ra=$(v6st | $bb grep -o '"ra":{"sent":[0-9]*,"solicits":[0-9]*}' | $bb sed -n '1s/.*"sent":\([0-9]*\),"solicits":\([0-9]*\)}/\1 \2/p')
     if [ "${ra%% *}" -gt 0 ] 2>/dev/null; then pass "ipv6: router sent ${ra%% *} RAs, ${ra##* } solicitations seen"; else fail "ipv6: router RA counters '$ra'"; fi
+    # The IPv6 routing table in /api/status routes (the Routes page): our
+    # ULA /64 connected on lan, with a global prefix that /64 too, and
+    # ::/0 on wan via the WAN's IPv6 router (wan_ipv6 gateway: the ISP's
+    # RA, also without a prefix), none without one. Negative control:
+    # LAB_ROUTER_ARGS=ipv6=0 (no IPv6 rows: the router ULA check above
+    # already fails).
+    st6=$(v6st)
+    rt6=$(echo "$st6" | $bb sed -n 's/.*"routes":\[\([^]]*\)\].*/\1/p')
+    gw6=$(echo "$st6" | $bb grep -o '"wan_ipv6":{[^}]*}' | $bb sed -n 's/.*"gateway":"\([^"]*\)".*/\1/p')
+    want6="${r6%::1}::/64"
+    [ -n "$gr" ] && want6="$want6 ${gr%::1}::/64"
+    miss6=""
+    for d in $want6; do
+      echo "$rt6" | $bb grep -q "\"dst\":\"$d\",\"via\":null,\"dev\":\"lan\",\"kind\":\"connected\"" || miss6="$miss6 $d"
+    done
+    if [ -n "$gw6" ]; then
+      echo "$rt6" | $bb grep -q "\"dst\":\"::/0\",\"via\":\"$gw6\",\"dev\":\"wan\",\"kind\":\"default\"" || miss6="$miss6 ::/0 via $gw6"
+    elif echo "$rt6" | $bb grep -q '"dst":"::/0"'; then
+      miss6="$miss6 (a ::/0 without a WAN IPv6 router)"
+    fi
+    if [ -z "$miss6" ]; then
+      pass "ipv6 routes: /api/status lists $want6 connected on lan$([ -n "$gw6" ] && echo ", ::/0 via $gw6 on wan")"
+    else
+      fail "ipv6 routes: missing$miss6 in /api/status routes"; echo "$rt6" | $bb tr '}' '\n' | $bb grep ':' | $bb sed 's/^,*{*/    | /'
+    fi
     # --- through the router to the ISP (docs/ipv6.md step 2b) ---
     if [ -n "$gr" ]; then
       if ag=$(v6slaac eth0 "${gr%::1}"); then pass "ipv6 wan: global slaac address $ag"; else fail "ipv6 wan: no global address under ${gr%::1}::/64"; fi

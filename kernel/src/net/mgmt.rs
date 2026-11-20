@@ -1343,7 +1343,8 @@ fn status_json(
         }
         (None, None) => s.push_str(",\"wan_ipv6\":null"),
     }
-    // The routing table, then configured routes not in use.
+    // The routing tables (IPv4, then IPv6), each followed by the
+    // configured routes not in use.
     s.push_str(",\"routes\":[");
     for (n, r) in sh.route_rows().iter().enumerate() {
         let _ = write!(
