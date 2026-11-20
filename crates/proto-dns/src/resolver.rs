@@ -63,7 +63,7 @@ use crate::wire::{self, Rdata};
 use crate::zone::{Lookup, View, Zone};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// TTL for answers from the local zone.
 pub const LOCAL_TTL: u32 = 60;
@@ -89,7 +89,7 @@ pub enum Action {
     /// framed by the caller) or as a datagram.
     Reply { to: SocketAddr, data: Vec<u8>, tcp: bool },
     /// Send `data` to upstream server `server`, port 53.
-    Upstream { server: Ipv4Addr, data: Vec<u8> },
+    Upstream { server: IpAddr, data: Vec<u8> },
 }
 
 #[derive(Clone, Debug)]
@@ -207,7 +207,7 @@ pub struct Resolver {
     cfg: Config,
     zone: Zone,
     cache: Cache,
-    upstreams: Vec<Ipv4Addr>,
+    upstreams: Vec<IpAddr>,
     pending: BTreeMap<u16, Pending>,
     by_question: BTreeMap<Key, u16>,
     rng: u32,
@@ -265,11 +265,11 @@ impl Resolver {
         &mut self.zone
     }
 
-    pub fn set_upstreams(&mut self, servers: &[Ipv4Addr]) {
-        self.upstreams = servers.to_vec();
+    pub fn set_upstreams<A: Copy + Into<IpAddr>>(&mut self, servers: &[A]) {
+        self.upstreams = servers.iter().map(|&a| a.into()).collect();
     }
 
-    pub fn upstreams(&self) -> &[Ipv4Addr] {
+    pub fn upstreams(&self) -> &[IpAddr] {
         &self.upstreams
     }
 
@@ -509,7 +509,8 @@ impl Resolver {
     }
 
     /// A response datagram from upstream server `from` (source port 53).
-    pub fn handle_upstream(&mut self, now_ms: u64, from: Ipv4Addr, response: &[u8]) -> Vec<Action> {
+    pub fn handle_upstream(&mut self, now_ms: u64, from: impl Into<IpAddr>, response: &[u8]) -> Vec<Action> {
+        let from: IpAddr = from.into();
         let Ok(h) = wire::Header::parse(response) else {
             return Vec::new();
         };
@@ -720,7 +721,7 @@ mod tests {
         }
     }
 
-    fn upstream(actions: &[Action]) -> (Ipv4Addr, Vec<u8>) {
+    fn upstream(actions: &[Action]) -> (IpAddr, Vec<u8>) {
         match actions {
             [Action::Upstream { server, data }] => (*server, data.clone()),
             other => panic!("expected one upstream query, got {other:?}"),
@@ -789,6 +790,28 @@ mod tests {
             &r.handle_query(301_000, client(6), &q)[..],
             [Action::Upstream { .. }]
         ));
+    }
+
+    #[test]
+    fn an_ipv6_upstream_takes_over_after_a_timeout() {
+        let mut r = resolver();
+        let v6: Ipv6Addr = "2a03:ab00:10::131".parse().unwrap();
+        r.set_upstreams(&[IpAddr::V4(UP1), IpAddr::V6(v6)]);
+        let (server, _) = upstream(&r.handle_query(0, client(5), &build_query(7, "example.com", TYPE_A)));
+        assert_eq!(server, UP1);
+        let mut retry = None;
+        for t in (100..20_000).step_by(100) {
+            if let [Action::Upstream { server, data }] = &r.poll(t)[..] {
+                retry = Some((*server, data.clone()));
+                break;
+            }
+        }
+        let (server, up) = retry.expect("retried");
+        assert_eq!(server, IpAddr::V6(v6));
+        // Only the server asked may answer.
+        assert!(r.handle_upstream(20_000, UP1, &answer(&up, Ipv4Addr::new(93, 184, 216, 34), 300)).is_empty());
+        let a = r.handle_upstream(20_000, v6, &answer(&up, Ipv4Addr::new(93, 184, 216, 34), 300));
+        assert_eq!(reply(&a).0, &client(5));
     }
 
     #[test]
@@ -930,7 +953,7 @@ mod tests {
     #[test]
     fn no_upstream_or_too_many_pending_gives_servfail() {
         let mut r = resolver();
-        r.set_upstreams(&[]);
+        r.set_upstreams::<Ipv4Addr>(&[]);
         let a = r.handle_query(0, client(1), &build_query(1, "x.com", TYPE_A));
         assert_eq!(rcode(reply(&a).1), RCODE_SERVFAIL);
 
@@ -1052,7 +1075,7 @@ mod tests {
         let [Action::Reply { to, .. }, Action::Upstream { server, data: up }] = &a[..] else {
             panic!("expected reply + renewal, got {a:?}");
         };
-        assert_eq!((*to, *server), (client(2), UP1));
+        assert_eq!((*to, *server), (client(2), IpAddr::V4(UP1)));
         assert_eq!(up[12..], q[12..], "same question and EDNS");
         assert_eq!(wire::udp_limit(up, 1472), 1232);
         // One renewal per question.
@@ -1312,7 +1335,7 @@ mod tests {
         });
         let q = build_query(7, "wan-down.example", TYPE_A);
         fill(&mut r, &q, 100);
-        r.set_upstreams(&[]);
+        r.set_upstreams::<Ipv4Addr>(&[]);
         let a = r.handle_query(100_000, client(2), &q);
         let (_, d) = reply(&a);
         assert_eq!((rcode(d), ttls(d)), (RCODE_NOERROR, vec![STALE_TTL]));
@@ -1327,7 +1350,7 @@ mod tests {
             ..Config::default()
         });
         fill(&mut r, &q, 100);
-        r.set_upstreams(&[]);
+        r.set_upstreams::<Ipv4Addr>(&[]);
         assert_eq!(rcode(reply(&r.handle_query(100_000, client(2), &q)).1), RCODE_SERVFAIL);
         assert_eq!(r.stats.stale_answers, 0);
     }
@@ -1352,7 +1375,7 @@ mod tests {
         let edns = with_edns("ede.example");
         let plain = build_query(9, "ede.example", TYPE_A);
         fill(&mut r, &edns, 100);
-        r.set_upstreams(&[]);
+        r.set_upstreams::<Ipv4Addr>(&[]);
         // Stale: EDE 3 for the EDNS client, no OPT at all for the other.
         let a = r.handle_query(100_000, client(2), &edns);
         let (_, d) = reply(&a);
@@ -1366,7 +1389,7 @@ mod tests {
         let (_, up) = upstream(&r.handle_query(0, client(1), &nx));
         let (_, _, end) = wire::parse_query(&up).unwrap();
         reply(&r.handle_upstream(0, UP1, &wire::build_response(&up, end, RCODE_NXDOMAIN, &[], false)));
-        r.set_upstreams(&[]);
+        r.set_upstreams::<Ipv4Addr>(&[]);
         let a = r.handle_query(61_000, client(2), &nx);
         let (_, d) = reply(&a);
         assert_eq!((rcode(d), ede_codes(d)), (RCODE_NXDOMAIN, vec![EDE_STALE_NXDOMAIN]));

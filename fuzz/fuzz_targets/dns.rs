@@ -89,7 +89,7 @@ fuzz_target!(|ops: Vec<Op>| {
     let mut r = Resolver::new(cfg, z, 0x5eed);
     r.set_upstreams(&UP);
     let mut now = 1_000u64;
-    let mut last_up: Option<(Ipv4Addr, Vec<u8>)> = None;
+    let mut last_up: Option<(core::net::IpAddr, Vec<u8>)> = None;
     let mut asked: Vec<SocketAddr> = Vec::new();
     for op in ops.into_iter().take(150) {
         let actions = match op {
@@ -134,7 +134,7 @@ fuzz_target!(|ops: Vec<Op>| {
                 if let Some(n) = &noise {
                     damage(&mut resp, n);
                 }
-                let from = if wrong_server { Ipv4Addr::new(6, 6, 6, 6) } else { *server };
+                let from = if wrong_server { core::net::IpAddr::V4(Ipv4Addr::new(6, 6, 6, 6)) } else { *server };
                 r.handle_upstream(now, from, &resp)
             }
             Op::RawUpstream { server, data } => r.handle_upstream(now, UP[usize::from(server)], &data),
@@ -150,7 +150,7 @@ fuzz_target!(|ops: Vec<Op>| {
         for a in actions {
             match a {
                 Action::Upstream { server, data } => {
-                    assert!(UP.contains(&server), "query to a server that is not an upstream: {server}");
+                    assert!(matches!(server, core::net::IpAddr::V4(a) if UP.contains(&a)), "query to a server that is not an upstream: {server}");
                     last_up = Some((server, data));
                 }
                 Action::Reply { to, data, tcp } => {
