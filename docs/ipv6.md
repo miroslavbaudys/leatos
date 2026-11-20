@@ -228,8 +228,10 @@ New or changed (2026-11-20):
   Kea needs `service-sockets-max-retries` when it starts before the link
   is up; `memfile` with `persist: false`. libssl3/libcrypto3 moved to
   3.5.9-r1 at the same time (r0 left the mirror; PPPoE and DoT labs pass).
-- smoltcp features: `iface-max-addr-count-4`,
-  `iface-max-multicast-group-count-8`. Measure heap and binary size.
+- ✅ smoltcp features `iface-max-addr-count-4`,
+  `iface-max-multicast-group-count-8` (2026-11-20): `.text` +556 B
+  (aarch64) / +1392 B (x86_64), heap in use after boot unchanged
+  (5 246 696 B, release, aarch64); smoke (both arches) and lab pass.
 
 ### Step 1: router IPv6 on the LAN, no forwarding
 - Link-local addresses (EUI-64 from the port MAC) on every link, the WAN

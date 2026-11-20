@@ -51,6 +51,10 @@ smoltcp = { version = "0.14", default-features = false, features = [
     "auto-icmp-echo-reply", # the router answers pings on its own addresses
     "multicast",            # 224.0.0.251 for the mDNS reflector (net::mdns)
     "iface-max-route-count-32", # `[[route]]`s (at most 16) + the default route
+    # IPv6 (M7, docs/ipv6.md): per link IPv4 + link-local + ULA + global;
+    # groups ff02::1/ff02::2, solicited-node per address, ff02::fb, 224.0.0.251
+    "iface-max-addr-count-4",
+    "iface-max-multicast-group-count-8",
 ] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
