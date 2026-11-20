@@ -366,6 +366,10 @@ impl Resolver {
                 wire::RCODE_NOERROR,
                 ips.into_iter().map(|a| (Rdata::A(a), LOCAL_TTL)).collect(),
             )),
+            Lookup::Aaaa(ips) => Some((
+                wire::RCODE_NOERROR,
+                ips.into_iter().map(|a| (Rdata::Aaaa(a), LOCAL_TTL)).collect(),
+            )),
             Lookup::Ptr(names) => Some((
                 wire::RCODE_NOERROR,
                 names
@@ -873,6 +877,19 @@ mod tests {
         let a = r.handle_upstream(1, UP1, &answer(&up, Ipv4Addr::new(192, 168, 1, 1), 60));
         assert_eq!(rcode(reply(&a).1), RCODE_REFUSED);
         assert_eq!((r.stats.rebind_blocked, r.cache_len()), (1, 0));
+    }
+
+    #[test]
+    fn router_aaaa_is_answered_locally() {
+        use crate::wire::TYPE_AAAA;
+        let mut r = resolver();
+        let ula: Ipv6Addr = "fd12:3456:789a::1".parse().unwrap();
+        r.zone.add_router6("lan", ula);
+        let a = r.handle_query(0, client(1), &build_query(1, "router.lan", TYPE_AAAA));
+        let (_, d) = reply(&a);
+        let recs = wire::records(d).unwrap();
+        assert_eq!(wire::answer_ipv6s(d, &recs), vec![ula]);
+        assert_eq!(r.stats.forwarded, 0);
     }
 
     #[test]

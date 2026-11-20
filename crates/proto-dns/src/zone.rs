@@ -21,7 +21,7 @@ use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::net::Ipv4Addr;
+use core::net::{Ipv4Addr, Ipv6Addr};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Source {
@@ -106,12 +106,18 @@ pub struct Zone {
     subnets: Vec<(Ipv4Addr, u8)>,
     /// Exact names outside the local domains, answered to some networks.
     overrides: BTreeMap<String, Vec<Record>>,
+    /// The router's IPv6 addresses: (domain, address) for `router.<domain>`
+    /// AAAA and its `ip6.arpa` PTR.
+    routers6: Vec<(String, Ipv6Addr)>,
+    /// The networks' IPv6 /64s: their `ip6.arpa` names are local.
+    subnets6: Vec<Ipv6Addr>,
 }
 
 #[derive(Debug)]
 pub enum Lookup {
     /// The name is ours and has addresses / PTR targets.
     A(Vec<Ipv4Addr>),
+    Aaaa(Vec<Ipv6Addr>),
     Ptr(Vec<String>),
     /// The name is ours but has no record of the requested type.
     NoData,
@@ -140,6 +146,26 @@ fn parse_reverse(name: &str) -> Option<Ipv4Addr> {
     parts.next().is_none().then(|| Ipv4Addr::new(a, b, c, d))
 }
 
+/// A full `ip6.arpa` name (32 nibbles, RFC 3596 §2.5).
+fn parse_reverse6(name: &str) -> Option<Ipv6Addr> {
+    let rest = name.strip_suffix(".ip6.arpa")?;
+    let mut v: u128 = 0;
+    let mut n = 0;
+    for (i, p) in rest.split('.').enumerate() {
+        if i >= 32 || p.len() != 1 {
+            return None;
+        }
+        let d = u128::from(char::from(p.as_bytes()[0]).to_digit(16)?);
+        v |= d << (4 * i);
+        n += 1;
+    }
+    (n == 32).then(|| Ipv6Addr::from(v))
+}
+
+fn prefix64(a: Ipv6Addr) -> u128 {
+    u128::from(a) >> 64
+}
+
 fn normalize(domain: &str) -> String {
     domain.trim_matches('.').to_ascii_lowercase()
 }
@@ -158,6 +184,8 @@ impl Zone {
             domains: Vec::new(),
             subnets: alloc::vec![subnet],
             overrides: BTreeMap::new(),
+            routers6: Vec::new(),
+            subnets6: Vec::new(),
         };
         z.add_domain(domain, router_ip);
         z
@@ -176,6 +204,19 @@ impl Zone {
             hosts: BTreeMap::new(),
         });
         self.add_in(&name, "router", router_ip, Source::Static, View::ALL);
+    }
+
+    /// The router's IPv6 address in a network whose domain is `domain`
+    /// (already local): `router.<domain>` AAAA, its PTR, and the /64's
+    /// `ip6.arpa` names local.
+    pub fn add_router6(&mut self, domain: &str, addr: Ipv6Addr) {
+        let name = normalize(domain);
+        if !self.routers6.iter().any(|(d, a)| *d == name && *a == addr) {
+            self.routers6.push((name, addr));
+        }
+        if !self.subnets6.iter().any(|&s| prefix64(s) == prefix64(addr)) {
+            self.subnets6.push(addr);
+        }
     }
 
     /// Another subnet whose reverse zone is local (a second network).
@@ -305,7 +346,23 @@ impl Zone {
     /// [`Self::lookup`], plus the `[[dns.host]]` entry that answered a
     /// forward name (A, or no data for another type), if one did.
     pub fn lookup_host(&self, name: &str, qtype: u16, view: View) -> (Lookup, Option<u16>) {
-        use crate::wire::{TYPE_A, TYPE_PTR};
+        use crate::wire::{TYPE_A, TYPE_AAAA, TYPE_PTR};
+        if let Some(ip6) = parse_reverse6(name) {
+            if !self.subnets6.iter().any(|&s| prefix64(s) == prefix64(ip6)) {
+                return (Lookup::NotLocal, None);
+            }
+            let names: Vec<String> = self
+                .routers6
+                .iter()
+                .filter(|(_, a)| *a == ip6)
+                .map(|(d, _)| format!("router.{d}"))
+                .collect();
+            return match (names.is_empty(), qtype == TYPE_PTR) {
+                (true, _) => (Lookup::NxDomain, None),
+                (false, true) => (Lookup::Ptr(names), None),
+                (false, false) => (Lookup::NoData, None),
+            };
+        }
         if let Some(ip) = parse_reverse(name) {
             if !self.in_subnet(ip) {
                 return (Lookup::NotLocal, None);
@@ -339,6 +396,12 @@ impl Zone {
             return (Lookup::NoData, None);
         }
         let host = &name[..name.len() - d.name.len() - 1];
+        if host == "router" && qtype == TYPE_AAAA {
+            let v6: Vec<Ipv6Addr> = self.routers6.iter().filter(|(dn, _)| *dn == d.name).map(|&(_, a)| a).collect();
+            if !v6.is_empty() {
+                return (Lookup::Aaaa(v6), None);
+            }
+        }
         match d.hosts.get(host) {
             Some(recs) => match effective(recs, view) {
                 Some(r) if qtype == TYPE_A => (Lookup::A(alloc::vec![r.ip]), r.host),
@@ -580,5 +643,38 @@ mod tests {
         // Under a local domain it is not an override (use add_in).
         z.add_override("x.lan", ip, LAN);
         assert!(matches!(z.lookup("x.lan", TYPE_A, LAN), Lookup::NxDomain));
+    }
+
+    #[test]
+    fn router_aaaa_and_ip6_arpa() {
+        let mut z = zone();
+        z.add_domain("guest.lan", Ipv4Addr::new(10, 20, 0, 1));
+        let lan6: Ipv6Addr = "fd12:3456:789a::1".parse().unwrap();
+        let guest6: Ipv6Addr = "fd12:3456:789a:1::1".parse().unwrap();
+        z.add_router6("lan", lan6);
+        z.add_router6("guest.lan", guest6);
+        z.add_router6("lan", lan6); // twice: once
+        assert!(matches!(z.lookup("router.lan", TYPE_AAAA, ALL), Lookup::Aaaa(v) if v == [lan6]));
+        assert!(matches!(z.lookup("router.guest.lan", TYPE_AAAA, ALL), Lookup::Aaaa(v) if v == [guest6]));
+        // A stays IPv4; other hosts have no AAAA.
+        assert!(matches!(z.lookup("router.lan", TYPE_A, ALL), Lookup::A(_)));
+        assert!(matches!(z.lookup("nas.lan", TYPE_AAAA, ALL), Lookup::NoData));
+        let rev = |a: Ipv6Addr| {
+            let mut n = String::new();
+            for i in 0..32 {
+                n.push_str(&format!("{:x}.", (u128::from(a) >> (4 * i)) & 0xf));
+            }
+            n + "ip6.arpa"
+        };
+        assert!(matches!(z.lookup(&rev(guest6), TYPE_PTR, ALL), Lookup::Ptr(v) if v == ["router.guest.lan"]));
+        assert!(matches!(z.lookup(&rev(lan6), TYPE_AAAA, ALL), Lookup::NoData));
+        // Other addresses in our /64s: NXDOMAIN; outside them: upstream.
+        let host: Ipv6Addr = "fd12:3456:789a::99".parse().unwrap();
+        assert!(matches!(z.lookup(&rev(host), TYPE_PTR, ALL), Lookup::NxDomain));
+        let public: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert!(matches!(z.lookup(&rev(public), TYPE_PTR, ALL), Lookup::NotLocal));
+        // Not 32 nibbles: not parsed as an address.
+        assert!(matches!(z.lookup("a.8.9.7.ip6.arpa", TYPE_PTR, ALL), Lookup::NotLocal));
+        assert!(matches!(z.lookup(&rev(lan6).replacen("1.", "x.", 1), TYPE_PTR, ALL), Lookup::NotLocal));
     }
 }
