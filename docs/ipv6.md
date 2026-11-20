@@ -1,6 +1,6 @@
 # IPv6 (M7, plan)
 
-Status (2026-11-20): steps 0 and 1 done in QEMU (step 0: AAAA rebind protection, Kea for the lab, smoltcp limits, IPv6CP offer logged; step 1: IPv6 on the router's networks, below). Steps 2a (conntrack generic over the address family) and 2b (IPv6 forwarding with a static WAN prefix) done too. The apu4 check of the IPv6CP offer waits for the soak run to end. Next: step 2c (fragments), then step 3. First plan 2026-11-15 (checked at
+Status (2026-11-20): steps 0 and 1 done in QEMU (step 0: AAAA rebind protection, Kea for the lab, smoltcp limits, IPv6CP offer logged; step 1: IPv6 on the router's networks, below). Steps 2a (conntrack generic over the address family) and 2b (IPv6 forwarding with a static WAN prefix) done too. The apu4 check of the IPv6CP offer waits for the soak run to end. Step 2c (IPv6 fragments) done too. Next: step 3 (DHCPv6-PD). First plan 2026-11-15 (checked at
 2712911); **revised 2026-11-20 against 74cb3d1**, after 135 commits that
 added routed LAN ports and live link slots, the WAN ingress stage, IPv4
 fragments, anti-spoofing, redirects, static routes, DNS views, DoT, the
@@ -391,6 +391,17 @@ The plan as written before:
   cost of the IPv4 path measured before and after: it must not regress.
 
 ### Step 2c: IPv6 fragments
+✅ in QEMU (2026-11-20). `fwd::frag` keys and decisions are enums (IPv4,
+IPv6). `classify` looks at an IPv6 frame only when an extension header
+follows the fixed one. A first fragment needs TCP/UDP/ICMPv6 and its
+whole header behind the chain, and a TCP fragment at offset 8 bytes is
+refused. `forward6` records a first fragment's decision
+(`Decision6`: connection, egress, next hop, class);
+`Forwarder::forward_fragment` takes later ones the same way, with no
+rewrite. IPv6 decisions never clash (no NAT). The datapath's park and
+release flow is shared with IPv4 unchanged. `fw_frag=0` drops IPv6
+fragments too. The `fwd` fuzz target sends later IPv6 fragments through
+`forward_fragment`.
 - Forward fragments, don't reassemble: the first fragment must carry the
   header chain through L4 (RFC 7112) and is decided like a whole packet;
   later fragments follow it via `frag`, generalised to IPv6 (32-bit ID +
