@@ -1,6 +1,6 @@
 # IPv6 (M7, plan)
 
-Status (2026-11-20): steps 0 and 1 done in QEMU (step 0: AAAA rebind protection, Kea for the lab, smoltcp limits, IPv6CP offer logged; step 1: IPv6 on the router's networks, below). Steps 2a (conntrack generic over the address family) and 2b (IPv6 forwarding with a static WAN prefix) done too. The apu4 check of the IPv6CP offer waits for the soak run to end. Step 2c (IPv6 fragments) done too. Next: step 3 (DHCPv6-PD). First plan 2026-11-15 (checked at
+Status (2026-11-20): steps 0 and 1 done in QEMU (step 0: AAAA rebind protection, Kea for the lab, smoltcp limits, IPv6CP offer logged; step 1: IPv6 on the router's networks, below). Steps 2a (conntrack generic over the address family) and 2b (IPv6 forwarding with a static WAN prefix) done too. The apu4 check of the IPv6CP offer waits for the soak run to end. Step 2c (IPv6 fragments) and step 3 (DHCPv6-PD on a DHCP WAN) done too. Next: step 4 (IPv6 over PPPoE). First plan 2026-11-15 (checked at
 2712911); **revised 2026-11-20 against 74cb3d1**, after 135 commits that
 added routed LAN ports and live link slots, the WAN ingress stage, IPv4
 fragments, anti-spoofing, redirects, static routes, DNS views, DoT, the
@@ -410,6 +410,37 @@ fragments too. The `fwd` fuzz target sends later IPv6 fragments through
   `LAB_ROUTER_ARGS=fw_frag=0`.
 
 ### Step 3: DHCPv6-PD on a DHCP WAN
+✅ in QEMU (2026-11-20). As built:
+- **`net::wan6`** runs in `svc` while IPv6 and `ipv6.dhcpv6_pd` are on and
+  the WAN is Ethernet without the development boot arguments. It:
+  - takes the ISP's RA (the last one the WAN received, `NdHints::take_ra`,
+    parsed by `proto_dhcp::v6::ra::parse_frame`: its link-local source
+    is the default router while the lifetime lasts)
+  - sends up to three Router Solicitations
+  - runs `proto_dhcp::v6::pd::Client` on the WAN's UDP :546
+- **Applying it:** the result (`wan6::state`) feeds `config::wan6` (the
+  datapath's default route) and `config::gua_router` (network `i` gets
+  `<delegated>:<i>::/64`). On a change `svc` reapplies the networks the
+  way a saved config does (`reapply_networks`). A saved config that
+  changes the WAN mode or `[ipv6]` restarts the client.
+- **When the prefix changes:** the RAs keep the old prefix deprecated for
+  2 h, and the forwarder drops IPv6 connections of the old /64.
+- **Default router:** a network advertises one only with an IPv6 default
+  route *and* a global /64 (RFC 7084 G-4).
+- **Config:** `[ipv6] dhcpv6_pd` (default on), `prefix_hint` (56).
+- **Status:** `/api/status` `wan_ipv6` (`source`, `state`, `gateway`,
+  `prefix`, lifetimes) and a WAN page row.
+- **Not yet:** a WAN global address (IA_NA or SLAAC), keeping the last
+  prefix across reboots, using the reply's DNS servers (the resolver's
+  upstreams are IPv4; step 5).
+- **Lab:** the ISP VM runs dnsmasq (RAs only) and Kea (prefix delegation,
+  `lab-kea`, renew 10 s). `LAB_IPV6=1` checks the delegation, every
+  step 2 WAN check through it, and a prefix change (`cgi-bin/pd?change`):
+  new addresses, the old one deprecated, traffic through the new one.
+  Negative control `LAB_IPV6_PD=0`; `LAB_IPV6=static` keeps step 2b's
+  boot arguments.
+
+The plan as written before:
 - WAN RA (sans-IO parser in `v6::ra`): default route from the ISP's RA
   (router lifetime), M/O flags, MTU, RDNSS. WAN address by SLAAC or IA_NA
   is optional: many ISPs route the prefix to the link-local only.

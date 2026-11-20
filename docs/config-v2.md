@@ -367,7 +367,12 @@ control `LAB_GUEST_DOMAIN=0`).
 [ipv6]
 enabled = true                       # default false; boot argument ipv6=0|1
 ula_prefix = "fd12:3456:789a::/48"   # optional: else derived from the WAN MAC
+dhcpv6_pd = true                     # default: ask the ISP for a prefix (Ethernet WAN)
+prefix_hint = 56                     # 48–64: the length asked for
 ```
+With `dhcpv6_pd`, network `i` also gets `<delegated prefix>:<i>::/64`
+(the router `::1`), renumbered live when the ISP changes the prefix
+(docs/ipv6.md step 3).
 With `enabled`, network `i` (config order) gets `<ula_prefix>:<i>::/64`:
 the router `::1` and its link-local address on the network, Router
 Advertisements (SLAAC, RDNSS = the router, DNSSL = the network's domain,
