@@ -1,6 +1,11 @@
 # IPv6 (M7, plan)
 
-Status (2026-11-20): steps 0 and 1 done in QEMU (step 0: AAAA rebind protection, Kea for the lab, smoltcp limits, IPv6CP offer logged; step 1: IPv6 on the router's networks, below). Steps 2a (conntrack generic over the address family) and 2b (IPv6 forwarding with a static WAN prefix) done too. The apu4 check of the IPv6CP offer waits for the soak run to end. Step 2c (IPv6 fragments), step 3 (DHCPv6-PD on a DHCP WAN) and step 4 (IPv6 over PPPoE: IPv6CP, PD over the session) done too. Next: the apu4 against the home ISP (after the soak run), then step 5. First plan 2026-11-15 (checked at
+Status (2026-11-20): steps 0–5b done in QEMU (§3). On the apu4 against
+the home ISP (IPv6 over PPPoE): IPv6CP up at once, a /60 delegated, the
+ISP's RA seen, clients online over IPv6 and AAAA names for them; b3079ef
+persisted there with `[ipv6] enabled` in the stored config. Left: the
+measurements in step 5 (IPv6 bufferbloat run, soak), whether IPv6 becomes
+the default, optional stateful DHCPv6. First plan 2026-11-15 (checked at
 2712911); **revised 2026-11-20 against 74cb3d1**, after 135 commits that
 added routed LAN ports and live link slots, the WAN ingress stage, IPv4
 fragments, anti-spoofing, redirects, static routes, DNS views, DoT, the
@@ -574,25 +579,23 @@ at once, a /60 delegated, no RA seen yet), these were added:
   /64s) and reflects each message in its own family (`Output::v6`, to
   ff02::fb from the router's link-local address). Lab: `LAB_MDNS=1
   LAB_IPV6=1` (the copy on the LAN capture; control `LAB_MDNS_RULES=0`).
-- Still open: stateful DHCPv6 on the LAN, the apu4 bufferbloat run with
-  IPv6 traffic, `mac-internet.sh` without `--ipv4-only`.
 
-### Step 5: the rest (plan)
-- Firewall page: IPv6 rules, pinholes by interface identifier, the
-  redirect caveat.
-- mDNS reflector on `ff02::fb` (link-local AAAA removed as for IPv4
-  today), SNTP and DNS upstreams/DoT over IPv6, `[[route]]` for IPv6.
-- AAAA for DHCP hostnames: neighbor table (MAC ↔ IPv6) joined with
-  DHCPv4 leases (MAC ↔ hostname), global and ULA addresses only.
-- Optional: stateful DHCPv6 server on the LAN (M flag).
+### Step 5: what is left
+The rest of the step 5 plan (firewall page, mDNS on `ff02::fb`, IPv6
+SNTP/DNS/DoT/routes, AAAA names) was built in 5a and 5b. Still open:
 - apu4: bufferbloat run with IPv6 traffic, `mac-internet.sh` without
-  `--ipv4-only`, 72 h soak with IPv6 on.
+  `--ipv4-only`, 72 h soak with IPv6 on (also shows whether IPv6
+  multicast puts pressure on `local_rx` and the packet pool, §4).
+- IPv6 on by default (`[ipv6] enabled`): §2 says on once step 4 runs on
+  the apu4, which it has; not switched yet.
+- Optional: stateful DHCPv6 server on the LAN (M flag).
 
 ## 4. Risks and open questions
 - **Home ISP:** IPv6 over PPPoE (confirmed 2026-11-20), so step 4 is the
   one that matters at home. Steps 1–3 stay first because the lab can check
-  them. Prefix size and WAN address are unknown until step 4 meets the
-  real AC.
+  them. The real AC (2026-11-20): IPv6CP at once, a /60 by DHCPv6-PD over
+  the session, an RA, no IA_NA (the WAN address comes from the prefix,
+  step 5a).
 - IPv4 hot path: the early EtherType branch and the conntrack refactor
   must keep the per-packet cost (2a and 2b measure it).
 - `local_rx` and packet pool pressure from IPv6 multicast (ND, MLD, mDNS)

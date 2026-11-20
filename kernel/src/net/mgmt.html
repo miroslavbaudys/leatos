@@ -236,7 +236,7 @@
       <p class="hint">Adding, removing or changing a network (VLAN, address, zone) applies at once, without a reboot; changing the address of the network you use for this page boots as a trial. A VLAN needs a switch or access point that tags it on the LAN cable.</p>
     </form>
     <form class="card cfg" autocomplete="off"><h3>IPv6</h3>
-      <label class="check"><input data-path="ipv6.enabled" type="checkbox">IPv6 on the networks: a unique local /64 each (SLAAC), router advertisements, DNS and this page over IPv6. Nothing is forwarded over IPv6 yet.</label>
+      <label class="check"><input data-path="ipv6.enabled" type="checkbox">IPv6: a unique local /64 per network and, with a prefix from the ISP (DHCPv6 prefix delegation, also over PPPoE), a global one; router advertisements (SLAAC), DNS and this page over IPv6, forwarding with a stateful firewall (inbound blocked unless a rule opens it).</label>
       <div class="form">
         <label>Unique local /48 (empty = derived from the WAN MAC)<input data-path="ipv6.ula_prefix" data-opt placeholder="e.g. fd12:3456:789a::/48"></label>
       </div>
@@ -377,7 +377,7 @@
       <div class="tw"><table id="redirs"></table></div>
       <div class="row"><button type="button" id="addredir" class="plain">Add redirect</button>
         <span class="hint">New connections from the networks of a zone to these ports of an outside server (or of the router, for ports it does not serve) go to a device inside instead, for devices with hard-coded servers (NTP, DNS). They still think they talk to the server they chose. No extra rule needed. Applied at once.</span></div>
-      <p class="hint">The target's own connections, and connections addressed to it or to other devices inside, are left alone. Clients on the target's network reach it through the router's address there. Target: <code>address</code> (same ports) or <code>address:port</code>.</p>
+      <p class="hint">The target's own connections, and connections addressed to it or to other devices inside, are left alone. Clients on the target's network reach it through the router's address there. Target: <code>address</code> (same ports) or <code>address:port</code>. Redirects are IPv4 only: a dual-stack device can reach the server over IPv6 instead (a reject rule for that port with destination <code>::/0</code>, IPv6 only, closes that path).</p>
     </form>
     <form class="card cfg" autocomplete="off" id="mdnsform"><h3>mDNS across networks</h3>
       <div class="tw"><table id="mdns"></table></div>
@@ -917,7 +917,7 @@ async function refresh() {
     ...(st.wan_ipv6 ? [["IPv6", st.wan_ipv6.source === "dhcpv6-pd"
       ? `prefix ${esc(st.wan_ipv6.prefix ?? "none")} (DHCPv6-PD ${esc(st.wan_ipv6.state)}${st.wan_ipv6.prefix ? `, valid ${st.wan_ipv6.valid} s` : ""})${st.wan_ipv6.addr ? ` · address ${esc(st.wan_ipv6.addr)}` : ""} · router ${esc(st.wan_ipv6.gateway ?? "none")}${st.wan_ipv6.router_from ? ` (${st.wan_ipv6.router_from === "ra" ? "from its RA" : "the PPPoE peer: no RA"})` : ""}${(st.wan_ipv6.dns || []).length ? ` · DNS ${st.wan_ipv6.dns.map(esc).join(", ")}` : ""}`
       : `${esc(st.wan_ipv6.addr ?? "")} · router ${esc(st.wan_ipv6.gateway)} (static)`]] : []),
-    ...(p?.ipv6cp_offered ? [["IPv6", `offered by the access concentrator (${n(p.ipv6cp_offered)} IPv6CP request(s)), not used yet`]] : [])]);
+    ...(p?.ipv6cp_offered ? [["IPv6", `offered by the access concentrator (${n(p.ipv6cp_offered)} IPv6CP request(s)), not used: IPv6 is off`]] : [])]);
   const d = st.dns;
   const ups = d ? (d.upstreams.length ? d.upstreams.map(esc).join(", ") + ` <span class=hint>(${esc(d.source)})</span>` : "none" + (d.source === "WAN lease" ? " (no WAN lease)" : ""))
     : (l?.dns?.length ? l.dns.map(esc).join(", ") : "none (no WAN lease)");
