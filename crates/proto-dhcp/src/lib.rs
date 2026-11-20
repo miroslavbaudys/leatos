@@ -1,5 +1,5 @@
-//! DHCP: DHCPv4 server (done), DHCPv4 client, DHCPv6-PD client and IPv6
-//! router advertisements (planned).
+//! DHCP: DHCPv4 server (done), IPv6 router advertisements ([`v6::ra`],
+//! done); DHCPv6-PD client (planned: docs/ipv6.md step 3).
 //!
 //! Design rules (see `docs/architecture.md`):
 //! - `#![no_std]` + `alloc`: the same code runs in the bare-metal kernel and
@@ -15,3 +15,4 @@
 extern crate alloc;
 
 pub mod v4;
+pub mod v6;

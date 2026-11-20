@@ -931,6 +931,9 @@ dependencies = [
 [[package]]
 name = "proto-dhcp"
 version = "0.1.0"
+dependencies = [
+ "smoltcp",
+]
 
 [[package]]
 name = "proto-dns"

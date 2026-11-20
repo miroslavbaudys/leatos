@@ -9,3 +9,8 @@ description = "DHCP: DHCPv4 server and client, DHCPv6-PD client, IPv6 router adv
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# An independent parser for the Router Advertisements (v6::ra tests);
+# socket-icmp only because smoltcp needs some socket type to build.
+smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv6", "socket-icmp"] }
