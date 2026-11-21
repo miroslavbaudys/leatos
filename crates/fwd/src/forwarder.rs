@@ -488,6 +488,10 @@ pub struct Stats {
     pub forwarded: u64,
     pub local: u64,
     pub icmp_errors_sent: u64,
+    /// IPv6 to the unused part of the delegated prefix, answered with
+    /// destination unreachable ([`Forwarder::set_delegated6`]; also in
+    /// `icmp_errors_sent`, not in `drops`).
+    pub unreachable6: u64,
     pub drops: [u64; DROP_REASONS],
     /// Tracked connections removed by [`Forwarder::recheck`].
     pub revoked: u64,
@@ -570,6 +574,11 @@ pub struct Forwarder {
     /// IPv6 connections: routed, not translated (same budget as `ct`).
     pub ct6: crate::conntrack::Conntrack<Ipv6Addr>,
     pub routes6: RouteTable<Ipv6Addr>,
+    /// The prefix delegated to the router: addresses in it that no network
+    /// holds (unused /64s, networks with IPv6 off) are unreachable, never
+    /// sent to the default route (RFC 7084 WPD-5: the ISP would route them
+    /// back until the hop limit runs out). [`Self::set_delegated6`].
+    delegated6: Option<(Ipv6Addr, u8)>,
     /// Drop IPv6 from a network whose source is not in one of its /64s
     /// (BCP 38; no NAT hides it); off only for the lab's negative control.
     pub lan_antispoof: bool,
@@ -925,6 +934,7 @@ impl Forwarder {
             ll6: Vec::new(),
             ct6: crate::conntrack::Conntrack::new_shard(max_conns, hash_key, shards, shard),
             routes6: RouteTable::new(),
+            delegated6: None,
             lan_antispoof: true,
         }
     }
@@ -982,6 +992,14 @@ impl Forwarder {
         self.sync_static_routes6();
     }
 
+    /// The prefix delegated to the router (DHCPv6-PD, or the development
+    /// `lan6_prefix=`), or none: what of it no connected route holds is
+    /// answered with ICMPv6 destination unreachable (no route).
+    pub fn set_delegated6(&mut self, p: Option<(Ipv6Addr, u8)>) {
+        use crate::route::RouteAddr;
+        self.delegated6 = p.map(|(a, l)| (a.masked(l), l));
+    }
+
     /// The IPv6 default route: through `gw` on `egress` (the WAN), or none.
     pub fn set_default_route6(&mut self, via: Option<(IfIndex, Ipv6Addr)>) {
         match via {
@@ -1009,6 +1027,18 @@ impl Forwarder {
     /// One of the router's own IPv6 addresses on `ifx`.
     fn is_mine6(&self, ifx: IfIndex, a: Ipv6Addr) -> bool {
         a == self.ll6(ifx) || self.addrs6[ifx as usize].iter().flatten().any(|&(m, _)| m == a)
+    }
+
+    fn in_delegated6(&self, a: Ipv6Addr) -> bool {
+        use crate::route::RouteAddr;
+        self.delegated6.is_some_and(|(p, l)| a.masked(l) == p)
+    }
+
+    /// IPv6 is on for `ifx`: always for the WAN; a network only with an
+    /// address of its own (ULA or global), none = `network.ipv6 = false`
+    /// (its frames dropped, even to the link-local address).
+    fn has_v6(&self, ifx: IfIndex) -> bool {
+        self.ifs[ifx as usize].role == Role::Wan || self.addrs6[ifx as usize].iter().any(Option::is_some)
     }
 
     /// `a` is in one of `ifx`'s prefixes, or a subnet routed through a
@@ -1349,7 +1379,7 @@ impl Forwarder {
     /// link-scope groups it is in goes through [`Self::input6`]; anything
     /// else is dropped.
     fn process6(&mut self, now: u64, ingress: IfIndex, buf: &mut [u8], len: usize) -> Verdict {
-        if !self.ipv6 {
+        if !self.ipv6 || !self.has_v6(ingress) {
             return self.drop(DropReason::Unsupported);
         }
         let iface = self.ifs[ingress as usize];
@@ -1413,6 +1443,16 @@ impl Forwarder {
         let Some(route) = self.routes6.lookup(dst).copied() else {
             return self.drop(DropReason::NoRoute);
         };
+        // Our own prefix, but no network there: unreachable (RFC 7084
+        // WPD-5), answered with destination unreachable, no route (RFC 4443
+        // §3.1 code 0).
+        if route.kind == RouteKind::Default && self.in_delegated6(dst) {
+            self.stats.unreachable6 += 1;
+            if is_error || !self.take_icmp_token(now) {
+                return self.drop(DropReason::NoRoute);
+            }
+            return self.icmp6_error(ingress, buf, len, v, 1, 0, 0);
+        }
         // Back out where it came from: only towards a `[[route]]`'s router
         // there (IPv6 hosts have no option 121; RFC 4191 route options are
         // ignored by default, e.g. on Linux).
@@ -2157,7 +2197,7 @@ impl Forwarder {
     fn forward_fragment6(&mut self, now: u64, ingress: IfIndex, buf: &mut [u8], len: usize, d: &frag::Decision6) -> Verdict {
         let iface = self.ifs[ingress as usize];
         let f = &buf[..len];
-        if wire::ethertype(f) != Some(ETHERTYPE_IPV6) || !self.ipv6 {
+        if wire::ethertype(f) != Some(ETHERTYPE_IPV6) || !self.ipv6 || !self.has_v6(ingress) {
             return self.drop(DropReason::Malformed);
         }
         let dmac = wire::dst_mac(f);
@@ -4842,6 +4882,41 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_unused_part_of_the_delegated_prefix_is_unreachable() {
+        let mut fw = router6f();
+        let unused = "2001:db8:100:7::5";
+        // Unknown prefix: out the default route.
+        let mut f = frame6(LAN_MAC, H6, unused, 64, PROTO_UDP, &udp6(H6, unused, 5000, 9, b"x"));
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward6 { egress: WAN, .. }));
+        fw.set_delegated6(Some((a6("2001:db8:100:12::"), 56))); // host bits ignored
+        // From a network: destination unreachable, no route (1/0), from our GUA.
+        let mut f = frame6(LAN_MAC, H6, unused, 64, PROTO_UDP, &udp6(H6, unused, 5000, 9, b"x"));
+        let Verdict::Forward6 { egress, next_hop, len, .. } = run(&mut fw, 0, LAN, &mut f) else { panic!() };
+        assert_eq!((egress, next_hop), (LAN, a6(H6)));
+        let (v, ok) = out6(&f, len);
+        assert!(ok);
+        assert_eq!((f[v.l4], f[v.l4 + 1], v.src(&f)), (1, 0, a6("2001:db8:100::1")));
+        assert_eq!(fw.stats.unreachable6, 1);
+        // From the ISP (the loop it would start): back to the WAN, not forwarded.
+        let mut f = frame6(WAN_MAC, S6, unused, 64, PROTO_UDP, &udp6(S6, unused, 5000, 9, b"x"));
+        let Verdict::Forward6 { egress, .. } = run(&mut fw, 0, WAN, &mut f) else { panic!() };
+        assert_eq!(egress, WAN);
+        let (v, _) = out6(&f, len);
+        assert_eq!(f[v.l4], 1);
+        // An ICMPv6 error to it: dropped silently.
+        let mut f = frame6(WAN_MAC, S6, unused, 64, PROTO_ICMPV6, &[1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(run(&mut fw, 0, WAN, &mut f), dropped(DropReason::NoRoute));
+        // The networks' /64s and everything outside still route.
+        let mut f = frame6(WAN_MAC, S6, H6, 64, PROTO_UDP, &udp6(S6, H6, 9, 5000, b"x"));
+        assert!(!matches!(run(&mut fw, 0, WAN, &mut f), Verdict::Forward6 { egress: WAN, .. }));
+        let mut f = frame6(LAN_MAC, H6, S6, 64, PROTO_UDP, &udp6(H6, S6, 5001, 9, b"x"));
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward6 { egress: WAN, .. }));
+        fw.set_delegated6(None);
+        let mut f = frame6(LAN_MAC, H6, unused, 64, PROTO_UDP, &udp6(H6, unused, 5000, 9, b"x"));
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward6 { egress: WAN, .. }));
+    }
+
+    #[test]
     fn ipv6_related_error_reaches_the_host() {
         let mut fw = router6f();
         let syn = tcp6(H6, S6, 40000, 443, wire::TCP_SYN, None);
@@ -4892,6 +4967,38 @@ mod tests {
         fw.set_default_route6(None);
         let mut f = frame6(LAN_MAC, H6, S6, 64, PROTO_UDP, &udp6(H6, S6, 1, 2, b""));
         assert_eq!(run(&mut fw, 0, LAN, &mut f), dropped(DropReason::NoRoute));
+    }
+
+    #[test]
+    fn ipv6_off_on_one_network() {
+        // `network.ipv6 = false` for the guest: no addresses there.
+        let mut fw = router6f();
+        fw.set_ula6(GUEST, None);
+        fw.set_gua6(GUEST, None);
+        // Not even anti-spoofing off lets it out, and nothing reaches the
+        // router there: neither its link-local address nor ND.
+        fw.lan_antispoof = false;
+        let g = "2001:db8:100:1::5";
+        let mut f = frame6(GUEST_MAC, g, S6, 64, PROTO_UDP, &udp6(g, S6, 1, 2, b""));
+        assert_eq!(run(&mut fw, 0, GUEST, &mut f), dropped(DropReason::Unsupported));
+        let ll = wire::link_local(GUEST_MAC);
+        let f = ipv6_frame(GUEST_MAC, Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 9), ll, 64, &[], PROTO_UDP, &l4(1000, 53));
+        assert_eq!(v6(&mut fw, GUEST, f), dropped(DropReason::Unsupported));
+        let rs = ipv6_frame([0x33, 0x33, 0, 0, 0, 2], Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 9), Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2), 255, &[], PROTO_ICMPV6, &icmp6(wire::ICMPV6_ROUTER_SOLICIT));
+        assert_eq!(v6(&mut fw, GUEST, rs), dropped(DropReason::Unsupported));
+        // Its old /64: without the delegated prefix known, the default
+        // route (to the ISP, which routes it back); with it, unreachable.
+        let mut f = frame6(LAN_MAC, H6, g, 64, PROTO_UDP, &udp6(H6, g, 1, 2, b""));
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward6 { egress: WAN, .. }));
+        fw.set_delegated6(Some((a6("2001:db8:100::"), 56)));
+        let mut f = frame6(LAN_MAC, H6, g, 64, PROTO_UDP, &udp6(H6, g, 1, 2, b""));
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward6 { egress: LAN, .. }), "destination unreachable back");
+        let mut f = frame6(LAN_MAC, H6, S6, 64, PROTO_UDP, &udp6(H6, S6, 1, 2, b""));
+        assert!(matches!(run(&mut fw, 0, LAN, &mut f), Verdict::Forward6 { .. }));
+        // Back on: the guest forwards again.
+        fw.set_gua6(GUEST, Some((a6("2001:db8:100:1::1"), 64)));
+        let mut f = frame6(GUEST_MAC, g, S6, 64, PROTO_UDP, &udp6(g, S6, 1, 2, b""));
+        assert!(matches!(run(&mut fw, 0, GUEST, &mut f), Verdict::Forward6 { .. }));
     }
 
     #[test]

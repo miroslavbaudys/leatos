@@ -112,6 +112,10 @@ pub static REJECTED: AtomicU64 = AtomicU64::new(0);
 /// needed, packet too big, port unreachable), summed over the shards once
 /// a second.
 pub static ICMP_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// IPv6 to the delegated prefix's unused part (no network there), refused
+/// with destination unreachable or dropped (RFC 7084 WPD-5), summed over
+/// the shards once a second.
+pub static UNREACHABLE6: AtomicU64 = AtomicU64::new(0);
 /// Connections that were not assured, removed to make room for new ones
 /// (full table or a shard's NAT ports taken), summed over the shards once
 /// a second.
@@ -487,6 +491,7 @@ impl Datapath {
             // PPPoE: IPv6CP's link-local address, not the MAC's.
             f.set_ll6(WAN, crate::net::wan6::ppp_link().map(|l| l.0).filter(|_| self.sh.ports[0].is_pppoe()));
             f.set_default_route6(wan6.map(|w| (WAN, w.gateway)));
+            f.set_delegated6(crate::config::delegated6().filter(|_| crate::config::v6_unreachable()));
             f.set_static_routes(&n.routes);
             f.set_static_routes6(&n.routes6);
             f.set_policy(Some(n.policy.clone()));
@@ -1057,6 +1062,7 @@ impl Datapath {
         let mut rhits: Vec<u64> = Vec::new();
         let mut rejected = 0;
         let mut icmp_errors = 0;
+        let mut unreachable6 = 0;
         let mut early_drops = 0;
         let add = |into: &mut Vec<u64>, from: &[u64]| {
             into.resize(into.len().max(from.len()), 0);
@@ -1078,6 +1084,7 @@ impl Datapath {
             add(&mut rhits, &f.redirect_hits);
             rejected += f.stats.rejected;
             icmp_errors += f.stats.icmp_errors_sent;
+            unreachable6 += f.stats.unreachable6;
             early_drops += f.ct.stats.early_drops;
             drop(f);
             longest = longest.max(held.elapsed().as_micros() as u64);
@@ -1086,6 +1093,7 @@ impl Datapath {
         EXPIRE_MAX_US.fetch_max(longest, Ordering::Relaxed);
         REJECTED.store(rejected, Ordering::Relaxed);
         ICMP_ERRORS.store(icmp_errors, Ordering::Relaxed);
+        UNREACHABLE6.store(unreachable6, Ordering::Relaxed);
         EARLY_DROPS.store(early_drops, Ordering::Relaxed);
         self.sh.conntrack.store(conns, Ordering::Relaxed);
         *self.sh.rule_hits.lock() = hits;

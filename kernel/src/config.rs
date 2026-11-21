@@ -618,8 +618,10 @@ pub fn networks() -> Vec<Lan> {
         .enumerate()
         .filter_map(|(i, n)| Some((i, n, network_port(n)?)))
         .map(|(i, n, port)| Lan {
-            ula: v6.then(|| ula_router(i)),
-            gua: gua_router(i),
+            // `network.ipv6 = false`: IPv4 only (no addresses, RAs, DNS
+            // or web over IPv6; the forwarder drops its IPv6).
+            ula: (v6 && n.ipv6).then(|| ula_router(i)),
+            gua: gua_router(i).filter(|_| n.ipv6),
             name: n.name.clone(),
             port,
             vid: n.vlan,
@@ -1216,18 +1218,23 @@ fn lan6_prefix() -> Option<schema::Cidr6> {
     arg(bootargs(), "lan6_prefix")?.parse::<schema::Cidr6>().ok().filter(|p| p.prefix <= 64)
 }
 
+/// The prefix delegated to the router, with `ipv6` on: `lan6_prefix`
+/// (development), else the DHCPv6-PD one. The forwarder answers what of it
+/// no network holds with destination unreachable (RFC 7084 WPD-5).
+pub fn delegated6() -> Option<(Ipv6Addr, u8)> {
+    match lan6_prefix() {
+        Some(p) => Some((p.network(), p.prefix)),
+        None if ipv6() => crate::net::wan6::state()?.prefix,
+        None => None,
+    }
+}
+
 /// The router's global address in network `index`'s /64 of the prefix:
 /// `lan6_prefix` (development), else the delegated one; none if the
 /// prefix holds fewer /64s.
 pub fn gua_router(index: usize) -> Option<Ipv6Addr> {
-    let p = match lan6_prefix() {
-        Some(p) => p,
-        None if ipv6() => {
-            let (a, l) = crate::net::wan6::state()?.prefix?;
-            schema::Cidr6::new(a, l)
-        }
-        None => return None,
-    };
+    let (a, l) = delegated6()?;
+    let p = schema::Cidr6::new(a, l);
     if p.prefix > 64 {
         return None;
     }
@@ -1251,6 +1258,13 @@ pub fn wan_mtu() -> Option<u16> {
 /// is not dropped: the negative control of the lab check.
 pub fn lan_antispoof() -> bool {
     arg_u64(bootargs(), "lan_antispoof") != Some(0)
+}
+
+/// `v6_unreachable=0`: the unused part of the delegated prefix goes out
+/// the default route instead of being unreachable (RFC 7084 WPD-5): the
+/// negative control of the lab check.
+pub fn v6_unreachable() -> bool {
+    arg_u64(bootargs(), "v6_unreachable") != Some(0)
 }
 
 /// `wan_antispoof=0`: WAN packets with a source in our own networks (or

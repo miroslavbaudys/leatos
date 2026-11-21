@@ -757,6 +757,10 @@ fn route6(c: &Config, x: &mut Issues, rt: &crate::Route, (dst, via): (Cidr6, Ipv
         x.add(vp, "an IPv6 route's router must be in a network's unique local /64 (<ula>:<network index>::/64)");
     } else if !matches!(c.route_via(rt), crate::RouteVia::Network(_)) {
         x.add(vp, format!("no network {} (its unique local /64 has subnet id {:x})", s[3], s[3]));
+    } else if let crate::RouteVia::Network(n) = c.route_via(rt)
+        && !n.ipv6
+    {
+        x.add(vp, format!("network {} has IPv6 off", n.name));
     } else if u128::from(via) as u64 == 1 {
         x.add(vp, "is the router's own address");
     } else if let Some(u) = c.ipv6.ula_prefix

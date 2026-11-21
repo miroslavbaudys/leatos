@@ -1851,6 +1851,24 @@ fn ipv6_section_round_trips_and_validates_the_ula() {
 }
 
 #[test]
+fn network_ipv6_switch() {
+    let c = parse(&lan_doc("10.10.0.1/24", "")).unwrap();
+    assert!(c.networks[0].ipv6);
+    assert!(!c.to_toml().contains("ipv6"), "on by default, not written");
+    let mut d = c.clone();
+    d.networks[0].ipv6 = false;
+    let t = d.to_toml();
+    assert!(t.contains("ipv6 = false"), "{t}");
+    assert_eq!(parse(&t).unwrap(), d);
+    // The CLI: by name and `lan.`, unset = back on.
+    let off = c.with_assignment("network.lan.ipv6 = false").unwrap();
+    assert_eq!(off, d);
+    assert_eq!(c.with_assignment("lan.ipv6 = false").unwrap(), d);
+    assert_eq!(off.without("network.lan.ipv6").unwrap(), c);
+    assert_eq!(c.without("network.lan.ipv6").unwrap(), c, "already on");
+}
+
+#[test]
 fn ipv6_prefix_delegation_settings() {
     let c = Config::default();
     assert!(c.ipv6.dhcpv6_pd && c.ipv6.prefix_hint == 56);
@@ -1925,6 +1943,11 @@ fn ipv6_upstreams_ntp_and_routes() {
     assert_eq!(one(r6("fd00:30::/64", "fd12:3456:789a:7::5")), ["route.r6.via"], "no network 7");
     assert_eq!(one(r6("fd00:30::/64", "fd12:3456:789a::1")), ["route.r6.via"], "the router");
     assert_eq!(one(r6("fd00:30::/64", "192.168.1.2")), ["route.r6.via"], "mixed families");
+    let off = r6("fd00:30::/64", "fd12:3456:789a::5");
+    assert_eq!(issues(move |c| {
+        c.networks[0].ipv6 = false;
+        c.routes.push(off);
+    }), ["route.r6.via"], "network with IPv6 off");
     let c = parse(&lan_doc("192.168.1.1/24", "[[route]]\nname = \"r6\"\ndst = \"fd00:30::/64\"\nvia = \"fd12:3456:789a::5\"\n")).unwrap();
     assert!(c.routes[0].v6().is_some() && c.routes[0].v4().is_none());
     assert_eq!(c.route_via(&c.routes[0]), RouteVia::Network(&c.networks[0]));

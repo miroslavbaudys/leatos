@@ -123,6 +123,11 @@ pub struct Network {
     pub vlan: u16,
     /// The router's address and the subnet.
     pub ipv4: Cidr,
+    /// IPv6 here while `[ipv6] enabled` (default): its ULA and global /64s,
+    /// RAs, DNS and the web interface over IPv6. `false`: IPv4 only, its
+    /// /64s stay unused (the others keep theirs: `<prefix>:<index>::/64`).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub ipv6: bool,
     #[serde(default = "zone_lan")]
     pub zone: String,
     /// The DNS domain of this network's clients (`<hostname>.<domain>`,
@@ -164,6 +169,7 @@ impl Default for Network {
             ports: lan_ports(),
             vlan: 0,
             ipv4: Cidr::new(Ipv4Addr::new(192, 168, 1, 1), 24),
+            ipv6: true,
             zone: zone_lan(),
             domain: None,
             dhcp: Dhcp::default(),

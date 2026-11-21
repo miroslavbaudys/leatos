@@ -454,14 +454,21 @@ The plan as written before:
   forwarder's upstreams (when `dns.upstreams` is empty).
 - Prefix split: a /64 per network slot (subnet id = slot index, or
   `subnet_id` from the config). Networks beyond the delegated size get
-  the ULA only, with a warning. RA lifetimes follow the lease.
+  the ULA only, with a warning. RA lifetimes follow the lease. The rest
+  of the prefix (unused /64s, networks with `ipv6 = false`) is
+  unreachable (RFC 7084 WPD-5; done 2026-11-21): ICMPv6 destination
+  unreachable, no route, from the router instead of the default route,
+  which would loop through the ISP until the hop limit
+  (`Forwarder::set_delegated6`; negative control `v6_unreachable=0`).
 - Prefix change or loss: RAs deprecating the old prefix (preferred 0,
   valid ≤ 2 h), conntrack6 entries of the old prefix flushed,
   pinhole rules re-resolved (interface identifiers, §2). The last prefix
   is kept in the store's lease area and asked for again after a reboot.
 - Config: `[ipv6]` (`enabled`, `ula_prefix`), `[wan.ipv6]` (`dhcpv6_pd`,
   `prefix_hint`, default /56), per network `ipv6` (default true when
-  `[ipv6] enabled`) and `subnet_id`. API and UI status (prefix, lease,
+  `[ipv6] enabled`; done 2026-11-21: `false` = IPv4 only, its /64s left
+  unused, its IPv6 dropped as `unsupported`; lab `LAB_GUEST_IPV6=0`) and
+  `subnet_id`. API and UI status (prefix, lease,
   per-network /64), CLI `status`.
 - Lab: the ISP VM runs RA (dnsmasq `enable-ra` or the PD server's) + the
   PD server from step 0. The client gets a global address. Prefix change

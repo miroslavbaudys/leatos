@@ -300,6 +300,7 @@
       <div class="form">
         <label>Router address / prefix<input data-net="ipv4" data-path="network.lan.ipv4" placeholder="192.168.1.1/24"></label>
         <label>Local domain (also for networks without their own)<input data-path="dns.domain" placeholder="lan"></label>
+        <label class="check"><input data-net="ipv6" data-path="network.lan.ipv6" data-default="true" type="checkbox">IPv6 on this network (while IPv6 is on under System)</label>
       </div>
       <p class="hint">Changing the router address boots as a trial: open the page at the new address and confirm, or the router goes back.</p>
     </form>
@@ -1201,12 +1202,12 @@ function lanPorts(extra) {
 }
 function renderNets(list) {
   const t = $("nets");
-  t.replaceChildren(el("tr", {}, ["Name", "Port", "VLAN", "Router address / prefix", "Zone", "DHCP", "Clients", ""].map((h) => el("th", { textContent: h }))));
+  t.replaceChildren(el("tr", {}, ["Name", "Port", "VLAN", "Router address / prefix", "Zone", "DHCP", "IPv6", "Clients", ""].map((h) => el("th", { textContent: h }))));
   const first = list[0];
   if (first) {
     t.append(el("tr", {}, [el("td", { textContent: first.name }), el("td", { textContent: (first.ports ?? ["lan0"]).join(", ") }), el("td", { textContent: first.vlan ? first.vlan : "untagged" }),
       el("td", { textContent: first.ipv4 }), el("td", { textContent: first.zone ?? "lan" }), el("td", { textContent: first.dhcp?.enabled === false ? "off" : "on" }),
-      el("td", { className: "num", dataset: { leases: first.name } }), el("td", {}, [el("a", { href: "#/lan", textContent: "Edit" })])]));
+      el("td", { textContent: first.ipv6 === false ? "off" : "on" }), el("td", { className: "num", dataset: { leases: first.name } }), el("td", {}, [el("a", { href: "#/lan", textContent: "Edit" })])]));
   }
   netOrig = list.slice(1).map((n) => structuredClone(n));
   list.slice(1).forEach((n, i) => netRow(n, i));
@@ -1226,12 +1227,14 @@ function netRow(n = {}, i = netOrig.length) {
   for (const p of lanPorts(cur)) port.append(el("option", { value: p, textContent: p }));
   port.value = cur;
   const dhcp = el("input", { type: "checkbox", checked: n.dhcp?.enabled !== false, dataset: { key: "dhcp" } });
+  const ipv6 = el("input", { type: "checkbox", checked: n.ipv6 !== false, dataset: { key: "ipv6" },
+    title: "IPv6 on this network (its unique local and global /64s, router advertisements) while IPv6 is on under System; off = IPv4 only" });
   const detail = netDetail(n);
   const more = el("button", { type: "button", className: "plain", textContent: "DHCP…", title: "Pool, lease time, reservations, DNS domain",
     onclick: () => { detail.hidden = !detail.hidden; } });
   const rm = el("button", { type: "button", className: "plain", textContent: "Remove", onclick: () => { tr.remove(); detail.remove(); netPaths(); updatePending(); showLeases(); } });
   tr.append(inp("name", { placeholder: "guest", size: 10 }), el("td", {}, [port]), inp("vlan", { type: "number", min: 1, max: 4094, placeholder: "20", size: 5 }),
-    inp("ipv4", { placeholder: "10.20.0.1/24", size: 15 }), el("td", {}, [zone]), el("td", {}, [dhcp]),
+    inp("ipv4", { placeholder: "10.20.0.1/24", size: 15 }), el("td", {}, [zone]), el("td", {}, [dhcp]), el("td", {}, [ipv6]),
     el("td", { className: "num", dataset: { leases: n.name ?? "" } }), el("td", {}, [more, rm]));
   $("nets").append(tr, detail);
   netPaths();
@@ -1244,7 +1247,7 @@ function netDetail(n) {
   const statics = el("table", { className: "netstatics" });
   const head = el("tr", {}, ["MAC", "IP address", "Name", ""].map((h) => el("th", { textContent: h })));
   statics.append(head);
-  const box = el("td", { colSpan: 8 }, [
+  const box = el("td", { colSpan: 9 }, [
     el("div", { className: "form" }, [
       field("lo", "Pool, first address (empty = automatic)", d.range?.[0], { placeholder: "automatic" }),
       field("hi", "Pool, last address", d.range?.[1], { placeholder: "automatic" }),
@@ -1293,6 +1296,7 @@ function readNets() {
     if (port === "lan0" && !(o.ports ?? []).length) delete o.ports; else o.ports = [port];
     o.dhcp = { ...(o.dhcp ?? {}) };
     if (v("dhcp").checked) delete o.dhcp.enabled; else o.dhcp.enabled = false;
+    if (v("ipv6").checked) delete o.ipv6; else o.ipv6 = false;
     const det = tr.nextElementSibling;
     if (det?.classList.contains("netdetail")) {
       const dv = (k) => det.querySelector(`[data-dkey="${k}"]`).value.trim();

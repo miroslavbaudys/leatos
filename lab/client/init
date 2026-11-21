@@ -689,6 +689,17 @@ if [ -n "$v6on" ]; then
       else
         fail "ipv6 clients: our lease: ${mylease:-not found}"
       fi
+      # The delegated prefix's unused /64s (RFC 7084 WPD-5): destination
+      # unreachable from the router, not sent to the ISP (which routes the
+      # prefix back: a loop until the hop limit). Read after the router's
+      # once-a-second sum. Negative control: LAB_ROUTER_ARGS=v6_unreachable=0.
+      noroute6() { v6st | $bb grep -o '"unreachable6":[0-9]*' | $bb head -1 | $bb cut -d: -f2; }
+      unused6="${gr%::1}:80::5"
+      n0=$(noroute6)
+      $bb ping6 -c 3 -W 1 "$unused6" >/dev/null 2>&1
+      $bb sleep 2
+      n1=$(noroute6)
+      if [ $((${n1:-0} - ${n0:-0})) -ge 3 ]; then pass "ipv6 wan: unused /64 $unused6 unreachable at the router (unreachable6 ${n0:-0} -> $n1)"; else fail "ipv6 wan: $unused6 not refused at the router (unreachable6 ${n0:-?} -> ${n1:-?})"; fi
       # Packet Too Big: the WAN takes 1400 (wan_mtu=1400).
       # (busybox shows no path MTU cache: the router's ICMP error count,
       # read after its once-a-second sum.)
@@ -798,7 +809,27 @@ if [ -n "$guest" ]; then
     if gl labclient.guest.lan | $bb grep -q "NXDOMAIN\|can't find"; then pass "guest: dns labclient.guest.lan -> NXDOMAIN (lan host, other domain)"; else fail "guest: labclient.guest.lan resolved"; gl labclient.guest.lan | $bb sed 's/^/    | /'; fi
     # IPv6 on the guest network: its own ULA /64; DNS allowed, the web
     # interface refused by the zone (negative control LAB_GUEST_ZONE=lan).
-    if [ -n "$v6on" ]; then
+    guest_v6=$($bb sed -n 's/.*lab_guest_v6=\([01]\).*/\1/p' /proc/cmdline)
+    if [ -n "$v6on" ] && [ "$guest_v6" = 0 ]; then
+      # network.guest.ipv6 = false (negative control: the store keeps it on).
+      gv=$(v6st | $bb grep -o '"name":"guest",[^}]*"ipv6":[^,]*' | $bb sed 's/.*"ipv6"://')
+      if [ "$gv" = null ]; then pass "guest ipv6 off: the router reports no IPv6 on the guest network"; else fail "guest ipv6 off: the router reports '$gv' on the guest network"; fi
+      $bb sleep 5 # past an RA that would arrive
+      if $bb ip -6 addr show dev eth0.20 scope global | $bb grep -q inet6; then
+        fail "guest ipv6 off: eth0.20 got a global address: $($bb ip -6 addr show dev eth0.20 scope global | $bb grep inet6)"
+      else
+        pass "guest ipv6 off: no SLAAC address on VLAN 20"
+      fi
+      # IPv6 sent anyway (pings to all routers, ff02::2, no neighbor
+      # needed): dropped as unsupported (the network has IPv6 off), not
+      # taken in by the router's input path.
+      unsup() { v6st | $bb grep -o '"unsupported":[0-9]*' | $bb head -1 | $bb cut -d: -f2; }
+      u0=$(unsup)
+      $bb ping6 -c 3 -W 1 -I eth0.20 ff02::2 >/dev/null 2>&1 && echo "    | answered"
+      $bb sleep 2 # the router's counters: summed once a second
+      u1=$(unsup)
+      if [ $((${u1:-0} - ${u0:-0})) -ge 3 ]; then pass "guest ipv6 off: IPv6 to the router dropped as unsupported (${u0:-?} -> ${u1:-?})"; else fail "guest ipv6 off: unsupported drops ${u0:-?} -> ${u1:-?}"; fi
+    elif [ -n "$v6on" ]; then
       g6=$(v6router 2)
       if [ -z "$g6" ]; then
         fail "guest ipv6: the router reports no IPv6 address on the guest network"

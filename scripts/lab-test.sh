@@ -146,6 +146,14 @@
 #                        router.guest.lan resolve, labclient.guest.lan is
 #                        NXDOMAIN. Negative control: LAB_GUEST_DOMAIN=0
 #                        (no domain line: the first three fail).
+#   LAB_GUEST_IPV6=0     (with LAB_IPV6) the guest network with
+#                        `ipv6 = false`: the router reports no IPv6 there,
+#                        the client gets no SLAAC address on VLAN 20, and
+#                        IPv6 it sends anyway (pings to ff02::2) is dropped
+#                        as `unsupported`; the main
+#                        LAN's IPv6 checks still pass. Negative control:
+#                        LAB_GUEST_IPV6_CONTROL=1 (the store keeps IPv6 on:
+#                        all three fail).
 #   LAB_MDNS=1           (implies LAB_GUEST=1) mDNS across networks
 #                        (docs/mdns.md): the guest zone allows "mdns" and
 #                        the rule guest-printers reflects _ipp._tcp from
@@ -388,6 +396,7 @@ FORWARD="${LAB_FORWARD:-1}"
 FWD_CUT="${LAB_FWD_CUT:-}"
 REDIRECT="${LAB_REDIRECT:-1}"
 GUEST_DOMAIN="${LAB_GUEST_DOMAIN:-1}"
+GUEST_IPV6="${LAB_GUEST_IPV6:-1}"
 DOT="${LAB_DOT:-}"
 DOT_NAME="${LAB_DOT_NAME:-dns.isp.example}"
 DOT_CA="${LAB_DOT_CA:-1}"
@@ -482,6 +491,7 @@ vlan = 20
 ipv4 = "10.20.0.1/24"
 zone = "$GUEST_ZONE"
 $([[ "$GUEST_DOMAIN" == 1 ]] && echo 'domain = "guest.lan"')
+$([[ "$GUEST_IPV6" == 0 && -z "${LAB_GUEST_IPV6_CONTROL:-}" ]] && echo 'ipv6 = false')
 
 [[zone]]
 name = "guest"
@@ -651,7 +661,7 @@ PIDS+=($!)
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
   VM_NIC2="${PORTS:+52:54:00:00:00:11 $((LAN1_PORT + 1)) $LAN1_PORT}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${ACK:+ lab_ack=1} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${ACK:+ lab_ack=1} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN lab_guest_v6=$GUEST_IPV6}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so

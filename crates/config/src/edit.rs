@@ -259,6 +259,7 @@ fn optional_known(path: &str) -> bool {
         "shaping.up_kbit"
             | "shaping.down_kbit"
             | "network.*.vlan"
+            | "network.*.ipv6"
             | "network.*.dhcp.enabled"
             | "network.*.dhcp.range"
             | "network.*.dhcp.static"

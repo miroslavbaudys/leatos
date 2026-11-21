@@ -149,6 +149,7 @@ negative controls `LAB_ROUTER_ARGS=mgmt=wan`, `LAB_WAN_OPEN=1`).
 | `ports` | `["lan0"]` | one of `lan0`, `lan1`, `lan2` (the LAN NICs in PCI order after `wan0`; more than one = a bridge, not supported yet). A network on a port the machine lacks is left out there with a boot-log line, not refused (the same file boots on QEMU and on the apu4) |
 | `vlan` | `0` | 0 = untagged, 1–4094 = tagged |
 | `ipv4` | required | router address/prefix, prefix 8–29 as in v1 |
+| `ipv6` | `true` | with `[ipv6] enabled`: its ULA and global /64s (`<prefix>:<index>::/64`), RAs, DNS and the web interface over IPv6. `false` = IPv4 only: no addresses or RAs there, the forwarder drops the network's IPv6 (`unsupported`), its /64s stay unused so the other networks keep theirs (and are unreachable: ICMPv6 no route, never sent to the ISP); an IPv6 `[[route]]` via it is refused. CLI `network.<name>.ipv6 = false`, web UI: Networks / LAN pages |
 | `zone` | `"lan"` | an existing `[[zone]]` or a built-in one |
 | `domain` | `dns.domain` | the network's own DNS domain (DHCP option 15, `<hostname>.<domain>`); version 2 only |
 | `dhcp` | enabled, pool derived as in v1 | v1's `[lan.dhcp]` fields plus `enabled` |
