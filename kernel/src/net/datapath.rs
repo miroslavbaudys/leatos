@@ -100,6 +100,8 @@ pub static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// part of `DROPPED` (the web interface's firewall page).
 pub static DROP_REASONS: [AtomicU64; fwd::forwarder::DROP_REASONS] =
     [const { AtomicU64::new(0) }; fwd::forwarder::DROP_REASONS];
+/// Packets the NIC refused after `can_transmit` (part of `DROPPED`).
+pub static TX_FAILED: AtomicU64 = AtomicU64::new(0);
 /// Received frames with the wrong VLAN tag for their port (or none).
 pub static VLAN_DROPS: AtomicU64 = AtomicU64::new(0);
 /// Tracked connections removed because a new firewall policy refused them
@@ -1253,6 +1255,7 @@ pub fn flush_port(port: &PortShared, dev: &mut Nic) -> FlushResult {
                 }
                 if dev.transmit(p).is_err() {
                     DROPPED.fetch_add(1, Ordering::Relaxed);
+                    TX_FAILED.fetch_add(1, Ordering::Relaxed);
                 }
             }
             Dequeue::WaitUntil(t) => {

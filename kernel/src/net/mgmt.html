@@ -903,7 +903,7 @@ async function refresh() {
   // The download is shaped where it arrives (WAN ingress stage); lan0's
   // egress is then unshaped, so traffic between networks is not capped.
   const qrow = (name, what, q) => `<tr><td>${esc(name)} <span class="muted">(${what})</span></td><td>${q.shaped_kbit === null ? "unshaped" : n(q.shaped_kbit) + " kbit/s"}${q.limit_bytes === undefined ? "" : `<br><span class="muted">limit ${bytes(q.limit_bytes)}${q.shaped_kbit ? `, ${Math.round(q.limit_bytes * 8 / q.shaped_kbit)} ms` : ""}</span>`}</td>` +
-    `<td class=num>${n(q.sent)}</td><td class=num>${n(q.dropped)}${q.ack_drops ? `<br><span class="muted">${n(q.ack_drops)} redundant ACKs</span>` : ""}</td><td class=num>${n(q.ecn_marked)}</td><td class=num>${n(q.backlog_packets)} pkts</td></tr>`;
+    `<td class=num>${n(q.sent)}</td><td class=num>${n(q.dropped)}${q.ack_drops ? `<br><span class="muted">${n(q.ack_drops)} redundant ACKs</span>` : ""}${q.overflow_drops ? `<br><span class="muted" title="dropped because the queue was full (the rest: the AQM)">${n(q.overflow_drops)} queue full</span>` : ""}</td><td class=num>${n(q.ecn_marked)}</td><td class=num>${n(q.backlog_packets)} pkts</td></tr>`;
   const qrows = "<tr><th>Queue</th><th>Shaper</th><th class=num>Sent</th><th class=num>Dropped</th><th class=num>ECN marked</th><th class=num>Queued now</th></tr>" +
     st.interfaces.map((i) => qrow(i.name + " egress", i === st.interfaces[0] ? "upload" : st.ingress ? "to the LAN, unshaped" : "download", i.qdisc)).join("") +
     (st.ingress ? qrow("wan0 ingress", "download", st.ingress) : "");
@@ -934,10 +934,26 @@ async function refresh() {
 
   // Firewall
   const dr = st.drop_reasons ?? {};
-  const drs = Object.entries(dr).sort((a, b) => b[1] - a[1]);
-  $("drops").innerHTML = "<tr><th>Reason</th><th class=num>Packets</th><th>Meaning</th></tr>" +
-    drs.map(([k, v]) => `<tr><td>${esc(k)}</td><td class=num>${n(v)}</td><td class="muted">${esc(DROP_TEXT[k] ?? "")}</td></tr>`).join("") +
-    `<tr><td>other</td><td class=num>${n(Math.max(0, st.dropped - drs.reduce((a, [, v]) => a + v, 0)))}</td><td class="muted">queue full, no packet buffer</td></tr>`;
+  // Outside the forwarder: a full queue (per queue), no buffer while
+  // splitting, a NIC refusing a packet; "other" is whatever is left of
+  // the total (a full queue can drop more than one packet per arrival).
+  const queues = [...st.interfaces.map((i) => [i.name + " egress", i.qdisc]), ...(st.ingress ? [["wan0 ingress", st.ingress]] : [])];
+  const extra = [
+    ...queues.filter(([, q]) => q.overflow_drops).map(([name, q]) => [`queue full · ${name}`, q.overflow_drops, "the queue was at its packet or byte limit: dropped from the biggest flow"]),
+    ...(st.fragments?.split_drops ? [["no buffer", st.fragments.split_drops, "packet pool empty while splitting a packet for a smaller MTU"]] : []),
+    ...(st.tx_failed ? [["send failed", st.tx_failed, "the NIC refused a packet"]] : []),
+  ];
+  const all = [...Object.entries(dr).map(([k, v]) => [k, v, DROP_TEXT[k] ?? ""]), ...extra].sort((a, b) => b[1] - a[1]);
+  const rest = st.dropped - all.reduce((a, [, v]) => a + v, 0);
+  if (rest > 0) all.push(["other", rest, "not counted by a reason above"]);
+  // Dropped by design inside the queues, on the way out: not in the total.
+  const aqm = queues.flatMap(([name, q]) => [
+    ...(q.aqm_drops ? [[`AQM · ${name}`, q.aqm_drops, "CAKE dropped it to keep the queue's delay low, so the sender slows down: normal under load" + (q.blue_drops ? ` (${n(q.blue_drops)} by BLUE, for flows that ignore it)` : "")]] : []),
+    ...(q.ack_drops ? [[`ACK filter · ${name}`, q.ack_drops, "a TCP ACK made redundant by a newer one in the queue"]] : []),
+  ]).sort((a, b) => b[1] - a[1]);
+  const drow = ([k, v, t]) => `<tr><td>${esc(k)}</td><td class=num>${n(v)}</td><td class="muted">${esc(t)}</td></tr>`;
+  $("drops").innerHTML = "<tr><th>Reason</th><th class=num>Packets</th><th>Meaning</th></tr>" + all.map(drow).join("") +
+    (aqm.length ? `<tr><th colspan=3>Shaping: dropped in the queues on purpose (not in the total above)</th></tr>` + aqm.map(drow).join("") : "");
   const fr = st.fragments;
   $("fragst").textContent = fr ? `IP fragments: ${n(fr.forwarded)} forwarded after their first one · ${n(fr.parked)} arrived before it (held) · ${n(fr.park_drops)} held and dropped · ${n(fr.split ?? 0)} packets split for a smaller MTU` + (fr.split_drops ? ` (${n(fr.split_drops)} lost: no buffer)` : "") : "";
 

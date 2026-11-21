@@ -58,6 +58,7 @@ $bb ifconfig "$IF" 203.0.113.1 netmask 255.255.255.0 up || { echo "LAB FAIL: isp
 $bb sed "s/^interface .*/interface $IF/" /etc/udhcpd.conf >/tmp/udhcpd.conf
 $bb touch /tmp/udhcpd.leases
 $bb dd if=/dev/zero of=/www/5mb bs=1024 count=5120 2>/dev/null   # shaper throughput test
+$bb dd if=/dev/zero of=/www/256k bs=1024 count=256 2>/dev/null   # swarm test: short transfers
 if [ -n "$pppoe" ]; then
   for m in ppp_generic ppp_async; do
     $bb modprobe "$m" || { echo "LAB FAIL: isp: no $m module"; $bb poweroff -f; }

@@ -117,6 +117,22 @@ impl Aqm {
         }
     }
 
+    /// BLUE's drops (CAKE only; part of the AQM drops).
+    pub fn blue_drops(&self) -> u64 {
+        match self {
+            Self::Cake(c) => c.blue_drops,
+            Self::FqCodel(_) => 0,
+        }
+    }
+
+    /// The drops by cause, for `/api/status`: (AQM incl. BLUE, BLUE,
+    /// overflow = the queue full). ACK filter drops are the rest.
+    pub fn drop_split(&self) -> (u64, u64, u64) {
+        let s = self.stats();
+        let aqm = s.aqm_actions - s.marked;
+        (aqm, self.blue_drops(), s.dropped - aqm - self.ack_drops())
+    }
+
     /// Change the byte limit in place (live shaping change, queue kept).
     pub fn set_limit_bytes(&mut self, bytes: usize) {
         match self {

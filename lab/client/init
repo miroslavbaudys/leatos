@@ -517,6 +517,74 @@ if [ -n "$want" ] && [ "$want" != 0 ]; then
   fi
 fi
 
+# --- swarm download (lab_swarm=N): many flows of small packets into the ------------
+# WAN ingress stage, as a torrent swarm on the apu4 (2026-11-21: 98 Mbit/s,
+# ~800 B packets, hundreds of peers). The ingress queue must leave the drops
+# to the AQM (CoDel/BLUE): overflow drops (queue full) above
+# lab_swarm_ovf percent of all its drops fail. The queue's packet limit
+# used to bind first (384 packets: ~25 ms of these packets), so overflow
+# decided. Validity: the queue was pushed (AQM or overflow drops > 0) and
+# the swarm moved at least half the shaped rate. Negative control:
+# LAB_ROUTER_ARGS=queue_pkts=384.
+swarm=$($bb sed -n 's/.*lab_swarm=\([0-9]*\).*/\1/p' /proc/cmdline)
+if [ -n "$swarm" ] && [ "$swarm" != 0 ]; then
+  srate=$($bb sed -n 's/.*lab_swarm_kbit=\([0-9]*\).*/\1/p' /proc/cmdline)
+  ssecs=$($bb sed -n 's/.*lab_swarm_secs=\([0-9]*\).*/\1/p' /proc/cmdline); ssecs=${ssecs:-15}
+  smtu=$($bb sed -n 's/.*lab_swarm_mtu=\([0-9]*\).*/\1/p' /proc/cmdline); smtu=${smtu:-680}
+  sovf=$($bb sed -n 's/.*lab_swarm_ovf=\([0-9]*\).*/\1/p' /proc/cmdline); sovf=${sovf:-10}
+  now_ms() { $bb awk '{printf "%d", $1 * 1000}' /proc/uptime; }
+  task_ms() { echo "$1" | $bb grep -o "\"name\":\"$2\",\"core\":[0-9]*,\"ms\":[0-9]*" | $bb sed 's/.*"ms"://'; }
+  ing() { echo "$1" | $bb grep -o '"ingress":{[^}]*}' | $bb grep -o "\"$2\":[0-9]*" | $bb cut -d: -f2; }
+  lantx() { echo "$1" | $bb grep -o '"name":"lan0"[^]]*\][^}]*' | $bb grep -o '"tx_bytes":[0-9]*' | $bb cut -d: -f2; }
+  st() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null; }
+  # Smaller segments from the ISP: our MSS follows the MTU.
+  $bb ip link set eth0 mtu "$smtu"
+  s0=$(st)
+  $bb ping -c $((ssecs * 5)) -i 0.2 "$ISP" >/tmp/ping-swarm 2>&1 &
+  pingp=$!
+  t0=$(now_ms); end=$((t0 + ssecs * 1000))
+  # Short transfers (256 KB) back to back per flow, so each loop ends soon
+  # after the deadline on its own; only these loops are waited for.
+  i=0; loops=""
+  while [ $i -lt "$swarm" ]; do
+    ( while [ "$(now_ms)" -lt "$end" ]; do $bb wget -q -T 5 -O /dev/null "http://$ISP/256k" 2>/dev/null; done ) &
+    loops="$loops $!"
+    i=$((i + 1))
+  done
+  $bb sleep "$ssecs"
+  # Under TCG the loaded router may answer late: retry.
+  for i in 1 2 3 4 5 6; do s1=$(st); [ -n "$s1" ] && break; done
+  t1=$(now_ms)
+  for p in $loops $pingp; do wait "$p"; done
+  $bb ip link set eth0 mtu 1500
+  load=""
+  for t in dp_down dp_up svc; do
+    a=$(task_ms "$s0" $t); b=$(task_ms "$s1" $t)
+    [ -n "$a" ] && [ -n "$b" ] && load="$load $t=$((b - a))"
+  done
+  echo "LAB CPU load:$load"
+  for k in sent dropped aqm_drops blue_drops overflow_drops ecn_marked; do
+    a=$(ing "$s0" $k); b=$(ing "$s1" $k)
+    eval "d_$k=$(( ${b:-0} - ${a:-0} ))"
+  done
+  lt0=$(lantx "$s0"); lt1=$(lantx "$s1")
+  kbit=$(( (${lt1:-0} - ${lt0:-0}) * 8 / (t1 - t0) ))
+  drops=$((d_aqm_drops + d_overflow_drops))
+  avg=$($bb awk -F'/' '/min\/avg\/max/{print int($4)}' /tmp/ping-swarm)
+  what="$swarm flows, MTU $smtu, ${kbit} kbit/s of $srate; ingress sent $d_sent, aqm drops $d_aqm_drops (blue $d_blue_drops), ecn marks $d_ecn_marked, overflow drops $d_overflow_drops; ping avg ${avg:-?} ms"
+  if [ -z "$(ing "$s1" overflow_drops)" ]; then
+    fail "swarm: no ingress drop counters in /api/status ($what)"
+  elif [ "$drops" = 0 ] && [ "$d_ecn_marked" = 0 ]; then
+    fail "swarm: INVALID, the queue was never pushed ($what)"
+  elif [ "$kbit" -lt $((srate / 2)) ]; then
+    fail "swarm: INVALID, below half the shaped rate ($what)"
+  elif [ $((d_overflow_drops * 100)) -le $((sovf * (drops > 0 ? drops : 1))) ]; then
+    pass "swarm: the AQM drops, not a full queue: $what"
+  else
+    fail "swarm: overflow drops above ${sovf}% of the drops: $what"
+  fi
+fi
+
 # --- IPv6 on the LAN (docs/ipv6.md step 1; lab_ipv6=1) -------------------------
 # The router gives each network a ULA /64 by Router Advertisement (router
 # lifetime 0: no IPv6 default route), answers DNS and the web interface on

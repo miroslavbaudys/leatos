@@ -37,19 +37,20 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Cidr, Ipv6Cidr
 use spin::Mutex;
 
 /// Qdisc hard limits, per port egress and for the WAN ingress stage
-/// (shared by all flows). The AQM keeps standing queues near 5 ms; the
-/// limits only bound bursts. Three full queues plus both RX rings
-/// (3 × 384 + 128 = 1280) stay within the packet pool (`net_pool_size`).
-const QDISC_PACKETS: usize = 384;
-const QDISC_BYTES: usize = 384 * 1514;
+/// (shared by all flows): `config::Qos::queue_pkts` packets (default
+/// `config::QUEUE_PACKETS`), and at most that many full frames. The AQM
+/// keeps standing queues near 5 ms; the limits only bound bursts. Full
+/// queues draw on the packet pool (`net_pool_size`); when it runs dry the
+/// NICs drop at RX, never grow it.
+const FRAME: usize = 1514;
 /// A shaped queue's byte limit follows its rate (`shaping.queue_ms`,
 /// `config::Qos::queue_limit`), between this floor (bursts at very low
-/// rates) and `QDISC_BYTES`.
-const QDISC_MIN_BYTES: usize = 16 * 1514;
+/// rates) and the ceiling.
+const QDISC_MIN_BYTES: usize = 16 * FRAME;
 
-/// The byte limit of a queue shaped at `rate` (unshaped: `QDISC_BYTES`).
+/// The byte limit of a queue shaped at `rate` (unshaped: the ceiling).
 fn queue_bytes(qos: &crate::config::Qos, rate: Option<qdisc::shaper::Rate>) -> usize {
-    qos.queue_limit(rate, QDISC_MIN_BYTES, QDISC_BYTES)
+    qos.queue_limit(rate, QDISC_MIN_BYTES, qos.queue_pkts * FRAME)
 }
 
 /// For the qos log lines: the limit and how long a full queue waits.
@@ -179,7 +180,7 @@ pub fn bring_up(
             qos,
             ecn,
             i == 0 && qos.ack_filter,
-            QDISC_PACKETS,
+            qos.queue_pkts,
             limit,
             timer::ticks() ^ mac_seed(&mac),
         );
@@ -297,7 +298,7 @@ fn ingress_qdisc(qos: &crate::config::Qos) -> PortQdisc {
         qos,
         qos.ecn_down,
         false,
-        QDISC_PACKETS,
+        qos.queue_pkts,
         queue_bytes(qos, qos.ingress_rate()),
         timer::ticks() ^ 0x1a9e_55c0_de0f_0001,
     );
@@ -442,7 +443,7 @@ pub fn apply_qos(sh: &Shared, old: &crate::config::Qos, new: &crate::config::Qos
                 new,
                 ecn_new,
                 up && new.ack_filter,
-                QDISC_PACKETS,
+                new.queue_pkts,
                 limit,
                 timer::ticks() ^ mac_seed(&port.mac),
             );

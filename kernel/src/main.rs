@@ -152,11 +152,12 @@ fn spawn_net(
     executor::spawn_on(lay.svc, Priority::Service, "svc", net::svc::run(hosts, shared, store));
 }
 
-/// Packet buffers to preallocate: 2 NICs × (RX ring + TX ring) plus room
-/// for queues (three qdiscs: wan0, lan0, the WAN ingress stage). 1536 ×
-/// 2.125 KiB ≈ 3.2 MiB.
+/// Packet buffers to preallocate: the NICs' RX and TX rings plus room for
+/// the queues (`config::QUEUE_PACKETS` each: wan0, the LAN ports, the WAN
+/// ingress stage), so a swarm filling the download queue still leaves
+/// buffers for the other direction. 8192 × 2.125 KiB ≈ 17 MiB.
 fn net_pool_size() -> usize {
-    1536
+    8192
 }
 
 #[panic_handler]

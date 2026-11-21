@@ -27,6 +27,16 @@
 #                        (its ACKs, ~230 kbit/s, queue on the upload), the
 #                        router must drop redundant ACKs and the download
 #                        must arrive whole. Negative control LAB_ACK_FILTER=0
+#   LAB_SWARM=N          a torrent-like download (apu4, 2026-11-21): the
+#                        download shaped at LAB_SWARM_KBIT (98000, the home
+#                        line), the client opens N parallel HTTP downloads
+#                        (256 when N=1; HVF: TCG cannot reach the rate) with MTU LAB_SWARM_MTU (680: small
+#                        packets) for LAB_SWARM_SECS (15) and checks that the
+#                        ingress queue's drops come from the AQM, overflow
+#                        drops at most LAB_SWARM_OVF (10) percent; the usual
+#                        shaping phase is skipped. Negative control
+#                        LAB_ROUTER_ARGS=queue_pkts=384 (the old limit: the
+#                        queue fills by packet count, overflow decides)
 #   LAB_EXPECT_KBIT=N    what the client expects (default: LAB_SHAPE_KBIT);
 #                        set it with LAB_SHAPE_KBIT=0 as a negative control
 #   LAB_ROUTER_ARGS="…"  extra router boot arguments, e.g. qdisc=codel (single
@@ -326,6 +336,13 @@ ROUTER_ARGS=""
 [[ "$SHAPE_KBIT" != 0 ]] && ROUTER_ARGS="shape_up=$SHAPE_KBIT shape_down=$SHAPE_KBIT"
 ACK="${LAB_ACK:-}"
 [[ -n "$ACK" && "$SHAPE_KBIT" != 0 ]] && ROUTER_ARGS="shape_up=${LAB_ACK_UP_KBIT:-150} shape_down=$SHAPE_KBIT ack_filter=${LAB_ACK_FILTER:-1}"
+SWARM="${LAB_SWARM:-}"
+[[ "$SWARM" == 1 ]] && SWARM=256
+SWARM_KBIT="${LAB_SWARM_KBIT:-98000}"
+if [[ -n "$SWARM" ]]; then
+  ROUTER_ARGS="shape_up=${LAB_SWARM_UP_KBIT:-20000} shape_down=$SWARM_KBIT"
+  EXPECT_KBIT=0 # no single-download shaping phase
+fi
 ROUTER_ARGS="$ROUTER_ARGS ${LAB_ROUTER_ARGS:-}"
 # The first ntp= wins: only add the default when the caller sets none.
 [[ " ${LAB_ROUTER_ARGS:-} " == *" ntp="* ]] || ROUTER_ARGS="$ROUTER_ARGS ntp=ntp.isp.example"
@@ -661,7 +678,7 @@ PIDS+=($!)
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
   VM_NIC2="${PORTS:+52:54:00:00:00:11 $((LAN1_PORT + 1)) $LAN1_PORT}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${ACK:+ lab_ack=1} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN lab_guest_v6=$GUEST_IPV6}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${ACK:+ lab_ack=1}${SWARM:+ lab_swarm=$SWARM lab_swarm_kbit=$SWARM_KBIT lab_swarm_secs=${LAB_SWARM_SECS:-15} lab_swarm_mtu=${LAB_SWARM_MTU:-680} lab_swarm_ovf=${LAB_SWARM_OVF:-10}} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN lab_guest_v6=$GUEST_IPV6}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so
@@ -695,7 +712,8 @@ tr -d '\r' <"$WORK/client.log" | grep -E "^LAB (PASS|FAIL|INFO|WARN)|^    \|" | 
 # egress, download = the WAN ingress stage (LAN egress with
 # shape_ingress=0).
 router_fails=0
-if [[ "$SHAPE_KBIT" != 0 ]]; then
+# Swarm mode has no upload phase: its check is the client's.
+if [[ "$SHAPE_KBIT" != 0 && -z "$SWARM" ]]; then
   bootarg() { echo " $ROUTER_ARGS " | sed -n "s/.* $1=\([0-9]*\) .*/\1/p"; }
   all=$(bootarg ecn)
   up=$(bootarg ecn_up); up=${up:-${all:-0}}

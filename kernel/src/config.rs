@@ -1321,7 +1321,9 @@ fn arg_u64(bootargs: &str, key: &str) -> Option<u64> {
 /// `isolation=triple-isolate|dual-srchost|dual-dsthost|flows` (CAKE's
 /// fairness, default `triple-isolate`) and `queue_ms=` (a shaped queue's
 /// limit as time at its rate, default 100; `0` = the fixed limit) and
-/// `ack_filter=0|1` (CAKE's ACK filter on the upload, default off).
+/// `ack_filter=0|1` (CAKE's ACK filter on the upload, default off) and
+/// `queue_pkts=` (every queue's packet limit, boot argument only, default
+/// [`QUEUE_PACKETS`]: the lab's negative control is the old `384`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AqmKind {
     Cake,
@@ -1360,7 +1362,19 @@ pub struct Qos {
     pub queue_ms: u32,
     /// CAKE's ACK filter on WAN egress (the upload) only.
     pub ack_filter: bool,
+    /// Every queue's packet limit (boot argument `queue_pkts=`, fixed at
+    /// boot; default [`QUEUE_PACKETS`]). The byte limits' ceiling is this
+    /// many full frames.
+    pub queue_pkts: usize,
 }
+
+/// A queue's packet limit unless `queue_pkts=` says otherwise. Large
+/// enough that a download from hundreds of peers (a torrent swarm, small
+/// packets) fills `queue_ms` of time before the packet count: with the
+/// old 384 a 98 Mbit/s queue of ~800 B packets held only ~25 ms, and
+/// overflow drops instead of the AQM decided (seen on the apu4,
+/// 2026-11-21; lab check `LAB_SWARM=1`, negative control `queue_pkts=384`).
+pub const QUEUE_PACKETS: usize = 2048;
 
 pub fn qos() -> Qos {
     let c = get();
@@ -1387,6 +1401,7 @@ pub fn qos() -> Qos {
         ingress: arg_u64(bootargs(), "shape_ingress") != Some(0),
         queue_ms: s.queue_ms,
         ack_filter: s.ack_filter,
+        queue_pkts: arg_u64(bootargs(), "queue_pkts").map_or(QUEUE_PACKETS, |n| (n as usize).clamp(16, QUEUE_PACKETS)),
     }
 }
 

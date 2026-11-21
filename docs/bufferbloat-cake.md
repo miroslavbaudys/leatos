@@ -464,10 +464,11 @@ upload started with 130 overflow drops and a 355 ms peak sojourn.
 
 Now a shaped queue's byte limit is the full-size packets its rate (with
 overhead) sends in `shaping.queue_ms` (default 100 ms; boot argument
-`queue_ms=`, `0` = the old fixed limit), at least 16 × 1514 B and at most
+`queue_ms=`, `0` = the fixed limit, since 2026-11-21 2048 × 1514 B), at least 16 × 1514 B and at most
 the fixed limit (`qdisc::shaper::Rate::queue_limit_bytes`,
 `config::Qos::queue_limit`). Unshaped queues keep the fixed limit; the
-384-packet count limit stays everywhere (it protects the packet pool).
+384-packet count limit stays everywhere (it protects the packet pool;
+raised to 2048 on 2026-11-21, see "Queue packet limit for swarms").
 Live saves change the limit with the rate, keeping the queue. At 18 Mbit/s
 the upload queue holds 145 packets (~100 ms); at 90 Mbit/s the download
 stays at 384 packets (the cap: 52 ms). The boot log's `qos` lines and
@@ -536,6 +537,52 @@ drops`, `/api/status` `ack_drops`, the web queue table "redundant ACKs".
 Fuzz targets: `ack_filter` (the decision on arbitrary bytes: no panic,
 never supersedes itself, never mutual) and `qdisc` (with ACK packets,
 well-formed and garbage, and the filter on: conservation and limits).
+
+### Queue packet limit for swarms (2026-11-21)
+On the apu4 a torrent download (90 Mbit/s line shaped at 98, ~750
+tracked connections, packets of 650–1000 B on average) swung between 30
+and 100 Mbit/s. The WAN ingress stage's counters showed why: of its drops,
+**73 % were overflow** (queue full), 20 % AQM and 7 % BLUE, in bursts of
+up to 2,000/s (13 % of the traffic in a 5 s window). The queue's
+384-packet limit bound before its byte limit: 384 packets of ~850 B are
+~330 KB, ~25 ms at 98 Mbit/s, about one packet per active flow. Every
+burst overflowed, many flows lost packets at once, backed off together
+and ramped up together. The CPU only followed the packet rate (~27 µs per
+packet on `dp_down`, peaks of 45 %), it was not the limit.
+
+Now every queue holds `config::QUEUE_PACKETS` = 2048 packets (boot
+argument `queue_pkts=`, 16..2048), and the byte ceiling is that many full
+frames (3.1 MB; a shaped queue's limit still follows `queue_ms`: 1.2 MB at
+98 Mbit/s). The packet pool grew from 1536 to 8192 buffers (~17 MiB) so
+a full download queue leaves buffers for the other direction.
+`/api/status` gives each queue's drops by cause: `aqm_drops` (incl. BLUE),
+`blue_drops`, `overflow_drops`.
+
+**Lab** `LAB_SWARM=1 scripts/lab-test.sh` (256 flows by default; download
+shaped at 98 Mbit/s, the client runs 256 loops of 256 KB HTTP downloads
+with MTU 680 for 15 s; check `swarm`: overflow ≤ 10 % of the ingress
+drops, valid only if the queue was pushed and the swarm moved at least
+half the rate), HVF, one run each:
+
+| | `queue_pkts=384` (negative control) | default (2048) | default, `QEMU_SMP=4` |
+|---|---|---|---|
+| overflow / AQM drops in the 15 s | **40,585** / 38,766 (BLUE 461): **FAIL** | **1,836** (slow start only) / 51,375 (BLUE 0): PASS | 1,789 / 46,615: PASS |
+| ingress backlog (10 s samples) | pinned at 343–384 packets | 390–490 packets | |
+| max sojourn | ~60 ms | ~77 ms | |
+| swarm throughput | 63.3 Mbit/s | 69.5 Mbit/s | 75.8 Mbit/s |
+
+`LEATOS_ARCH=x86_64` (TCG) cannot run it: the emulated router forwards
+only ~25 Mbit/s of these packets, so the check reports INVALID (below half
+the rate); at a rate it reaches, the byte limit binds before the packet
+limit and the check cannot tell the two apart.
+
+64 flows do not reproduce it in the lab (backlog ~230 packets, overflow
+only during slow start, PASS with either limit): the lab's RTT is ~1 ms,
+so only the flows' minimum windows fill the queue, and 64 of them fit.
+The same RTT is why throughput is equal in both runs: 256 flows at 1 ms
+need ~18 % AQM drops, which the ingress shaper charges to the rate (a
+dropped packet used the line). Whether the home download steadies is for
+the apu4 to show (after the soak ending 2026-11-24).
 
 ## 5. Configuration UX
 **Implemented** (`[shaping]`, docs/config-and-storage.md §5; boot
