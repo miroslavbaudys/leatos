@@ -1283,14 +1283,18 @@ fn status_json(
     s.push_str(",\"dhcp_leases\":[");
     if let Some(svc) = services {
         let now = timer::uptime().as_secs();
-        for (n, (net, l)) in svc.leases_by_network().enumerate() {
+        // With the IPv6 addresses the client's MAC was seen at (neighbor
+        // discovery, the last 30 min; empty without IPv6).
+        for (n, (net, l, v6)) in svc.leases_with_ipv6(sh, timer::uptime().as_millis() as u64).into_iter().enumerate() {
+            let ipv6: Vec<String> = v6.iter().map(|a| format!("\"{a}\"")).collect();
             let _ = write!(
                 s,
-                "{}{{\"network\":{},\"mac\":{},\"ip\":{},\"hostname\":{},\"bound\":{},\"expires_in_s\":{}}}",
+                "{}{{\"network\":{},\"mac\":{},\"ip\":{},\"ipv6\":[{}],\"hostname\":{},\"bound\":{},\"expires_in_s\":{}}}",
                 if n > 0 { "," } else { "" },
                 json_str(net),
                 json_str(&format!("{}", smoltcp::wire::EthernetAddress(l.mac))),
                 json_str(&format!("{}", l.ip)),
+                ipv6.join(","),
                 l.hostname
                     .as_deref()
                     .map(json_str)

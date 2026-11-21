@@ -242,6 +242,26 @@ fn build_zone<'a>(
     zone
 }
 
+/// The IPv6 neighbors the datapath saw on `net`'s link
+/// (`LinkShared::neigh6`) in the last [`AAAA_FORGET_MS`], in one of the
+/// network's /64s: global before unique local, newest first.
+fn neighbors6(net: &Net, sh: &Shared, now_ms: u64) -> Vec<(Ipv6Addr, [u8; 6])> {
+    let prefixes: Vec<u128> = [net.cfg.ula, net.cfg.gua].into_iter().flatten().map(|a| u128::from(a) >> 64).collect();
+    if prefixes.is_empty() {
+        return Vec::new();
+    }
+    let mut seen: Vec<(Ipv6Addr, [u8; 6], u64)> = sh.links[net.host]
+        .neigh6
+        .lock()
+        .iter()
+        .filter(|e| now_ms.saturating_sub(e.2) <= AAAA_FORGET_MS && prefixes.contains(&(u128::from(e.0) >> 64)))
+        .copied()
+        .collect();
+    let ula = |a: &Ipv6Addr| a.segments()[0] & 0xfe00 == 0xfc00;
+    seen.sort_by(|a, b| ula(&a.0).cmp(&ula(&b.0)).then(b.2.cmp(&a.2)));
+    seen.into_iter().map(|(ip, mac, _)| (ip, mac)).collect()
+}
+
 fn now_ms() -> u64 {
     timer::uptime().as_millis() as u64
 }
@@ -549,11 +569,6 @@ impl LanServices {
         (restored, saved.iter().map(|s| s.leases.len()).sum())
     }
 
-    /// Current DHCP leases of all networks (status page).
-    pub fn leases(&self) -> impl Iterator<Item = &dhcp::Lease> {
-        self.leases_by_network().map(|(_, l)| l)
-    }
-
     /// Current DHCP leases with their network's name.
     pub fn leases_by_network(&self) -> impl Iterator<Item = (&str, &dhcp::Lease)> {
         self.nets.iter().flat_map(|n| {
@@ -561,6 +576,22 @@ impl LanServices {
                 .iter()
                 .flat_map(move |(s, _)| s.leases().map(move |l| (n.cfg.name.as_str(), l)))
         })
+    }
+
+    /// Each lease with its network and the IPv6 addresses its MAC was
+    /// seen at on that network ([`neighbors6`]: global before unique
+    /// local, newest first). For the Clients page and the CLI.
+    pub fn leases_with_ipv6(&self, sh: &Shared, now_ms: u64) -> Vec<(&str, &dhcp::Lease, Vec<Ipv6Addr>)> {
+        let mut out = Vec::new();
+        for n in &self.nets {
+            let Some((s, _)) = &n.dhcp else { continue };
+            let seen = neighbors6(n, sh, now_ms);
+            for l in s.leases() {
+                let v6 = seen.iter().filter(|e| e.1 == l.mac).map(|e| e.0).collect();
+                out.push((n.cfg.name.as_str(), l, v6));
+            }
+        }
+        out
     }
 
     /// The clients' IPv6 addresses as AAAA names: each neighbor seen in
@@ -572,15 +603,7 @@ impl LanServices {
         let mut want: Vec<(String, String, Ipv6Addr, View)> = Vec::new();
         if config::dns_aaaa() {
             for net in &self.nets {
-                let prefixes: Vec<u128> = [net.cfg.ula, net.cfg.gua].into_iter().flatten().map(|a| u128::from(a) >> 64).collect();
-                if prefixes.is_empty() {
-                    continue;
-                }
-                let seen: Vec<(Ipv6Addr, [u8; 6], u64)> = sh.links[net.host].neigh6.lock().clone();
-                for (ip, mac, at) in seen {
-                    if now.saturating_sub(at) > AAAA_FORGET_MS || !prefixes.contains(&(u128::from(ip) >> 64)) {
-                        continue;
-                    }
+                for (ip, mac) in neighbors6(net, sh, now) {
                     let lease = net.dhcp.as_ref().and_then(|(s, _)| {
                         s.leases()
                             .find(|l| l.mac == mac && l.state == dhcp::LeaseState::Bound && l.hostname.is_some())

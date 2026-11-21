@@ -679,6 +679,16 @@ if [ -n "$v6on" ]; then
       else
         fail "ipv6 names: labclient.lan AAAA ($ag, ${ula6:-no ULA}): $(echo "$aaaa" | $bb grep -i 'address\|answer\|NXDOMAIN' | $bb tr '\n' ' ') / PTR: $(echo "$ptr" | $bb grep -i 'name\|NXDOMAIN' | $bb tr '\n' ' ')"
       fi
+      # The Clients page: our lease in /api/status lists the same two
+      # addresses (`ipv6`, from neighbor discovery by MAC). Checked
+      # against a build listing none (ipv6=0 skips this section).
+      mymac=$($bb cat /sys/class/net/eth0/address | $bb sed 's/[:-]/./g')
+      mylease=$(v6st | $bb grep -o '{"network":[^}]*}' | $bb grep -i "\"mac\":\"$mymac\"" | $bb head -1)
+      if echo "$mylease" | $bb grep -q "\"ipv6\":\[[^]]*\"$ag\"" && [ -n "$ula6" ] && echo "$mylease" | $bb grep -q "\"ipv6\":\[[^]]*\"$ula6\""; then
+        pass "ipv6 clients: our lease lists $ag and $ula6"
+      else
+        fail "ipv6 clients: our lease: ${mylease:-not found}"
+      fi
       # Packet Too Big: the WAN takes 1400 (wan_mtu=1400).
       # (busybox shows no path MTU cache: the router's ICMP error count,
       # read after its once-a-second sum.)

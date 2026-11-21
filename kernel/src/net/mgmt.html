@@ -50,6 +50,7 @@
   .tile span { display:block; color:var(--muted); font-size:12px; }
   .tile b { display:block; font-size:21px; font-weight:600; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
   .tile small { color:var(--muted); overflow-wrap:anywhere; }
+  small.v6 { color:var(--muted); white-space:nowrap; }
   /* ---- tables */
   .tw { overflow-x:auto; }
   table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
@@ -218,9 +219,9 @@
   <!-- ================= Clients ================= -->
   <section class="page" data-page="clients" data-title="Clients" hidden>
     <h2>Clients</h2>
-    <p class="lead">Devices with a DHCP lease from the router.</p>
+    <p class="lead">Devices with a DHCP lease from the router, with the IPv6 addresses they were seen using in the last 30 minutes.</p>
     <div class="card">
-      <div class="row"><input id="clientq" placeholder="Filter by name, IP or MAC" style="flex:1; min-width:180px"></div>
+      <div class="row"><input id="clientq" placeholder="Filter by name, IPv4/IPv6 address or MAC" style="flex:1; min-width:180px"></div>
       <div class="tw"><table id="leases"></table></div>
     </div>
   </section>
@@ -989,10 +990,13 @@ function showLeases() {
   if (!st) return;
   const q = $("clientq").value.trim().toLowerCase();
   const reserved = new Set([...readStatics(), ...(readNets() ?? []).flatMap((x) => x.dhcp?.static ?? [])].map((s) => (s.mac ?? "").toLowerCase()));
-  const ls = st.dhcp_leases.filter((d) => !q || [d.hostname, d.ip, d.mac].some((v) => (v ?? "").toLowerCase().includes(q)));
+  const ls = st.dhcp_leases.filter((d) => !q || [d.hostname, d.ip, d.mac, ...(d.ipv6 ?? [])].some((v) => (v ?? "").toLowerCase().includes(q)));
+  // IPv6: the addresses the device's MAC was seen at in neighbor
+  // discovery (global first, then unique local "ULA"; the last 30 min).
+  const v6 = (d) => (d.ipv6 ?? []).map((a) => `<br><small class="v6">${esc(a)}${/^f[cd]/i.test(a) ? " (ULA)" : ""}</small>`).join("");
   $("leases").innerHTML = st.dhcp_leases.length
     ? "<tr><th>Name</th><th>IP address</th><th>Network</th><th>MAC</th><th>State</th><th>Expires in</th><th></th></tr>" + ls.map((d) =>
-        `<tr><td>${esc(d.hostname ?? "–")}</td><td>${esc(d.ip)}</td><td>${esc(d.network ?? "")}</td><td>${esc(d.mac)}</td><td>${d.bound ? "bound" : "offered"}</td><td>${dur(d.expires_in_s)}</td>` +
+        `<tr><td>${esc(d.hostname ?? "–")}</td><td>${esc(d.ip)}${v6(d)}</td><td>${esc(d.network ?? "")}</td><td>${esc(d.mac)}</td><td>${d.bound ? "bound" : "offered"}</td><td>${dur(d.expires_in_s)}</td>` +
         `<td>${reserved.has(d.mac.toLowerCase()) ? '<span class="pill">reserved</span>' : `<button class="plain" data-reserve="${esc(d.mac)}">Reserve</button>`}</td></tr>`).join("")
     : rows([["Leases", "none"]]);
 }

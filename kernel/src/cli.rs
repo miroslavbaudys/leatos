@@ -592,7 +592,7 @@ fn leases(ctx: &Ctx) {
     };
     let now = timer::uptime().as_secs();
     let mut n = 0;
-    for l in svc.leases() {
+    for (_, l, v6) in svc.leases_with_ipv6(ctx.sh, timer::uptime().as_millis() as u64) {
         n += 1;
         println!(
             "{:<15} {}  {:<20} {} {}",
@@ -602,6 +602,10 @@ fn leases(ctx: &Ctx) {
             if l.state == proto_dhcp::v4::server::LeaseState::Bound { "bound, expires in" } else { "offered, expires in" },
             dur(l.expires.saturating_sub(now))
         );
+        // The IPv6 addresses its MAC was seen at (neighbor discovery).
+        for a in v6 {
+            println!("  {a}");
+        }
     }
     if n == 0 {
         println!("no leases");

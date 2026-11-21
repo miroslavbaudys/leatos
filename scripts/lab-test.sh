@@ -249,6 +249,10 @@
 #                        global and ULA addresses (neighbor discovery x
 #                        its DHCP lease) and the PTR of the global one;
 #                        negative control LAB_ROUTER_ARGS=dns_aaaa=0.
+#                        The client's lease in /api/status lists both
+#                        addresses (`ipv6`, the Clients page); no run-time
+#                        negative control (ipv6=0 skips the section):
+#                        checked with a build listing none.
 #                        IPv6 on the router's networks (docs/ipv6.md step
 #                        1; router ipv6=1): the client gets a SLAAC
 #                        address from the main LAN's ULA /64, no default
