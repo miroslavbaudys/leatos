@@ -1,0 +1,5 @@
+[[route]]
+name = "lab"            # key
+dst = "10.30.0.0/24"    # subnet (host bits zero) or one address
+via = "192.168.1.2"     # the next router
+# enabled = true

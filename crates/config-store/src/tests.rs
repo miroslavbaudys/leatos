@@ -503,3 +503,37 @@ fn trial_mark_confirm_and_revert() {
     let p = d.save(&c, 1, &payload(10, 3));
     assert_eq!((p.slot, p.header.seq), (Slot::B, 2));
 }
+
+/// Fuzz find (`store` target, 2026-11-22): a record with the highest
+/// sequence number (only a crafted or damaged store has one) made the next
+/// save's `seq + 1` overflow: in the kernel it wrapped to 0, the old record
+/// stayed current and every later save was silently ignored. Such a header
+/// is not valid, so a save replaces it and wins.
+#[test]
+fn a_record_with_the_last_sequence_number_is_not_current() {
+    let layout = small_layout();
+    let area = *layout.area("config").unwrap();
+    let mut disk = Disk::new(&layout);
+    let plan = disk.save(&area, 1, b"first");
+    let mut h = plan.header;
+    h.seq = u64::MAX;
+    disk.write(area.slot_lba(plan.slot), &h.encode(&area));
+    assert!(disk.state(&area).current(u32::MAX).is_none(), "seq u64::MAX taken as current");
+    let next = disk.save(&area, 1, b"second");
+    assert_eq!(next.header.seq, 1);
+    assert_eq!(disk.load(&area).as_deref(), Some(&b"second"[..]));
+    assert_eq!(disk.save(&area, 1, b"third").header.seq, 2);
+    assert_eq!(disk.load(&area).as_deref(), Some(&b"third"[..]));
+    // The highest valid one (fuzz find 2, `store` target): the next would
+    // need u64::MAX, which is never valid: the save is refused, loudly,
+    // instead of writing a record nobody reads.
+    let st = disk.state(&area);
+    let (s, h) = st.current(1).unwrap();
+    let mut top = h;
+    top.seq = u64::MAX - 1;
+    disk.write(area.slot_lba(s), &top.encode(&area));
+    let st = disk.state(&area);
+    assert_eq!(st.current(1).map(|c| c.1.seq), Some(u64::MAX - 1));
+    let cur = st.current(1).map(|c| c.0);
+    assert_eq!(st.plan_write(&area, cur, 1, b"fourth"), Err(Error::LastSequence));
+}

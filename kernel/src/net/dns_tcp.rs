@@ -9,11 +9,9 @@
 //! it.
 //!
 //! Bounded: [`CONNS`] connections per network (more are refused with a
-//! RST by smoltcp: no socket listens), queries up to [`MAX_QUERY`] bytes
-//! (larger: the connection is aborted), at most [`MAX_OUTSTANDING`]
-//! unanswered queries per connection (then reading stops and TCP's window
-//! holds the client back), [`MAX_OUT`] bytes of answers waiting for the
-//! client to read (more: aborted). A connection with nothing to answer is
+//! RST by smoltcp: no socket listens); the framing and its limits (query
+//! size, unanswered queries, answers waiting) are `proto_dns::tcp`, which
+//! the `dns_tcp` fuzz target covers. A connection with nothing to answer is
 //! closed after [`IDLE_MS`] without traffic; one still waiting after
 //! [`HARD_MS`] is aborted.
 //!
@@ -24,6 +22,7 @@ use alloc::vec::Vec;
 use core::net::SocketAddr;
 use core::sync::atomic::{AtomicU64, Ordering};
 use smoltcp::iface::{SocketHandle, SocketSet};
+use proto_dns::tcp::Framing;
 use smoltcp::socket::tcp;
 
 const PORT: u16 = 53;
@@ -31,12 +30,6 @@ const PORT: u16 = 53;
 pub const CONNS: usize = 4;
 const RX_BUF: usize = 2048;
 const TX_BUF: usize = 16 * 1024;
-/// Largest query accepted (a query is one question, maybe an OPT record).
-pub const MAX_QUERY: usize = 1024;
-/// Unanswered queries per connection before reading pauses.
-pub const MAX_OUTSTANDING: u16 = 16;
-/// Answers queued beyond the socket's send buffer, per connection.
-pub const MAX_OUT: usize = 128 * 1024;
 /// A connection with nothing outstanding is closed after this long
 /// without traffic.
 pub const IDLE_MS: u64 = 10_000;
@@ -55,12 +48,8 @@ struct Conn {
     sock: SocketHandle,
     /// The client, once connected (answers are routed by it).
     remote: Option<SocketAddr>,
-    /// Bytes received but not yet a whole message.
-    inbuf: Vec<u8>,
-    /// Framed answers the socket had no room for yet.
-    out: Vec<u8>,
-    /// Queries handed to the resolver and not answered yet.
-    outstanding: u16,
+    /// Queries in, answers out (`proto_dns::tcp`).
+    framing: Framing,
     /// Last traffic (ms since boot).
     last_ms: u64,
     /// We sent our FIN: smoltcp finishes the connection.
@@ -70,19 +59,18 @@ struct Conn {
 impl Conn {
     fn reset(&mut self) {
         self.remote = None;
-        self.inbuf.clear();
-        self.out.clear();
-        self.outstanding = 0;
+        self.framing.reset();
         self.closing = false;
     }
 
     /// Move queued answers into the socket.
     fn flush(&mut self, s: &mut tcp::Socket) {
-        if self.out.is_empty() || !s.may_send() {
+        let out = self.framing.pending_out();
+        if out.is_empty() || !s.may_send() {
             return;
         }
-        if let Ok(n) = s.send_slice(&self.out) {
-            self.out.drain(..n);
+        if let Ok(n) = s.send_slice(out) {
+            self.framing.consume_out(n);
         }
     }
 }
@@ -105,9 +93,7 @@ impl Listener {
             .map(|_| Conn {
                 sock: sockets.add(socket()),
                 remote: None,
-                inbuf: Vec::new(),
-                out: Vec::new(),
-                outstanding: 0,
+                framing: Framing::new(),
                 last_ms: 0,
                 closing: false,
             })
@@ -141,27 +127,26 @@ impl Listener {
                 ACCEPTED.fetch_add(1, Ordering::Relaxed);
             }
             let Some(client) = c.remote else { continue };
-            while c.outstanding < MAX_OUTSTANDING && c.inbuf.len() < 2 + MAX_QUERY && s.can_recv() {
+            // Queries that waited for answers to make room come out first.
+            match c.framing.push(&[]) {
+                Ok(qs) => queries.extend(qs.into_iter().map(|q| (client, q))),
+                Err(_) => {
+                    s.abort();
+                    continue;
+                }
+            }
+            while c.framing.wants_input() && s.can_recv() {
                 let Ok(n) = s.recv_slice(&mut buf) else { break };
                 if n == 0 {
                     break;
                 }
-                c.inbuf.extend_from_slice(&buf[..n]);
                 c.last_ms = now_ms;
-                // Whole messages out of the buffer.
-                while c.inbuf.len() >= 2 && c.outstanding < MAX_OUTSTANDING {
-                    let len = usize::from(u16::from_be_bytes([c.inbuf[0], c.inbuf[1]]));
-                    if !(12..=MAX_QUERY).contains(&len) {
+                match c.framing.push(&buf[..n]) {
+                    Ok(qs) => queries.extend(qs.into_iter().map(|q| (client, q))),
+                    Err(_) => {
                         s.abort(); // not DNS, or more than a query
-                        c.inbuf.clear();
                         break;
                     }
-                    if c.inbuf.len() < 2 + len {
-                        break;
-                    }
-                    queries.push((client, c.inbuf[2..2 + len].to_vec()));
-                    c.inbuf.drain(..2 + len);
-                    c.outstanding += 1;
                 }
             }
         }
@@ -175,18 +160,13 @@ impl Listener {
             return false;
         };
         let s = sockets.get_mut::<tcp::Socket>(c.sock);
-        c.outstanding = c.outstanding.saturating_sub(1);
         c.last_ms = now_ms;
-        let Ok(len) = u16::try_from(data.len()) else {
-            return true; // cannot be framed (the resolver never makes one)
-        };
-        if c.out.len() + 2 + data.len() > MAX_OUT {
+        // Queries that waited behind the outstanding limit come out on the
+        // next `recv`.
+        if c.framing.answer(data).is_err() {
             s.abort(); // the client does not read its answers
-            c.out.clear();
             return true;
         }
-        c.out.extend_from_slice(&len.to_be_bytes());
-        c.out.extend_from_slice(data);
         c.flush(s);
         true
     }
@@ -207,7 +187,7 @@ impl Listener {
             }
             c.flush(s);
             let idle = now_ms.saturating_sub(c.last_ms);
-            let done = c.outstanding == 0 && c.out.is_empty() && s.send_queue() == 0;
+            let done = c.framing.idle() && s.send_queue() == 0;
             let peer_closed = s.state() == tcp::State::CloseWait;
             if idle > HARD_MS {
                 s.abort();
@@ -226,7 +206,7 @@ impl Listener {
             .iter()
             .filter(|c| c.remote.is_some())
             .map(|c| {
-                let busy = c.closing || c.outstanding > 0 || !c.out.is_empty();
+                let busy = c.closing || !c.framing.idle();
                 c.last_ms + if busy { HARD_MS } else { IDLE_MS } + 1
             })
             .min()

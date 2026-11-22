@@ -1,0 +1,77 @@
+version = 2
+
+[wan]                       # one WAN; zone "wan" is implied
+port = "wan0"
+vlan = 848                  # as in v1
+mode = "pppoe"              # "dhcp" | "pppoe" | "static"
+[wan.pppoe]                 # as in v1
+username = "user@isp.cz"
+[wan.static]                # mode = "static" only
+ipv4 = "203.0.113.2/30"
+gateway = "203.0.113.1"
+dns = ["203.0.113.53"]
+
+[[network]]
+name = "lan"                # key: [a-z][a-z0-9-]{0,14}; also the interface name
+ports = ["lan0"]            # physical ports; more than one = bridged (M10)
+vlan = 0                    # 0 / absent = untagged on its ports
+ipv4 = "10.10.0.1/24"
+zone = "lan"
+[network.dhcp]              # v1's [lan.dhcp], per network
+enabled = true
+range = ["10.10.0.100", "10.10.0.199"]
+lease_secs = 43200
+[[network.dhcp.static]]
+mac = "52:54:00:00:00:05"
+ip = "10.10.0.10"
+hostname = "nas"
+
+[[network]]
+name = "guest"
+ports = ["lan0"]
+vlan = 20                   # tagged on lan0 (trunk to the AP)
+ipv4 = "10.20.0.1/24"
+zone = "guest"
+
+[[zone]]
+name = "lan"
+input = "accept"
+forward_to = ["wan", "guest"]
+
+[[zone]]
+name = "guest"
+input = "drop"              # nothing to the router ...
+allow = ["dhcp", "dns", "ping"]   # ... except these services
+forward_to = ["wan"]        # internet only
+
+[[firewall.rule]]           # exceptions, first match wins
+name = "printer-from-guest"
+from = "guest"
+to = "lan"                  # a zone, or "router" for input
+proto = "tcp"
+dst = "10.10.0.20"
+dst_port = "9100"
+action = "accept"           # accept | drop | reject
+
+[[firewall.forward]]        # DNAT from the WAN address
+name = "nas-https"
+proto = "tcp"               # tcp | udp | tcp+udp
+wan_port = "8443"           # a port or a range "8000-8010"
+to = "10.10.0.10:443"       # with a range: a base port, or no port = same ports
+src = "0.0.0.0/0"           # optional: limit who may connect
+hairpin = true              # also from inside, via the WAN address
+
+[dns]
+cache_entries = 4096
+rebind_protection = true
+prefetch = true             # default; false needs version 2
+stale_secs = 86400          # serve-stale window (RFC 8767), 0 = off, max a week
+views = "firewall"          # "all" (default): who resolves which local names
+[[dns.host]]                # local records beside DHCP names
+name = "nas"
+ip = "10.10.0.10"
+networks = ["lan"]          # optional: who gets this answer (docs/dns-views.md)
+
+[shaping]                   # unchanged from v1
+[mgmt]                      # on_wan, password_hash (PBKDF2-SHA256, crates/auth)
+[time]                      # unchanged

@@ -5,6 +5,7 @@
 //! - [`zone`]: local authoritative names + reverse records
 //! - [`cache`]: bounded TTL cache with in-place TTL aging
 //! - [`resolver`]: zone → cache → upstream, with retries and merging
+//! - [`tcp`]: DNS over TCP framing for one client connection (bounded)
 //!
 //! Design rules (see `docs/architecture.md`): `#![no_std]` + `alloc`,
 //! sans-IO (bytes and `now_ms` in, [`resolver::Action`]s out).
@@ -17,5 +18,6 @@ extern crate alloc;
 
 pub mod cache;
 pub mod resolver;
+pub mod tcp;
 pub mod wire;
 pub mod zone;

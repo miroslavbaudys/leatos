@@ -57,6 +57,10 @@ pub enum Error {
         len: usize,
         max: usize,
     },
+    /// Sequence numbers run out: a header with `u64::MAX` is never a
+    /// record, and a save after `u64::MAX - 1` is refused (a correct
+    /// writer never gets there; only a crafted or damaged store does).
+    LastSequence,
 }
 
 fn crc32(data: &[u8]) -> u32 {

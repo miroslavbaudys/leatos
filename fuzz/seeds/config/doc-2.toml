@@ -1,0 +1,5 @@
+[[firewall.redirect]]
+name = "ntp"
+from = "any"
+dst_port = 123
+to = "192.168.1.200"

@@ -186,7 +186,7 @@ fn tlv(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
 /// The leaf's (`notBefore`, `notAfter`) in Unix seconds: Certificate →
 /// TBSCertificate → [0] version (optional), serial, signature algorithm,
 /// issuer, validity.
-pub(crate) fn validity(cert: &[u8]) -> Option<(u64, u64)> {
+pub fn validity(cert: &[u8]) -> Option<(u64, u64)> {
     let (0x30, c, _) = tlv(cert)? else { return None };
     let (0x30, mut tbs, _) = tlv(c)? else { return None };
     if tbs.first() == Some(&0xa0) {

@@ -370,7 +370,44 @@ the LAN side), the rest are open.
    (538 port unreachables, one port 65005). Smoke test passes.
 8. **PPPoE password in clear** on the SD card (A7).
 9. **DoT provider**: own RustCrypto glue in `proto-dot/src/provider.rs` is crypto code written here; review against rustls' provider requirements.
-10. **Missing fuzz targets**: CLI line parser, config TOML/JSON, config-store records, DoT record layer, DNS-TCP framing.
+10. **DONE (2026-11-22): missing fuzz targets.** Six new targets (fuzz/README.md):
+    `cli` (line editor + parser: lines ≤ `MAX_LINE`, whole and split feeds
+    agree), `config` (TOML/JSON: a parsed config re-parses from its own
+    TOML and JSON to itself; views, `with_assignment`, `without`; seeds in
+    `fuzz/seeds/config` from docs/config-v2.md), `store` (MBR, header round
+    trip, a planned write gives a valid slot that becomes current, the other
+    untouched; slots generated as real records too, not only raw bytes),
+    `dns_tcp` (the framing, moved from the kernel to `proto_dns::tcp` for
+    this: queries match a reference parse, bounds, output = framed answers),
+    `auth` (hash strings, sessions accept only issued tokens, throttle
+    bounds, hash budget rate), `dot` (the crypto provider: key exchange with
+    arbitrary peer shares, every signature algorithm, TLS 1.3/1.2 record
+    decryption with 32-byte keys; `verify::validity` on arbitrary DER; a
+    client on an arbitrary server stream). 30 min each: `cli` 14 M, `config`
+    9.5 M, `dns_tcp` 7.1 M, `auth` 13.9 M, `dot` 0.9 M runs, clean; `store`
+    51 M runs clean after the fix below.
+    **Found by `store`**: a record with sequence number `u64::MAX` made the
+    next save's `seq + 1` overflow (the kernel's release build wraps: the new
+    record got seq 0, the old one stayed current, every later save was
+    silently ignored, trials included); the first fix (refuse `u64::MAX` in
+    `RecordHeader::parse`) only moved the edge (a store at `u64::MAX - 1`
+    then wrote a record nobody reads), found again by the 30 min run. Now: a
+    header with `u64::MAX` is never a record, and a save after `u64::MAX - 1`
+    is refused with `Error::LastSequence`; regression test
+    `a_record_with_the_last_sequence_number_is_not_current` (fails on both
+    earlier versions). Reachable only with a crafted or damaged store (A7).
+    Not covered: the DoT record framing after decryption (`Conn::deframe`,
+    eight lines, reachable only after a TLS handshake) and the 16-byte-key
+    AEAD suites (rustls gives them 16-byte keys, the fuzzer cannot build
+    one through the public API).
+11. **OPEN: PBKDF2 iterations in a stored hash** (found writing the `auth`
+    target). `auth::decode` accepts up to 10,000,000 iterations, and the web
+    interface spends them in the services task on a login: 20,000 take
+    about 5 ms under HVF, so the maximum is seconds per check, past the 5 s
+    cross-core watchdog on the apu4. Only someone who can save a config
+    (A6) or write the store (A7) sets the hash. Fix direction: accept at
+    most a small multiple of `ITERATIONS` (e.g. 200,000) in `decode`, so a
+    config with more is refused on load and save.
 
 ## 6. Next steps
 

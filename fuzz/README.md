@@ -16,7 +16,10 @@ cargo +nightly fuzz run fwd artifacts/fwd/crash-...        # reproduce
 cargo +nightly fuzz fmt fwd artifacts/fwd/crash-...        # show the input
 ```
 
-Corpora (`corpus/`) and crashes (`artifacts/`) are gitignored. A crash that
+Corpora (`corpus/`) and crashes (`artifacts/`) are gitignored; `seeds/`
+holds committed starting inputs (`seeds/config`: the examples of
+docs/config-v2.md), passed as a second corpus directory:
+`cargo +nightly fuzz run config corpus/config seeds/config -- -max_len=16384`. A crash that
 reveals a bug gets a host regression test in its crate before the fix.
 
 | Target | Code | Exposure | Beyond "no panic" it checks |
@@ -31,6 +34,12 @@ reveals a bug gets a host regression test in its crate before the fix.
 | `qdisc` | `crates/qdisc` CAKE / FQ-CoDel / CoDel + shaper, ACK filter on and off | every forwarded packet | backlog limits; packet conservation; no duplicates; drains |
 | `ack_filter` | `crates/qdisc` ACK filter decision on arbitrary bytes | pure TCP ACKs from the LAN | no panic; never supersedes itself; never mutual |
 | `boot_image` | `crates/boot-image` ELF / Multiboot2 | uploaded kernels (authenticated) | plan inside the allowed range; flatten fits |
+| `cli` | `crates/cli` line editor + command parser | the serial console | lines ≤ `MAX_LINE`; whole and split feeds give the same lines |
+| `config` | `crates/config` TOML / JSON parse, validation, `with_assignment`, `without`, diffs, secrets | the store at boot, `POST /api/config`, CLI `config set` | a config that parses re-parses from its own TOML and JSON to itself |
+| `store` | `crates/config-store` MBR, store header, A/B record slots, write plans | the SD card / disk at boot | header round trip, areas inside the partition; a planned write gives a valid slot that becomes current, the other slot untouched |
+| `dns_tcp` | `proto_dns::tcp` DNS-over-TCP framing | LAN clients on port 53 | queries 12..=`MAX_QUERY` and equal to a reference parse; outstanding and output bounds; output = framed answers in order |
+| `auth` | `crates/auth` hash strings, sessions, login throttle (PBKDF2 only with ≤ 64 iterations) | stored hashes, any client's tokens and logins | only issued tokens accepted; session and source caps; backoff ≤ `MAX_BLOCK_MS`; hash budget rate |
+| `dot` | `crates/proto-dot` crypto provider (key exchange, signatures, AEAD), `verify::validity`, a client on an arbitrary server stream | DoT servers / the path before the certificate check | no all-zero shared secret accepted |
 
 The stateful targets generate operations rather than bytes: packets built from
 fields over the addresses and ports the configuration knows (with correct

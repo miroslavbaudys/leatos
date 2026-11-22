@@ -79,6 +79,9 @@ impl RecordHeader {
             crc: le32(s, 32),
             flags: le32(s, 36),
         };
+        if h.seq == u64::MAX {
+            return Err(Error::LastSequence);
+        }
         if h.len as usize > area.max_payload() {
             return Err(Error::PayloadTooLarge {
                 len: h.len as usize,
@@ -221,7 +224,12 @@ impl AreaState {
                 }
             },
         };
-        let seq = seq_of(Slot::A).max(seq_of(Slot::B)).map_or(1, |s| s + 1);
+        // Valid records end at u64::MAX - 1 (`RecordHeader::parse`): a store
+        // already there (only a crafted one) takes no more saves, and says so.
+        let seq = match seq_of(Slot::A).max(seq_of(Slot::B)) {
+            None => 1,
+            Some(s) => s.checked_add(1).filter(|&n| n != u64::MAX).ok_or(Error::LastSequence)?,
+        };
         let header = RecordHeader {
             seq,
             version,

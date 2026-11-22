@@ -1,0 +1,8 @@
+[[firewall.rule]]
+name = "qbittorrent6"
+from = "wan"
+to = "lan"
+proto = "tcp+udp"
+dst_iid = "::5054:ff:fe00:10"
+dst_port = 9524
+action = "accept"
