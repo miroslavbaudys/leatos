@@ -399,7 +399,50 @@ the LAN side), the rest are open.
    Where it matters: an ISP that accepts the credentials from any line, or
    whose PPPoE password is also the customer-portal password; a stolen
    card then exposes that account. Advice: do not reuse it anywhere else.
-9. **DoT provider**: own RustCrypto glue in `proto-dot/src/provider.rs` is crypto code written here; review against rustls' provider requirements.
+9. **REVIEWED (2026-11-22): the DoT crypto glue** (`proto-dot/src/provider.rs`,
+   `verify.rs`). Read against rustls' provider contracts and its `ring`
+   provider; no bug found:
+   - hashes and HMAC as the traits specify;
+   - records: TLS 1.3 nonce = IV ⊕ sequence, AAD over the record length,
+     inner content type (RFC 8446 §5.2); TLS 1.2 AES-GCM salt ‖ explicit
+     nonce, AAD over the plaintext length (RFC 5288); ChaCha20-Poly1305
+     IV ⊕ sequence (RFC 7905); tags split off, oversized records refused
+     where `ring` refuses them;
+   - key exchange: X25519 refuses low-order points (`was_contributory`,
+     RFC 7748 §6.1); P-256/P-384 only uncompressed points, checked on the
+     curve, shared secret = the x-coordinate; private keys by rejection
+     sampling, zeroized;
+   - signatures: scheme → algorithm table and algorithm identifiers as in
+     rustls' own providers; Ed25519 `verify_strict`; RSA 2048–8192 bits
+     (`rsa` 0.10 caps at 8192 itself), PSS salt = hash length (RFC 8446
+     §4.2.3); verification touches public data only;
+   - on the soft-float x86_64 kernel the constant-time software backends
+     are pinned (`.cargo/config.toml`: `aes_backend="soft"` and the
+     others), so no AES-NI/SSE and no table-lookup AES;
+   - the certificate verifier changes only the time a chain is checked at
+     (before SNTP: the RTC, or the leaf's issue time, never before the
+     build time); chain, names and signatures are webpki's.
+   Minor, left as is: ECDSA keys may also be compressed points and RSA
+   accepts exponent 2 (more lenient than `ring`, reachable only with a
+   CA-signed key); certificate dates are as good as SNTP, which is not
+   authenticated (someone who can intercept DoT can usually also feed
+   the time), a known limit of the design.
+   **Gap closed: rejection was untested.** The handshake tests show that
+   every suite, group and certificate type works against rustls/ring, but
+   a `verify_signature` that accepted anything would have passed all of
+   them (only `unknown_issuer_fails` covered rejection, for ECDSA P-256
+   with SHA-256), and anyone on the path could then impersonate a DoT
+   server with its public certificate. New tests:
+   `every_signature_algorithm_rejects_what_it_must` (each of the 11
+   algorithms: a real signature verifies; another message, a changed
+   signature byte, another key, an empty signature fail; no other
+   algorithm accepts it; signatures from `ring`, the two cross
+   combinations P-256/SHA-384 and P-384/SHA-256 from RustCrypto) and
+   `a_handshake_signed_with_another_key_fails` (a valid certificate, the
+   handshake signed with another key: ECDSA, Ed25519, RSA, TLS 1.3 and
+   1.2, `BadSignature`, nothing sent). Negative control: an Ed25519
+   verifier that accepts anything failed only these two (none of the
+   earlier tests); an ECDSA P-256 one also `unknown_issuer_fails`.
 10. **DONE (2026-11-22): missing fuzz targets.** Six new targets (fuzz/README.md):
     `cli` (line editor + parser: lines ≤ `MAX_LINE`, whole and split feeds
     agree), `config` (TOML/JSON: a parsed config re-parses from its own

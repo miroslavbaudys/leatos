@@ -953,6 +953,7 @@ dependencies = [
  "p256",
  "p384",
  "rcgen",
+ "ring",
  "rsa",
  "rustls",
  "sha2",

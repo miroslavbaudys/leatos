@@ -559,3 +559,156 @@ fn pem_certificates() {
     assert_eq!(certs[0], *p.ca.der());
     assert!(certs_from_pem("-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n").is_err());
 }
+
+// ---- rejection (docs/security-audit.md §5 item 9) -----------------------------
+//
+// The handshake tests above show that what should verify does. These show
+// that what must not, does not: a provider whose `verify_signature`
+// accepted anything would pass every handshake test, and anyone on the path
+// could then impersonate a DoT server with its public certificate alone.
+
+use alloc::boxed::Box;
+use rustls::pki_types::alg_id;
+use rustls::pki_types::{AlgorithmIdentifier, SignatureVerificationAlgorithm};
+
+/// A ring signer for one of the provider's algorithms: (public key as
+/// webpki passes it, sign).
+type Signer = (Vec<u8>, Box<dyn Fn(&[u8]) -> Vec<u8>>);
+
+fn rsa_pkcs8(pem: &str) -> Vec<u8> {
+    KeyPair::from_pem_and_sign_algo(pem, &rcgen::PKCS_RSA_SHA256).unwrap().serialize_der()
+}
+
+/// `n` = 0 or 1: two different keys of the algorithm's type.
+fn signer(alg: &dyn SignatureVerificationAlgorithm, n: usize) -> Signer {
+    use ring::signature::{self as rs, KeyPair as _};
+    let rng = ring::rand::SystemRandom::new();
+    let (pk, sa): (AlgorithmIdentifier, AlgorithmIdentifier) = (alg.public_key_alg_id(), alg.signature_alg_id());
+    let ecdsa = |s: &'static rs::EcdsaSigningAlgorithm| -> Signer {
+        let pkcs8 = rs::EcdsaKeyPair::generate_pkcs8(s, &rng).unwrap();
+        let k = rs::EcdsaKeyPair::from_pkcs8(s, pkcs8.as_ref(), &rng).unwrap();
+        let public = k.public_key().as_ref().to_vec();
+        (public, Box::new(move |m| k.sign(&ring::rand::SystemRandom::new(), m).unwrap().as_ref().to_vec()))
+    };
+    let rsa = |s: &'static dyn rs::RsaEncoding| -> Signer {
+        let pem = [include_str!("testdata/rsa2048.pem"), include_str!("testdata/rsa2048-b.pem")][n];
+        let k = rs::RsaKeyPair::from_pkcs8(&rsa_pkcs8(pem)).unwrap();
+        let public = k.public().as_ref().to_vec();
+        (public, Box::new(move |m| {
+            let mut sig = vec![0; k.public().modulus_len()];
+            k.sign(s, &ring::rand::SystemRandom::new(), m, &mut sig).unwrap();
+            sig
+        }))
+    };
+    // ring has no signing for the cross combinations (a P-256 key with
+    // SHA-384, P-384 with SHA-256): RustCrypto's prehash signing over the
+    // other hash.
+    let scalar = |n: usize, len: usize| -> Vec<u8> { (0..len).map(|i| (i as u8).wrapping_mul(7).wrapping_add(n as u8 + 1)).collect() };
+    match (pk, sa) {
+        (p, s) if p == alg_id::ECDSA_P256 && s == alg_id::ECDSA_SHA256 => ecdsa(&rs::ECDSA_P256_SHA256_ASN1_SIGNING),
+        (p, s) if p == alg_id::ECDSA_P384 && s == alg_id::ECDSA_SHA384 => ecdsa(&rs::ECDSA_P384_SHA384_ASN1_SIGNING),
+        (p, s) if p == alg_id::ECDSA_P256 && s == alg_id::ECDSA_SHA384 => {
+            use ecdsa::signature::hazmat::PrehashSigner;
+            use sha2::Digest as _;
+            let k = p256::ecdsa::SigningKey::from_slice(&scalar(n, 32)).unwrap();
+            let public = k.verifying_key().to_sec1_point(false).as_bytes().to_vec();
+            (public, Box::new(move |m| {
+                let s: p256::ecdsa::Signature = k.sign_prehash(&sha2::Sha384::digest(m)).unwrap();
+                s.to_der().as_bytes().to_vec()
+            }))
+        }
+        (p, s) if p == alg_id::ECDSA_P384 && s == alg_id::ECDSA_SHA256 => {
+            use ecdsa::signature::hazmat::PrehashSigner;
+            use sha2::Digest as _;
+            let k = p384::ecdsa::SigningKey::from_slice(&scalar(n, 48)).unwrap();
+            let public = k.verifying_key().to_sec1_point(false).as_bytes().to_vec();
+            (public, Box::new(move |m| {
+                let s: p384::ecdsa::Signature = k.sign_prehash(&sha2::Sha256::digest(m)).unwrap();
+                s.to_der().as_bytes().to_vec()
+            }))
+        }
+        (p, _) if p == alg_id::ED25519 => {
+            let pkcs8 = rs::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+            let k = rs::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+            let public = k.public_key().as_ref().to_vec();
+            (public, Box::new(move |m| k.sign(m).as_ref().to_vec()))
+        }
+        (_, s) if s == alg_id::RSA_PKCS1_SHA256 => rsa(&rs::RSA_PKCS1_SHA256),
+        (_, s) if s == alg_id::RSA_PKCS1_SHA384 => rsa(&rs::RSA_PKCS1_SHA384),
+        (_, s) if s == alg_id::RSA_PKCS1_SHA512 => rsa(&rs::RSA_PKCS1_SHA512),
+        (_, s) if s == alg_id::RSA_PSS_SHA256 => rsa(&rs::RSA_PSS_SHA256),
+        (_, s) if s == alg_id::RSA_PSS_SHA384 => rsa(&rs::RSA_PSS_SHA384),
+        (_, s) if s == alg_id::RSA_PSS_SHA512 => rsa(&rs::RSA_PSS_SHA512),
+        _ => panic!("no test signer for {alg:?}"),
+    }
+}
+
+#[test]
+fn every_signature_algorithm_rejects_what_it_must() {
+    let p = provider::provider(&RNG);
+    let all = p.signature_verification_algorithms.all;
+    assert_eq!(all.len(), 11, "a new algorithm needs a signer here");
+    let msg = b"the transcript hash the server signs";
+    for (i, alg) in all.iter().enumerate() {
+        let (public, sign) = signer(*alg, 0);
+        let sig = sign(msg);
+        assert!(alg.verify_signature(&public, msg, &sig).is_ok(), "{alg:?}: a real signature");
+        // Another message, any changed byte of the signature, another key.
+        assert!(alg.verify_signature(&public, b"another message", &sig).is_err(), "{alg:?}: other message");
+        for at in [0, sig.len() / 2, sig.len() - 1] {
+            let mut bad = sig.clone();
+            bad[at] ^= 1;
+            assert!(alg.verify_signature(&public, msg, &bad).is_err(), "{alg:?}: signature byte {at} changed");
+        }
+        let (other, _) = signer(*alg, 1);
+        assert!(alg.verify_signature(&other, msg, &sig).is_err(), "{alg:?}: another key");
+        assert!(alg.verify_signature(&public, msg, &[]).is_err(), "{alg:?}: empty signature");
+        // Only the algorithm that made it accepts it: no hash, padding or
+        // curve confusion between them.
+        for (j, them) in all.iter().enumerate() {
+            if i != j {
+                assert!(them.verify_signature(&public, msg, &sig).is_err(), "{alg:?} signature accepted by {them:?}");
+            }
+        }
+    }
+}
+
+/// A server that sends a valid certificate but signs the handshake with
+/// another key: what someone with only the public certificate could do.
+#[derive(Debug)]
+struct WrongKey(Arc<rustls::sign::CertifiedKey>);
+
+impl rustls::server::ResolvesServerCert for WrongKey {
+    fn resolve(&self, _: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.0.clone())
+    }
+}
+
+#[test]
+fn a_handshake_signed_with_another_key_fails() {
+    for alg in [&rcgen::PKCS_ECDSA_P256_SHA256, &rcgen::PKCS_ED25519, &rcgen::PKCS_RSA_SHA256] {
+        let p = pki(&rcgen::PKCS_ECDSA_P256_SHA256);
+        let cfg = client_config(&p, Some(NOW), 0);
+        let genuine = valid_leaf(&p, alg);
+        let impostor = if alg == &rcgen::PKCS_RSA_SHA256 {
+            PrivateKeyDer::try_from(rsa_pkcs8(include_str!("testdata/rsa2048-b.pem"))).unwrap()
+        } else {
+            PrivateKeyDer::try_from(KeyPair::generate_for(alg).unwrap().serialize_der()).unwrap()
+        };
+        let key = rustls::crypto::ring::sign::any_supported_type(&impostor).unwrap();
+        let certified = Arc::new(rustls::sign::CertifiedKey::new(genuine.chain.clone(), key));
+        for versions in [V13, V12] {
+            let server = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(versions)
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(WrongKey(certified.clone())));
+            let (mut c, mut s) = connect(&cfg, "dns.test", Arc::new(server));
+            c.send(&query(1));
+            pump(&mut c, &mut s);
+            assert_eq!(cert_error(&c), CertificateError::BadSignature, "{alg:?} {versions:?}");
+            assert!(!c.usable());
+            assert!(c.pop_response().is_none(), "nothing reaches an impostor");
+        }
+    }
+}
