@@ -537,6 +537,8 @@ if [ -n "$want" ] && [ "$want" != 0 ]; then
   $bb wget -q -T 30 -O /tmp/5mb "http://$ISP/5mb"
   t1=$(now_ms)
   wait
+  # The download queue's delay counters after it (the pings ran only then).
+  dl1=$($bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null)
   got=$($bb wc -c </tmp/5mb 2>/dev/null || echo 0); $bb rm -f /tmp/5mb
   kbit=$(( 5242880 * 8 / (t1 - t0) ))
   if [ "$got" != 5242880 ]; then fail "shaper down: got $got of 5242880 bytes"
@@ -574,12 +576,37 @@ if [ -n "$want" ] && [ "$want" != 0 ]; then
     [ -n "$a" ] && [ -n "$b" ] && load="$load $t=$((b - a))"
   done
   [ "$ackmode" = 1 ] || echo "LAB CPU load:$load"
-  # The ISP's ping replies wait in the WAN ingress stage (download shaper)
-  # with the download. With flow isolation (CAKE, FQ-CoDel) they skip the
-  # download's queue: avg ~1 ms. One CoDel queue (router arg qdisc=codel,
-  # the negative control) gives ~8 ms.
-  avg=$($bb awk -F'/' '/min\/avg\/max/{print int($4)}' /tmp/ping-load)
-  if [ -n "$avg" ] && [ "$avg" -lt 3 ]; then pass "latency under shaped load: avg ${avg} ms ($($bb grep -o 'min/avg/max = [^ ]*' /tmp/ping-load))"; else fail "latency under shaped load: avg '${avg}' ms"; $bb tail -2 /tmp/ping-load | $bb sed 's/^/    | /'; fi
+  # The ISP's ping replies wait in the download's queue (the WAN ingress
+  # stage; lan0 egress with shape_ingress=0) with the download. With flow
+  # isolation (CAKE, FQ-CoDel) they are a sparse flow and skip it. The
+  # router's own count of the time packets waited there (/api/status
+  # `delay`, over the download) decides, not the ping's round trip: that
+  # one also holds the VMs' wake-up and, on x86_64 (TCG), the emulated
+  # router's CPU time, which say nothing about the queue. Pass: the pings
+  # waited under 1 ms on average and under a quarter of the download's
+  # packets; invalid if the download built no queue (under 2 ms) or the
+  # pings did not pass it. Negative control: router arg qdisc=codel (one
+  # queue: the pings wait as long as the download).
+  qdelay() { # status-json -> "pkts us echo_pkts echo_us" of the download queue
+    d=$(echo "$1" | $bb sed -n 's/.*"ingress":{[^}]*"delay":{\([^}]*\)}.*/\1/p')
+    [ -n "$d" ] || d=$(echo "$1" | $bb sed -n 's/.*"name":"lan0"[^]]*\][^{]*{[^}]*"delay":{\([^}]*\)}.*/\1/p')
+    for k in pkts us echo_pkts echo_us; do echo "$d" | $bb grep -o "\"$k\":[0-9]*" | $bb cut -d: -f2; done | $bb tr '\n' ' '
+  }
+  set -- $(qdelay "$cpu0") $(qdelay "$dl1")
+  rtt=$($bb grep -o 'min/avg/max = [^ ]*' /tmp/ping-load)
+  if [ $# != 8 ]; then
+    fail "latency under shaped load: no queue delay counters in /api/status (ping $rtt)"
+  else
+    pk=$(($5 - $1)); us=$(($6 - $2)); epk=$(($7 - $3)); eus=$(($8 - $4))
+    bpk=$((pk - epk)); [ "$bpk" -gt 0 ] || bpk=1
+    [ "$epk" -gt 0 ] && eavg=$((eus / epk)) || eavg=0
+    bavg=$(( (us - eus) / bpk ))
+    what="pings waited avg ${eavg} us over $epk, the download's packets ${bavg} us over $((pk - epk)) (ping $rtt)"
+    if [ "$epk" -lt 20 ]; then fail "latency under shaped load: INVALID, only $epk pings passed the queue ($what)"
+    elif [ "$bavg" -lt 2000 ]; then fail "latency under shaped load: INVALID, the download built no queue ($what)"
+    elif [ "$eavg" -lt 1000 ] && [ $((eavg * 4)) -lt "$bavg" ]; then pass "latency under shaped load: $what"
+    else fail "latency under shaped load: $what"; fi
+  fi
   # A UDP burst far above the upload rate (2.5 MB to the ISP's discard
   # port as fast as this VM sends): the WAN queue fills to its limit, so
   # scripts/lab-test.sh can check that a full queue's delay follows the

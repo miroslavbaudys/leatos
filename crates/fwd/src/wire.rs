@@ -847,6 +847,38 @@ pub fn build_arp_request(
     len
 }
 
+/// An ICMP or ICMPv6 echo request or reply (ping) in an Ethernet frame,
+/// with or without one 802.1Q tag: the sparse flow whose queue delay the
+/// qdisc statistics keep apart (`net::device::Delay`). IPv6 only without
+/// extension headers.
+pub fn is_echo(frame: &[u8]) -> bool {
+    let (mut t, mut ip) = match ethertype(frame) {
+        Some(t) => (t, ETH_HDR),
+        None => return false,
+    };
+    if t == ETHERTYPE_VLAN {
+        if frame.len() < ETH_HDR + 4 {
+            return false;
+        }
+        (t, ip) = (get16(frame, ETH_HDR + 2), ETH_HDR + 4);
+    }
+    match t {
+        ETHERTYPE_IPV4 => {
+            let Some(&vihl) = frame.get(ip) else { return false };
+            let l4 = ip + ((vihl & 0x0f) as usize) * 4;
+            vihl >> 4 == 4
+                && frame.get(ip + 9) == Some(&PROTO_ICMP)
+                && frame.get(l4).is_some_and(|&ty| ty == ICMP_ECHO_REQUEST || ty == ICMP_ECHO_REPLY)
+        }
+        ETHERTYPE_IPV6 => {
+            frame.get(ip).is_some_and(|v| v >> 4 == 6)
+                && frame.get(ip + 6) == Some(&PROTO_ICMPV6)
+                && frame.get(ip + 40).is_some_and(|&ty| ty == ICMPV6_ECHO_REQUEST || ty == ICMPV6_ECHO_REPLY)
+        }
+        _ => false,
+    }
+}
+
 /// Bytes of an ARP neighbor hint ([`ipv4_neighbor_hint`]).
 pub const ARP_HINT_LEN: usize = ETH_HDR + 28;
 
@@ -1145,6 +1177,26 @@ mod tests {
         for g in [&ns[..], &m[..], &f[..50]] {
             assert_eq!(ipv6_neighbor_hint(g, &mut out), None);
         }
+    }
+
+    #[test]
+    fn echo_frames_are_recognised() {
+        let (c, r) = (Ipv4Addr::new(192, 168, 1, 100), Ipv4Addr::new(203, 0, 113, 1));
+        let req = test_util::ipv4_frame(c, r, PROTO_ICMP, 64, &[ICMP_ECHO_REQUEST, 0, 0, 0, 0, 1, 0, 1]);
+        let rep = test_util::ipv4_frame(r, c, PROTO_ICMP, 64, &[ICMP_ECHO_REPLY, 0, 0, 0, 0, 1, 0, 1]);
+        let unreach = test_util::ipv4_frame(r, c, PROTO_ICMP, 64, &[3, 3, 0, 0, 0, 0, 0, 0]);
+        let udp = test_util::ipv4_frame(c, r, PROTO_UDP, 64, &[0; 8]);
+        assert!(is_echo(&req) && is_echo(&rep));
+        assert!(!is_echo(&unreach) && !is_echo(&udp) && !is_echo(&req[..ETH_HDR + 20]));
+        // Tagged (a VLAN network's frame in the port queue).
+        let mut tagged = req[..12].to_vec();
+        tagged.extend_from_slice(&[0x81, 0x00, 0x00, 20]);
+        tagged.extend_from_slice(&req[12..]);
+        assert!(is_echo(&tagged));
+        let a: Ipv6Addr = "fd00::1".parse().unwrap();
+        let b: Ipv6Addr = "fd00::2".parse().unwrap();
+        assert!(is_echo(&v6_frame(RMAC, CMAC, a, b, PROTO_ICMPV6, &[ICMPV6_ECHO_REPLY, 0, 0, 0, 0, 1, 0, 1])));
+        assert!(!is_echo(&v6_frame(RMAC, CMAC, a, b, PROTO_ICMPV6, &[135, 0, 0, 0, 0, 0, 0, 0])));
     }
 
     #[test]

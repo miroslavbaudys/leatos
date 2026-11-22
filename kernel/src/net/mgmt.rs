@@ -1217,10 +1217,11 @@ fn status_json(
     for (n, nif) in sh.ports.iter().enumerate() {
         let snap = *nif.snap.lock();
         let st = snap.stats;
-        let (q, rate, limit, ack_drops, (aqm_drops, blue_drops, overflow_drops)) = {
+        let (q, rate, limit, ack_drops, (aqm_drops, blue_drops, overflow_drops), delay) = {
             let q = nif.qdisc.lock();
-            (q.stats(), q.rate(), q.inner().limit_bytes(), q.inner().ack_drops(), q.inner().drop_split())
+            (q.stats(), q.rate(), q.inner().limit_bytes(), q.inner().ack_drops(), q.inner().drop_split(), q.inner().delay)
         };
+        let delay = delay.json();
         let link = match snap.link {
             Some((up, mbps, full)) => {
                 format!("{{\"up\":{up},\"mbps\":{mbps},\"full_duplex\":{full}}}")
@@ -1245,7 +1246,7 @@ fn status_json(
             s,
             "{}{{\"name\":{},\"model\":{},\"mac\":{},\"vlan\":{vlan},\"link\":{link},\"addrs\":[{}],\
              \"rx_packets\":{},\"rx_bytes\":{},\"rx_no_buf\":{},\"tx_packets\":{},\"tx_bytes\":{},\
-             \"qdisc\":{{\"shaped_kbit\":{rate},\"limit_bytes\":{limit},\"ack_drops\":{ack_drops},\"sent\":{},\"dropped\":{},\"aqm_drops\":{aqm_drops},\"blue_drops\":{blue_drops},\"overflow_drops\":{overflow_drops},\"ecn_marked\":{},\"backlog_packets\":{}}}}}",
+             \"qdisc\":{{\"shaped_kbit\":{rate},\"limit_bytes\":{limit},\"ack_drops\":{ack_drops},\"sent\":{},\"dropped\":{},\"aqm_drops\":{aqm_drops},\"blue_drops\":{blue_drops},\"overflow_drops\":{overflow_drops},\"ecn_marked\":{},\"backlog_packets\":{},\"delay\":{delay}}}}}",
             if n > 0 { "," } else { "" },
             json_str(nif.name),
             json_str(nif.model),
@@ -1266,10 +1267,10 @@ fn status_json(
     // `shape_ingress=0`, where lan0 egress shapes it).
     s.push_str("],\"ingress\":");
     {
-        let (on, q, rate, charged, limit, (aqm_drops, blue_drops, overflow_drops)) = {
+        let (on, q, rate, charged, limit, (aqm_drops, blue_drops, overflow_drops), delay) = {
             let q = sh.ingress.lock();
             let split = q.inner().drop_split();
-            (crate::config::qos().ingress, q.stats(), q.rate(), q.charged_bytes, q.inner().limit_bytes(), split)
+            (crate::config::qos().ingress, q.stats(), q.rate(), q.charged_bytes, q.inner().limit_bytes(), split, q.inner().delay)
         };
         if on {
             let rate = rate
@@ -1277,8 +1278,8 @@ fn status_json(
                 .unwrap_or_else(|| String::from("null"));
             let _ = write!(
                 s,
-                "{{\"shaped_kbit\":{rate},\"limit_bytes\":{limit},\"sent\":{},\"dropped\":{},\"aqm_drops\":{aqm_drops},\"blue_drops\":{blue_drops},\"overflow_drops\":{overflow_drops},\"ecn_marked\":{},\"backlog_packets\":{},\"charged_bytes\":{charged}}}",
-                q.dequeued, q.dropped, q.marked, q.backlog_packets
+                "{{\"shaped_kbit\":{rate},\"limit_bytes\":{limit},\"sent\":{},\"dropped\":{},\"aqm_drops\":{aqm_drops},\"blue_drops\":{blue_drops},\"overflow_drops\":{overflow_drops},\"ecn_marked\":{},\"backlog_packets\":{},\"charged_bytes\":{charged},\"delay\":{}}}",
+                q.dequeued, q.dropped, q.marked, q.backlog_packets, delay.json()
             );
         } else {
             s.push_str("null");

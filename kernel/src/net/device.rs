@@ -43,11 +43,40 @@ pub fn tx_drops() -> u64 {
 /// Egress on every port: optional rate shaper around the AQM.
 pub type PortQdisc = Shaper<Aqm>;
 
-/// The egress AQM, chosen by boot argument (`qdisc=`) for A/B tests.
-pub enum Aqm {
+/// The egress AQM, chosen by boot argument (`qdisc=`) for A/B tests, and
+/// the time its packets waited.
+pub struct Aqm {
+    q: AqmQ,
+    pub delay: Delay,
+}
+
+enum AqmQ {
     Cake(Cake<PacketBuf>),
     /// FQ-CoDel; with one flow queue it is plain CoDel.
     FqCodel(FqCodel<PacketBuf>),
+}
+
+/// Time packets waited in a queue (shaping included), summed since boot:
+/// all of them, and pings (ICMP / ICMPv6 echo, `fwd::wire::is_echo`)
+/// apart. A ping next to a download is a sparse flow, so with flow
+/// isolation it waits far less than the download's packets; the
+/// difference over a load phase is the lab's latency-under-load check,
+/// independent of how fast the machine is (`/api/status` `delay`).
+#[derive(Clone, Copy, Default)]
+pub struct Delay {
+    pub pkts: u64,
+    pub us: u64,
+    pub echo_pkts: u64,
+    pub echo_us: u64,
+}
+
+impl Delay {
+    pub fn json(&self) -> String {
+        format!(
+            "{{\"pkts\":{},\"us\":{},\"echo_pkts\":{},\"echo_us\":{}}}",
+            self.pkts, self.us, self.echo_pkts, self.echo_us
+        )
+    }
 }
 
 impl Aqm {
@@ -59,26 +88,27 @@ impl Aqm {
             ecn,
             ..Default::default()
         };
-        match qos.aqm {
-            AqmKind::Cake => Self::Cake(Cake::new(CakeParams {
+        let q = match qos.aqm {
+            AqmKind::Cake => AqmQ::Cake(Cake::new(CakeParams {
                 codel,
                 isolation: qos.isolation,
                 seed,
                 ack_filter,
                 ..Default::default()
             })),
-            AqmKind::FqCodel | AqmKind::Codel => Self::FqCodel(FqCodel::new(FqParams {
+            AqmKind::FqCodel | AqmKind::Codel => AqmQ::FqCodel(FqCodel::new(FqParams {
                 codel,
                 flows: if qos.aqm == AqmKind::Codel { 1 } else { 1024 },
                 ..Default::default()
             })),
-        }
+        };
+        Self { q, delay: Delay::default() }
     }
 
     /// For the boot log, e.g. "CAKE (Triple, 1024 flows, 8-way, COBALT) + ECN".
     pub fn describe(&self, ecn: bool) -> String {
-        let kind = match self {
-            Self::Cake(c) => {
+        let kind = match &self.q {
+            AqmQ::Cake(c) => {
                 let p = c.params();
                 format!(
                     "CAKE ({:?}, {} flows, {}-way, COBALT{})",
@@ -88,40 +118,40 @@ impl Aqm {
                     if p.ack_filter { ", ACK filter" } else { "" }
                 )
             }
-            Self::FqCodel(f) if f.flows() == 1 => String::from("CoDel (single queue)"),
-            Self::FqCodel(f) => format!("FQ-CoDel ({} flows)", f.flows()),
+            AqmQ::FqCodel(f) if f.flows() == 1 => String::from("CoDel (single queue)"),
+            AqmQ::FqCodel(f) => format!("FQ-CoDel ({} flows)", f.flows()),
         };
         format!("{kind}{}", if ecn { " + ECN" } else { " (drop only)" })
     }
 
     /// The shared byte limit over all flows.
     pub fn limit_bytes(&self) -> usize {
-        match self {
-            Self::Cake(c) => c.params().codel.limit_bytes,
-            Self::FqCodel(f) => f.limit_bytes(),
+        match &self.q {
+            AqmQ::Cake(c) => c.params().codel.limit_bytes,
+            AqmQ::FqCodel(f) => f.limit_bytes(),
         }
     }
 
     /// Switch the ACK filter in place (live shaping change, queue kept).
     pub fn set_ack_filter(&mut self, on: bool) {
-        if let Self::Cake(c) = self {
+        if let AqmQ::Cake(c) = &mut self.q {
             c.set_ack_filter(on);
         }
     }
 
     /// Redundant ACKs the ACK filter dropped (part of `stats().dropped`).
     pub fn ack_drops(&self) -> u64 {
-        match self {
-            Self::Cake(c) => c.ack_drops,
-            Self::FqCodel(_) => 0,
+        match &self.q {
+            AqmQ::Cake(c) => c.ack_drops,
+            AqmQ::FqCodel(_) => 0,
         }
     }
 
     /// BLUE's drops (CAKE only; part of the AQM drops).
     pub fn blue_drops(&self) -> u64 {
-        match self {
-            Self::Cake(c) => c.blue_drops,
-            Self::FqCodel(_) => 0,
+        match &self.q {
+            AqmQ::Cake(c) => c.blue_drops,
+            AqmQ::FqCodel(_) => 0,
         }
     }
 
@@ -135,23 +165,23 @@ impl Aqm {
 
     /// Change the byte limit in place (live shaping change, queue kept).
     pub fn set_limit_bytes(&mut self, bytes: usize) {
-        match self {
-            Self::Cake(c) => c.set_limit_bytes(bytes),
-            Self::FqCodel(f) => f.set_limit_bytes(bytes),
+        match &mut self.q {
+            AqmQ::Cake(c) => c.set_limit_bytes(bytes),
+            AqmQ::FqCodel(f) => f.set_limit_bytes(bytes),
         }
     }
 
     pub fn take_max_sojourn_ns(&mut self) -> u64 {
-        match self {
-            Self::Cake(c) => c.take_max_sojourn_ns(),
-            Self::FqCodel(f) => f.take_max_sojourn_ns(),
+        match &mut self.q {
+            AqmQ::Cake(c) => c.take_max_sojourn_ns(),
+            AqmQ::FqCodel(f) => f.take_max_sojourn_ns(),
         }
     }
 
     /// AQM-specific part of the periodic stats line.
     pub fn diag(&self) -> String {
-        match self {
-            Self::Cake(c) => {
+        match &self.q {
+            AqmQ::Cake(c) => {
                 let (n, o) = c.active_flows();
                 let (sh, dh) = c.active_hosts();
                 format!(
@@ -159,7 +189,7 @@ impl Aqm {
                     c.new_flow_count, c.way_collisions, c.blue_drops, c.ack_drops
                 )
             }
-            Self::FqCodel(f) => {
+            AqmQ::FqCodel(f) => {
                 let (n, o) = f.active_flows();
                 format!(
                     "flows {n} new + {o} old (activations {}), ",
@@ -172,27 +202,43 @@ impl Aqm {
 
 impl Qdisc<PacketBuf> for Aqm {
     fn enqueue(&mut self, p: PacketBuf, now_ns: u64) -> Result<(), PacketBuf> {
-        match self {
-            Self::Cake(c) => c.enqueue(p, now_ns),
-            Self::FqCodel(f) => f.enqueue(p, now_ns),
+        match &mut self.q {
+            AqmQ::Cake(c) => c.enqueue(p, now_ns),
+            AqmQ::FqCodel(f) => f.enqueue(p, now_ns),
         }
     }
     fn dequeue(&mut self, now_ns: u64) -> Dequeue<PacketBuf> {
-        match self {
-            Self::Cake(c) => c.dequeue(now_ns),
-            Self::FqCodel(f) => f.dequeue(now_ns),
+        let (d, soj_ns) = match &mut self.q {
+            AqmQ::Cake(c) => {
+                let d = c.dequeue(now_ns);
+                (d, c.last_sojourn_ns())
+            }
+            AqmQ::FqCodel(f) => {
+                let d = f.dequeue(now_ns);
+                (d, f.last_sojourn_ns())
+            }
+        };
+        if let Dequeue::Packet(p) = &d {
+            let us = soj_ns / 1000;
+            self.delay.pkts += 1;
+            self.delay.us += us;
+            if fwd::wire::is_echo(p.data()) {
+                self.delay.echo_pkts += 1;
+                self.delay.echo_us += us;
+            }
         }
+        d
     }
     fn has_room(&self) -> bool {
-        match self {
-            Self::Cake(c) => c.has_room(),
-            Self::FqCodel(f) => f.has_room(),
+        match &self.q {
+            AqmQ::Cake(c) => c.has_room(),
+            AqmQ::FqCodel(f) => f.has_room(),
         }
     }
     fn stats(&self) -> Stats {
-        match self {
-            Self::Cake(c) => c.stats(),
-            Self::FqCodel(f) => f.stats(),
+        match &self.q {
+            AqmQ::Cake(c) => c.stats(),
+            AqmQ::FqCodel(f) => f.stats(),
         }
     }
 }
