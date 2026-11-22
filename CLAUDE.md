@@ -45,7 +45,7 @@ Keep them current when you change what they describe; keep this file to the map 
 - `docs/`: design and reference. Start with architecture.md and roadmap.md;
   **boot-arguments.md** (every kernel option), **lab-tests.md** (every test and its negative
   controls), safety-and-portability, smp, config-and-storage, config-v2, upgrades, ipv6,
-  security-audit, …
+  security-audit, lan-neighbors (plan: LAN links on `Medium::Ip`, one neighbor table), …
 
 ## Rules
 
