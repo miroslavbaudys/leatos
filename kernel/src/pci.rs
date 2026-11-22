@@ -9,8 +9,9 @@
 //! (`mm::mmu::map_device`): on PCs, firmware may put BARs anywhere in the
 //! PCI hole.
 //!
-//! **MSI-X** ([`Pci::enable_msix`]): one table entry per device, pointing
-//! at a local-APIC vector (`arch::irqchip`). Used where legacy INTx routing
+//! **MSI-X** ([`Pci::enable_msix`]): a table entry per interrupt source
+//! (entry 0; igb also entry 1 for TX), each pointing at a local-APIC vector
+//! (`arch::irqchip`). Used where legacy INTx routing
 //! would need ACPI AML (`_PRT`): x86_64.
 //!
 //! With `-kernel` on QEMU aarch64 no firmware assigns BARs, so we size every
@@ -128,21 +129,24 @@ impl Pci {
             .map(|c| c.offset)
     }
 
-    /// Route the device's MSI-X entry 0 to `vector` (masked until
-    /// `arch::irqchip::enable`) and switch the function from INTx to MSI-X.
-    /// `None` if the device or the platform lacks MSI-X.
-    /// `core`: the core the interrupt is delivered to.
-    pub fn enable_msix(&mut self, dev: &PciDevice, vector: u32, core: usize) -> Option<()> {
+    /// Route the device's MSI-X table entry `entry` to `vector` (masked
+    /// until `arch::irqchip::enable`) and switch the function from INTx to
+    /// MSI-X. `None` if the device or the platform lacks MSI-X, or the
+    /// table has no such entry. `core`: the core the interrupt is delivered to.
+    pub fn enable_msix(&mut self, dev: &PciDevice, entry: u16, vector: u32, core: usize) -> Option<()> {
         let (addr, data) = arch::irqchip::msi_message(vector, core)?;
         let cap = self.capability(dev.df, CAP_MSIX)?;
         let header = self.cfg.read_word(dev.df, cap);
+        if entry > (header >> 16) as u16 & 0x7ff {
+            return None; // the field is the table size - 1
+        }
         let table = self.cfg.read_word(dev.df, cap + 4);
         let bar = dev.bars.get((table & 7) as usize).copied().flatten()?;
-        let entry_addr = bar.addr + (table & !7) as u64;
+        let entry_addr = bar.addr + (table & !7) as u64 + 16 * entry as u64;
         if entry_addr + 16 > bar.addr + bar.size {
             return None;
         }
-        // SAFETY: MSI-X table entry 0 inside a memory BAR that init()
+        // SAFETY: MSI-X table entry `entry` inside a memory BAR that init()
         // mapped as device memory; nothing else accesses the MSI-X table.
         let mut entry = unsafe { Region::new(entry_addr as usize, 16) };
         entry.write32(12, 1); // vector control: masked

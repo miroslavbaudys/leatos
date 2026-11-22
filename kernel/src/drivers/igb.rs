@@ -28,6 +28,13 @@
 //! `EICR` bit, so the IRQ action only signals, no `ICR` read is needed (a
 //! non-posted PCIe read), and [`Igb::unmask_irq`] re-arms it with one
 //! posted `EIMS` write; a cause that came in meanwhile fires at once.
+//!
+//! MSI-X with a TX vector ([`Igb::enable_irq`] `tx_vector`): TX queue 0
+//! maps to vector 1 instead, delivered to the core that transmits on the
+//! port (the other datapath direction), and it is armed only while that
+//! side waits for room ([`Igb::arm_tx_irq`]: qdisc backlog, ring or byte
+//! limit full). Otherwise completions are reaped on the next flush, and
+//! no transmitted packet raises an interrupt.
 
 use crate::drivers::Stats;
 use crate::mm::dma::{self, DmaRegion};
@@ -64,7 +71,9 @@ const EIMS: usize = 0x1524;
 const EIMC: usize = 0x1528;
 const EIAC: usize = 0x152c;
 const EIAM: usize = 0x1530;
+const EICR: usize = 0x1580;
 const EITR0: usize = 0x1680;
+const EITR1: usize = 0x1684;
 const IVAR0: usize = 0x1700;
 const RLPML: usize = 0x5004;
 const RAL0: usize = 0x5400;
@@ -116,6 +125,9 @@ const GPIE_MSIX_MODE: u32 = 1 << 4;
 const GPIE_EIAME: u32 = 1 << 30;
 const GPIE_PBA: u32 = 1 << 31;
 const IVAR_VALID: u32 = 0x80;
+/// Extended interrupt bits: vector 0 = RX (and TX without a TX vector), 1 = TX.
+const EI_RX: u32 = 1 << 0;
+const EI_TX: u32 = 1 << 1;
 const ICR_TXDW: u32 = 1 << 0;
 const ICR_LSC: u32 = 1 << 2;
 const ICR_RXDMT0: u32 = 1 << 4;
@@ -191,6 +203,8 @@ pub struct Igb {
     link_reported: Option<(bool, u32, bool)>,
     /// MSI-X mode ([`Self::enable_irq`]): the device masks itself.
     msix: bool,
+    /// TX completions on their own MSI-X vector (1), armed on demand.
+    tx_vector: bool,
     pub model: &'static str,
     pub stats: Stats,
 }
@@ -230,6 +244,7 @@ impl Igb {
             mac: [0; 6],
             link_reported: None,
             msix: false,
+            tx_vector: false,
             model,
             stats: Stats::default(),
         };
@@ -367,17 +382,25 @@ impl Igb {
 
     /// Route queue 0 to interrupt vector 0 and unmask it: MSI-X mode when
     /// `msix` (the PCI MSI-X capability is already enabled), else INTx.
-    pub fn enable_irq(&mut self, msix: bool) {
+    /// `tx_vector` (MSI-X only, table entry 1 routed): TX queue 0 on vector
+    /// 1, left masked until [`Self::arm_tx_irq`].
+    pub fn enable_irq(&mut self, msix: bool, tx_vector: bool) {
+        let tx_vector = msix && tx_vector;
         self.regs.write32(EITR0, 0);
-        // IVAR0: byte 0 = RX queue 0, byte 1 = TX queue 0 → vector 0.
-        self.regs.write32(IVAR0, IVAR_VALID | IVAR_VALID << 8);
+        self.regs.write32(EITR1, 0);
+        // IVAR0: byte 0 = RX queue 0 → vector 0, byte 1 = TX queue 0 →
+        // vector 0, or 1 with a TX vector.
+        self.regs
+            .write32(IVAR0, IVAR_VALID | (IVAR_VALID | tx_vector as u32) << 8);
         self.msix = msix;
+        self.tx_vector = tx_vector;
         if msix {
+            let vectors = if tx_vector { EI_RX | EI_TX } else { EI_RX };
             self.regs
                 .write32(GPIE, GPIE_NSICR | GPIE_MSIX_MODE | GPIE_EIAME | GPIE_PBA);
-            self.regs.write32(EIAC, 1); // auto-clear EICR bit 0 on the message
-            self.regs.write32(EIAM, 1); // and auto-mask it (EIMS bit 0)
-            self.regs.write32(EIMS, 1);
+            self.regs.write32(EIAC, vectors); // auto-clear the EICR bit on the message
+            self.regs.write32(EIAM, vectors); // and auto-mask it (EIMS)
+            self.regs.write32(EIMS, EI_RX);
         } else {
             self.regs.write32(GPIE, GPIE_NSICR);
             self.regs
@@ -419,7 +442,29 @@ impl Igb {
 
     /// MSI-X: the device masked vector 0 when it fired (`EIAM`); re-arm it.
     pub fn unmask_irq(&mut self) {
-        self.regs.write32(EIMS, 1);
+        self.regs.write32(EIMS, EI_RX);
+    }
+
+    /// The TX side is blocked (ring or byte limit full, packets waiting):
+    /// arm the TX vector so the next completion wakes it. `false` = not
+    /// armed: no TX vector, or reaping freed room (transmit again).
+    ///
+    /// A completion while the vector was masked left its `EICR` bit set and
+    /// would fire at once on arming, so clear it first and flush that
+    /// (posted) write with a read, then reap: a completion after the reap
+    /// sets the bit again and fires when `EIMS` is written.
+    pub fn arm_tx_irq(&mut self) -> bool {
+        if !self.tx_vector {
+            return false;
+        }
+        self.regs.write32(EICR, EI_TX);
+        let _ = self.regs.read32(STATUS);
+        self.reap_tx();
+        if self.can_transmit() {
+            return false;
+        }
+        self.regs.write32(EIMS, EI_TX);
+        true
     }
 
     /// The device masks its own interrupt (MSI-X with `EIAM`) and is

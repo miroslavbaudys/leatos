@@ -298,6 +298,9 @@ pub struct FlushResult {
     pub shaper_wake_ns: Option<u64>,
     /// A qdisc has packets but the NIC ring is full (wait for TX completion).
     pub ring_full_backlog: bool,
+    /// ... and the NIC's TX completion interrupt is armed to say when
+    /// (`Nic::arm_tx_irq`), so no polling is needed.
+    pub tx_armed: bool,
 }
 
 /// Print per-port qdisc statistics every this many ms (only if there was traffic).
@@ -1293,28 +1296,41 @@ pub fn flush_port(port: &PortShared, dev: &mut Nic) -> FlushResult {
     let pppoe = port.is_pppoe();
     let session = port.pppoe_session();
     let mut qdisc = port.qdisc.lock();
-    while dev.can_transmit() {
-        match qdisc.dequeue(now) {
-            Dequeue::Packet(mut p) => {
-                if pppoe && !pppoe_tx(&mut p, session, port.mac) {
-                    PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
-                    continue;
+    loop {
+        while dev.can_transmit() {
+            match qdisc.dequeue(now) {
+                Dequeue::Packet(mut p) => {
+                    if pppoe && !pppoe_tx(&mut p, session, port.mac) {
+                        PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    if let Some(tci) = tag {
+                        p.push_vlan(tci);
+                    }
+                    if dev.transmit(p).is_err() {
+                        DROPPED.fetch_add(1, Ordering::Relaxed);
+                        TX_FAILED.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-                if let Some(tci) = tag {
-                    p.push_vlan(tci);
+                Dequeue::WaitUntil(t) => {
+                    r.shaper_wake_ns = Some(t);
+                    return r;
                 }
-                if dev.transmit(p).is_err() {
-                    DROPPED.fetch_add(1, Ordering::Relaxed);
-                    TX_FAILED.fetch_add(1, Ordering::Relaxed);
-                }
+                Dequeue::Empty => break,
             }
-            Dequeue::WaitUntil(t) => {
-                r.shaper_wake_ns = Some(t);
-                return r;
-            }
-            Dequeue::Empty => break,
+        }
+        r.ring_full_backlog = qdisc.stats().backlog_packets > 0;
+        if !r.ring_full_backlog || dev.can_transmit() {
+            return r;
+        }
+        // Blocked on the NIC: arm its TX interrupt, or go on if that
+        // freed room.
+        if dev.arm_tx_irq() {
+            r.tx_armed = true;
+            return r;
+        }
+        if !dev.can_transmit() {
+            return r; // no TX interrupt of its own: the caller polls
         }
     }
-    r.ring_full_backlog = qdisc.stats().backlog_packets > 0;
-    r
 }

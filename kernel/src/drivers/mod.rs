@@ -72,11 +72,27 @@ impl Nic {
         }
     }
 
-    /// Unmask the device's interrupts once the line or vector is set up.
-    pub fn enable_irq(&mut self, msix: bool) {
+    /// Can TX completions get their own MSI-X vector (table entry 1, armed
+    /// on demand: [`Self::arm_tx_irq`])?
+    pub fn has_tx_vector(&self) -> bool {
+        matches!(self, Self::Igb(_))
+    }
+
+    /// Unmask the device's interrupts once the line or vector is set up;
+    /// `tx_vector`: MSI-X table entry 1 is routed too ([`Self::has_tx_vector`]).
+    pub fn enable_irq(&mut self, msix: bool, tx_vector: bool) {
         match self {
             Self::Virtio(_) => {} // virtio-drivers enables queue interrupts at init
-            Self::Igb(n) => n.enable_irq(msix),
+            Self::Igb(n) => n.enable_irq(msix, tx_vector),
+        }
+    }
+
+    /// TX blocked with packets waiting: arm the TX completion interrupt.
+    /// `false` = not armed (no TX vector, or room again: transmit).
+    pub fn arm_tx_irq(&mut self) -> bool {
+        match self {
+            Self::Virtio(_) => false,
+            Self::Igb(n) => n.arm_tx_irq(),
         }
     }
 

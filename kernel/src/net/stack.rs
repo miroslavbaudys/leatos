@@ -84,6 +84,9 @@ pub struct Port {
     /// Last known link state (up, Mbit/s, full duplex), if the NIC reports one.
     pub link: Mutex<Option<(bool, u32, bool)>>,
     irq: Option<PortIrq>,
+    /// TX completions on their own vector (igb MSI-X), delivered to the
+    /// core that transmits on this port and armed only while it is blocked.
+    tx_irq: Option<PortIrq>,
 }
 
 #[derive(Clone, Copy)]
@@ -176,6 +179,7 @@ pub fn bring_up(
         let i = shared_ports.len();
         // Interrupts go to the core of the task that receives on this port.
         let rx_core = if i == 0 { lay.down } else { lay.up };
+        let tx_core = if i == 0 { lay.up } else { lay.down };
         let name = crate::config::PORTS[i];
         let mut dev = match Nic::new(pci, d) {
             Ok(dev) => dev,
@@ -251,26 +255,42 @@ pub fn bring_up(
         let line = d.intx.map(|intid| (intid, Trigger::Level, "")).or_else(|| {
             let vector = arch::irqchip::msi_vector(i)?;
             dev.prepare_msix(pci, d).ok()?;
-            pci.enable_msix(d, vector, rx_core)?;
+            pci.enable_msix(d, 0, vector, rx_core)?;
             Some((vector, Trigger::Edge, " (MSI-X)"))
         });
+        // TX completions on MSI-X entry 1, to the transmitting core.
+        let tx_irq = line
+            .filter(|&(_, trigger, _)| trigger == Trigger::Edge && dev.has_tx_vector())
+            .and_then(|_| {
+                let intid = arch::irqchip::msi_vector(i + shared::MAX_PORTS)?;
+                pci.enable_msix(d, 1, intid, tx_core)?;
+                let ev = irq::new_event();
+                irq::register(intid, device_masked, ev);
+                Some(PortIrq { intid, ev, self_mask: true })
+            });
         let irq = line.map(|(intid, trigger, kind)| {
             let ev = irq::new_event();
             // The device first (the line / MSI-X entry is still masked), so
             // the action can depend on how it masks.
-            dev.enable_irq(trigger == Trigger::Edge);
+            dev.enable_irq(trigger == Trigger::Edge, tx_irq.is_some());
             let self_mask = dev.self_masking();
             irq::register(intid, if self_mask { device_masked } else { mask_intx }, ev);
             arch::irqchip::enable(intid, trigger);
             (PortIrq { intid, ev, self_mask }, kind)
         });
+        if let Some(t) = tx_irq {
+            arch::irqchip::enable(t.intid, Trigger::Edge); // the device keeps it masked
+        }
         println!(
             "  net {name}       : {} {} mac {} {}",
             dev.model(),
             d.df,
             EthernetAddress(mac),
             match irq {
-                Some((i, kind)) => alloc::format!("intid {}{kind}", i.intid),
+                Some((irq, kind)) => match tx_irq {
+                    Some(t) => alloc::format!("intid {}{kind}, tx intid {}", irq.intid, t.intid),
+                    None => alloc::format!("intid {}{kind}", irq.intid),
+                },
                 None => alloc::string::String::from("(no irq: polling)"),
             }
         );
@@ -284,6 +304,7 @@ pub fn bring_up(
             name,
             dev: Mutex::new(Some(dev)),
             irq: irq.map(|(i, _)| i),
+            tx_irq,
             link: Mutex::new(None),
         });
         shared_ports.push(port);
@@ -721,6 +742,7 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
     let tx_ports: Vec<usize> = d.tx.iter().filter(|&p| p < ports.len()).collect();
     let mut events: Vec<&'static IrqEvent> = rx_ports.iter().filter_map(|&p| ports[p].irq.map(|i| i.ev)).collect();
     events.extend(tx_ports.iter().map(|&p| sh.tx_kick[p]));
+    events.extend(tx_ports.iter().filter_map(|&p| ports[p].tx_irq.map(|i| i.ev)));
     if d.primary {
         events.push(sh.dp_kick);
     }
@@ -731,6 +753,9 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
     loop {
         for &p in &tx_ports {
             sh.tx_kick[p].take();
+            if let Some(t) = ports[p].tx_irq {
+                t.ev.take(); // a TX completion: the flush below reaps it
+            }
         }
         if d.primary {
             sh.dp_kick.take();
@@ -740,12 +765,13 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
         for (k, &p) in rx_ports.iter().enumerate() {
             let rx = &ports[p];
             // NAPI step 1: IRQ fired → clear device interrupt status. The
-            // TX side of this NIC (the other direction) may have completions.
+            // TX side of this NIC (the other direction) may have completions,
+            // unless they have their own interrupt.
             if let Some(i) = rx.irq
                 && i.ev.take()
             {
                 masked[k] = true;
-                if !d.tx.has(p) {
+                if !d.tx.has(p) && rx.tx_irq.is_none() {
                     sh.tx_kick[p].signal();
                 }
             }
@@ -856,7 +882,7 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
-            ring_full_backlog |= tx.ring_full_backlog;
+            ring_full_backlog |= tx.ring_full_backlog && !tx.tx_armed;
         }
 
         // Step 5: unmask (a still-pending device re-fires). On aarch64 this
