@@ -266,6 +266,16 @@
 #   LAB_WAN_OPEN=1       (implies LAB_GUEST=1) negative control for the WAN
 #                        input check: a rule accepting wan -> router, so the
 #                        router answers the ISP's probes (RST, ping) again.
+#   LAB_ND_FLOOD=1       (implies LAB_GUEST=1 and LAB_IPV6=1) the WAN's IPv6
+#                        neighbor cache under a flood (docs/security-audit.md
+#                        §4.2): rule lab-wan-ping6 lets the ISP ping the
+#                        router's WAN address from 2001:db8::/32; the ISP
+#                        (cgi-bin/ndflood) pings it once from each of 1500
+#                        addresses of 2001:db8:eeee::/64 (replies via its
+#                        default router): at most 2 lost. INVALID unless
+#                        100+ were answered. Negative control:
+#                        LAB_ROUTER_ARGS=wan_hints6=all (every source into
+#                        smoltcp's cache, its default router evicted).
 #   LAB_ROUTES=1         (implies LAB_GUEST=1) static routes: [[route]]
 #                        lab-behind = 10.30.0.0/24 via the client
 #                        (192.168.1.100), which puts 10.30.0.5 on its
@@ -428,6 +438,10 @@ ISP_STATIC="${LAB_WAN_STATIC:-}"
 IPV6="${LAB_IPV6:-}"
 IPV6_OPEN="${LAB_IPV6_OPEN:-}"
 [[ -n "$IPV6_OPEN" && -z "$IPV6" ]] && IPV6=1
+ND_FLOOD="${LAB_ND_FLOOD:-}"
+[[ -n "$ND_FLOOD" && -z "$IPV6" ]] && IPV6=1
+# The flood adds and removes 1500 addresses on the ISP around its 15 s.
+[[ -n "$ND_FLOOD" && -z "${LAB_TIMEOUT:-}" ]] && TIMEOUT=$((TIMEOUT + 90))
 [[ "$IPV6" == 1 ]] && IPV6=pd
 ISP_IPV6="$IPV6"
 ISP_PD="${LAB_IPV6_PD:-1}"
@@ -465,6 +479,7 @@ DNS_HOSTS="${LAB_DNS_HOSTS:-1}"
 [[ -n "$DNS_VIEWS" ]] && GUEST=1
 [[ -n "$WAN_OPEN" ]] && GUEST=1
 [[ -n "$IPV6_OPEN" ]] && GUEST=1
+[[ -n "$ND_FLOOD" ]] && GUEST=1
 GUEST_ZONE="${LAB_GUEST_ZONE:-guest}"
 GUEST_RULES="${LAB_GUEST_RULES:-1}"
 GUEST_REJECT="${LAB_GUEST_REJECT:-reject}"
@@ -623,6 +638,19 @@ from = "wan"
 to = "router"
 action = "accept"
 CFG
+  # The WAN neighbor-cache flood (LAB_ND_FLOOD): the ISP's IPv6 pings to
+  # the router's WAN address, from its documentation /32 only (the WAN
+  # input probe pings over IPv4 and stays silent).
+  [[ -n "$ND_FLOOD" ]] && cat >>"$WORK/config.toml" <<'CFG'
+
+[[firewall.rule]]
+name = "lab-wan-ping6"
+from = "wan"
+to = "router"
+proto = "icmp"
+src = "2001:db8::/32"
+action = "accept"
+CFG
   # IPv6 pinhole (docs/ipv6.md step 5b): the client's interface
   # identifier, any prefix. Negative control LAB_IPV6_PINHOLE=0.
   [[ -n "$IPV6" && "${LAB_IPV6_PINHOLE:-1}" != 0 ]] && cat >>"$WORK/config.toml" <<'CFG'
@@ -737,7 +765,7 @@ PIDS+=($!)
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
   VM_NIC2="${PORTS:+52:54:00:00:00:11 $((LAN1_PORT + 1)) $LAN1_PORT}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${NEIGH:+ lab_neigh=1 lab_neigh_hosts=$NEIGH_HOSTS lab_neigh_secs=$NEIGH_SECS}${ACK:+ lab_ack=1}${SWARM:+ lab_swarm=$SWARM lab_swarm_kbit=$SWARM_KBIT lab_swarm_secs=${LAB_SWARM_SECS:-15} lab_swarm_mtu=${LAB_SWARM_MTU:-680} lab_swarm_ovf=${LAB_SWARM_OVF:-10}} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN lab_guest_v6=$GUEST_IPV6}${GUEST_LIVE:+ lab_guest_live=1}${LAB_MGMT_SAME_SOURCE:+ lab_mgmt_same=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${NEIGH:+ lab_neigh=1 lab_neigh_hosts=$NEIGH_HOSTS lab_neigh_secs=$NEIGH_SECS}${ACK:+ lab_ack=1}${SWARM:+ lab_swarm=$SWARM lab_swarm_kbit=$SWARM_KBIT lab_swarm_secs=${LAB_SWARM_SECS:-15} lab_swarm_mtu=${LAB_SWARM_MTU:-680} lab_swarm_ovf=${LAB_SWARM_OVF:-10}} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN lab_guest_v6=$GUEST_IPV6}${GUEST_LIVE:+ lab_guest_live=1}${LAB_MGMT_SAME_SOURCE:+ lab_mgmt_same=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}${ND_FLOOD:+ lab_nd_flood=1}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so

@@ -107,10 +107,12 @@ the poisoning:
   such a check (`iface/interface/ipv6.rs:486`) and, when full, evicts the entry closest to expiry.
   Found in this review: on the WAN, hints from remote sources (ICMPv6 errors to the router pass
   from anyone, with any source) mapped them to the gateway's MAC, and more than the cache's 256
-  within its 60 s lifetime would have evicted the gateway, so the router's own IPv6 traffic (DNS,
-  NTP, DoT upstream; not forwarding, which uses `fwd::neigh`) lost packets until smoltcp resolved
-  it again. Fixed: on the WAN only link-local sources get hints (`device.rs` `hint6_on_link`);
-  they never helped there anyway (internet frames carry the remote source, not the gateway's).
+  within its 60 s lifetime would have evicted the gateway, once per 256 new sources. smoltcp then
+  asks for the gateway again (the ISP answers within a millisecond): UDP and TCP wait in their
+  socket buffers, and what it sends without a buffer, a ping reply, is lost (measured: 10 of
+  1500 replies). A nuisance, not an outage; forwarding was unaffected (`fwd::neigh`). Fixed: on the WAN only link-local sources get hints (`device.rs`
+  `hint6_on_link`); they never helped there anyway (internet frames carry the remote source, not
+  the gateway's). Lab check `LAB_ND_FLOOD=1`, negative control `wan_hints6=all`.
   On the LANs a client's own addresses are on-link; an off-link source is a spoofing client (A3).
 - **Per network.** Each network is its own link with its own smoltcp interface and `local_rx`; a
   frame on one network cannot change another's cache (the question in the table above).

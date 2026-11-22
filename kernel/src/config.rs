@@ -1343,6 +1343,13 @@ pub fn arp_hints() -> bool {
     arg_u64(bootargs(), "arp_hints") != Some(0)
 }
 
+/// IPv6 hints on the WAN from every source, not only link-local ones
+/// (`net::device::hint6_on_link`): boot argument `wan_hints6=all`, the
+/// old behaviour, the lab's negative control (`LAB_ND_FLOOD=1`).
+pub fn wan_hints6_all() -> bool {
+    arg(bootargs(), "wan_hints6") == Some("all")
+}
+
 /// The management interface refuses DNS-rebound `Host`s and cross-site
 /// requests (`proto_http::check_browser_origin`, docs/security-audit.md);
 /// boot argument `mgmt_origin=0` turns that off (the lab's negative control).

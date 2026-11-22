@@ -177,6 +177,13 @@ Modes that imply `LAB_GUEST=1`:
     `LAB_ROUTER_ARGS=wan_mtu=1500` (no PTB), `LAB_ROUTER_ARGS=lan_antispoof=0`.
   - An unused /64 of the prefix is unreachable at the router (`/api/status` `unreachable6`);
     negative control `LAB_ROUTER_ARGS=v6_unreachable=0`.
+- `LAB_ND_FLOOD=1` (implies `LAB_GUEST=1` and `LAB_IPV6=1`): the WAN's IPv6 neighbor cache under a
+  flood (docs/security-audit.md §4.2). Rule lab-wan-ping6 lets the ISP ping the router's WAN
+  address from 2001:db8::/32; the ISP (`cgi-bin/ndflood`) pings it once from each of 1500
+  addresses of 2001:db8:eeee::/64, whose replies all go via the router's default router: at most
+  2 lost. INVALID unless 100+ were answered. Negative control `LAB_ROUTER_ARGS=wan_hints6=all`
+  (every source into smoltcp's cache: the default router is evicted once per 256 sources and the
+  reply that finds it missing is lost; 10 of 1500 in the first run).
 - `LAB_IPV6=static`: step 2b's boot arguments.
 - `LAB_GUEST_IPV6=0` (with `LAB_GUEST=1`): the guest network has `ipv6 = false`: no IPv6 reported
   there, no SLAAC address, its IPv6 dropped as `unsupported`. Negative control

@@ -1,0 +1,51 @@
+#!/usr/bin/busybox sh
+# WAN neighbor-cache flood (scripts/lab-test.sh LAB_ND_FLOOD=1,
+# docs/security-audit.md §4.2): pings the router's WAN IPv6 address once
+# from each of N addresses of 2001:db8:eeee::/64. They are off-link for the
+# router, so every reply goes via its default router (our link-local
+# address). A router that let every source into smoltcp's 256-entry
+# neighbor cache evicts that default router once per 256 new sources and
+# loses the reply that finds it missing; one that keeps the WAN's hints to
+# link-local sources answers them all. Query string: the router's WAN
+# address, then &n=N (default 1500). Prints sprayed= answered= lost=.
+bb=/usr/bin/busybox
+target=$(echo "${QUERY_STRING%%&*}" | $bb tr -cd '0-9a-fA-F:')
+n=$(echo "$QUERY_STRING" | $bb sed -n 's/.*&n=\([0-9]*\).*/\1/p')
+n=${n:-1500}
+echo "Content-Type: text/plain"
+echo
+dev=$($bb ip -6 route get "$target" | $bb sed -n 's/.* dev \([^ ]*\).*/\1/p')
+if [ -z "$target" ] || [ -z "$dev" ]; then
+  echo "error=no route to '$target'"
+  exit 0
+fi
+dad=/proc/sys/net/ipv6/conf/$dev/accept_dad
+d0=$($bb cat "$dad")
+echo 0 >"$dad" # usable at once, no tentative state
+i=1
+while [ "$i" -le "$n" ]; do
+  $bb ip -6 addr add "2001:db8:eeee::$($bb printf '%x' "$i")/128" dev "$dev" 2>/dev/null
+  i=$((i + 1))
+done
+work=$($bb mktemp -d)
+# One ping from each address, 32 at a time.
+i=1 batch=""
+while [ "$i" -le "$n" ]; do
+  ( $bb ping6 -c 1 -W 2 -I "2001:db8:eeee::$($bb printf '%x' "$i")" "$target" >/dev/null 2>&1 && echo >>"$work/ok" ) &
+  batch="$batch $!"
+  if [ $((i % 32)) -eq 0 ]; then
+    wait $batch 2>/dev/null
+    batch=""
+  fi
+  i=$((i + 1))
+done
+wait $batch 2>/dev/null
+answered=$($bb cat "$work/ok" 2>/dev/null | $bb wc -l)
+echo "sprayed=$n answered=$answered lost=$((n - answered))"
+i=1
+while [ "$i" -le "$n" ]; do
+  $bb ip -6 addr del "2001:db8:eeee::$($bb printf '%x' "$i")/128" dev "$dev" 2>/dev/null
+  i=$((i + 1))
+done
+echo "$d0" >"$dad"
+$bb rm -rf "$work"

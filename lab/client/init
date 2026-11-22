@@ -825,6 +825,22 @@ if [ -n "$v6on" ]; then
       else
         fail "ipv6 pd: wan_ipv6 $w6"
       fi
+      # WAN neighbor-cache flood (scripts/lab-test.sh LAB_ND_FLOOD=1,
+      # docs/security-audit.md §4.2): the ISP pings the router's WAN
+      # address once from each of 1500 off-link addresses; every reply goes
+      # via the router's default router, which must stay in smoltcp's cache
+      # (evicted once per 256 new sources, it costs the reply that finds it
+      # missing). Negative control LAB_ROUTER_ARGS=wan_hints6=all.
+      if $bb grep -q 'lab_nd_flood=1' /proc/cmdline; then
+        nf=$($bb wget -q -T 120 -O - "http://[$ISP6]/cgi-bin/ndflood?2001:db8:100:ff::1" 2>&1)
+        nf_ans=$(echo "$nf" | $bb sed -n 's/.*answered=\([0-9]*\).*/\1/p')
+        nf_lost=$(echo "$nf" | $bb sed -n 's/.*lost=\([0-9]*\).*/\1/p')
+        if [ -z "$nf_lost" ] || [ -z "$nf_ans" ]; then fail "wan nd flood: no result ($nf)"
+        elif [ "$nf_ans" -lt 100 ]; then fail "wan nd flood: INVALID, the flood did not reach the router ($nf)"
+        elif [ "$nf_lost" -le 2 ]; then pass "wan nd flood: $nf_lost replies lost ($nf)"
+        else fail "wan nd flood: $nf_lost replies lost ($nf)"
+        fi
+      fi
     fi
     if [ -z "$gr" ]; then
       if $bb ip -6 route show default 2>/dev/null | $bb grep -q .; then fail "ipv6: a default route appeared (router lifetime must be 0)"; else pass "ipv6: no default route (router lifetime 0)"; fi

@@ -291,6 +291,9 @@ pub struct NdHints {
     recent: alloc::vec::Vec<(core::net::IpAddr, [u8; 6], u64)>,
     /// IPv4 hints on (`config::arp_hints`, read once).
     arp: Option<bool>,
+    /// WAN IPv6 hints from every source (`config::wan_hints6_all`, read
+    /// once).
+    wan6_all: Option<bool>,
     /// The last Router Advertisement the link received (the WAN's:
     /// `net::wan6`).
     last_ra: Option<alloc::vec::Vec<u8>>,
@@ -335,9 +338,10 @@ impl NdHints {
 /// from anyone): hints from them would map those to the gateway's MAC
 /// and, past the cache's size within its 60 s lifetime, evict the
 /// gateway itself. The WAN's only on-link neighbors are link-local, so
-/// only those get hints there (docs/security-audit.md §4.2).
-fn hint6_on_link(link: &LinkShared, src: core::net::Ipv6Addr) -> bool {
-    link.port() >= crate::net::shared::FIRST_LAN_PORT || src.is_unicast_link_local()
+/// only those get hints there (docs/security-audit.md §4.2). `all`: the
+/// old behaviour (boot argument `wan_hints6=all`, a negative control).
+fn hint6_on_link(link: &LinkShared, src: core::net::Ipv6Addr, all: bool) -> bool {
+    all || link.port() >= crate::net::shared::FIRST_LAN_PORT || src.is_unicast_link_local()
 }
 
 /// A received frame; `skip` = 14 on an IP-only port (the Ethernet header).
@@ -434,7 +438,7 @@ impl Device for PortDevice<'_> {
             fwd::wire::ipv6_ns_to_solicited(pkt.data_mut());
             let mut hint = [0u8; fwd::wire::NEIGHBOR_HINT_LEN];
             if let Some((ip, mac)) = fwd::wire::ipv6_neighbor_hint(pkt.data(), &mut hint)
-                && hint6_on_link(self.link, ip)
+                && hint6_on_link(self.link, ip, *nd.wan6_all.get_or_insert_with(crate::config::wan_hints6_all))
                 && nd.due(ip.into(), mac, self.now_ns)
                 && let Some(mut h) = PacketBuf::alloc()
             {
