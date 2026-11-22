@@ -1350,6 +1350,14 @@ pub fn mgmt_origin() -> bool {
     arg_u64(bootargs(), "mgmt_origin") != Some(0)
 }
 
+/// The management interface keeps a connection slot free per network by
+/// cutting idle connections (`net::mgmt`, docs/security-audit.md §5 item
+/// 6); boot argument `mgmt_evict=0` turns that off (the lab's negative
+/// control).
+pub fn mgmt_evict() -> bool {
+    arg_u64(bootargs(), "mgmt_evict") != Some(0)
+}
+
 /// The router's own DNS domains (`dns.domain` and the networks' own):
 /// names under them may reach the management interface as `Host`.
 pub fn local_domains() -> Vec<String> {

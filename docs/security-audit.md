@@ -163,7 +163,43 @@ the LAN side), the rest are open.
    `[[dns.host]]` override of a public name) no longer open the interface.
    Counter `mgmt.refused.host`; same lab checks and negative control.
 3. **Unsigned upgrades** (P7): an attacker with the password, or one CSRF, installs a persistent kernel. Candidate fix: Ed25519 signature over the image, key compiled in, `image=golden` unaffected.
-4. **Remote panics in WAN parsers** (P1): `unwrap`/indexing/arithmetic in `proto-pppoe`, `proto-dhcp` v6, `proto-dns`, `fwd::wire` (release builds wrap on overflow: `overflow-checks` not set).
+4. **REVIEWED, none found (2026-11-22): remote panics in WAN parsers** (P1).
+   Survey: clippy `indexing_slicing`, `unwrap_used`, `expect_used`,
+   `panic`, `unreachable`, `arithmetic_side_effects` on `proto-pppoe`,
+   `proto-dhcp`, `proto-dns`, `fwd` (about 900 sites, 470 of them indexing
+   or slicing), plus `proto-dot` and `proto-sntp`; every parser path of
+   WAN input read by hand:
+   - PPPoE discovery tags, LCP/IPCP/IPv6CP options, PAP/CHAP: lengths via
+     `get()` or checked first; option handlers match on the length before
+     indexing.
+   - DHCPv6 RA and PD: bounds checked; the one `unreachable!` (`message`
+     while Bound) is behind `poll`'s early return.
+   - DNS: names (≤ 16 pointers, ≤ 255 bytes), records (offsets checked in
+     `records`, the ±2/±5 offsets stay inside the record), cache TTL
+     offsets from parsed records; the resolver's `upstreams[0]` and `% n`
+     behind non-empty checks.
+   - DoT: framing and certificate dates checked; the `expect`s are on key
+     and IV lengths rustls fixes (`KeyBlockShape`). SNTP: length first.
+   - `fwd::wire` views check every header length (IPv6 extension headers
+     ≤ 8 / 256 B); port rewrites only for flows whose L4 header was found
+     (`l4_len ≥ 8/20`); `tcp_reset`'s `clamp(20, l4_len)` only behind
+     `rejectable` (`l4_len ≥ 20`); both ICMP error builders check the
+     buffer first; port-range math relies on `PortRange` refusing
+     `lo > hi`.
+   - Kernel glue (VLAN pop, PPPoE decap, `PacketBuf` asserts): lengths
+     checked before; the asserts fire only on internal misuse.
+   The low-level accessors (`get16`, `set_port`, view getters) index
+   unchecked by contract; every caller traced meets it.
+   Fuzzing at the same commit, 40 min each with overflow checks on
+   (cargo-fuzz's default): `pppoe` 36 M, `dhcp6` 71 M, `dns` 10 M, `fwd`
+   24 M runs, no crash (the one old `fwd` artifact, from 2026-11-20, no
+   longer reproduces).
+   `overflow-checks` for the kernel's release build: left off. Every
+   length traced is a 16-bit field in a `usize`; turning the checks on
+   would make a missed overflow a reboot instead of a value a later bounds
+   check drops. The fuzzers keep running with them on.
+   Not covered: smoltcp's own DHCPv4 client (WAN), the DoT crypto glue
+   (item 9).
 5. **FIXED a–c, f; d–e accepted (2026-11-22): DHCP pool exhaustion** (A3/A4: any
    client on a network the server answers, guest networks included).
    Measured on `proto_dhcp::v4::server` with the default pool (.100–.199,
@@ -226,7 +262,54 @@ the LAN side), the rest are open.
    restart" checks since 206e9e2 (the lease JSON gained `ipv6` between `ip`
    and `hostname`); its grep is fixed, negative control
    `LEASE_TEST_NO_STORE=1` still fails.
-6. **Global 1 s login block** lets a LAN client lock the owner out by guessing continuously.
+6. **FIXED (2026-11-22): web interface lockouts** (A3: a client
+   in a zone that may reach the web interface; guests are refused by zone
+   input by default). Probed over `mgmt=wan` + a host port forward (the
+   same code as on the LAN):
+   - a. **Password block is global:** after a wrong password every
+     password check is refused for 1 s (`fail_until`), the right one
+     included. A client sending a wrong password every 0.7 s: the
+     owner's correct login answered 429 in 6 of 10 tries (0 of 10
+     without it). Existing sessions (Bearer) are not affected; new logins
+     and Basic scripts are.
+   - b. **Connection slots:** each network with management has 4 sockets
+     (`LAN_SOCKETS`), one connection each. 4 idle connections (nothing
+     sent) refuse everyone else until they time out (about 6 s here; the
+     limit is `REQUEST_TIMEOUT` 20 s); an attacker that reconnects as
+     slots free: 0 of the owner's 20 requests over 60 s answered.
+   - Not a problem: session tokens are 128 random bits, compared in
+     constant time; a wrong guess against the stored hash costs one
+     PBKDF2 (about 5 ms under HVF, 20,000 iterations), at most one per
+     second today.
+   Fixes:
+   - a: `auth::Throttle`: wrong passwords counted per source
+     (`auth::source_key`: an IPv4 address, or an IPv6 /64), that source
+     alone waits 1 s, doubling per failure in a row up to 30 s, cleared by
+     a success or 10 min without failure; at most 64 sources (the least
+     recently failed goes). PBKDF2 checks: at most 4 per second in all
+     (`HASH_CHECKS_PER_SEC`); a password that already verified costs one
+     HMAC and needs none (`Cache::known`); none left: 429, not counted as
+     a failure. The boot-argument password is a plain compare.
+   - b: 8 slots per network (`LAN_SOCKETS`), and one is always kept
+     listening: when the last is taken, a connection whose request head
+     has not arrived goes, from the source holding the most slots there,
+     the oldest first (`Mgmt::keep_one_listening`; a request that has
+     arrived is never cut). The first plan, at most 2 slots per source,
+     was dropped: browsers open several connections to one host at once.
+     A request head must arrive within 5 s (`HEAD_TIMEOUT`; the body keeps
+     20 s, uploads 120 s).
+   - Counters: `/api/status` `mgmt.throttle` (`sources`, `throttled`,
+     `hash_busy`, `evicted`).
+   Tests: `auth` host tests (per-source backoff and doubling, forgetting,
+   bounded table, the budget's rate and burst, /64 keys); lab checks in
+   every mode (`web lockout`: a second client address guesses twice a
+   second while the client's own logs in, 8 of 8 answered and the guesser
+   backed off; `web slots`: 8 idle connections from it, the client still
+   answered, `evicted` rises); negative controls `LAB_MGMT_SAME_SOURCE=1`
+   (the client's logins get 429) and `LAB_ROUTER_ARGS=mgmt_evict=0` (its
+   request is refused). Store, upgrade and persist tests pass. The QEMU
+   port-forward probe cannot show the per-source split: every host
+   connection arrives from 10.0.2.2.
 7. **Router-client port pass-through** (§4.1): what A1 can send to 60000–65535 and UDP 68 and what smoltcp does with it.
 8. **PPPoE password in clear** on the SD card (A7).
 9. **DoT provider**: own RustCrypto glue in `proto-dot/src/provider.rs` is crypto code written here; review against rustls' provider requirements.

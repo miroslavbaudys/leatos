@@ -15,6 +15,10 @@
 //! - [`Cache`]: remembers the last password that verified (as an HMAC
 //!   under a random key), so HTTP Basic clients (scripts) pay PBKDF2 only
 //!   once.
+//! - [`Throttle`]: wrong passwords back off their source only (an IPv4
+//!   address or an IPv6 /64, [`source_key`]), so one client guessing
+//!   cannot lock the owner out, and a global budget caps the PBKDF2 checks
+//!   many sources can cause (docs/security-audit.md §5 item 6).
 //!
 //! `#![no_std]` + `alloc`, sans-IO (the caller passes `now` and the
 //! entropy), no unsafe.
@@ -229,6 +233,113 @@ impl Sessions {
     }
 }
 
+/// What a [`Throttle`] counts failures by: an IPv4 address (as its
+/// IPv4-mapped IPv6 address) or an IPv6 address's /64 (one host may hold
+/// any number of addresses in its /64).
+pub fn source_key(ip: core::net::IpAddr) -> u128 {
+    match ip {
+        core::net::IpAddr::V4(a) => u128::from(a.to_ipv6_mapped()),
+        core::net::IpAddr::V6(a) => match a.to_ipv4_mapped() {
+            Some(v4) => u128::from(v4.to_ipv6_mapped()),
+            None => u128::from(a) & !((1u128 << 64) - 1),
+        },
+    }
+}
+
+/// Login throttling. Per source: after `n` wrong passwords in a row the
+/// source must wait `2^(n-1)` s (at most [`Self::MAX_BLOCK_MS`]) before the
+/// next password check; a success or [`Self::FORGET_MS`] without failure
+/// clears it. Other sources are not affected. At most `max_sources` are
+/// tracked (the least recently failed goes). Globally, at most
+/// `hash_per_sec` PBKDF2 checks per second (burst as many), so many
+/// sources together cannot keep the CPU busy.
+pub struct Throttle {
+    sources: Vec<Source>,
+    max_sources: usize,
+    hash_per_sec: u32,
+    tokens_milli: u64,
+    refilled_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Source {
+    key: u128,
+    fails: u32,
+    until_ms: u64,
+    last_ms: u64,
+}
+
+impl Throttle {
+    pub const MAX_BLOCK_MS: u64 = 30_000;
+    pub const FORGET_MS: u64 = 10 * 60_000;
+
+    pub fn new(max_sources: usize, hash_per_sec: u32) -> Self {
+        let hash_per_sec = hash_per_sec.max(1);
+        Throttle {
+            sources: Vec::new(),
+            max_sources: max_sources.max(1),
+            hash_per_sec,
+            tokens_milli: u64::from(hash_per_sec) * 1000,
+            refilled_ms: 0,
+        }
+    }
+
+    /// `Err(ms)`: `key` must wait that long before its next try.
+    pub fn check(&mut self, key: u128, now_ms: u64) -> Result<(), u64> {
+        self.sources.retain(|s| now_ms.saturating_sub(s.last_ms) < Self::FORGET_MS);
+        match self.sources.iter().find(|s| s.key == key) {
+            Some(s) if s.until_ms > now_ms => Err(s.until_ms - now_ms),
+            _ => Ok(()),
+        }
+    }
+
+    /// A wrong password from `key`.
+    pub fn failed(&mut self, key: u128, now_ms: u64) {
+        let i = match self.sources.iter().position(|s| s.key == key) {
+            Some(i) => i,
+            None => {
+                if self.sources.len() >= self.max_sources
+                    && let Some(old) = (0..self.sources.len()).min_by_key(|&i| self.sources[i].last_ms)
+                {
+                    self.sources.swap_remove(old);
+                }
+                self.sources.push(Source { key, fails: 0, until_ms: 0, last_ms: now_ms });
+                self.sources.len() - 1
+            }
+        };
+        let s = &mut self.sources[i];
+        s.fails = s.fails.saturating_add(1);
+        let block = 1000u64.saturating_mul(1 << (s.fails - 1).min(15)).min(Self::MAX_BLOCK_MS);
+        s.until_ms = now_ms.saturating_add(block);
+        s.last_ms = now_ms;
+    }
+
+    /// The right password from `key`: its count starts over.
+    pub fn succeeded(&mut self, key: u128) {
+        self.sources.retain(|s| s.key != key);
+    }
+
+    /// Take one PBKDF2 check from the global budget; false: none left now
+    /// (answer "busy", do not count it as a failure).
+    pub fn take_hash_check(&mut self, now_ms: u64) -> bool {
+        let cap = u64::from(self.hash_per_sec) * 1000;
+        let elapsed = now_ms.saturating_sub(self.refilled_ms);
+        self.tokens_milli = (self.tokens_milli + elapsed.saturating_mul(u64::from(self.hash_per_sec))).min(cap);
+        self.refilled_ms = now_ms;
+        if self.tokens_milli >= 1000 {
+            self.tokens_milli -= 1000;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Sources currently tracked (status page).
+    pub fn tracked(&self) -> usize {
+        self.sources.len()
+    }
+}
+
 /// The last password that verified against a stored hash, as
 /// HMAC-SHA256(random key, password): a repeat costs one HMAC, not PBKDF2.
 pub struct Cache {
@@ -247,6 +358,13 @@ impl Cache {
         let mut m = Hmac::<Sha256>::new_from_slice(&self.key).expect("any key length");
         m.update(password.as_bytes());
         m.finalize().into_bytes().into()
+    }
+
+    /// `password` is the one that last verified against `encoded`: checking
+    /// it costs one HMAC, no PBKDF2.
+    pub fn known(&self, password: &str, encoded: &str) -> bool {
+        let tag = self.tag(password);
+        self.last.as_ref().is_some_and(|(t, e)| e == encoded && ct_eq(t, &tag))
     }
 
     /// [`verify`], remembering a success for `encoded`.
@@ -339,5 +457,64 @@ mod tests {
         assert!(!c.verify("pw2", &h));
         let other = hash_password("other", &mut pool, 500);
         assert!(!c.verify("pw", &other), "cached for another hash only");
+        assert!(c.known("pw", &h) && !c.known("nope", &h) && !c.known("pw", &other));
+    }
+
+    #[test]
+    fn source_keys_group_a_v6_host_by_its_64() {
+        use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let v6 = |s: &str| source_key(IpAddr::V6(s.parse::<Ipv6Addr>().unwrap()));
+        assert_eq!(v6("2001:db8:1:2::1"), v6("2001:db8:1:2:abcd::9"));
+        assert_ne!(v6("2001:db8:1:2::1"), v6("2001:db8:1:3::1"));
+        let a = source_key(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)));
+        assert_ne!(a, source_key(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 101))));
+        assert_eq!(a, v6("::ffff:192.168.1.100"), "a mapped address is its IPv4 address");
+    }
+
+    #[test]
+    fn a_guessing_source_does_not_block_another() {
+        let (bad, owner) = (1u128, 2u128);
+        let mut t = Throttle::new(64, 4);
+        t.failed(bad, 0);
+        assert_eq!(t.check(bad, 500), Err(500));
+        assert_eq!(t.check(owner, 500), Ok(()), "the owner is not blocked");
+        assert_eq!(t.check(bad, 1000), Ok(()));
+        // Backoff doubles per failure in a row, up to MAX_BLOCK_MS.
+        t.failed(bad, 1000);
+        assert_eq!(t.check(bad, 1000), Err(2000));
+        t.failed(bad, 3000);
+        assert_eq!(t.check(bad, 3000), Err(4000));
+        for i in 0..20 {
+            t.failed(bad, 10_000 + i);
+        }
+        assert_eq!(t.check(bad, 10_019), Err(Throttle::MAX_BLOCK_MS));
+        // A success starts over; so does a long quiet time.
+        t.succeeded(bad);
+        assert_eq!(t.check(bad, 10_020), Ok(()));
+        t.failed(owner, 20_000);
+        t.failed(owner, 22_000);
+        assert_eq!(t.check(owner, 22_000 + Throttle::FORGET_MS), Ok(()));
+        t.failed(owner, 30_000 + Throttle::FORGET_MS);
+        assert_eq!(t.check(owner, 30_000 + Throttle::FORGET_MS), Err(1000), "forgotten: first failure again");
+    }
+
+    #[test]
+    fn the_source_table_is_bounded() {
+        let mut t = Throttle::new(4, 4);
+        for k in 0..100u128 {
+            t.failed(k, k as u64);
+        }
+        assert_eq!(t.tracked(), 4);
+        assert!(t.check(99, 100).is_err(), "the most recent stay");
+    }
+
+    #[test]
+    fn the_global_hash_budget_refills_at_its_rate() {
+        let mut t = Throttle::new(4, 4);
+        assert_eq!((0..10).filter(|_| t.take_hash_check(0)).count(), 4, "burst of 4");
+        assert!(!t.take_hash_check(100));
+        assert!(t.take_hash_check(250), "one per 250 ms");
+        assert!(!t.take_hash_check(260));
+        assert_eq!((0..10).filter(|_| t.take_hash_check(60_000)).count(), 4, "capped at the burst");
     }
 }

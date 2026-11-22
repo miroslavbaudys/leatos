@@ -250,6 +250,59 @@ mexpect "POST /api/config from the router's own origin passes" "422 501" \
 mexpect "POST /api/config from a script (no Origin) passes" "422 501" \
   "$(mreq POST /api/config 192.168.1.1 '' 'csrf=1')"
 
+# --- web interface: lockouts (docs/security-audit.md §5 item 6) -----------------
+# A second address of ours (192.168.1.150) plays a guessing client: wrong
+# passwords twice a second while our own address logs in with the right one
+# (every answer 200; the guesser's turn to 429 as it backs off), then 8
+# idle connections from it while ours asks (answered, /api/status
+# mgmt.throttle.evicted rises). Negative controls: LAB_MGMT_SAME_SOURCE=1
+# (the guesses come from our own address: our logins get 429),
+# LAB_ROUTER_ARGS=mgmt_evict=0 (no free slot: our request is refused).
+att=192.168.1.150
+$bb grep -q 'lab_mgmt_same=1' /proc/cmdline && att=$ip
+[ "$att" = "$ip" ] || $bb ip addr add "$att/24" dev eth0
+hreq() { # source base64-credentials path: the status code
+  printf 'GET %s HTTP/1.1\r\nHost: 192.168.1.1\r\nAuthorization: Basic %s\r\nConnection: close\r\n\r\n' "$3" "$2" \
+    | $bb nc -w 5 -s "$1" 192.168.1.1 80 2>/dev/null | $bb head -1 | $bb cut -d' ' -f2
+}
+good=YWRtaW46bGFiLXBhc3M= # admin:lab-pass
+bad=YWRtaW46d3JvbmctcGFzcw== # admin:wrong-pass
+( for _ in $($bb seq 1 10); do hreq "$att" "$bad" /api/status; $bb sleep 0.5; done ) >/tmp/guesses &
+gpid=$!
+$bb sleep 0.3
+owner=""
+for _ in $($bb seq 1 8); do owner="$owner $(hreq "$ip" "$good" /api/status)"; $bb sleep 0.5; done
+wait $gpid
+g429=$($bb grep -c 429 /tmp/guesses)
+n200=$(echo "$owner" | $bb tr ' ' '\n' | $bb grep -c '^200$')
+if [ "$n200" -ne 8 ]; then
+  fail "web lockout: our logins while another address guesses:$owner (its answers: $($bb tr '\n' ' ' </tmp/guesses))"
+elif [ "$g429" -eq 0 ]; then
+  fail "web lockout: the guessing address was never backed off ($($bb tr '\n' ' ' </tmp/guesses))"
+else
+  pass "web lockout: our logins answered while another address guesses (8 x 200; it got $g429 x 429)"
+fi
+if [ "$att" = "$ip" ]; then
+  # Negative control: our own address is backed off; wait it out.
+  for _ in $($bb seq 1 40); do [ "$(hreq "$ip" "$good" /api/status)" = 200 ] && break; $bb sleep 1; done
+fi
+evicted() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb sed -n 's/.*"evicted":\([0-9]*\).*/\1/p'; }
+ev0=$(evicted)
+idle=""
+for _ in $($bb seq 1 8); do ( $bb sleep 15 | $bb nc -s "$att" 192.168.1.1 80 >/dev/null 2>&1 ) & idle="$idle $!"; $bb sleep 0.2; done
+$bb sleep 1
+c=$(hreq "$ip" "$good" /api/status)
+for p in $idle; do $bb kill "$p" 2>/dev/null; done
+$bb pkill -f "nc -s $att" 2>/dev/null
+$bb sleep 1
+ev1=$(evicted)
+if [ "$c" = 200 ] && [ "${ev1:-0}" -gt "${ev0:-0}" ]; then
+  pass "web slots: answered with 8 idle connections from another address (evicted ${ev0:-?} -> $ev1)"
+else
+  fail "web slots: with 8 idle connections from another address: '$c', evicted ${ev0:-?} -> ${ev1:-?}"
+fi
+[ "$att" = "$ip" ] || $bb ip addr del "$att/24" dev eth0
+
 # --- forwarding, NAT, firewall (M4) -------------------------------------------
 $bx httpd -p 8080 -h /www   # target for the firewall probe from the ISP side
 

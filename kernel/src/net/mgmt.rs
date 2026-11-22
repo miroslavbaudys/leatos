@@ -54,7 +54,14 @@
 //! HTTP Basic (user `admin`, scripts) with the password from the
 //! `mgmt_pass=` boot argument or else the config's `mgmt.password_hash`
 //! (PBKDF2-SHA256, checked once per login; scripts' repeats are cached).
-//! A wrong password blocks password attempts for a second. A saved `mgmt.password` (clear text, from the form or the
+//! Wrong passwords back off their source only (an IPv4 address or an IPv6
+//! /64: 1 s, doubling per failure in a row, at most 30 s; `auth::Throttle`),
+//! and PBKDF2 checks are limited to 4 per second in all (a password that
+//! already verified needs none); 429 otherwise. Each network has 8
+//! connection slots, one always kept listening: when the last is taken, a
+//! connection whose request head has not arrived goes (the source holding
+//! the most slots, oldest first), and a head must arrive within 5 s
+//! (docs/security-audit.md §5 item 6; `/api/status` `mgmt.throttle`). A saved `mgmt.password` (clear text, from the form or the
 //! CLI) is hashed before it is stored, and ends all sessions.
 //! Before routing or auth, [`check_origin`] refuses what only a browser
 //! made to by another site sends (docs/security-audit.md §5): a `Host`
@@ -93,7 +100,9 @@ const PORT: u16 = 80;
 /// Login sessions at once, and how long one lasts unused.
 const SESSIONS: usize = 8;
 const SESSION_IDLE_MS: u64 = 12 * 3600 * 1000;
-const LAN_SOCKETS: usize = 4;
+/// Connection slots per network (docs/security-audit.md §5 item 6: one
+/// listening socket is always kept free, see [`Mgmt::keep_one_listening`]).
+const LAN_SOCKETS: usize = 8;
 const WAN_SOCKETS: usize = 4;
 const RX_BUF: usize = 64 * 1024;
 const TX_BUF: usize = 16 * 1024;
@@ -102,6 +111,13 @@ const MAX_HEAD: usize = 8 * 1024;
 const MAX_SMALL_BODY: usize = 64 * 1024;
 /// A connection that takes longer is aborted (uploads get more time).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Until the request head (line + headers) is in: a client that sends it
+/// slowly or not at all gives its slot back sooner (slowloris).
+const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
+/// Sources whose wrong passwords are remembered, and PBKDF2 checks per
+/// second for all of them ([`auth::Throttle`]).
+const THROTTLE_SOURCES: usize = 64;
+const HASH_CHECKS_PER_SEC: u32 = 4;
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// After the response to an upgrade/reboot: wait at most this long for the
 /// client to receive it before acting anyway.
@@ -220,6 +236,8 @@ struct Conn {
     responded_at: Option<timer::Instant>,
     /// `X-Leatos-UI`: answer 401 without `WWW-Authenticate`.
     no_prompt: bool,
+    /// The client's source ([`auth::source_key`]), once connected.
+    peer: Option<u128>,
 }
 
 impl Conn {
@@ -239,6 +257,7 @@ impl Conn {
             since: None,
             responded_at: None,
             no_prompt: false,
+            peer: None,
         }
     }
 
@@ -284,8 +303,8 @@ pub struct Mgmt {
     sessions: auth::Sessions,
     /// The last password that verified against the stored hash.
     pass_cache: auth::Cache,
-    /// After a wrong password: no password checks until then.
-    fail_until: Option<timer::Instant>,
+    /// Wrong passwords per source, the global PBKDF2 budget.
+    throttle: auth::Throttle,
     /// The save being written changes the password: end the sessions.
     password_changing: bool,
     on_wan: bool,
@@ -332,6 +351,13 @@ impl Trial {
         }
     }
 }
+
+/// Password checks refused for their source's backoff, or for the global
+/// PBKDF2 budget; connections cut to keep a slot free (`/api/status`
+/// `mgmt.throttle`).
+static THROTTLED: AtomicU64 = AtomicU64::new(0);
+static HASH_BUSY: AtomicU64 = AtomicU64::new(0);
+static EVICTED: AtomicU64 = AtomicU64::new(0);
 
 /// Requests refused by [`check_origin`] (`/api/status` `mgmt.refused`).
 static REFUSED_HOST: AtomicU64 = AtomicU64::new(0);
@@ -408,7 +434,7 @@ impl Mgmt {
             boot_pass: cfg.password,
             sessions: auth::Sessions::new(SESSIONS, SESSION_IDLE_MS),
             pass_cache: crate::entropy::with(auth::Cache::new),
-            fail_until: None,
+            throttle: auth::Throttle::new(THROTTLE_SOURCES, HASH_CHECKS_PER_SEC),
             password_changing: false,
             on_wan: cfg.on_wan,
             wan_lease: String::from("null"),
@@ -568,7 +594,7 @@ impl Mgmt {
 
     /// A session token, or Basic auth with the password: Ok, or the error
     /// status and message.
-    fn authorized(&mut self, head: &Head) -> Result<(), (u16, &'static str)> {
+    fn authorized(&mut self, head: &Head, peer: Option<u128>) -> Result<(), (u16, &'static str)> {
         if !self.auth_configured() {
             return Err((
                 403,
@@ -589,19 +615,32 @@ impl Mgmt {
         let Some((u, p)) = proto_http::basic_auth(head) else {
             return Err((401, "wrong or missing credentials (user admin)"));
         };
-        if self.fail_until.is_some_and(|t| timer::Instant::now() < t) {
-            return Err((429, "wrong password just now: wait a second"));
+        // Wrong passwords back off their own source only (an IPv4 address
+        // or an IPv6 /64), docs/security-audit.md §5 item 6.
+        let key = peer.unwrap_or(0);
+        if self.throttle.check(key, now).is_err() {
+            THROTTLED.fetch_add(1, Ordering::Relaxed);
+            return Err((429, "wrong password from this address just now: wait a few seconds"));
         }
         let ok = u == "admin"
             && match (self.boot_pass, config::password_hash()) {
                 (Some(pass), _) => proto_http::ct_eq(p.as_bytes(), pass.as_bytes()),
-                (None, Some(hash)) => self.pass_cache.verify(&p, &hash),
+                (None, Some(hash)) => {
+                    // A password that already verified costs one HMAC; any
+                    // other a PBKDF2 run, from a global budget.
+                    if !self.pass_cache.known(&p, &hash) && !self.throttle.take_hash_check(now) {
+                        HASH_BUSY.fetch_add(1, Ordering::Relaxed);
+                        return Err((429, "too many password checks just now: try again in a second"));
+                    }
+                    self.pass_cache.verify(&p, &hash)
+                }
                 (None, None) => false,
             };
         if ok {
+            self.throttle.succeeded(key);
             Ok(())
         } else {
-            self.fail_until = timer::Instant::now().checked_add(Duration::from_secs(1));
+            self.throttle.failed(key, now);
             Err((401, "wrong or missing credentials (user admin)"))
         }
     }
@@ -617,6 +656,7 @@ impl Mgmt {
 
     /// A request head arrived: route it, check auth, claim the staging area.
     fn on_head(&mut self, i: usize, head: Head) {
+        let peer = self.conns[i].peer;
         crate::entropy::mix(head.path.as_bytes());
         self.conns[i].no_prompt = head.header("x-leatos-ui").is_some();
         let route = check_origin(&head).and(match (head.method, head.path.as_str()) {
@@ -665,13 +705,13 @@ impl Mgmt {
                     | Route::EffectiveJson
             );
             if reads && self.auth_configured() {
-                self.authorized(&head)?;
+                self.authorized(&head, peer)?;
             }
             if changes_config
                 || changes_image
                 || matches!(r, Route::Upgrade | Route::Reboot | Route::Login | Route::Log)
             {
-                self.authorized(&head)?;
+                self.authorized(&head, peer)?;
             }
             if changes_config && !self.has_store {
                 return Err((501, "no store: the config cannot be saved"));
@@ -1021,6 +1061,9 @@ impl Mgmt {
             let sock = ifs[ifx].sockets.get_mut::<tcp::Socket>(handle);
             if sock.is_active() && self.conns[i].since.is_none() {
                 self.conns[i].since = Some(timer::Instant::now());
+                self.conns[i].peer = sock
+                    .remote_endpoint()
+                    .map(|e| auth::source_key(core::net::IpAddr::from(e.addr)));
             }
             while sock.can_recv() {
                 if sock.recv(|buf| (buf.len(), self.on_bytes(i, buf))).is_err() {
@@ -1073,8 +1116,9 @@ impl Mgmt {
             // gets REQUEST_TIMEOUT to be delivered, counted from the answer
             // (a rejected upload releases the upload slot, but its 422 must
             // still go out after a long body).
+            let wait = if c.head.is_none() { HEAD_TIMEOUT } else { limit };
             let timed_out = match c.responded_at {
-                None => c.since.is_some_and(|t| t.elapsed() > limit),
+                None => c.since.is_some_and(|t| t.elapsed() > wait),
                 Some(t) => t.elapsed() > REQUEST_TIMEOUT,
             };
             if lingering || timed_out {
@@ -1088,7 +1132,39 @@ impl Mgmt {
                 let _ = sock.listen(PORT);
             }
         }
+        if config::mgmt_evict() {
+            self.keep_one_listening(ifs);
+        }
         action
+    }
+
+    /// Keep a listening socket on every interface, so a new client always
+    /// gets in (docs/security-audit.md §5 item 6): when the last one was
+    /// taken, a connection whose request head has not arrived yet goes,
+    /// from the source holding the most slots there, the oldest first. A
+    /// request that has arrived is never cut.
+    fn keep_one_listening(&mut self, ifs: &mut [HostIf]) {
+        use crate::net::shared::MAX_LINKS;
+        let (mut used, mut listening) = ([false; MAX_LINKS], [false; MAX_LINKS]);
+        for c in &self.conns {
+            used[c.ifx] = true;
+            listening[c.ifx] |= ifs[c.ifx].sockets.get::<tcp::Socket>(c.handle).state() == tcp::State::Listen;
+        }
+        for ifx in (0..MAX_LINKS).filter(|&x| used[x] && !listening[x]) {
+            let conns = &self.conns;
+            let held = |peer: Option<u128>| conns.iter().filter(|c| c.ifx == ifx && c.peer == peer).count();
+            let victim = (0..conns.len())
+                .filter(|&i| conns[i].ifx == ifx && conns[i].head.is_none() && conns[i].since.is_some())
+                // Most slots first; among those the oldest (earliest `since`).
+                .max_by_key(|&i| (held(conns[i].peer), core::cmp::Reverse(conns[i].since)));
+            if let Some(i) = victim {
+                let sock = ifs[ifx].sockets.get_mut::<tcp::Socket>(self.conns[i].handle);
+                sock.abort();
+                self.conns[i].reset();
+                let _ = sock.listen(PORT);
+                EVICTED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// A connection is in progress (poll again soon).
@@ -1210,7 +1286,7 @@ fn status_json(
         "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"tx_failed\":{},\"vlan_drops\":{},\"conntrack\":{},\"early_drops\":{},\"conntrack_pass_us\":{{\"last\":{},\"max\":{}}},\"housekeeping_us\":{{\"last\":{},\"max\":{}}},\"revoked\":{},\"rejected\":{},\"icmp_errors\":{},\"unreachable6\":{},\"neigh_probes\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free},{heap_ops}}},\"cpu\":{cpu},\"temp\":{temp},\"memory\":{memory},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
-         \"fragments\":{{\"forwarded\":{},\"parked\":{},\"park_drops\":{},\"split\":{},\"split_drops\":{}}},\"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{},\"origin_check\":{},\"refused\":{{\"host\":{},\"cross_site\":{}}}}},\"interfaces\":[",
+         \"fragments\":{{\"forwarded\":{},\"parked\":{},\"park_drops\":{},\"split\":{},\"split_drops\":{}}},\"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{},\"origin_check\":{},\"refused\":{{\"host\":{},\"cross_site\":{}}},\"throttle\":{{\"sources\":{},\"throttled\":{},\"hash_busy\":{},\"evicted\":{}}}}},\"interfaces\":[",
         json_str(env!("CARGO_PKG_VERSION")),
         json_str(env!("LEATOS_BUILD")),
         json_str(if cfg!(target_arch = "x86_64") {
@@ -1275,6 +1351,10 @@ fn status_json(
         config::mgmt_origin(),
         REFUSED_HOST.load(Ordering::Relaxed),
         REFUSED_CROSS_SITE.load(Ordering::Relaxed),
+        mgmt.throttle.tracked(),
+        THROTTLED.load(Ordering::Relaxed),
+        HASH_BUSY.load(Ordering::Relaxed),
+        EVICTED.load(Ordering::Relaxed),
     );
     for (n, nif) in sh.ports.iter().enumerate() {
         let snap = *nif.snap.lock();
