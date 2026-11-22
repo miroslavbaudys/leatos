@@ -1283,7 +1283,7 @@ fn status_json(
     };
     let _ = write!(
         s,
-        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"tx_failed\":{},\"vlan_drops\":{},\"conntrack\":{},\"early_drops\":{},\"conntrack_pass_us\":{{\"last\":{},\"max\":{}}},\"housekeeping_us\":{{\"last\":{},\"max\":{}}},\"revoked\":{},\"rejected\":{},\"icmp_errors\":{},\"unreachable6\":{},\"neigh_probes\":{},\
+        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"tx_failed\":{},\"vlan_drops\":{},\"conntrack\":{},\"early_drops\":{},\"conntrack_pass_us\":{{\"last\":{},\"max\":{}}},\"housekeeping_us\":{{\"last\":{},\"max\":{}}},\"revoked\":{},\"rejected\":{},\"icmp_errors\":{},\"unreachable6\":{},\"neigh_probes\":{},\"lan_nd\":{{\"medium\":\"{}\",\"arp_replies\":{},\"na_sent\":{},\"conflicts\":{},\"local_no_route\":{}}},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free},{heap_ops}}},\"cpu\":{cpu},\"temp\":{temp},\"memory\":{memory},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
          \"fragments\":{{\"forwarded\":{},\"parked\":{},\"park_drops\":{},\"split\":{},\"split_drops\":{}}},\"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{},\"origin_check\":{},\"refused\":{{\"host\":{},\"cross_site\":{}}},\"throttle\":{{\"sources\":{},\"throttled\":{},\"hash_busy\":{},\"evicted\":{}}}}},\"interfaces\":[",
@@ -1324,6 +1324,11 @@ fn status_json(
         datapath::ICMP_ERRORS.load(Ordering::Relaxed),
         datapath::UNREACHABLE6.load(Ordering::Relaxed),
         datapath::NEIGH_PROBES.load(Ordering::Relaxed),
+        if crate::config::lan_medium_ip() { "ip" } else { "eth" },
+        datapath::ARP_REPLIES.load(Ordering::Relaxed),
+        datapath::NA_SENT.load(Ordering::Relaxed),
+        datapath::ND_CONFLICTS.load(Ordering::Relaxed),
+        datapath::LOCAL_NO_ROUTE.load(Ordering::Relaxed),
         mgmt.wan_pppoe.as_deref().unwrap_or("null"),
         datapath::PPPOE_DROPS.load(Ordering::Relaxed),
         datapath::FRAGS_FORWARDED.load(Ordering::Relaxed),

@@ -114,7 +114,7 @@ impl Pppoe {
                     if u32::from(link.mtu) != port.mtu.load(Ordering::Relaxed) {
                         // smoltcp reads the MTU when the interface is made.
                         port.mtu.store(u32::from(link.mtu), Ordering::Relaxed);
-                        host.iface = stack::new_iface(port);
+                        host.iface = stack::new_iface(port, false);
                     }
                     host.iface.update_ip_addrs(|a| {
                         a.clear();

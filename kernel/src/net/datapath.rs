@@ -99,6 +99,12 @@ pub static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// The router stack's packets on a link without a link layer that had no
 /// next hop there ([`Datapath::send_local`]).
 pub static LOCAL_NO_ROUTE: AtomicU64 = AtomicU64::new(0);
+/// The datapath's ARP / ND answers for the router on IP-only LAN links
+/// (`fwd::nd`, docs/lan-neighbors.md): replies sent, and another MAC
+/// claiming or probing for one of the router's addresses.
+pub static ARP_REPLIES: AtomicU64 = AtomicU64::new(0);
+pub static NA_SENT: AtomicU64 = AtomicU64::new(0);
+pub static ND_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 /// The forwarder's drops by reason (`fwd::forwarder::DropReason::index`),
 /// part of `DROPPED` (the web interface's firewall page).
 pub static DROP_REASONS: [AtomicU64; fwd::forwarder::DROP_REASONS] =
@@ -281,6 +287,10 @@ pub struct Datapath {
     /// own packets on a link without a link layer ([`Self::send_local`],
     /// docs/lan-neighbors.md).
     local: Vec<Mutex<fwd::local::LocalLink>>,
+    /// LAN links' router stack is IP-only: the datapath answers their ARP
+    /// / ND (`config::lan_medium_ip`), with these switches.
+    lan_ip: bool,
+    nd_cfg: fwd::nd::Config,
     /// Which link a frame belongs to and what `shard_of` needs: replaced
     /// whole by [`Self::apply`], read once per batch.
     topo: Mutex<alloc::sync::Arc<Topo>>,
@@ -453,6 +463,8 @@ impl Datapath {
                 .collect(),
             addrs: ifaces.iter().map(|i| Mutex::new(i.addr)).collect(),
             local: ifaces.iter().map(|_| Mutex::new(fwd::local::LocalLink::default())).collect(),
+            lan_ip: crate::config::lan_medium_ip(),
+            nd_cfg: crate::config::nd_config(),
             topo: Mutex::new(alloc::sync::Arc::new(Topo::default())),
             hk: Mutex::new(Hk {
                 next_housekeeping: 0,
@@ -600,7 +612,6 @@ impl Datapath {
 
     /// The router stack's addresses and routes on link `ifx`
     /// ([`Self::send_local`]).
-    #[allow(dead_code)] // wired in docs/lan-neighbors.md step 3
     pub fn set_local_link(&self, ifx: IfIndex, l: fwd::local::LocalLink) {
         if let Some(m) = self.local.get(ifx as usize) {
             *m.lock() = l;
@@ -616,7 +627,6 @@ impl Datapath {
     /// resolved). Called from the services task; takes the link's lock,
     /// then the neighbor table's and the qdisc's (the datapath's order).
     /// Returns false if it was dropped for want of a next hop.
-    #[allow(dead_code)] // wired in docs/lan-neighbors.md step 3
     pub fn send_local(&self, ifx: IfIndex, mut pkt: PacketBuf, touched: &mut Touched) -> bool {
         let Some(link) = self.local.get(ifx as usize) else {
             return false;
@@ -633,6 +643,52 @@ impl Datapath {
                 LOCAL_NO_ROUTE.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
+        }
+        true
+    }
+
+    /// ARP and ND on a LAN link whose router stack has no link layer
+    /// (docs/lan-neighbors.md): answered here for the router's addresses
+    /// (`fwd::nd`), never passed on (the stack could not read them).
+    /// Learning from them happened before ([`Self::snoop_arp`] /
+    /// [`Self::snoop_nd`]). Returns true for those frames.
+    fn link_layer(&self, ifx: IfIndex, frame: &[u8], touched: &mut Touched) -> bool {
+        let arp = match wire::ethertype(frame) {
+            Some(wire::ETHERTYPE_ARP) => true,
+            Some(wire::ETHERTYPE_IPV6)
+                if frame.get(wire::ETH_HDR + 6) == Some(&wire::PROTO_ICMPV6)
+                    && frame.get(wire::ETH_HDR + 40).is_some_and(|&t| t == 135 || t == 136) =>
+            {
+                false
+            }
+            _ => return false,
+        };
+        let mac = self.sh.ports[self.sh.links[ifx as usize].port()].mac;
+        let mut v6 = [Ipv6Addr::UNSPECIFIED; 4];
+        let mut n6 = 0;
+        let v4 = {
+            let l = self.local[ifx as usize].lock();
+            for a in l.addrs6().take(v6.len()) {
+                v6[n6] = a;
+                n6 += 1;
+            }
+            l.v4
+        };
+        let me = fwd::nd::Link { mac, v4, v6: &v6[..n6] };
+        let mut out = [0u8; fwd::nd::REPLY_LEN];
+        let o = fwd::nd::answer(frame, &me, self.nd_cfg, &mut out);
+        if o.conflict.is_some() {
+            ND_CONFLICTS.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(n) = o.reply
+            && let Some(mut pkt) = PacketBuf::alloc()
+        {
+            pkt.set_len(n);
+            pkt.data_mut().copy_from_slice(&out[..n]);
+            pkt.meta.wire_len = n as u32;
+            pkt.meta.enqueue_ts = now_ns();
+            (if arp { &ARP_REPLIES } else { &NA_SENT }).fetch_add(1, Ordering::Relaxed);
+            self.enqueue(ifx, pkt, touched);
         }
         true
     }
@@ -809,6 +865,9 @@ impl Datapath {
                     self.snoop_nd(ifx, pkt.data(), now, b.touched)
                 }
                 _ => {}
+            }
+            if self.lan_ip && ifx != WAN && self.link_layer(ifx, pkt.data(), b.touched) {
+                continue;
             }
             let len = pkt.len();
             let kind = if self.fragments && port_ix < self.frags.len() {

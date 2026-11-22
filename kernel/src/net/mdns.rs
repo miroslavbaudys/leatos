@@ -83,11 +83,7 @@ fn reflector_config(nets: &[config::Lan], hosts: &[HostIf], links: &[usize]) -> 
             .map(|(k, n)| {
                 let mut net = proto_mdns::Net::v4(n.addr, n.prefix);
                 if config::ipv6() && n.ula.is_some() {
-                    let ll = links.get(k).and_then(|&l| hosts.get(l)).and_then(|h| match h.iface.hardware_addr() {
-                        smoltcp::wire::HardwareAddress::Ethernet(e) => Some(fwd::wire::link_local(e.0)),
-                        #[allow(unreachable_patterns)]
-                        _ => None,
-                    });
+                    let ll = links.get(k).and_then(|&l| hosts.get(l)).map(|h| fwd::wire::link_local(h.mac));
                     net.addrs6 = [ll, n.ula, n.gua];
                 }
                 Some(net)

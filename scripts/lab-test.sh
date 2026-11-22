@@ -54,10 +54,13 @@
 #                        hints; rounds 2-3: its neighbor cache holds them
 #                        all), then downloads for LAB_NEIGH_SECS (35) with
 #                        no `neighbor` drops and some probes. Negative
-#                        controls LAB_ROUTER_ARGS=arp_hints=0 (round 1
-#                        fails), LAB_NEIGH_CACHE=8 (smoltcp's default cache:
-#                        rounds 2-3 fail), LAB_ROUTER_ARGS=neigh_probe=0
-#                        (forwarded fails)
+#                        controls (the router's answers use the datapath's
+#                        neighbor table since docs/lan-neighbors.md step 3,
+#                        so the first two need the old path):
+#                        LAB_ROUTER_ARGS="lan_medium=eth arp_hints=0" (round
+#                        1 fails), LAB_NEIGH_CACHE=8 with lan_medium=eth
+#                        (smoltcp's default cache: rounds 2-3 fail),
+#                        LAB_ROUTER_ARGS=neigh_probe=0 (forwarded fails)
 #   LAB_EXPECT_KBIT=N    what the client expects (default: LAB_SHAPE_KBIT);
 #                        set it with LAB_SHAPE_KBIT=0 as a negative control
 #                        The web interface's origin checks run in every mode
@@ -357,6 +360,11 @@
 #                        reaches the client), LAB_ROUTER_ARGS=wan_mtu=1500
 #                        (no PTB), LAB_ROUTER_ARGS=lan_antispoof=0 (the
 #                        forged source passes).
+#                        Also (pd): the client probes the router with
+#                        unicast NS (2 s reachable time) for 15 s: no
+#                        resolution fails, the default route stays (Router
+#                        flag in the NAs). Negative controls
+#                        LAB_ROUTER_ARGS=nd_unicast=0 / na_router=0.
 #   LAB_PORTS=1          (implies LAB_GUEST=1) a second LAN port: the router
 #                        gets a third NIC (lan1), network "wired"
 #                        10.40.0.1/24 untagged on it (zone lan); the client
@@ -443,6 +451,8 @@ ND_FLOOD="${LAB_ND_FLOOD:-}"
 # The flood adds and removes 1500 addresses on the ISP around its 15 s.
 [[ -n "$ND_FLOOD" && -z "${LAB_TIMEOUT:-}" ]] && TIMEOUT=$((TIMEOUT + 90))
 [[ "$IPV6" == 1 ]] && IPV6=pd
+# The client's IPv6 neighbor-discovery check (15 s of probes).
+[[ "$IPV6" == pd && -z "${LAB_TIMEOUT:-}" ]] && TIMEOUT=$((TIMEOUT + 60))
 ISP_IPV6="$IPV6"
 ISP_PD="${LAB_IPV6_PD:-1}"
 ISP_DNS6="${LAB_IPV6_DNS6:-1}"
@@ -975,7 +985,8 @@ fi
 # 2. placement: with QEMU_SMP >= 3 dp_up runs on core 1, else on core 0
 #    (LAB_EXPECT_UP_CORE overrides). Negative control: QEMU_SMP=4 with
 #    LAB_ROUTER_ARGS=cores=2 keeps dp_up on core 0 and fails.
-line=$(cat "$RLOG" | grep "  cpu  " | tail -1 || true)
+# The last complete line: the router may be stopped in the middle of one.
+line=$(cat "$RLOG" | grep "  cpu  .*dev irqs \[[0-9, ]*\]" | tail -1 || true)
 task_ms() { echo "$line" | sed -n "s/.*, $1@[0-9]* \([0-9]*\) ms.*/\1/p"; }
 task_core() { echo "$line" | sed -n "s/.*, $1@\([0-9]*\) .*/\1/p"; }
 load=$(tr -d '\r' <"$WORK/client.log" | grep "^LAB CPU load:" | tail -1 || true)

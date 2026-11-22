@@ -230,12 +230,12 @@ pub fn bring_up(
         let port_ix = i;
         if i == 0 {
             let link = LinkShared::new(port_ix, true);
-            let iface = new_iface(&port);
+            let iface = new_iface(&port, false);
             let mut sockets = SocketSet::new(Vec::new());
             if crate::config::wan_link() == crate::config::WanLink::Dhcp {
                 sockets.add(dhcpv4::Socket::new());
             }
-            hosts.push(HostIf { iface, sockets, nd: Default::default() });
+            hosts.push(HostIf { iface, sockets, nd: Default::default(), mac: port.mac, lan_ip: false });
             links.push(link);
         } else if i == shared::FIRST_LAN_PORT {
             // Every network slot, with an interface without addresses (on
@@ -243,10 +243,13 @@ pub fn bring_up(
             // config's networks their addresses and port MACs.
             for _ in 1..shared::MAX_LINKS {
                 links.push(LinkShared::new(port_ix, false));
+                let lan_ip = crate::config::lan_medium_ip();
                 hosts.push(HostIf {
-                    iface: new_iface(&port),
+                    iface: new_iface(&port, lan_ip),
                     sockets: SocketSet::new(Vec::new()),
                     nd: Default::default(),
+                    mac: port.mac,
+                    lan_ip,
                 });
             }
         }
@@ -366,11 +369,13 @@ fn log_ingress(qos: &crate::config::Qos, rate: Option<qdisc::shaper::Rate>, what
 }
 
 /// The router stack's interface for a link on `port`: Ethernet, or
-/// IP-only on a PPPoE port ([`PortShared::is_pppoe`], set before calling).
-/// smoltcp only reads the device's capabilities here.
-pub fn new_iface(port: &PortShared) -> Interface {
+/// IP-only on a PPPoE port ([`PortShared::is_pppoe`], set before calling)
+/// and on a LAN link with `lan_ip` (the datapath does its link layer,
+/// docs/lan-neighbors.md). smoltcp only reads the device's capabilities
+/// here.
+pub fn new_iface(port: &PortShared, lan_ip: bool) -> Interface {
     let link = &LinkShared::detached();
-    let hw = if port.is_pppoe() {
+    let hw = if port.is_pppoe() || lan_ip {
         HardwareAddress::Ip
     } else {
         HardwareAddress::Ethernet(EthernetAddress(port.mac))
@@ -383,9 +388,12 @@ pub fn new_iface(port: &PortShared) -> Interface {
     let mut device = PortDevice {
         link,
         port,
+        ifx: 0,
         now_ns: datapath::now_ns(),
         queued: &mut queued,
         nd: None,
+        dp: None,
+        lan_ip,
     };
     Interface::new(config, &mut device, now())
 }
@@ -523,8 +531,63 @@ pub fn apply_qos(sh: &Shared, old: &crate::config::Qos, new: &crate::config::Qos
 }
 
 pub fn new_datapath(sh: &'static Shared) -> SharedDatapath {
-    let (_, _, initial) = place_networks(&[]);
-    alloc::boxed::Box::leak(alloc::boxed::Box::new(Datapath::new(sh, initial)))
+    let (_, links, initial) = place_networks(&[]);
+    let dp: SharedDatapath = alloc::boxed::Box::leak(alloc::boxed::Box::new(Datapath::new(sh, initial)));
+    set_local_links(dp, sh, &crate::config::networks(), &links);
+    DATAPATH.call_once(|| dp);
+    dp
+}
+
+static DATAPATH: spin::Once<SharedDatapath> = spin::Once::new();
+
+/// The datapath, once [`new_datapath`] made it (the services task's
+/// router-stack devices send through it: [`Datapath::send_local`]).
+pub fn datapath() -> Option<SharedDatapath> {
+    DATAPATH.get().copied()
+}
+
+/// Every link's addresses and routes for the router stack's own packets
+/// ([`Datapath::send_local`], the ARP / ND answers): after
+/// [`set_host_addrs`], from the same [`local_links`].
+pub fn set_local_links(dp: SharedDatapath, sh: &Shared, nets: &[crate::config::Lan], links: &[usize]) {
+    for (i, l) in local_links(nets, links, &port_macs(&sh.ports), sh.links.len()).into_iter().enumerate() {
+        dp.set_local_link(i as fwd::IfIndex, l);
+    }
+}
+
+/// Per link (index = link; the WAN's left empty): the network's IPv4
+/// subnet, its IPv6 addresses (link-local from its port's MAC, ULA,
+/// global; each a /64), its `[[route]]`s and the IPv6 ones through a
+/// router in its ULA /64. The one source for the router stack's
+/// interfaces ([`set_host_addrs`]) and the datapath's view of them.
+pub fn local_links(nets: &[crate::config::Lan], links: &[usize], macs: &[[u8; 6]], n: usize) -> Vec<fwd::local::LocalLink> {
+    let routes6_all = crate::config::static_routes6();
+    (0..n)
+        .map(|i| {
+            let Some(k) = (i > 0).then(|| links.iter().position(|&l| l == i)).flatten() else {
+                return fwd::local::LocalLink::default();
+            };
+            let net = &nets[k];
+            let mut l = fwd::local::LocalLink {
+                v4: Some((net.addr, net.prefix)),
+                routes4: net.routes.clone(),
+                ..Default::default()
+            };
+            if let (Some(ula), Some(&mac)) = (net.ula, macs.get(net.port)) {
+                l.v6.push((fwd::wire::link_local(mac), 64));
+                l.v6.push((ula, 64));
+                if let Some(gua) = net.gua {
+                    l.v6.push((gua, 64));
+                }
+                l.routes6 = routes6_all
+                    .iter()
+                    .copied()
+                    .filter(|&(_, _, via)| u128::from(via) >> 64 == u128::from(ula) >> 64)
+                    .collect();
+            }
+            l
+        })
+        .collect()
 }
 
 /// The config's networks in link slots: a network keeps its slot while
@@ -610,33 +673,25 @@ pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: 
             }
         }
     }
+    let views = local_links(nets, links, macs, hosts.len());
     for (i, host) in hosts.iter_mut().enumerate().skip(1) {
         let k = links.iter().position(|&l| l == i);
         if let Some(&mac) = k.and_then(|k| macs.get(nets[k].port)) {
+            host.mac = mac;
+            // Only an Ethernet interface has one (smoltcp asserts it).
             let hw = HardwareAddress::Ethernet(EthernetAddress(mac));
-            if host.iface.hardware_addr() != hw {
+            if !host.lan_ip && host.iface.hardware_addr() != hw {
                 host.iface.set_hardware_addr(hw);
             }
         }
-        // IPv6 [[route]]s through a router in this network's ULA /64.
-        let routes6: Vec<(core::net::Ipv6Addr, u8, core::net::Ipv6Addr)> = match k.and_then(|k| nets[k].ula) {
-            Some(ula) => crate::config::static_routes6()
-                .into_iter()
-                .filter(|&(_, _, via)| u128::from(via) >> 64 == u128::from(ula) >> 64)
-                .collect(),
-            None => Vec::new(),
-        };
-        set_host_routes46(&mut host.iface, k.map_or(&[][..], |k| &nets[k].routes), &routes6);
+        let view = &views[i];
+        set_host_routes46(&mut host.iface, &view.routes4, &view.routes6);
         let mut want: Vec<IpCidr> = Vec::new();
-        if let Some(k) = k {
-            want.push(IpCidr::Ipv4(cidr(&nets[k])));
-            if let (Some(ula), Some(&mac)) = (nets[k].ula, macs.get(nets[k].port)) {
-                want.push(IpCidr::Ipv6(Ipv6Cidr::new(fwd::wire::link_local(mac), 64)));
-                want.push(IpCidr::Ipv6(Ipv6Cidr::new(ula, 64)));
-                if let Some(gua) = nets[k].gua {
-                    want.push(IpCidr::Ipv6(Ipv6Cidr::new(gua, 64)));
-                }
-            }
+        if let Some((a, len)) = view.v4 {
+            want.push(IpCidr::Ipv4(Ipv4Cidr::new(a, len)));
+        }
+        for &(a, len) in &view.v6 {
+            want.push(IpCidr::Ipv6(Ipv6Cidr::new(a, len)));
         }
         if host.iface.ip_addrs() != want.as_slice() {
             host.iface.update_ip_addrs(|a| {

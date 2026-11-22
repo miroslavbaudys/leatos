@@ -257,11 +257,20 @@ fn is_router_solicitation(f: &[u8]) -> bool {
 pub struct PortDevice<'a> {
     pub link: &'a LinkShared,
     pub port: &'a PortShared,
+    /// The link's index (the forwarder's `IfIndex`).
+    pub ifx: fwd::IfIndex,
     pub now_ns: u64,
     /// Frames put into the qdisc (the datapath must be woken to send them).
     pub queued: &'a mut u32,
     /// The link's IPv6 neighbor hints (`None`: only making the interface).
     pub nd: Option<&'a mut NdHints>,
+    /// The datapath, for a LAN link without a link layer (`lan_ip`; `None`
+    /// while only making the interface).
+    pub dp: Option<crate::net::stack::SharedDatapath>,
+    /// A LAN link whose stack runs on `Medium::Ip` (docs/lan-neighbors.md):
+    /// RX strips the Ethernet header and passes IP only, TX goes through
+    /// [`crate::net::datapath::Datapath::send_local`], no neighbor hints.
+    pub lan_ip: bool,
 }
 
 /// smoltcp (0.14) learns IPv6 neighbors only from neighbor discovery and
@@ -356,8 +365,11 @@ impl phy::RxToken for RxToken {
 pub struct TxToken<'a> {
     link: &'a LinkShared,
     port: &'a PortShared,
+    ifx: fwd::IfIndex,
     now_ns: u64,
     queued: &'a mut u32,
+    dp: Option<crate::net::stack::SharedDatapath>,
+    lan_ip: bool,
 }
 
 impl TxToken<'_> {
@@ -379,6 +391,24 @@ impl TxToken<'_> {
 impl phy::TxToken for TxToken<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         match PacketBuf::alloc() {
+            Some(mut pkt) if self.lan_ip => {
+                // IP only: the datapath finds the destination MAC (its
+                // neighbor table) and sends it.
+                let eth = fwd::wire::ETH_HDR;
+                pkt.set_len(eth + len);
+                let d = pkt.data_mut();
+                d[..12].fill(0);
+                let r = f(&mut d[eth..]);
+                let t = if d[eth] >> 4 == 6 { fwd::wire::ETHERTYPE_IPV6 } else { fwd::wire::ETHERTYPE_IPV4 };
+                fwd::wire::put16(d, 12, t);
+                if let Some(dp) = self.dp {
+                    let mut touched = [false; crate::net::shared::MAX_PORTS];
+                    if dp.send_local(self.ifx, pkt, &mut touched) {
+                        *self.queued += 1;
+                    }
+                }
+                r
+            }
             Some(mut pkt) if self.port.is_pppoe() => {
                 // IP only: an Ethernet header for the datapath to replace.
                 let eth = fwd::wire::ETH_HDR;
@@ -422,6 +452,16 @@ impl Device for PortDevice<'_> {
 
     fn receive(&mut self, _ts: Instant) -> Option<(RxToken, TxToken<'_>)> {
         let mut pkt = self.link.local_rx.lock().pop_front()?;
+        if self.lan_ip {
+            // IP only: the datapath answered ARP / ND itself; anything not
+            // IP is not for a `Medium::Ip` stack.
+            while !matches!(
+                fwd::wire::ethertype(pkt.data()),
+                Some(fwd::wire::ETHERTYPE_IPV4 | fwd::wire::ETHERTYPE_IPV6)
+            ) {
+                pkt = self.link.local_rx.lock().pop_front()?;
+            }
+        }
         if let Some(nd) = self.nd.as_deref_mut()
             && fwd::wire::ethertype(pkt.data()) == Some(fwd::wire::ETHERTYPE_IPV6)
         {
@@ -430,9 +470,11 @@ impl Device for PortDevice<'_> {
                 nd.last_ra = Some(d.to_vec());
             }
         }
-        // Neighbor discovery help (Ethernet only: PPP has no link layer).
+        // Neighbor discovery help (Ethernet only: PPP has no link layer,
+        // and an IP-only LAN link's neighbors are the datapath's).
         if let Some(nd) = self.nd.as_deref_mut()
             && !self.port.is_pppoe()
+            && !self.lan_ip
             && fwd::wire::ethertype(pkt.data()) == Some(fwd::wire::ETHERTYPE_IPV6)
         {
             fwd::wire::ipv6_ns_to_solicited(pkt.data_mut());
@@ -451,6 +493,7 @@ impl Device for PortDevice<'_> {
         }
         if let Some(nd) = self.nd.as_deref_mut()
             && !self.port.is_pppoe()
+            && !self.lan_ip
             && fwd::wire::ethertype(pkt.data()) == Some(fwd::wire::ETHERTYPE_IPV4)
             && *nd.arp.get_or_insert_with(crate::config::arp_hints)
         {
@@ -469,7 +512,7 @@ impl Device for PortDevice<'_> {
             // smoltcp ignores it (a host); the network's advertiser answers.
             self.link.rs_seen.store(true, Ordering::Relaxed);
         }
-        let skip = if self.port.is_pppoe() {
+        let skip = if self.port.is_pppoe() || self.lan_ip {
             fwd::wire::ETH_HDR
         } else {
             0
@@ -479,8 +522,11 @@ impl Device for PortDevice<'_> {
             TxToken {
                 link: self.link,
                 port: self.port,
+                ifx: self.ifx,
                 now_ns: self.now_ns,
                 queued: self.queued,
+                dp: self.dp,
+                lan_ip: self.lan_ip,
             },
         ))
     }
@@ -491,8 +537,11 @@ impl Device for PortDevice<'_> {
         room.then_some(TxToken {
             link: self.link,
             port: self.port,
+            ifx: self.ifx,
             now_ns,
             queued: self.queued,
+            dp: self.dp,
+            lan_ip: self.lan_ip,
         })
     }
 
@@ -501,6 +550,9 @@ impl Device for PortDevice<'_> {
         if self.port.is_pppoe() {
             caps.medium = Medium::Ip;
             caps.max_transmission_unit = self.port.mtu() as usize;
+        } else if self.lan_ip {
+            caps.medium = Medium::Ip;
+            caps.max_transmission_unit = 1500;
         } else {
             caps.medium = Medium::Ethernet;
             caps.max_transmission_unit = 1514;

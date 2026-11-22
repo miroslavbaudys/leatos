@@ -49,6 +49,11 @@ pub struct HostIf {
     pub sockets: SocketSet<'static>,
     /// IPv6 neighbors recently made known to smoltcp (`net::device`).
     pub nd: crate::net::device::NdHints,
+    /// The link's MAC (its port's): smoltcp has none on `Medium::Ip`.
+    pub mac: [u8; 6],
+    /// A LAN link whose interface is IP-only (`config::lan_medium_ip`, set
+    /// when made): smoltcp's `hardware_addr` panics on one.
+    pub lan_ip: bool,
 }
 
 struct Pinger {
@@ -354,7 +359,7 @@ fn restart_wan(
         };
         port.mtu.store(u32::from(mtu), Ordering::Relaxed);
         // Another medium: a new interface (the sockets stay).
-        wan.iface = stack::new_iface(port);
+        wan.iface = stack::new_iface(port, false);
     }
     // The DHCP client runs only in DHCP mode.
     match (dhcp, dhcp_socket(wan)) {
@@ -462,6 +467,9 @@ fn reapply_networks(
         *slots = placed;
         let nets = crate::config::networks();
         stack::set_host_addrs(hosts, &nets, &links, &stack::port_macs(&sh.ports));
+        if let Some(dp) = stack::datapath() {
+            stack::set_local_links(dp, sh, &nets, &links);
+        }
         let shape = |v: &[crate::config::Lan]| -> Vec<(String, usize, u16, core::net::Ipv4Addr, u8, u8)> {
             v.iter().map(|n| (n.name.clone(), n.port, n.vid, n.addr, n.prefix, n.zone)).collect()
         };
@@ -506,16 +514,21 @@ fn publish_wan(
 fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
     let t = stack::now();
     let now_ns = datapath::now_ns();
-    for (host, link) in hosts.iter_mut().zip(&sh.links) {
+    let dp = stack::datapath();
+    for (ifx, (host, link)) in hosts.iter_mut().zip(&sh.links).enumerate() {
         let i = link.port();
         let port = &sh.ports[i];
         let mut queued = 0;
+        let lan_ip = host.lan_ip;
         let mut dev = PortDevice {
             link,
             port,
+            ifx: ifx as fwd::IfIndex,
             now_ns,
             queued: &mut queued,
             nd: Some(&mut host.nd),
+            dp,
+            lan_ip,
         };
         host.iface.poll(t, &mut dev, &mut host.sockets);
         if queued > 0 {

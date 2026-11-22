@@ -112,15 +112,13 @@ const AAAA_FORGET_MS: u64 = 30 * 60_000;
 /// interface; a default router only with an IPv6 default route.
 fn ra_config(cfg: &config::Lan, host: &HostIf) -> Option<RaConfig> {
     let ula = cfg.ula?;
-    let smoltcp::wire::HardwareAddress::Ethernet(mac) = host.iface.hardware_addr() else {
-        return None;
-    };
+    let mac = host.mac;
     // A default router only while the WAN has an IPv6 default route and
     // the network a global prefix (RFC 7084 G-4: with a ULA alone there
     // is no source address to go out with).
     let default = config::wan6().is_some() && cfg.gua.is_some();
     Some(RaConfig {
-        mac: mac.0,
+        mac,
         prefixes: [Some(ula), cfg.gua].into_iter().flatten().collect(),
         router_lifetime: if default { proto_dhcp::v6::ra::ROUTER_SECS } else { 0 },
         mtu: 1500,

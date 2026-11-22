@@ -841,6 +841,38 @@ if [ -n "$v6on" ]; then
         else fail "wan nd flood: $nf_lost replies lost ($nf)"
         fi
       fi
+      # The router's neighbor discovery as a client sees it
+      # (docs/lan-neighbors.md §4): with a 2 s reachable time and a 1 s
+      # delay, Linux keeps moving its entry for the router (its default
+      # router, the RA's link-local address) to PROBE while pings to the
+      # ISP go through it (echo replies confirm nothing), and probes with
+      # unicast NS. Answered: no resolution fails (ndisc_cache res_failed,
+      # summed over the CPUs) and the default route stays (NAs with the
+      # Router flag, RFC 4861 §7.2.5). Negative controls
+      # LAB_ROUTER_ARGS=nd_unicast=0 (res_failed rises) and na_router=0
+      # (the default route goes). INVALID unless the router sent NAs.
+      ndp=/proc/sys/net/ipv6/neigh/eth0
+      rt0=$($bb cat $ndp/base_reachable_time_ms); dp0=$($bb cat $ndp/delay_first_probe_time)
+      resf() { $bb awk 'NR > 1 { s += ("0x" $7) + 0 } END { print s + 0 }' /proc/net/stat/ndisc_cache; }
+      nas() { v6st | $bb grep -o '"na_sent":[0-9]*' | $bb cut -d: -f2; }
+      echo 2000 >$ndp/base_reachable_time_ms; echo 1 >$ndp/delay_first_probe_time
+      f0=$(resf); n0=$(nas)
+      $bb ping6 -c 75 -i 0.2 -W 1 "$ISP6" >/tmp/ndp 2>&1
+      f1=$(resf); n1=$(nas)
+      echo "$rt0" >$ndp/base_reachable_time_ms; echo "$dp0" >$ndp/delay_first_probe_time
+      ndinfo="res_failed $f0 -> $f1, router na_sent $n0 -> $n1, $($bb tail -2 /tmp/ndp | $bb head -1)"
+      # Probes: a failed resolution fails; else the router must have
+      # answered some (INVALID if nothing was exercised at all).
+      if [ "$f1" != "$f0" ]; then fail "ipv6 nd: resolutions of the router failed: unicast probes unanswered? ($ndinfo)"
+      elif v6st | $bb grep -q '"lan_nd":{"medium":"eth"'; then
+        echo "LAB INFO: ipv6 nd: probes not counted on lan_medium=eth (smoltcp answers them) ($ndinfo)"
+      elif [ -z "$n1" ] || [ $((n1 - ${n0:-0})) -lt 3 ]; then fail "ipv6 nd: INVALID, no probe was answered or failed ($ndinfo)"
+      else pass "ipv6 nd: unicast probes of the router answered ($ndinfo)"
+      fi
+      # The Router flag, on its own: a client that gets the router's NA
+      # without it drops the router as its default router at once.
+      if $bb ip -6 route show default 2>/dev/null | $bb grep -q .; then pass "ipv6 nd: default route kept after the router's NAs (Router flag)"
+      else fail "ipv6 nd: the default route went after the router's NAs (Router flag cleared?)"; fi
     fi
     if [ -z "$gr" ]; then
       if $bb ip -6 route show default 2>/dev/null | $bb grep -q .; then fail "ipv6: a default route appeared (router lifetime must be 0)"; else pass "ipv6: no default route (router lifetime 0)"; fi

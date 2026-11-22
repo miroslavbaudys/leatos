@@ -1343,6 +1343,24 @@ pub fn arp_hints() -> bool {
     arg_u64(bootargs(), "arp_hints") != Some(0)
 }
 
+/// The LAN links' router stack without a link layer (smoltcp on
+/// `Medium::Ip`, the datapath answering ARP / ND and resolving its
+/// packets, docs/lan-neighbors.md); boot argument `lan_medium=eth` keeps
+/// smoltcp on Ethernet with its neighbor hints (the fallback).
+pub fn lan_medium_ip() -> bool {
+    arg(bootargs(), "lan_medium") != Some("eth")
+}
+
+/// The datapath's ARP / ND answers on the LANs (`fwd::nd::Config`):
+/// `nd_unicast=0` ignores unicast NS (as smoltcp did), `na_router=0`
+/// clears the Router flag in NAs; both negative controls of the lab.
+pub fn nd_config() -> fwd::nd::Config {
+    fwd::nd::Config {
+        unicast_ns: arg_u64(bootargs(), "nd_unicast") != Some(0),
+        router: arg_u64(bootargs(), "na_router") != Some(0),
+    }
+}
+
 /// IPv6 hints on the WAN from every source, not only link-local ones
 /// (`net::device::hint6_on_link`): boot argument `wan_hints6=all`, the
 /// old behaviour, the lab's negative control (`LAB_ND_FLOOD=1`).

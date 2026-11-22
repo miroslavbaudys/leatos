@@ -184,6 +184,12 @@ Modes that imply `LAB_GUEST=1`:
   2 lost. INVALID unless 100+ were answered. Negative control `LAB_ROUTER_ARGS=wan_hints6=all`
   (every source into smoltcp's cache: the default router is evicted once per 256 sources and the
   reply that finds it missing is lost; 10 of 1500 in the first run).
+- Neighbor discovery as a client sees it (pd mode, docs/lan-neighbors.md §4): with a 2 s reachable
+  time and a 1 s probe delay the client keeps probing the router (its default router) with unicast
+  NS while it pings the ISP through it for 15 s: no resolution fails (`res_failed` in
+  `/proc/net/stat/ndisc_cache`) and the default route stays. INVALID unless the router sent NAs
+  (`lan_nd.na_sent`). Negative controls `LAB_ROUTER_ARGS=nd_unicast=0` (resolutions fail) and
+  `na_router=0` (the default route goes).
 - `LAB_IPV6=static`: step 2b's boot arguments.
 - `LAB_GUEST_IPV6=0` (with `LAB_GUEST=1`): the guest network has `ipv6 = false`: no IPv6 reported
   there, no SLAAC address, its IPv6 dropped as `unsupported`. Negative control
@@ -195,8 +201,11 @@ Unshaped unless `LAB_SHAPE_KBIT` is set; router `neigh_secs=10`. The client pins
 (never ARPs) and pings the router from `LAB_NEIGH_HOSTS` (40) addresses of its own, 3 rounds,
 without loss (round 1 = first contact: ARP hints; rounds 2–3: smoltcp's cache holds them all), then
 downloads for `LAB_NEIGH_SECS` (35) across several neighbor lifetimes with no `neighbor` drops and
-some probes. Negative controls `LAB_ROUTER_ARGS=arp_hints=0` (round 1), `LAB_NEIGH_CACHE=8` (kernel
-built `--no-default-features`: rounds 2–3), `LAB_ROUTER_ARGS=neigh_probe=0` (forwarded).
+some probes. Since docs/lan-neighbors.md step 3 the router's answers use the datapath's neighbor
+table (no hints, no smoltcp cache on the LANs). Negative controls
+`LAB_ROUTER_ARGS="lan_medium=eth arp_hints=0"` (the old path without hints: round 1 fails),
+`LAB_NEIGH_CACHE=8` with `lan_medium=eth` (kernel built `--no-default-features`: rounds 2–3),
+`LAB_ROUTER_ARGS=neigh_probe=0` (forwarded).
 
 ### `LAB_ACK=1`: ACK filter
 
