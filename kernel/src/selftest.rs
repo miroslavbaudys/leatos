@@ -230,9 +230,82 @@ pub fn conntrack_bench() {
     );
 }
 
+/// `heap_bench=N` (M9): what heap fragmentation costs. On the apu4 the
+/// conntrack pass (`conntrack_pass_us`) slowed from 75 to 1186 µs over a
+/// day with a flat connection count; the heap is a first-fit linked list
+/// (`mm::heap`), whose allocations and frees walk the free holes. Times
+/// alloc/free pairs and a conntrack fill + expiry pass on the heap as it
+/// is, then with `holes` 64-byte holes in front of the free space, then
+/// frees them. Prints the numbers; nothing is asserted.
+pub fn heap_bench(holes: usize) {
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+    use core::hint::black_box;
+    use core::net::Ipv4Addr;
+    use fwd::conntrack::{Budget, Conntrack, Tuple};
+    use fwd::wire::PROTO_UDP;
+    use net::datapath::{EXPIRE_PER_PASS, MAX_CONNS};
+    const PAIRS: usize = 10_000;
+    const CONNS: usize = 4096;
+    let wan = Ipv4Addr::new(203, 0, 113, 10);
+    let run = || {
+        let t0 = timer::Instant::now();
+        for i in 0..PAIRS {
+            black_box(Vec::<u8>::with_capacity(256 + i % 512));
+        }
+        let pair_ns = t0.elapsed().as_nanos() as u64 / PAIRS as u64;
+        let mut ct = Conntrack::new_shard(MAX_CONNS, 0x5eed, 16, 0);
+        ct.set_budget(Budget::with_host_limit(MAX_CONNS, MAX_CONNS, 0x5eed));
+        let t0 = timer::Instant::now();
+        for i in 0..CONNS {
+            let t = Tuple {
+                proto: PROTO_UDP,
+                src: Ipv4Addr::new(192, 168, 1, (i % 128) as u8 + 1),
+                sport: 40_000 + (i / 128 % 8) as u16,
+                dst: Ipv4Addr::new(198, 51, 100, (i / 1024) as u8 + 1),
+                dport: 443,
+            };
+            ct.create(0, t, Some(wan), 0).expect("heap bench: room");
+        }
+        let fill_ns = t0.elapsed().as_nanos() as u64 / CONNS as u64;
+        let t0 = timer::Instant::now();
+        let n = ct.expire_some(u64::MAX, EXPIRE_PER_PASS);
+        let pass_us = t0.elapsed().as_micros() as u64;
+        assert_eq!(n, EXPIRE_PER_PASS);
+        drop(ct);
+        (pair_ns, fill_ns, pass_us)
+    };
+    let before = crate::mm::heap::stats();
+    let (p0, f0, e0) = run();
+    // Holes: every other one of 2 × `holes` small blocks, so they cannot
+    // merge; anything larger than 64 B walks past all of them.
+    let mut blocks: Vec<Option<Box<[u8; 64]>>> = Vec::with_capacity(2 * holes);
+    for _ in 0..2 * holes {
+        blocks.push(Some(Box::new([0; 64])));
+    }
+    for b in blocks.iter_mut().step_by(2) {
+        *b = None;
+    }
+    let (p1, f1, e1) = run();
+    drop(blocks);
+    let after = crate::mm::heap::stats();
+    println!(
+        "  heap bench      : fresh: alloc+free {p0} ns, conn create {f0} ns, expire {EXPIRE_PER_PASS} {e0} us; \
+         {holes} holes: alloc+free {p1} ns, conn create {f1} ns, expire {EXPIRE_PER_PASS} {e1} us; \
+         live allocations {}, longest alloc {} ns, free {} ns, lock wait {} ns",
+        before.live,
+        after.alloc.max_ns,
+        after.free.max_ns,
+        after.wait.max_ns
+    );
+}
+
 pub fn spawn(has_net: bool) {
     if crate::config::ct_bench() {
         executor::spawn(Priority::Service, "ct-bench", async { conntrack_bench() });
+    }
+    if let Some(holes) = crate::config::heap_bench() {
+        executor::spawn(Priority::Service, "heap-bench", async move { heap_bench(holes) });
     }
     // Spawned in "wrong" order on purpose: the datapath task must still run first.
     executor::spawn(Priority::Service, "selftest-a", async {

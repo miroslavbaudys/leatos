@@ -1286,6 +1286,14 @@ pub fn ct_bench() -> bool {
     arg_u64(bootargs(), "ct_bench") == Some(1)
 }
 
+/// `heap_bench=N` (N ≥ 1): time heap operations and a conntrack expiry
+/// pass on the fresh heap, then again with N small holes in front of the
+/// free space (`selftest::heap_bench`): what fragmentation costs on this
+/// CPU. `heap_bench=1` (one hole) is its negative control.
+pub fn heap_bench() -> Option<usize> {
+    arg_u64(bootargs(), "heap_bench").filter(|&n| n >= 1).map(|n| n as usize)
+}
+
 /// Connections one host may initiate (`conn_per_host=N`, `0` = no limit):
 /// default a quarter of the table, so one host never takes it all.
 pub fn conn_per_host(table: usize) -> usize {

@@ -144,7 +144,7 @@ AUTH=()
 mkdir -p lab/cache
 CSV="lab/cache/soak-$LABEL.csv"
 [[ -e "$CSV" ]] && { echo "$CSV exists: pick another --label" >&2; exit 2; }
-echo "ts,uptime_s,build,heap_used,heap_free,pool_free,pool_cap,pool_fail,conntrack,early_drops,forwarded,dropped,pass_us_max,temp_mc" >"$CSV"
+echo "ts,uptime_s,build,heap_used,heap_free,pool_free,pool_cap,pool_fail,conntrack,early_drops,forwarded,dropped,pass_us_max,temp_mc,hk_us_max,heap_live,alloc_n,alloc_avg_ns,alloc_max_ns,dealloc_n,dealloc_avg_ns,dealloc_max_ns" >"$CSV"
 
 sample() {
   local now json
@@ -159,9 +159,14 @@ try:
     v = [d["uptime_s"], d["build"], d["heap"]["used"], d["heap"]["free"], d["pool"]["free"],
          d["pool"]["capacity"], d["pool"]["alloc_failures"], d["conntrack"], d.get("early_drops", 0),
          d["forwarded"], d["dropped"], (d.get("conntrack_pass_us") or {}).get("max", 0), t.get("cpu_mc", "")]
+    h = d["heap"]
+    a, f = h.get("alloc") or {}, h.get("dealloc") or {}
+    v += [(d.get("housekeeping_us") or {}).get("max", ""), h.get("live", ""),
+          a.get("count", ""), a.get("avg_ns", ""), a.get("max_ns", ""),
+          f.get("count", ""), f.get("avg_ns", ""), f.get("max_ns", "")]
     print(",".join([now] + ["%s" % x for x in v]))
 except Exception:
-    print(now + "," * 13)
+    print(now + "," * 21)
 ' "$now" >>"$CSV"
 }
 

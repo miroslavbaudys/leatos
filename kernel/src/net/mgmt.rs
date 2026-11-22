@@ -1081,6 +1081,24 @@ fn status_json(
     );
     let (pool_free, pool_cap, pool_fail) = crate::net::packet::pool_stats();
     let (heap_used, heap_free) = crate::mm::heap::usage();
+    let heap_ops = {
+        let h = crate::mm::heap::stats();
+        let op = |o: crate::mm::heap::OpTimes| {
+            format!(
+                "{{\"count\":{},\"avg_ns\":{},\"max_ns\":{}}}",
+                o.count,
+                o.total_ns.checked_div(o.count).unwrap_or(0),
+                o.max_ns
+            )
+        };
+        format!(
+            "\"live\":{},\"alloc\":{},\"dealloc\":{},\"lock_wait\":{}",
+            h.live,
+            op(h.alloc),
+            op(h.free),
+            op(h.wait)
+        )
+    };
     // CPU load history per core: [busy, datapath, service] in permille,
     // oldest first.
     let mut cpu = format!(
@@ -1150,9 +1168,9 @@ fn status_json(
     };
     let _ = write!(
         s,
-        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"tx_failed\":{},\"vlan_drops\":{},\"conntrack\":{},\"early_drops\":{},\"conntrack_pass_us\":{{\"last\":{},\"max\":{}}},\"revoked\":{},\"rejected\":{},\"icmp_errors\":{},\"unreachable6\":{},\"neigh_probes\":{},\
+        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"tx_failed\":{},\"vlan_drops\":{},\"conntrack\":{},\"early_drops\":{},\"conntrack_pass_us\":{{\"last\":{},\"max\":{}}},\"housekeeping_us\":{{\"last\":{},\"max\":{}}},\"revoked\":{},\"rejected\":{},\"icmp_errors\":{},\"unreachable6\":{},\"neigh_probes\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
-         \"heap\":{{\"used\":{heap_used},\"free\":{heap_free}}},\"cpu\":{cpu},\"temp\":{temp},\"memory\":{memory},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
+         \"heap\":{{\"used\":{heap_used},\"free\":{heap_free},{heap_ops}}},\"cpu\":{cpu},\"temp\":{temp},\"memory\":{memory},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
          \"fragments\":{{\"forwarded\":{},\"parked\":{},\"park_drops\":{},\"split\":{},\"split_drops\":{}}},\"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
         json_str(env!("CARGO_PKG_VERSION")),
         json_str(env!("LEATOS_BUILD")),
@@ -1184,6 +1202,8 @@ fn status_json(
         datapath::EARLY_DROPS.load(Ordering::Relaxed),
         datapath::EXPIRE_LAST_US.load(Ordering::Relaxed),
         datapath::EXPIRE_MAX_US.load(Ordering::Relaxed),
+        datapath::HOUSEKEEPING_LAST_US.load(Ordering::Relaxed),
+        datapath::HOUSEKEEPING_MAX_US.load(Ordering::Relaxed),
         datapath::REVOKED.load(Ordering::Relaxed),
         datapath::REJECTED.load(Ordering::Relaxed),
         datapath::ICMP_ERRORS.load(Ordering::Relaxed),

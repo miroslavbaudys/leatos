@@ -4,13 +4,20 @@
 //! copy into place must never overwrite it). A simple linked-list
 //! allocator is enough for bring-up. Packet buffers come from
 //! `net::packet`'s pool, not ad-hoc allocations.
+//!
+//! Every allocation and free is timed ([`stats`]): the time spent waiting
+//! for the one heap lock (other cores) and the time holding it (the
+//! first-fit walk of the free list, which grows with fragmentation). The
+//! counters live under the same lock, so they cost no atomics.
 
 use crate::mm::sym;
 use crate::platform::BootInfo;
 use crate::println;
 use core::sync::atomic::{AtomicBool, Ordering};
-use linked_list_allocator::LockedHeap;
-use spin::Once;
+use core::alloc::{GlobalAlloc, Layout as AllocLayout};
+use core::ptr::{self, NonNull};
+use linked_list_allocator::Heap;
+use spin::{Mutex, Once};
 
 /// Staging area size, where the arch supports the in-RAM upgrade and RAM allows.
 pub const STAGING_SIZE: usize = 32 << 20;
@@ -18,7 +25,119 @@ static STAGING: Once<(usize, usize)> = Once::new();
 static STAGING_TAKEN: AtomicBool = AtomicBool::new(false);
 
 #[global_allocator]
-static HEAP: LockedHeap = LockedHeap::empty();
+static HEAP: TimedHeap = TimedHeap(Mutex::new(Inner {
+    heap: Heap::empty(),
+    alloc: Op::ZERO,
+    free: Op::ZERO,
+    wait: Op::ZERO,
+    live: 0,
+}));
+
+/// Counts and timer ticks of one kind of heap operation.
+#[derive(Clone, Copy)]
+struct Op {
+    n: u64,
+    ticks: u64,
+    max: u64,
+}
+
+impl Op {
+    const ZERO: Self = Self { n: 0, ticks: 0, max: 0 };
+
+    fn record(&mut self, dt: u64) {
+        self.n += 1;
+        self.ticks += dt;
+        self.max = self.max.max(dt);
+    }
+}
+
+struct Inner {
+    heap: Heap,
+    /// Lock held by `allocate_first_fit` / `deallocate`.
+    alloc: Op,
+    free: Op,
+    /// Lock wait, both kinds.
+    wait: Op,
+    /// Allocations not yet freed (the free list has at most one more hole).
+    live: u64,
+}
+
+/// `linked_list_allocator::LockedHeap` (same calls), timed.
+struct TimedHeap(Mutex<Inner>);
+
+// SAFETY: allocation and deallocation go straight to
+// `linked_list_allocator::Heap` under a lock, exactly as its `LockedHeap`
+// does; the timing only reads the clock and updates counters.
+unsafe impl GlobalAlloc for TimedHeap {
+    unsafe fn alloc(&self, layout: AllocLayout) -> *mut u8 {
+        let t0 = crate::timer::ticks();
+        let mut g = self.0.lock();
+        let t1 = crate::timer::ticks();
+        let p = g.heap.allocate_first_fit(layout).map_or(ptr::null_mut(), |p| p.as_ptr());
+        let t2 = crate::timer::ticks();
+        g.wait.record(t1 - t0);
+        g.alloc.record(t2 - t1);
+        if !p.is_null() {
+            g.live += 1;
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: AllocLayout) {
+        let Some(p) = NonNull::new(ptr) else { return };
+        let t0 = crate::timer::ticks();
+        let mut g = self.0.lock();
+        let t1 = crate::timer::ticks();
+        // SAFETY: the caller's `GlobalAlloc::dealloc` contract: `ptr` came
+        // from `alloc` above (this heap) with this `layout`.
+        unsafe { g.heap.deallocate(p, layout) };
+        let t2 = crate::timer::ticks();
+        g.wait.record(t1 - t0);
+        g.free.record(t2 - t1);
+        g.live -= 1;
+    }
+}
+
+/// One kind of heap operation since boot, in nanoseconds.
+#[derive(Clone, Copy, Debug)]
+pub struct OpTimes {
+    pub count: u64,
+    pub total_ns: u64,
+    pub max_ns: u64,
+}
+
+/// Heap operation costs since boot ([`stats`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Stats {
+    /// Allocations not yet freed.
+    pub live: u64,
+    /// Time holding the lock to allocate (the first-fit walk).
+    pub alloc: OpTimes,
+    /// Time holding the lock to free (the walk to the insertion point).
+    pub free: OpTimes,
+    /// Time waiting for the lock (contention between cores).
+    pub wait: OpTimes,
+}
+
+/// The heap's operation costs. Call it only after `timer::init`.
+pub fn stats() -> Stats {
+    let (alloc, free, wait, live) = {
+        let g = HEAP.0.lock();
+        (g.alloc, g.free, g.wait, g.live)
+    };
+    let ns = |t: u64| crate::timer::ticks_to_duration(t).as_nanos() as u64;
+    let times = |o: Op| OpTimes {
+        count: o.n,
+        total_ns: ns(o.ticks),
+        max_ns: ns(o.max),
+    };
+    Stats {
+        live,
+        alloc: times(alloc),
+        free: times(free),
+        wait: times(wait),
+    }
+}
 
 /// How the RAM region the kernel runs in is split (bytes), for the
 /// management page.
@@ -56,7 +175,7 @@ pub fn init(info: &BootInfo) {
     });
     // SAFETY: [start, end) is RAM after the kernel image, mapped Normal RW
     // (boot map, later mm::mmu), used by nothing else; called exactly once.
-    unsafe { HEAP.lock().init(start as *mut u8, size) };
+    unsafe { HEAP.0.lock().heap.init(start as *mut u8, size) };
     println!(
         "  heap            : {start:#x}..{end:#x} ({} MiB){}",
         size >> 20,
@@ -93,6 +212,6 @@ pub fn return_staging(staging: &'static mut [u8]) {
 
 /// (used, free) bytes.
 pub fn usage() -> (usize, usize) {
-    let h = HEAP.lock();
-    (h.used(), h.free())
+    let g = HEAP.0.lock();
+    (g.heap.used(), g.heap.free())
 }

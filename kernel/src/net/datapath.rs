@@ -130,6 +130,11 @@ pub static EARLY_DROPS: AtomicU64 = AtomicU64::new(0);
 /// Packets of that shard wait meanwhile (M9: measured on the apu4).
 pub static EXPIRE_LAST_US: AtomicU64 = AtomicU64::new(0);
 pub static EXPIRE_MAX_US: AtomicU64 = AtomicU64::new(0);
+/// The whole once-a-second housekeeping pass (every shard, fragments,
+/// neighbors, stats): the primary direction task forwards nothing
+/// meanwhile. Last and longest since boot (µs).
+pub static HOUSEKEEPING_LAST_US: AtomicU64 = AtomicU64::new(0);
+pub static HOUSEKEEPING_MAX_US: AtomicU64 = AtomicU64::new(0);
 /// On a PPPoE port: received frames that are not PPPoE, control frames
 /// that found the client's queue full, and IPv4 to send while there is no
 /// session.
@@ -1099,6 +1104,7 @@ impl Datapath {
             }
             p
         };
+        let started = timer::Instant::now();
         let mut conns = 0;
         let mut hits: Vec<u64> = Vec::new();
         let mut fhits: Vec<u64> = Vec::new();
@@ -1168,6 +1174,9 @@ impl Datapath {
         if print {
             self.print_qdisc_stats();
         }
+        let took = started.elapsed().as_micros() as u64;
+        HOUSEKEEPING_LAST_US.store(took, Ordering::Relaxed);
+        HOUSEKEEPING_MAX_US.fetch_max(took, Ordering::Relaxed);
     }
 
     /// One console line per port that sent traffic since the last report.
