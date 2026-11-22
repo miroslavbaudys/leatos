@@ -328,6 +328,18 @@ impl NdHints {
     }
 }
 
+/// Whether an IPv6 hint from `src` may reach smoltcp on `link`. smoltcp
+/// fills its cache from any NS, with no subnet check (unlike ARP), and
+/// evicts the entry closest to expiry when full. On the WAN, frames from
+/// the internet carry remote sources (ICMPv6 errors to the router pass
+/// from anyone): hints from them would map those to the gateway's MAC
+/// and, past the cache's size within its 60 s lifetime, evict the
+/// gateway itself. The WAN's only on-link neighbors are link-local, so
+/// only those get hints there (docs/security-audit.md §4.2).
+fn hint6_on_link(link: &LinkShared, src: core::net::Ipv6Addr) -> bool {
+    link.port() >= crate::net::shared::FIRST_LAN_PORT || src.is_unicast_link_local()
+}
+
 /// A received frame; `skip` = 14 on an IP-only port (the Ethernet header).
 pub struct RxToken(PacketBuf, usize);
 
@@ -422,6 +434,7 @@ impl Device for PortDevice<'_> {
             fwd::wire::ipv6_ns_to_solicited(pkt.data_mut());
             let mut hint = [0u8; fwd::wire::NEIGHBOR_HINT_LEN];
             if let Some((ip, mac)) = fwd::wire::ipv6_neighbor_hint(pkt.data(), &mut hint)
+                && hint6_on_link(self.link, ip)
                 && nd.due(ip.into(), mac, self.now_ns)
                 && let Some(mut h) = PacketBuf::alloc()
             {

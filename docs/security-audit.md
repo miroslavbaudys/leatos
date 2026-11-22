@@ -87,6 +87,41 @@ Columns: **Parser** = where untrusted bytes are first interpreted.
 | Web interface :80 | `proto-http` (head ≤ 8 KiB, small body ≤ 64 KiB), `mgmt.rs` (1560 lines) | 4 LAN sockets, 20 s request / 120 s upload timeout, 8 sessions, 12 h idle | `http` | see 4.3 |
 | Other router ports | smoltcp | — | — | what does smoltcp answer on closed ports per zone (RST/ICMP), and is `input` mask applied before smoltcp sees the packet? |
 
+#### Neighbor hints and cache poisoning (reviewed 2026-11-22)
+
+smoltcp used to learn neighbors from the source of any unicast IP packet and upstream removed that
+on purpose: a router's periodic broadcast poisoned its ARP cache and blackholed the default
+gateway. `NdHints` (`device.rs`) brings back a narrow form of it: before a frame from a client,
+smoltcp gets an ARP reply / NS from that client's address and MAC. Why that does not reintroduce
+the poisoning:
+
+- **Only frames to the router.** Hints are made in `PortDevice::receive`, i.e. from `local_rx`:
+  frames the forwarder classified `Local`. Forwarded traffic never makes one.
+- **No broadcast or multicast.** `ipv4_neighbor_hint` / `ipv6_neighbor_hint` refuse a broadcast,
+  multicast or unspecified source or destination address and a multicast source MAC (IPv4: either
+  MAC); the upstream case (a broadcast) is excluded. ND itself makes no hint (smoltcp learns from
+  it).
+- **Only on-link sources.** IPv4: smoltcp drops an ARP sender outside the interface's subnet
+  (`iface/interface/ipv4.rs:288`), so a packet from the internet (WAN) or from behind a `[[route]]`
+  cannot map its source to the frame's MAC. IPv6: smoltcp fills its cache from any NS without
+  such a check (`iface/interface/ipv6.rs:486`) and, when full, evicts the entry closest to expiry.
+  Found in this review: on the WAN, hints from remote sources (ICMPv6 errors to the router pass
+  from anyone, with any source) mapped them to the gateway's MAC, and more than the cache's 256
+  within its 60 s lifetime would have evicted the gateway, so the router's own IPv6 traffic (DNS,
+  NTP, DoT upstream; not forwarding, which uses `fwd::neigh`) lost packets until smoltcp resolved
+  it again. Fixed: on the WAN only link-local sources get hints (`device.rs` `hint6_on_link`);
+  they never helped there anyway (internet frames carry the remote source, not the gateway's).
+  On the LANs a client's own addresses are on-link; an off-link source is a spoofing client (A3).
+- **Per network.** Each network is its own link with its own smoltcp interface and `local_rx`; a
+  frame on one network cannot change another's cache (the question in the table above).
+- **No new power for an attacker.** Mapping an on-link address to the wrong MAC takes one forged
+  frame with a hint, and one forged ARP reply or NS without: ARP and ND are unauthenticated on the
+  link either way (A2 on the WAN, A3 on its own network: expected). Hints are rate-limited per
+  address (`NdHints::EVERY_NS`, 128 clients remembered), so they cannot flood the pool.
+
+docs/lan-neighbors.md replaces the hints on the LANs (smoltcp on `Medium::Ip`, the datapath's
+`fwd::neigh` the only neighbor table); a DHCP WAN keeps them.
+
 ### 4.3 Web interface in detail (A3–A6)
 
 | Item | Current design | Review notes |

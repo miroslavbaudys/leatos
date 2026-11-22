@@ -602,7 +602,9 @@ pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: 
                 wan.iface.update_ip_addrs(|a| {
                     a.retain(|c| matches!(c, IpCidr::Ipv4(_)));
                     for c in &want {
-                        let _ = a.push(*c);
+                        if a.push(*c).is_err() {
+                            no_room_for(c, "wan");
+                        }
                     }
                 });
             }
@@ -640,12 +642,22 @@ pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: 
             host.iface.update_ip_addrs(|a| {
                 a.clear();
                 for c in &want {
-                    // iface-max-addr-count-4 (kernel/Cargo.toml) holds them.
-                    let _ = a.push(*c);
+                    // iface-max-addr-count-4 (kernel/Cargo.toml) holds
+                    // them today: IPv4, link-local, ULA, global.
+                    if a.push(*c).is_err() {
+                        no_room_for(c, k.map_or("-", |k| nets[k].name.as_str()));
+                    }
                 }
             });
         }
     }
+}
+
+/// An address that did not fit on a router-stack interface (smoltcp's
+/// `iface-max-addr-count`, kernel/Cargo.toml): logged, not dropped
+/// silently.
+fn no_room_for(c: &IpCidr, link: &str) {
+    println!("  net             : no room for {c} on {link} (iface-max-addr-count, kernel/Cargo.toml)");
 }
 
 /// An interface's routes: `routes`, plus the default route it has (the
