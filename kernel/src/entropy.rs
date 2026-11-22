@@ -64,6 +64,15 @@ pub fn mix(data: &[u8]) {
     stir(p, data);
 }
 
+/// A random `u64` from the pool (seeds, port choices).
+pub fn u64() -> u64 {
+    with(|p| {
+        let mut b = [0u8; 8];
+        p.fill(&mut b);
+        u64::from_le_bytes(b)
+    })
+}
+
 /// Use the pool (salts, tokens); the time, and fresh hardware words if
 /// there is a healthy source, are mixed in first.
 pub fn with<R>(f: impl FnOnce(&mut auth::Pool) -> R) -> R {

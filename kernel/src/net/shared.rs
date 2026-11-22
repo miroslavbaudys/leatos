@@ -35,6 +35,11 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsiz
 use spin::{Mutex, Once};
 
 /// Bound on frames waiting for the router stack.
+/// The router's bound UDP client ports (60000–65535): the forwarder lets
+/// UDP from outside reach only these (docs/security-audit.md §5 item 7).
+/// Set and cleared by the services task (`services::Upstream`, `ntp`).
+pub static CLIENT_PORTS: fwd::forwarder::ClientPorts = fwd::forwarder::ClientPorts::new();
+
 pub const LOCAL_RX_MAX: usize = 64;
 /// Bound on PPPoE control frames waiting for the client.
 pub const CTRL_RX_MAX: usize = 16;

@@ -19,4 +19,14 @@ echo "tcp22=$(tcp "$addr" 22)"
 echo "tcp80=$(tcp "$addr" 80)"
 echo "tcp61000=$(tcp "$addr" 61000)"   # the router's UDP client range: not open for TCP
 if $bb ping -c 1 -W 2 "$addr" >/dev/null 2>&1; then echo "ping=REPLY"; else echo "ping=SILENT"; fi
+# UDP to the router's client range and its DHCP client port, from source
+# ports 40120-40127: scripts/lab-test.sh judges the answers on the router's
+# WAN capture (busybox nc does not report ICMP errors): none may come back.
+n=0
+for p in 60000 60999 61000 62345 64000 65000 65535 68; do
+  (echo probe | $bb nc -u -w 1 -p $((40120 + n)) "$addr" $p >/dev/null 2>&1) &
+  n=$((n + 1))
+done
+wait
+echo "udp_probes=$n"
 echo "addr=$addr"

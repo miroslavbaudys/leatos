@@ -241,7 +241,7 @@ ports:
   in one conntrack shard, so the shards share one connection budget
   (`conntrack::Budget`, 16384 in all) instead of a fixed 1/16 each.
 - **Router-local ports (60000–65535):** the router's own client sockets
-  (SNTP UDP 60000–64999, DNS upstream UDP 65000–65535, DoT TCP
+  (SNTP UDP 60000–60999, DNS upstream UDP 61000–65535 (a random port per query), DoT TCP
   61000–64999) live here, and forwards
   may not use them (validation), so a reply to the router is never taken
   for a forwarded connection. Forwards may use everything below,

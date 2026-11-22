@@ -425,6 +425,9 @@ impl Datapath {
                 f.lan_antispoof = crate::config::lan_antispoof();
                 f.fragments = crate::config::fw_fragments();
                 f.split = crate::config::fw_split();
+                if crate::config::fw_client_ports() {
+                    f.set_client_ports(&crate::net::shared::CLIENT_PORTS);
+                }
                 Mutex::new(f)
             })
             .collect();

@@ -1358,6 +1358,21 @@ pub fn mgmt_evict() -> bool {
     arg_u64(bootargs(), "mgmt_evict") != Some(0)
 }
 
+/// The forwarder passes UDP to the router's client range only to bound
+/// ports (`fwd::forwarder::ClientPorts`); boot argument `fw_client_ports=0`
+/// passes the whole range from anyone, as before (the lab's negative
+/// control: unbound ports answer with port unreachable again).
+pub fn fw_client_ports() -> bool {
+    arg_u64(bootargs(), "fw_client_ports") != Some(0)
+}
+
+/// Upstream DNS queries over UDP leave from a fresh random port each
+/// (`net::services`, RFC 5452); boot argument `dns_port_random=0` keeps one
+/// port for the whole boot, as before (the lab's negative control).
+pub fn dns_port_random() -> bool {
+    arg_u64(bootargs(), "dns_port_random") != Some(0)
+}
+
 /// The router's own DNS domains (`dns.domain` and the networks' own):
 /// names under them may reach the management interface as `Host`.
 pub fn local_domains() -> Vec<String> {

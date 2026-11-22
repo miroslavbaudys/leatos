@@ -310,7 +310,64 @@ the LAN side), the rest are open.
    request is refused). Store, upgrade and persist tests pass. The QEMU
    port-forward probe cannot show the per-source split: every host
    connection arrives from 10.0.2.2.
-7. **Router-client port pass-through** (§4.1): what A1 can send to 60000–65535 and UDP 68 and what smoltcp does with it.
+7. **FIXED (2026-11-22): router-client port pass-through**
+   (A1). `Forwarder::input`/`input6` pass to smoltcp, from any source and
+   before zone rules: UDP to any port ≥ 60000 and to 68 (v6: 546), every
+   ICMP type but echo request (v6: errors, echo replies), TCP ≥ 60000
+   from `router_tcp_peers` only. Measured from the ISP VM, judged on the
+   router's WAN capture (`LAB_PCAP_DIR`; busybox `nc -u` cannot see
+   ICMP errors, its control stayed silent, so only the capture counts):
+   - a. **Not silent on UDP:** smoltcp answers UDP to an unbound port
+     with ICMP port unreachable (`iface/interface/udp.rs`), no rate
+     limit: 537 of 538 probes (68, 60500, 65000–65535) drew one. A port
+     scanner sees the router, and a forged source turns it into a 1:1
+     ICMP reflector.
+   - b. **The DNS upstream port is found in 13 s:** the one probe that
+     drew nothing was 65005, the port every upstream query of this boot
+     left from. The forwarder binds one port per boot (`65000 + ticks %
+     536`), so after the scan a forged answer needs only the 16-bit ID
+     (the resolver checks ID, upstream address and port — spoofable — and
+     the question). RFC 5452 wants a random port per query. Poisoning one
+     name takes a LAN client asking for it (a web page can arrange that)
+     and a forged-answer flood winning the race against the upstream; not
+     attempted. DNS over TLS (`dns.tls`) is not affected.
+   - c. **Seeds from the tick counter:** smoltcp's `random_seed` (TCP
+     initial sequence numbers, DHCPv4 transaction IDs), the resolver's ID
+     generator (`ticks as u32`, xorshift32), the SNTP cookie and the two
+     client ports all start from `timer::ticks()`, not `crate::entropy`.
+   - Fine: ICMP other than echo reaches smoltcp, which only answers echo
+     requests (`process_icmpv4`); TCP ≥ 60000 needs a DoT server's address
+     and port plus the sequence window; the DHCPv4 client checks a 32-bit
+     transaction ID and the server identifier, the DHCPv6-PD client a
+     24-bit one and the client ID.
+   Fixes:
+   - a: `fwd::forwarder::ClientPorts`, a lock-free bitmap of the bound
+     client ports (`net::shared::CLIENT_PORTS`, set by the services task):
+     UDP to the client range reaches smoltcp only at a bound port, 68
+     only from 67, 546 only from 547; everything else falls to the zone
+     policy (WAN: dropped silently, `input`). Boot argument
+     `fw_client_ports=0` restores the old pass (the negative control).
+   - b: `services::Upstream`: each upstream query over UDP binds one of 64
+     sockets to a fresh random port in 61000–65535 (SNTP moved to
+     60000–60999), freed by an answer from the server it went to (address
+     and port) or after 3 s; all busy: the oldest goes (the resolver
+     retries). With the port unknown and silent, a forged answer needs
+     port and ID: about 12 + 16 bits. `dns_port_random=0`: one port per
+     boot (the negative control). Not done: 0x20 case randomization
+     (upstreams that do not echo case would break).
+   - c: smoltcp's `random_seed`, the resolver's ID seed, the SNTP cookie
+     seed and both port choices from `crate::entropy` (`entropy::u64`).
+   Tests: `fwd` host tests (v4 and v6: bound ports pass, the rest and
+   closed-again ports drop, DHCP only from the server port, the bitmap's
+   range); lab checks on the WAN capture in every mode but swarm (`client
+   ports`: 8 probes from the ISP, none answered; `dns upstream ports`:
+   distinct source ports for ≥ 90 % of the router's queries, INVALID
+   below 10), passing in the base lab and with PPPoE, VLAN 848, IPv6
+   (prefix delegation through 546), DoT (port check not applicable),
+   guest and x86_64; negative controls `LAB_ROUTER_ARGS=fw_client_ports=0`
+   (8 port unreachables for 8 probes) and `dns_port_random=0` (1 port for
+   10 queries); the capture from before the fix gives the same failures
+   (538 port unreachables, one port 65005). Smoke test passes.
 8. **PPPoE password in clear** on the SD card (A7).
 9. **DoT provider**: own RustCrypto glue in `proto-dot/src/provider.rs` is crypto code written here; review against rustls' provider requirements.
 10. **Missing fuzz targets**: CLI line parser, config TOML/JSON, config-store records, DoT record layer, DNS-TCP framing.

@@ -76,7 +76,7 @@ Tests (`scripts/smoke-test.sh`; each passes only if a second boot is seen):
   passes our queries to its resolver as if from the client `127.0.0.1:1`
   and routes the answers back, so they share its cache and upstreams.
   smoltcp's DNS socket would use source ports in the NAT range.
-- The UDP socket sits on the WAN, port 60000–64999.
+- The UDP socket sits on the WAN, at a random port in 60000–60999 (the forwarder lets UDP in only to bound client ports, docs/security-audit.md §5 item 7).
 - `wallclock` keeps the Unix time at monotonic 0. No clock discipline: the
   time is unknown until the first sync. It is shown on the status page and
   in `/api/status` (`time`).

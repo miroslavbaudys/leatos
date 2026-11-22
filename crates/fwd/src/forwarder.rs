@@ -34,6 +34,7 @@ use crate::wire::{
 };
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, Ipv6Addr};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -524,6 +525,52 @@ enum Key {
 /// `NAT_PORTS`), port forwards anything below this.
 pub const ROUTER_CLIENT_PORTS: u16 = 60_000;
 
+/// Which of the router's client ports ([`ROUTER_CLIENT_PORTS`]..=65535)
+/// have a UDP socket bound: only those take datagrams from outside, the
+/// rest are dropped silently, so nothing answers a scan with port
+/// unreachable and the client sockets' ports cannot be found by elimination
+/// (docs/security-audit.md §5 item 7). Lock-free: the services task sets
+/// and clears ports, every datapath shard reads them.
+pub struct ClientPorts {
+    bits: [AtomicU64; Self::WORDS],
+}
+
+impl ClientPorts {
+    const WORDS: usize = (65_536 - ROUTER_CLIENT_PORTS as usize).div_ceil(64);
+
+    pub const fn new() -> Self {
+        ClientPorts { bits: [const { AtomicU64::new(0) }; Self::WORDS] }
+    }
+
+    fn at(port: u16) -> Option<(usize, u64)> {
+        let i = usize::from(port.checked_sub(ROUTER_CLIENT_PORTS)?);
+        Some((i / 64, 1 << (i % 64)))
+    }
+
+    /// A client socket is bound to `port` (ignored below the range).
+    pub fn open(&self, port: u16) {
+        if let Some((w, b)) = Self::at(port) {
+            self.bits[w].fetch_or(b, Ordering::Relaxed);
+        }
+    }
+
+    pub fn close(&self, port: u16) {
+        if let Some((w, b)) = Self::at(port) {
+            self.bits[w].fetch_and(!b, Ordering::Relaxed);
+        }
+    }
+
+    pub fn is_open(&self, port: u16) -> bool {
+        Self::at(port).is_some_and(|(w, b)| self.bits[w].load(Ordering::Relaxed) & b != 0)
+    }
+}
+
+impl Default for ClientPorts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// ICMP errors: token bucket, 50/s with a burst of 20.
 const ICMP_RATE_PER_SEC: u64 = 50;
 const ICMP_BURST: u64 = 20;
@@ -563,6 +610,11 @@ pub struct Forwarder {
     /// ([`Verdict::Forward`] `split`); off: dropped as `too-big`, as before
     /// (the lab's negative control).
     pub split: bool,
+    /// The router's bound client ports: with them, UDP to the client range
+    /// passes only to these (and 68 only from 67, 546 only from 547); `None`
+    /// (tests, boot argument `fw_client_ports=0`): every port in the range
+    /// passes, from any source port, as before 2026-11-22.
+    client_ports: Option<&'static ClientPorts>,
     /// The last [`Self::process`]'s first fragment, forwarded: what its
     /// datagram's later fragments need ([`Self::take_fragment`]).
     frag: Option<frag::Decision>,
@@ -934,6 +986,7 @@ impl Forwarder {
             wan_antispoof: true,
             fragments: true,
             split: true,
+            client_ports: None,
             frag: None,
             ipv6: false,
             addrs6: Vec::new(),
@@ -1167,6 +1220,22 @@ impl Forwarder {
 
     /// Count this shard's connections against `budget`, shared with the
     /// other shards (`conntrack::Budget`). Call before the first packet.
+    /// Pass UDP to the client range only to the ports `ports` has open
+    /// ([`ClientPorts`]).
+    pub fn set_client_ports(&mut self, ports: &'static ClientPorts) {
+        self.client_ports = Some(ports);
+    }
+
+    /// UDP from `sport` to the router's `dport` is a reply to one of its
+    /// clients: the DHCP client's (68 from 67, 546 from 547 for DHCPv6) or a
+    /// bound client port.
+    fn client_reply(&self, sport: u16, dport: u16, dhcp: (u16, u16)) -> bool {
+        match self.client_ports {
+            None => dport >= ROUTER_CLIENT_PORTS || dport == dhcp.1,
+            Some(p) => (dport == dhcp.1 && sport == dhcp.0) || p.is_open(dport),
+        }
+    }
+
     pub fn set_conn_budget(&mut self, budget: alloc::sync::Arc<crate::conntrack::Budget>) {
         self.ct6.set_budget(budget.clone());
         self.ct.set_budget(budget);
@@ -1647,7 +1716,10 @@ impl Forwarder {
         }
         let dport = (matches!(v.proto, PROTO_TCP | PROTO_UDP) && l4(4)).then(|| wire::get16(f, v.l4 + 2));
         // Replies to the router's UDP clients; 546: its DHCPv6 client.
-        if v.proto == PROTO_UDP && dport.is_some_and(|d| d >= ROUTER_CLIENT_PORTS || d == 546) {
+        if v.proto == PROTO_UDP
+            && let Some(d) = dport
+            && self.client_reply(wire::get16(f, v.l4), d, (547, 546))
+        {
             return self.local();
         }
         // TCP replies only from the servers it connects to (DNS over TLS).
@@ -1705,7 +1777,7 @@ impl Forwarder {
         let dport = (v.l4_len >= 4 && !v.is_fragment).then(|| wire::get16(f, v.l4 + 2));
         let icmp_type = (v.proto == PROTO_ICMP && v.l4_len >= 1 && !v.is_fragment).then(|| f[v.l4]);
         let reply = match v.proto {
-            PROTO_UDP => dport.is_some_and(|d| d >= ROUTER_CLIENT_PORTS || d == 68),
+            PROTO_UDP => dport.is_some_and(|d| self.client_reply(wire::get16(f, v.l4), d, (67, 68))),
             PROTO_TCP => dport.is_some_and(|d| d >= ROUTER_CLIENT_PORTS) && {
                 let peer = (v.src(f), wire::get16(f, v.l4));
                 self.policy.as_ref().is_some_and(|p| p.router_tcp_peers.contains(&peer))
@@ -3230,6 +3302,53 @@ mod tests {
         let reply = icmp_echo(0, 7, 1);
         let mut f = to(WAN_MAC, ipv4_frame(SERVER, ROUTER_WAN, PROTO_ICMP, 64, &reply));
         assert_eq!(run(&mut fw, 0, WAN, &mut f), Verdict::Local, "echo reply");
+    }
+
+    #[test]
+    fn udp_to_the_client_range_passes_only_to_bound_ports() {
+        static PORTS: ClientPorts = ClientPorts::new();
+        let mut fw = router();
+        zoned(&mut fw);
+        let mut p = fw.policy.clone().unwrap();
+        p.input[0] = Some(0);
+        fw.set_policy(Some(p));
+        fw.set_client_ports(&PORTS);
+        PORTS.open(61_234);
+        PORTS.open(60_100);
+        let udp = |sport, dport| {
+            let d = udp_datagram(SERVER, ROUTER_WAN, sport, dport, b"a");
+            to(WAN_MAC, ipv4_frame(SERVER, ROUTER_WAN, PROTO_UDP, 64, &d))
+        };
+        assert_eq!(run(&mut fw, 0, WAN, &mut udp(53, 61_234)), Verdict::Local, "a query's port");
+        assert_eq!(run(&mut fw, 0, WAN, &mut udp(123, 60_100)), Verdict::Local, "SNTP's port");
+        // Anything else in the range: dropped silently, no port unreachable
+        // from the host stack, so a scan cannot tell bound from unbound.
+        for dport in [60_000, 61_233, 61_235, 65_000, 65_535] {
+            assert_eq!(run(&mut fw, 0, WAN, &mut udp(53, dport)), Verdict::Drop(DropReason::Input), "{dport}");
+        }
+        PORTS.close(61_234);
+        assert_eq!(run(&mut fw, 0, WAN, &mut udp(53, 61_234)), Verdict::Drop(DropReason::Input), "closed again");
+        // The DHCP client: only from a server's port 67.
+        assert_eq!(run(&mut fw, 0, WAN, &mut udp(67, 68)), Verdict::Local);
+        assert_eq!(run(&mut fw, 0, WAN, &mut udp(40_000, 68)), Verdict::Drop(DropReason::Input));
+        assert!(!PORTS.is_open(59_999) && !PORTS.is_open(68), "outside the range: never open");
+        PORTS.open(68);
+        assert!(!PORTS.is_open(68));
+    }
+
+    #[test]
+    fn ipv6_udp_to_the_client_range_passes_only_to_bound_ports() {
+        static PORTS: ClientPorts = ClientPorts::new();
+        let mut fw = router6();
+        fw.set_client_ports(&PORTS);
+        PORTS.open(65_535);
+        let gw = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let me = wire::link_local(WAN_MAC);
+        let udp = |sport, dport| ipv6_frame(WAN_MAC, gw, me, 64, &[], PROTO_UDP, &l4(sport, dport));
+        assert_eq!(v6(&mut fw, WAN, udp(53, 65_535)), LOCAL, "the last port of the range");
+        assert_eq!(v6(&mut fw, WAN, udp(53, 65_534)), dropped(DropReason::Input));
+        assert_eq!(v6(&mut fw, WAN, udp(547, 546)), LOCAL, "DHCPv6 from a server");
+        assert_eq!(v6(&mut fw, WAN, udp(53, 546)), dropped(DropReason::Input));
     }
 
     #[test]

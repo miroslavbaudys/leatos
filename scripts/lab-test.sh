@@ -68,6 +68,12 @@
 #                        (the guesses come from the client's own address:
 #                        its logins get 429) and LAB_ROUTER_ARGS=mgmt_evict=0
 #                        (no free slot: the request is refused)
+#                        Client ports (§5 item 7), from the WAN capture
+#                        (always taken but in swarm mode): the ISP's UDP
+#                        probes to unbound client ports and 68 get no port
+#                        unreachable, upstream DNS queries use many ports.
+#                        Negative controls LAB_ROUTER_ARGS=fw_client_ports=0
+#                        and LAB_ROUTER_ARGS=dns_port_random=0
 #   LAB_ROUTER_ARGS="…"  extra router boot arguments, e.g. qdisc=codel (single
 #                        CoDel queue: the negative control for the flow-
 #                        isolation latency check), or dns_prefetch=0 (the
@@ -469,6 +475,8 @@ LAN1_PORT="${LAB_LAN1_PORT:-10007}"
 WORK=$(mktemp -d -t leatos-lab)
 PCAP_DIR="${LAB_PCAP_DIR:-}"
 [[ -n "$MDNS" && -z "$PCAP_DIR" ]] && PCAP_DIR="$WORK/pcap"
+# The client-port checks read the WAN capture (not in swarm mode: its rate).
+[[ -z "$SWARM" && -z "$PCAP_DIR" ]] && PCAP_DIR="$WORK/pcap"
 PIDS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null || true; done
@@ -1012,6 +1020,46 @@ if [[ -n "$MDNS" ]]; then
     echo "  LAB PASS: mdns igmp: router joined 224.0.0.251 on lan ($igmp_lan) and guest ($igmp_guest)"
   else
     echo "  LAB FAIL: mdns igmp: joins lan=$igmp_lan guest=$igmp_guest"; router_fails=$((router_fails + 1))
+  fi
+fi
+
+# Router client ports (docs/security-audit.md §5 item 7), judged on the
+# router's WAN capture: the ISP's UDP probes (cgi-bin/wanprobe, source ports
+# 40120-40127) to unbound client ports and to 68 draw no ICMP port
+# unreachable, and the router's upstream DNS queries leave from many ports.
+# Negative controls: LAB_ROUTER_ARGS=fw_client_ports=0 (port unreachable
+# again), LAB_ROUTER_ARGS=dns_port_random=0 (one port).
+if [[ -z "$SWARM" ]]; then
+  if ! command -v tcpdump >/dev/null || [[ ! -f "$PCAP_DIR/wan.pcap" ]]; then
+    echo "  LAB FAIL: client ports: INVALID, no WAN capture or no tcpdump to read it"; router_fails=$((router_fails + 1))
+  else
+    pre=""
+    [[ -n "$ISP_VLAN" ]] && pre="vlan and "
+    [[ -n "$ISP_PPPOE" ]] && pre="${pre}pppoes and "
+    td() { tcpdump -nr "$PCAP_DIR/wan.pcap" "$1" 2>/dev/null || true; }
+    probes=$(td "${pre}udp src portrange 40120-40127" | grep -c . || true)
+    unreach=$(td "${pre}icmp[icmptype] == 3 and icmp[icmpcode] == 3 and (icmp[30:2] >= 60000 or icmp[30:2] == 68)" | grep -c . || true)
+    if [[ "$probes" -lt 8 ]]; then
+      echo "  LAB FAIL: client ports: INVALID, $probes of 8 UDP probes in the WAN capture"; router_fails=$((router_fails + 1))
+    elif [[ "$unreach" == 0 ]]; then
+      echo "  LAB PASS: client ports: $probes UDP probes to unbound client ports and 68, no port unreachable back"
+    else
+      echo "  LAB FAIL: client ports: $unreach port unreachable answers to $probes UDP probes"; router_fails=$((router_fails + 1))
+    fi
+    if [[ -n "$DOT" ]]; then
+      echo "  LAB INFO: dns upstream ports: not checked (DNS over TLS)"
+    else
+      qports=$(td "${pre}udp dst port 53 and src portrange 60000-65535" | sed -n 's/.* IP6\{0,1\} [^ ]*\.\([0-9]*\) > .*/\1/p')
+      total=$(echo "$qports" | grep -c . || true)
+      distinct=$(echo "$qports" | sort -u | grep -c . || true)
+      if [[ "$total" -lt 10 ]]; then
+        echo "  LAB FAIL: dns upstream ports: INVALID, $total upstream queries in the WAN capture"; router_fails=$((router_fails + 1))
+      elif [[ $((distinct * 10)) -ge $((total * 9)) ]]; then
+        echo "  LAB PASS: dns upstream ports: $distinct ports for $total queries"
+      else
+        echo "  LAB FAIL: dns upstream ports: $distinct ports for $total queries"; router_fails=$((router_fails + 1))
+      fi
+    fi
   fi
 fi
 

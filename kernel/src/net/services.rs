@@ -25,6 +25,7 @@ use crate::net::dns_tcp;
 use crate::net::dot::Dot;
 use crate::net::mdns::Mdns;
 use crate::net::ntp::{self, Ntp};
+use crate::net::shared::CLIENT_PORTS;
 use crate::net::shared::Shared;
 use crate::net::svc::HostIf;
 use crate::{println, timer};
@@ -72,7 +73,7 @@ pub struct LanServices {
     /// The `[[dns.host]]` entries in the zone (their hits follow them
     /// through config changes).
     local_hosts: Vec<LocalHost>,
-    upstream_sock: Option<SocketHandle>,
+    upstream: Option<Upstream>,
     /// The WAN lease's DNS servers (used without `dns.upstreams`).
     lease_dns: Vec<Ipv4Addr>,
     /// The ISP's IPv6 DNS servers (DHCPv6, `net::wan6`): after the lease's,
@@ -148,6 +149,133 @@ pub fn send_frame(sh: &Shared, link: usize, frame: &[u8]) {
         sh.tx_kick[port].signal();
     }
 }
+/// Upstream DNS over UDP (docs/security-audit.md §5 item 7): each query
+/// leaves from a socket bound to a fresh random port in
+/// [`UPSTREAM_PORTS`] (RFC 5452 §9.2: port and ID to guess, not the ID
+/// alone), freed by an answer from the server it went to or after
+/// [`UPSTREAM_SLOT_MS`]; all [`UPSTREAM_SLOTS`] busy: the oldest goes (its
+/// query is retried by the resolver). The forwarder passes UDP only to
+/// ports bound here or by SNTP (`shared::CLIENT_PORTS`), so the others
+/// stay silent. `dns_port_random=0`: one port for the whole boot.
+const UPSTREAM_SLOTS: usize = 64;
+const UPSTREAM_SLOT_MS: u64 = 3_000;
+const UPSTREAM_PORTS: (u16, u16) = (61_000, 65_535);
+
+struct Slot {
+    handle: SocketHandle,
+    /// 0: unbound.
+    port: u16,
+    /// Where its query went: the only source of its answer.
+    server: Option<IpEndpoint>,
+    sent_ms: u64,
+}
+
+struct Upstream {
+    slots: Vec<Slot>,
+    /// `dns_port_random=0`: slot 0 only, bound for good.
+    fixed: bool,
+}
+
+impl Upstream {
+    fn new(wan: &mut HostIf) -> Self {
+        let fixed = !config::dns_port_random();
+        let n = if fixed { 1 } else { UPSTREAM_SLOTS };
+        let slots = (0..n)
+            .map(|_| {
+                // One query, one answer (EDNS: up to 4096 B); the fixed
+                // port carries every query.
+                let s = if fixed { udp_socket(32, 32 * 4096) } else { udp_socket(2, 2 * 4096) };
+                Slot { handle: wan.sockets.add(s), port: 0, server: None, sent_ms: 0 }
+            })
+            .collect();
+        let mut up = Upstream { slots, fixed };
+        if fixed {
+            up.bind(wan, 0);
+        }
+        up
+    }
+
+    /// Bind slot `i` to a random free port of the range.
+    fn bind(&mut self, wan: &mut HostIf, i: usize) {
+        let (lo, hi) = UPSTREAM_PORTS;
+        let span = u64::from(hi - lo) + 1;
+        let port = loop {
+            let p = lo + (crate::entropy::u64() % span) as u16;
+            if !CLIENT_PORTS.is_open(p) {
+                break p;
+            }
+        };
+        if wan.sockets.get_mut::<udp::Socket>(self.slots[i].handle).bind(port).is_ok() {
+            CLIENT_PORTS.open(port);
+            self.slots[i].port = port;
+        }
+    }
+
+    fn free(&mut self, wan: &mut HostIf, i: usize) {
+        let sl = &mut self.slots[i];
+        if sl.port != 0 {
+            wan.sockets.get_mut::<udp::Socket>(sl.handle).close();
+            CLIENT_PORTS.close(sl.port);
+        }
+        sl.port = 0;
+        sl.server = None;
+    }
+
+    fn send(&mut self, wan: &mut HostIf, to: IpEndpoint, data: &[u8], now: u64) {
+        let i = if self.fixed {
+            0
+        } else {
+            self.expire(wan, now);
+            let i = (0..self.slots.len())
+                .find(|&i| self.slots[i].port == 0)
+                .or_else(|| (0..self.slots.len()).min_by_key(|&i| self.slots[i].sent_ms))
+                .unwrap_or(0);
+            self.free(wan, i);
+            self.bind(wan, i);
+            i
+        };
+        let sl = &mut self.slots[i];
+        sl.server = Some(to);
+        sl.sent_ms = now;
+        let _ = wan.sockets.get_mut::<udp::Socket>(sl.handle).send_slice(data, to);
+    }
+
+    fn expire(&mut self, wan: &mut HostIf, now: u64) {
+        for i in 0..self.slots.len() {
+            if self.slots[i].port != 0 && now.saturating_sub(self.slots[i].sent_ms) > UPSTREAM_SLOT_MS {
+                self.free(wan, i);
+            }
+        }
+    }
+
+    /// Datagrams received: (from, data). A random-port slot takes one
+    /// answer, from the server its query went to, and is freed.
+    fn recv(&mut self, wan: &mut HostIf, now: u64) -> Vec<(IpEndpoint, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut rbuf = [0u8; 4096]; // EDNS responses may exceed 1500 B
+        for i in 0..self.slots.len() {
+            if self.slots[i].port == 0 {
+                continue;
+            }
+            let sock = wan.sockets.get_mut::<udp::Socket>(self.slots[i].handle);
+            let mut answered = false;
+            while let Ok((n, meta)) = sock.recv_slice(&mut rbuf) {
+                if self.fixed || Some(meta.endpoint) == self.slots[i].server {
+                    out.push((meta.endpoint, rbuf[..n].to_vec()));
+                    answered = !self.fixed;
+                }
+            }
+            if answered {
+                self.free(wan, i);
+            }
+        }
+        if !self.fixed {
+            self.expire(wan, now);
+        }
+        out
+    }
+}
+
 fn udp_socket(datagrams: usize, bytes: usize) -> udp::Socket<'static> {
     let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; datagrams], vec![0; bytes]);
     let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; datagrams], vec![0; bytes]);
@@ -330,19 +458,16 @@ impl LanServices {
         let dns_cfg = config::dns();
         let (names, local_hosts) = config::dns_names();
         let zone = build_zone(&cfgs, &names, &local_hosts, core::iter::empty());
-        let dns = Resolver::new(resolver_config(&dns_cfg), zone, timer::ticks() as u32);
+        let dns = Resolver::new(resolver_config(&dns_cfg), zone, crate::entropy::u64() as u32);
         let nets = cfgs
             .into_iter()
             .zip(links)
             .map(|(cfg, &link)| open_net(cfg, link, hosts))
             .collect();
         let wan = &mut hosts[0];
-        // 65000–65535: router-local (fwd::forwarder::ROUTER_CLIENT_PORTS),
-        // apart from SNTP's 60000–64999; never a NAT or forwarded port.
-        let port = 65_000 + (timer::ticks() % 536) as u16;
-        let mut s = udp_socket(32, 32 * 4096);
-        s.bind(port).expect("bind upstream port");
-        let upstream_sock = Some(wan.sockets.add(s));
+        // 61000–65535: router-local (fwd::forwarder::ROUTER_CLIENT_PORTS),
+        // apart from SNTP's 60000–60999; never a NAT or forwarded port.
+        let upstream = Some(Upstream::new(wan));
         let ntp = Some(Ntp::new(wan));
         println!("  lan services    : dns cache {}", dns_cfg.cache_entries);
         let mdns = Mdns::new(hosts, links);
@@ -351,7 +476,7 @@ impl LanServices {
             dns,
             names,
             local_hosts,
-            upstream_sock,
+            upstream,
             lease_dns: Vec::new(),
             lease_dns6: Vec::new(),
             udp_ports: Vec::new(),
@@ -757,9 +882,9 @@ impl LanServices {
                     }
                 }
                 Action::Upstream { server, data } => {
-                    if let Some(h) = self.upstream_sock {
-                        let ep = IpEndpoint::new(server.into(), self.udp_port(server));
-                        let _ = hosts[0].sockets.get_mut::<udp::Socket>(h).send_slice(&data, ep);
+                    let ep = IpEndpoint::new(server.into(), self.udp_port(server));
+                    if let Some(up) = self.upstream.as_mut() {
+                        up.send(&mut hosts[0], ep, &data, now_ms());
                     }
                 }
             }
@@ -846,16 +971,14 @@ impl LanServices {
         // DNS: upstream responses. Over TLS only from the TLS connections:
         // a UDP datagram is never an answer then (no query went out by UDP,
         // so one with a pending ID is spoofed).
-        if let Some(h) = self.upstream_sock {
-            let mut rbuf = [0u8; 4096]; // EDNS responses may exceed 1500 B
-            while let Ok((n, meta)) = hosts[0].sockets.get_mut::<udp::Socket>(h).recv_slice(&mut rbuf) {
-                let from = IpAddr::from(meta.endpoint.addr);
-                if self.tls || meta.endpoint.port != self.udp_port(from) {
-                    continue;
-                }
-                let actions = self.dns.handle_upstream(now_ms(), from, &rbuf[..n]);
-                self.send_dns(hosts, actions);
+        let answers = self.upstream.as_mut().map(|up| up.recv(&mut hosts[0], now_ms())).unwrap_or_default();
+        for (ep, data) in answers {
+            let from = IpAddr::from(ep.addr);
+            if self.tls || ep.port != self.udp_port(from) {
+                continue;
             }
+            let actions = self.dns.handle_upstream(now_ms(), from, &data);
+            self.send_dns(hosts, actions);
         }
         if let Some(dot) = self.dot.as_mut() {
             if core::mem::take(&mut self.wan_changed) {

@@ -376,7 +376,9 @@ pub fn new_iface(port: &PortShared) -> Interface {
         HardwareAddress::Ethernet(EthernetAddress(port.mac))
     };
     let mut config = Config::new(hw);
-    config.random_seed = timer::ticks();
+    // TCP initial sequence numbers, DHCP transaction IDs: from the entropy
+    // pool, not the tick count (docs/security-audit.md §5 item 7).
+    config.random_seed = crate::entropy::u64();
     let mut queued = 0;
     let mut device = PortDevice {
         link,

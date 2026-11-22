@@ -6,8 +6,10 @@
 //!   [`SELF_CLIENT`] address, and routes the answers back here), so they
 //!   share its cache, upstreams and port rules. IPv4 literals need no
 //!   lookup.
-//! - Transport: one UDP socket on the WAN interface, bound at a port
-//!   ≥ 60000 (router-local, never mistaken for NAT or a port forward).
+//! - Transport: one UDP socket on the WAN interface, bound at a random port
+//!   in 60000–60999 (router-local, never mistaken for NAT or a port
+//!   forward; the forwarder lets replies in only to bound client ports,
+//!   `shared::CLIENT_PORTS`; DNS upstream queries use 61000–65535).
 //! - Starts once the WAN has a lease (DNS upstreams known).
 
 use crate::net::svc::HostIf;
@@ -77,16 +79,17 @@ impl Ntp {
         let rx = udp::PacketBuffer::new(vec_meta(4), alloc::vec![0; 4 * 64]);
         let tx = udp::PacketBuffer::new(vec_meta(4), alloc::vec![0; 4 * 64]);
         let mut s = udp::Socket::new(rx, tx);
-        // 60000–64999: router-local, apart from the DNS upstream port.
-        let port = 60_000 + (timer::ticks() % 5_000) as u16;
+        // 60000–60999: router-local, apart from the DNS upstream ports.
+        let port = 60_000 + (crate::entropy::u64() % 1_000) as u16;
         s.bind(port).expect("bind ntp port");
+        crate::net::shared::CLIENT_PORTS.open(port);
         let servers = servers_from_config();
         if servers.is_empty() {
             println!("  ntp             : off (no servers)");
         }
         Ntp {
             servers,
-            client: Client::new(timer::ticks()),
+            client: Client::new(crate::entropy::u64()),
             sock: wan.sockets.add(s),
             wan_up: false,
             next_id: (timer::ticks() as u16) | 1,

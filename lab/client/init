@@ -387,7 +387,7 @@ fi
 # must refuse). Negative controls (scripts/lab-test.sh): LAB_ROUTER_ARGS=
 # mgmt=wan (tcp80 open), LAB_WAN_OPEN=1 (a rule accepting wan -> router:
 # RST and ping reply again).
-wp=$($bb wget -q -T 20 -O - "http://$ISP/cgi-bin/wanprobe" 2>&1)
+wp=$($bb wget -q -T 40 -O - "http://$ISP/cgi-bin/wanprobe" 2>&1)
 if echo "$wp" | $bb grep -q "control=REFUSED" && echo "$wp" | $bb grep -q "tcp22=SILENT" \
    && echo "$wp" | $bb grep -q "tcp80=SILENT" && echo "$wp" | $bb grep -q "tcp61000=SILENT" \
    && echo "$wp" | $bb grep -q "ping=SILENT"; then
