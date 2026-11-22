@@ -1,13 +1,18 @@
 //! Kernel heap: everything from the end of the kernel image to the end of
 //! the RAM bank, minus the **staging area** at the very top (where an
 //! uploaded kernel waits for the in-RAM upgrade, `crate::upgrade`: the
-//! copy into place must never overwrite it). A simple linked-list
-//! allocator is enough for bring-up. Packet buffers come from
+//! copy into place must never overwrite it). Packet buffers come from
 //! `net::packet`'s pool, not ad-hoc allocations.
 //!
+//! The allocator is `talc` (free blocks binned by size, boundary tags:
+//! allocation and free cost do not grow with fragmentation). Boot argument
+//! `heap=list` selects the first-fit linked list used before 2026-11-22,
+//! whose every allocation and free walks the free holes: on the apu4 the
+//! conntrack pass slowed from 75 to 1186 µs over a day (`heap_bench=N`
+//! measures it). It stays as the benchmark's control and a fallback.
+//!
 //! Every allocation and free is timed ([`stats`]): the time spent waiting
-//! for the one heap lock (other cores) and the time holding it (the
-//! first-fit walk of the free list, which grows with fragmentation). The
+//! for the one heap lock (other cores) and the time holding it. The
 //! counters live under the same lock, so they cost no atomics.
 
 use crate::mm::sym;
@@ -17,6 +22,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::alloc::{GlobalAlloc, Layout as AllocLayout};
 use core::ptr::{self, NonNull};
 use linked_list_allocator::Heap;
+use talc::{ErrOnOom, Span, Talc};
 use spin::{Mutex, Once};
 
 /// Staging area size, where the arch supports the in-RAM upgrade and RAM allows.
@@ -26,7 +32,9 @@ static STAGING_TAKEN: AtomicBool = AtomicBool::new(false);
 
 #[global_allocator]
 static HEAP: TimedHeap = TimedHeap(Mutex::new(Inner {
-    heap: Heap::empty(),
+    talc: Talc::new(ErrOnOom),
+    list: Heap::empty(),
+    use_list: false,
     alloc: Op::ZERO,
     free: Op::ZERO,
     wait: Op::ZERO,
@@ -52,7 +60,10 @@ impl Op {
 }
 
 struct Inner {
-    heap: Heap,
+    talc: Talc<ErrOnOom>,
+    /// `heap=list`: the one claimed at boot; the other stays empty.
+    list: Heap,
+    use_list: bool,
     /// Lock held by `allocate_first_fit` / `deallocate`.
     alloc: Op,
     free: Op,
@@ -62,18 +73,26 @@ struct Inner {
     live: u64,
 }
 
-/// `linked_list_allocator::LockedHeap` (same calls), timed.
+/// `talc` or `linked_list_allocator` under one lock, timed.
 struct TimedHeap(Mutex<Inner>);
 
-// SAFETY: allocation and deallocation go straight to
-// `linked_list_allocator::Heap` under a lock, exactly as its `LockedHeap`
-// does; the timing only reads the clock and updates counters.
+// SAFETY: allocation and deallocation go straight to the allocator chosen
+// at boot (`talc::Talc` or `linked_list_allocator::Heap`) under a lock, as
+// their own locked wrappers do; the timing only reads the clock and updates
+// counters.
 unsafe impl GlobalAlloc for TimedHeap {
     unsafe fn alloc(&self, layout: AllocLayout) -> *mut u8 {
         let t0 = crate::timer::ticks();
         let mut g = self.0.lock();
         let t1 = crate::timer::ticks();
-        let p = g.heap.allocate_first_fit(layout).map_or(ptr::null_mut(), |p| p.as_ptr());
+        let p = if g.use_list {
+            g.list.allocate_first_fit(layout)
+        } else {
+            // SAFETY: `GlobalAlloc::alloc`'s contract: `layout` has a
+            // non-zero size (talc's only requirement).
+            unsafe { g.talc.malloc(layout) }
+        };
+        let p = p.map_or(ptr::null_mut(), |p| p.as_ptr());
         let t2 = crate::timer::ticks();
         g.wait.record(t1 - t0);
         g.alloc.record(t2 - t1);
@@ -88,9 +107,14 @@ unsafe impl GlobalAlloc for TimedHeap {
         let t0 = crate::timer::ticks();
         let mut g = self.0.lock();
         let t1 = crate::timer::ticks();
-        // SAFETY: the caller's `GlobalAlloc::dealloc` contract: `ptr` came
-        // from `alloc` above (this heap) with this `layout`.
-        unsafe { g.heap.deallocate(p, layout) };
+        if g.use_list {
+            // SAFETY: the caller's `GlobalAlloc::dealloc` contract: `ptr`
+            // came from `alloc` above (this allocator) with this `layout`.
+            unsafe { g.list.deallocate(p, layout) };
+        } else {
+            // SAFETY: as above, for talc.
+            unsafe { g.talc.free(p, layout) };
+        }
         let t2 = crate::timer::ticks();
         g.wait.record(t1 - t0);
         g.free.record(t2 - t1);
@@ -109,11 +133,15 @@ pub struct OpTimes {
 /// Heap operation costs since boot ([`stats`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Stats {
+    /// `"talc"` or `"list"` (`heap=list`).
+    pub allocator: &'static str,
+    /// Free holes between allocations (talc only).
+    pub fragments: Option<usize>,
     /// Allocations not yet freed.
     pub live: u64,
-    /// Time holding the lock to allocate (the first-fit walk).
+    /// Time holding the lock to allocate (the list: the first-fit walk).
     pub alloc: OpTimes,
-    /// Time holding the lock to free (the walk to the insertion point).
+    /// Time holding the lock to free (the list: the walk to the insertion point).
     pub free: OpTimes,
     /// Time waiting for the lock (contention between cores).
     pub wait: OpTimes,
@@ -121,9 +149,10 @@ pub struct Stats {
 
 /// The heap's operation costs. Call it only after `timer::init`.
 pub fn stats() -> Stats {
-    let (alloc, free, wait, live) = {
+    let (alloc, free, wait, live, use_list, fragments) = {
         let g = HEAP.0.lock();
-        (g.alloc, g.free, g.wait, g.live)
+        let frags = g.talc.get_counters().fragment_count;
+        (g.alloc, g.free, g.wait, g.live, g.use_list, frags)
     };
     let ns = |t: u64| crate::timer::ticks_to_duration(t).as_nanos() as u64;
     let times = |o: Op| OpTimes {
@@ -132,6 +161,8 @@ pub fn stats() -> Stats {
         max_ns: ns(o.max),
     };
     Stats {
+        allocator: if use_list { "list" } else { "talc" },
+        fragments: (!use_list).then_some(fragments),
         live,
         alloc: times(alloc),
         free: times(free),
@@ -173,12 +204,26 @@ pub fn init(info: &BootInfo) {
         staging: STAGING.get().map_or(0, |&(_, l)| l),
         heap: size,
     });
-    // SAFETY: [start, end) is RAM after the kernel image, mapped Normal RW
-    // (boot map, later mm::mmu), used by nothing else; called exactly once.
-    unsafe { HEAP.0.lock().heap.init(start as *mut u8, size) };
+    let list = crate::config::heap_list();
+    {
+        let mut g = HEAP.0.lock();
+        g.use_list = list;
+        if list {
+            // SAFETY: [start, end) is RAM after the kernel image, mapped
+            // Normal RW (boot map, later mm::mmu), used by nothing else;
+            // called exactly once.
+            unsafe { g.list.init(start as *mut u8, size) };
+        } else {
+            let span = Span::from_base_size(start as *mut u8, size);
+            // SAFETY: as above: talc gets sole use of [start, end).
+            let claimed = unsafe { g.talc.claim(span) };
+            claimed.expect("heap: talc could not claim the heap");
+        }
+    }
     println!(
-        "  heap            : {start:#x}..{end:#x} ({} MiB){}",
+        "  heap            : {start:#x}..{end:#x} ({} MiB, {}){}",
         size >> 20,
+        if list { "linked list" } else { "talc" },
         STAGING
             .get()
             .map(|&(s, l)| alloc::format!(", upgrade staging {s:#x}..{:#x}", s + l))
@@ -213,5 +258,10 @@ pub fn return_staging(staging: &'static mut [u8]) {
 /// (used, free) bytes.
 pub fn usage() -> (usize, usize) {
     let g = HEAP.0.lock();
-    (g.heap.used(), g.heap.free())
+    if g.use_list {
+        (g.list.used(), g.list.free())
+    } else {
+        let c = g.talc.get_counters();
+        (c.allocated_bytes, c.available_bytes)
+    }
 }

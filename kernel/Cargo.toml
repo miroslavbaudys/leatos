@@ -50,6 +50,7 @@ proto-dot.workspace = true
 cli.workspace = true
 config-store.workspace = true
 linked_list_allocator = "0.10"
+talc = { version = "=4.4.3", default-features = false, features = ["counters"] }
 spin = { version = "0.12", default-features = false, features = ["spin_mutex", "once"] }
 virtio-drivers = { version = "0.13", default-features = false }
 safe-mmio = "0.4"

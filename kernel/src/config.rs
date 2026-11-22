@@ -1286,6 +1286,13 @@ pub fn ct_bench() -> bool {
     arg_u64(bootargs(), "ct_bench") == Some(1)
 }
 
+/// `heap=list`: the first-fit linked-list allocator instead of talc
+/// (`mm::heap`): `heap_bench`'s control and a fallback. Read before the
+/// heap exists: no allocation.
+pub fn heap_list() -> bool {
+    bootargs().split_ascii_whitespace().any(|a| a == "heap=list")
+}
+
 /// `heap_bench=N` (N ≥ 1): time heap operations and a conntrack expiry
 /// pass on the fresh heap, then again with N small holes in front of the
 /// free space (`selftest::heap_bench`): what fragmentation costs on this

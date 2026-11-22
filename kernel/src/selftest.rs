@@ -286,13 +286,15 @@ pub fn heap_bench(holes: usize) {
     for b in blocks.iter_mut().step_by(2) {
         *b = None;
     }
+    let frags = crate::mm::heap::stats().fragments;
     let (p1, f1, e1) = run();
     drop(blocks);
     let after = crate::mm::heap::stats();
     println!(
         "  heap bench      : fresh: alloc+free {p0} ns, conn create {f0} ns, expire {EXPIRE_PER_PASS} {e0} us; \
-         {holes} holes: alloc+free {p1} ns, conn create {f1} ns, expire {EXPIRE_PER_PASS} {e1} us; \
+         {holes} holes ({}): alloc+free {p1} ns, conn create {f1} ns, expire {EXPIRE_PER_PASS} {e1} us; \
          live allocations {}, longest alloc {} ns, free {} ns, lock wait {} ns",
+        frags.map_or("list".into(), |n| alloc::format!("talc counts {n} fragments")),
         before.live,
         after.alloc.max_ns,
         after.free.max_ns,

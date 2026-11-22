@@ -1092,7 +1092,9 @@ fn status_json(
             )
         };
         format!(
-            "\"live\":{},\"alloc\":{},\"dealloc\":{},\"lock_wait\":{}",
+            "\"allocator\":{},\"fragments\":{},\"live\":{},\"alloc\":{},\"dealloc\":{},\"lock_wait\":{}",
+            json_str(h.allocator),
+            h.fragments.map_or("null".into(), |n| format!("{n}")),
             h.live,
             op(h.alloc),
             op(h.free),
