@@ -121,11 +121,38 @@ Columns: **Parser** = where untrusted bytes are first interpreted.
 
 ## 5. First hypotheses for phase 2, by priority
 
-None of these is verified yet. Each becomes a finding (with a test or negative
-control) or is struck out with the reason.
+Each becomes a finding (with a test or negative control) or is struck out with
+the reason. 1 and 2 were checked on 2026-11-22 (65005d4, aarch64, HVF, QEMU
+user networking with `mgmt=wan` and a host port forward; same mgmt code as on
+the LAN side), the rest are open.
 
-1. **CSRF via cached Basic credentials** on `POST /api/config` / `/api/reboot` (A5, §4.3). Candidate fix: refuse Basic for browsers (require `Bearer` or check `Origin`/`Host`) and refuse non-JSON/TOML content types sent by forms.
-2. **No `Host` check**: DNS rebinding reads the public API when no password is set (A5).
+1. **CONFIRMED (server side): CSRF via cached Basic credentials** (A5, §4.3).
+   A request without `X-Leatos-UI` gets `401` + `WWW-Authenticate: Basic`, so a
+   browser that opens any API URL directly prompts and caches the credentials.
+   A cross-site `text/plain` POST to `/api/config` with them (`Origin:
+   http://evil.example`, `Sec-Fetch-Site: cross-site`) whose body is what an
+   HTML form with `enctype="text/plain"` sends (`name=value` CRLF, the name
+   carrying the TOML up to `[dns] domain`, the value `"csrf.example"`) was
+   answered `200 saved and applied`, no trial, and the stored config had
+   `domain = "csrf.example"`. Any field can be set this way (firewall rules,
+   port forwards, DNS upstreams); `/api/reboot` and `/api/upgrade` take the same
+   path. That browsers attach cached Basic credentials to cross-site top-level
+   form POSTs is standard behaviour, not re-checked here in a browser.
+   Fix direction: refuse requests whose `Origin` (or, without it,
+   `Sec-Fetch-Site: cross-site`) is not the router's own; accept only
+   `application/json` or `application/toml` bodies (forms cannot send these
+   without CORS preflight); consider dropping Basic for anything but
+   `/api/login` and scripts that send no `Origin`.
+2. **CONFIRMED: no `Host` check**, DNS rebinding reads the API when no password
+   is set (A5). With `Host: rebind.evil.example` and a matching `Origin`,
+   `/api/status`, `/api/config` and `/api/config.json` answered `200` with
+   content (leases, MACs, host names, the whole config without secrets);
+   `/api/log` and all changes were refused (`403` without a password, as
+   designed). The router's DNS rebind protection only helps clients that use
+   the router as their resolver (not browsers with DoH). Fix direction:
+   answer only when `Host` is the router's address (any of its networks',
+   v4 or `[v6]`, with an optional port) or a name in the router's own zone
+   (`router.<domain>`, configured names); else `421`/`403`.
 3. **Unsigned upgrades** (P7): an attacker with the password, or one CSRF, installs a persistent kernel. Candidate fix: Ed25519 signature over the image, key compiled in, `image=golden` unaffected.
 4. **Remote panics in WAN parsers** (P1): `unwrap`/indexing/arithmetic in `proto-pppoe`, `proto-dhcp` v6, `proto-dns`, `fwd::wire` (release builds wrap on overflow: `overflow-checks` not set).
 5. **DHCP pool exhaustion** by one client with random MACs (A3/A4): 100 addresses per network.
