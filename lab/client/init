@@ -59,7 +59,8 @@ if $bb grep -q 'lab_leases=1' /proc/cmdline; then
     done; return 1
   }
   kept() { # ip hostname what
-    if st | $bb grep -q "\"ip\":\"$1\",\"hostname\":\"$2\",\"bound\":true"; then pass "leases: $3: $2 $1 listed after the restart"
+    # The lease's IPv6 addresses sit between ip and hostname (206e9e2).
+    if st | $bb grep -q "\"ip\":\"$1\",\"ipv6\":\[[^]]*\],\"hostname\":\"$2\",\"bound\":true"; then pass "leases: $3: $2 $1 listed after the restart"
     else fail "leases: $3: $2 $1 not listed after the restart"; fi
     if $bb nslookup "$2.lan" 192.168.1.1 2>&1 | $bb grep -v "^Server" | $bb grep -q "$1\$"; then pass "leases: $3: $2.lan resolves"
     else fail "leases: $3: $2.lan does not resolve"; fi

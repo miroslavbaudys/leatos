@@ -38,6 +38,10 @@ pub const MAX_MDNS_RULES: usize = 32;
 pub const MAX_PORTS: usize = 8;
 const MIN_LEASE_SECS: u32 = 60;
 const MAX_LEASE_SECS: u32 = 30 * 86400;
+/// Addresses one network's DHCP pool may have: the server's per-request
+/// work grows with the pool, and lease snapshots hold 4096 per network
+/// (`proto_dhcp::v4::persist::MAX_LEASES`; docs/security-audit.md §5 item 5).
+pub const MAX_DHCP_POOL: u32 = 4096;
 const MIN_RATE_KBIT: u64 = 64;
 const MAX_RATE_KBIT: u64 = 10_000_000;
 const MAX_OVERHEAD: u32 = 256;
@@ -442,6 +446,8 @@ fn address(n: &Network, p: &str, x: &mut Issues) {
         }
         if u32::from(lo) > u32::from(hi) {
             x.add(format!("{p}.dhcp.range"), "first address is above the last");
+        } else if u32::from(hi) - u32::from(lo) >= MAX_DHCP_POOL {
+            x.add(format!("{p}.dhcp.range"), format!("at most {MAX_DHCP_POOL} addresses"));
         }
     }
     if !(MIN_LEASE_SECS..=MAX_LEASE_SECS).contains(&d.lease_secs) {

@@ -1389,9 +1389,19 @@ fn status_json(
             (None, _) => (String::from("null"), String::from("null")),
         };
         let gua = net.gua.map_or_else(|| String::from("null"), |g| json_str(&format!("{g}/64")));
+        // Pool exhaustion attempts (docs/security-audit.md §5 item 5).
+        let dhcp_stats = services.and_then(|svc| svc.dhcp_stats(&net.name)).map_or_else(
+            || String::from("null"),
+            |d| {
+                format!(
+                    "{{\"pool_full\":{},\"offers_reclaimed\":{},\"declines_refused\":{}}}",
+                    d.pool_full, d.offers_reclaimed, d.declines_refused
+                )
+            },
+        );
         let _ = write!(
             s,
-            "{}{{\"name\":{},\"port\":{},\"vlan\":{},\"ipv4\":{},\"ipv6\":{ipv6},\"ipv6_global\":{gua},\"ra\":{ra},\"zone\":{},\"dhcp\":{},\"mgmt\":{},\"leases\":{leases}}}",
+            "{}{{\"name\":{},\"port\":{},\"vlan\":{},\"ipv4\":{},\"ipv6\":{ipv6},\"ipv6_global\":{gua},\"ra\":{ra},\"zone\":{},\"dhcp\":{},\"dhcp_stats\":{dhcp_stats},\"mgmt\":{},\"leases\":{leases}}}",
             if n > 0 { "," } else { "" },
             json_str(&net.name),
             json_str(config::PORTS[net.port]),

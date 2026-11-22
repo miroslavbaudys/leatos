@@ -14,6 +14,13 @@
 //!   without a store (with one, [`Server::restore`] brings the leases back:
 //!   [`super::persist`]).
 //! - Relayed requests (giaddr != 0) are ignored.
+//!
+//! Against a client exhausting the pool (docs/security-audit.md §5 item 5):
+//! a DECLINE counts only for the address the declining MAC was offered or
+//! holds; a DISCOVER that finds the pool full takes over the oldest offer
+//! nobody requested; leases are indexed by address (one lease per
+//! address), so checking an address is O(log n) and picking one at most a
+//! pass over the pool (whose size the config caps). Counters: [`Stats`].
 
 use super::packet::{
     FLAG_BROADCAST, Message, MessageType, OPT_CLASSLESS_ROUTES, OPT_MS_CLASSLESS_ROUTES, OP_REPLY, OP_REQUEST, Options,
@@ -97,7 +104,26 @@ pub struct Output {
 pub struct Server {
     cfg: Config,
     leases: BTreeMap<Mac, Lease>,
+    /// The lease holding each address: at most one per address (a new
+    /// lease replaces an expired one of another MAC, [`Self::put_lease`]).
+    by_ip: BTreeMap<u32, Mac>,
+    /// Reserved addresses and their MACs (from `cfg.statics`).
+    static_ips: BTreeMap<u32, Mac>,
+    /// Addresses a client declined (a conflict), until when. Only ones it
+    /// was offered or held, so at most the pool and the reservations.
     declined: BTreeMap<Ipv4Addr, u64>,
+    stats: Stats,
+}
+
+/// What the server refused or reclaimed (`/api/status` per network).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// DISCOVERs left unanswered: no free address and no offer to take over.
+    pub pool_full: u64,
+    /// Offers taken over by a DISCOVER while the pool was full.
+    pub offers_reclaimed: u64,
+    /// DECLINEs for an address the client was not offered and does not hold.
+    pub declines_refused: u64,
 }
 
 fn u32_of(a: Ipv4Addr) -> u32 {
@@ -119,11 +145,45 @@ pub fn sanitize_hostname(raw: &str) -> Option<String> {
 
 impl Server {
     pub fn new(cfg: Config) -> Self {
+        let static_ips = Self::static_index(&cfg);
         Self {
             cfg,
             leases: BTreeMap::new(),
+            by_ip: BTreeMap::new(),
+            static_ips,
             declined: BTreeMap::new(),
+            stats: Stats::default(),
         }
+    }
+
+    fn static_index(cfg: &Config) -> BTreeMap<u32, Mac> {
+        cfg.statics.iter().map(|s| (u32_of(s.ip), s.mac)).collect()
+    }
+
+    pub fn stats(&self) -> Stats {
+        self.stats
+    }
+
+    /// Store `lease` (replacing its MAC's) and index it by address. Another
+    /// MAC's lease of the same address (expired: callers checked
+    /// [`Self::available_for`]) goes first, with its `Released` event.
+    /// Returns the MAC's previous lease.
+    fn put_lease(&mut self, lease: Lease, out: &mut Output) -> Option<Lease> {
+        let (mac, ip) = (lease.mac, u32_of(lease.ip));
+        if let Some(&other) = self.by_ip.get(&ip)
+            && other != mac
+        {
+            self.drop_lease(&other, out);
+        }
+        let prev = self.leases.insert(mac, lease);
+        if let Some(p) = &prev
+            && u32_of(p.ip) != ip
+            && self.by_ip.get(&u32_of(p.ip)) == Some(&mac)
+        {
+            self.by_ip.remove(&u32_of(p.ip));
+        }
+        self.by_ip.insert(ip, mac);
+        prev
     }
 
     pub fn config(&self) -> &Config {
@@ -155,16 +215,16 @@ impl Server {
         if ip == self.cfg.server_ip || Some(ip) == self.cfg.router {
             return false;
         }
-        if let Some(s) = self.cfg.statics.iter().find(|s| s.ip == ip) {
-            return &s.mac == mac;
+        if let Some(owner) = self.static_ips.get(&u32_of(ip)) {
+            return owner == mac;
         }
         if !self.in_range(ip) || self.declined.get(&ip).is_some_and(|&until| until > now) {
             return false;
         }
-        !self
-            .leases
-            .values()
-            .any(|l| l.ip == ip && &l.mac != mac && l.expires > now)
+        self.by_ip
+            .get(&u32_of(ip))
+            .and_then(|m| self.leases.get(m))
+            .is_none_or(|l| &l.mac == mac || l.expires <= now)
     }
 
     /// Choose an address for `mac`: static → previous → requested → first free.
@@ -186,6 +246,23 @@ impl Server {
         (u32_of(lo)..=u32_of(hi))
             .map(Ipv4Addr::from)
             .find(|&ip| self.available_for(ip, mac, now))
+    }
+
+    /// The pool is full: take over the oldest offer of another MAC that was
+    /// never requested (a client that went elsewhere, or someone sending
+    /// DISCOVERs only). Oldest first, so a flood of DISCOVERs takes its own
+    /// offers back before a real client's, which it requests at once.
+    fn reclaim_offer(&mut self, mac: &Mac, now: u64, out: &mut Output) -> Option<Ipv4Addr> {
+        let (other, ip) = self
+            .leases
+            .values()
+            .filter(|l| l.state == LeaseState::Offered && &l.mac != mac && l.expires > now)
+            .filter(|l| !self.static_ips.contains_key(&u32_of(l.ip)))
+            .min_by_key(|l| l.expires)
+            .map(|l| (l.mac, l.ip))?;
+        self.drop_lease(&other, out);
+        self.stats.offers_reclaimed += 1;
+        Some(ip)
     }
 
     fn hostname_for(&self, mac: &Mac, msg: &Message) -> Option<String> {
@@ -257,16 +334,14 @@ impl Server {
         out: &mut Output,
     ) {
         let expires = now + self.cfg.lease_secs as u64;
-        let prev = self.leases.insert(
+        let lease = Lease {
             mac,
-            Lease {
-                mac,
-                ip,
-                hostname: hostname.clone(),
-                state: LeaseState::Bound,
-                expires,
-            },
-        );
+            ip,
+            hostname: hostname.clone(),
+            state: LeaseState::Bound,
+            expires,
+        };
+        let prev = self.put_lease(lease, out);
         // Report changes only: a renewal with the same address and name is silent.
         let changed = !matches!(&prev, Some(p) if p.state == LeaseState::Bound && p.ip == ip && p.hostname == hostname);
         if let Some(p) = prev
@@ -285,9 +360,11 @@ impl Server {
     }
 
     fn drop_lease(&mut self, mac: &Mac, out: &mut Output) {
-        if let Some(l) = self.leases.remove(mac)
-            && l.state == LeaseState::Bound
-        {
+        let Some(l) = self.leases.remove(mac) else { return };
+        if self.by_ip.get(&u32_of(l.ip)) == Some(mac) {
+            self.by_ip.remove(&u32_of(l.ip));
+        }
+        if l.state == LeaseState::Bound {
             out.events.push(Event::Released {
                 mac: l.mac,
                 ip: l.ip,
@@ -308,7 +385,11 @@ impl Server {
         let mac = msg.chaddr;
         match msg.options.msg_type {
             Some(MessageType::Discover) => {
-                let Some(ip) = self.pick_address(&mac, msg.options.requested_ip, now) else {
+                let Some(ip) = self
+                    .pick_address(&mac, msg.options.requested_ip, now)
+                    .or_else(|| self.reclaim_offer(&mac, now, &mut out))
+                else {
+                    self.stats.pool_full += 1;
                     return out; // pool exhausted: stay silent
                 };
                 let hostname = self.hostname_for(&mac, &msg);
@@ -317,16 +398,14 @@ impl Server {
                     .get(&mac)
                     .is_some_and(|l| l.state == LeaseState::Bound && l.ip == ip);
                 if !keep_bound {
-                    self.leases.insert(
+                    let offer = Lease {
                         mac,
-                        Lease {
-                            mac,
-                            ip,
-                            hostname,
-                            state: LeaseState::Offered,
-                            expires: now + OFFER_HOLD_SECS,
-                        },
-                    );
+                        ip,
+                        hostname,
+                        state: LeaseState::Offered,
+                        expires: now + OFFER_HOLD_SECS,
+                    };
+                    self.put_lease(offer, &mut out);
                 }
                 out.reply = Some(self.reply(&msg, MessageType::Offer, ip, true));
             }
@@ -336,14 +415,17 @@ impl Server {
                     self.drop_lease(&mac, &mut out);
                 }
             }
-            Some(MessageType::Decline) => {
-                if let Some(ip) = msg.options.requested_ip {
+            // Only for the address this client was offered or holds (RFC
+            // 2131 §4.3.3: a client declines what the server gave it), so
+            // no client can take others' addresses out of the pool or grow
+            // the table.
+            Some(MessageType::Decline) => match msg.options.requested_ip {
+                Some(ip) if self.leases.get(&mac).is_some_and(|l| l.ip == ip) => {
                     self.declined.insert(ip, now + DECLINE_HOLD_SECS);
-                    if self.leases.get(&mac).is_some_and(|l| l.ip == ip) {
-                        self.drop_lease(&mac, &mut out);
-                    }
+                    self.drop_lease(&mac, &mut out);
                 }
-            }
+                _ => self.stats.declines_refused += 1,
+            },
             Some(MessageType::Inform) => {
                 out.reply = Some(self.reply(&msg, MessageType::Ack, Ipv4Addr::UNSPECIFIED, false));
             }
@@ -413,6 +495,7 @@ impl Server {
     /// then gets a NAK and asks again. A reservation's new hostname is
     /// reported as `Released` + `Bound`, so the DNS zone follows.
     pub fn reconfigure(&mut self, now: u64, cfg: Config) -> Vec<Event> {
+        self.static_ips = Self::static_index(&cfg);
         self.cfg = cfg;
         let mut out = Output::default();
         let macs: Vec<Mac> = self.leases.keys().copied().collect();
@@ -485,7 +568,7 @@ impl Server {
     /// or when its MAC already has a lease. A reservation's hostname wins
     /// over the saved one. Returns `Bound` events for the DNS zone.
     pub fn restore(&mut self, now: u64, saved: &[super::persist::Saved]) -> Vec<Event> {
-        let mut out = Vec::new();
+        let mut out = Output::default();
         for s in saved {
             if self.leases.contains_key(&s.mac) {
                 continue;
@@ -501,23 +584,21 @@ impl Server {
                 .static_for_mac(&s.mac)
                 .and_then(|st| st.hostname.clone())
                 .or_else(|| s.hostname.clone());
-            self.leases.insert(
-                s.mac,
-                Lease {
-                    mac: s.mac,
-                    ip: s.ip,
-                    hostname: hostname.clone(),
-                    state: LeaseState::Bound,
-                    expires: now + u64::from(self.cfg.lease_secs),
-                },
-            );
-            out.push(Event::Bound {
+            let lease = Lease {
+                mac: s.mac,
+                ip: s.ip,
+                hostname: hostname.clone(),
+                state: LeaseState::Bound,
+                expires: now + u64::from(self.cfg.lease_secs),
+            };
+            self.put_lease(lease, &mut out);
+            out.events.push(Event::Bound {
                 mac: s.mac,
                 ip: s.ip,
                 hostname,
             });
         }
-        out
+        out.events
     }
 }
 
@@ -866,6 +947,135 @@ mod tests {
         m.giaddr = Ipv4Addr::new(10, 1, 1, 1);
         assert!(s.handle(0, &m.emit()).reply.is_none());
         assert!(s.handle(0, b"junk").reply.is_none());
+    }
+
+    // ---- pool exhaustion (docs/security-audit.md §5 item 5) ----------------
+
+    fn decline(s: &mut Server, mac: Mac, ip: Ipv4Addr, now: u64) -> Output {
+        let mut m = client_msg(mac, MessageType::Decline);
+        m.options.requested_ip = Some(ip);
+        s.handle(now, &m.emit())
+    }
+
+    fn offered(s: &mut Server, mac: Mac, now: u64) -> Option<Ipv4Addr> {
+        let out = s.handle(now, &client_msg(mac, MessageType::Discover).emit());
+        out.reply.map(|r| Message::parse(&r).unwrap().yiaddr)
+    }
+
+    #[test]
+    fn decline_only_for_the_clients_own_address() {
+        let mut s = Server::new(cfg());
+        let (a100, a101) = (Ipv4Addr::new(192, 168, 1, 100), Ipv4Addr::new(192, 168, 1, 101));
+        // B declines both pool addresses, holding neither: refused.
+        decline(&mut s, B, a100, 0);
+        decline(&mut s, B, a101, 0);
+        assert_eq!(s.stats().declines_refused, 2);
+        assert!(s.declined.is_empty());
+        assert_eq!(dora(&mut s, A, None, 1), a100, "the pool stays usable");
+        // A declines the address it holds: it leaves the pool for a while.
+        let out = decline(&mut s, A, a100, 2);
+        assert!(matches!(out.events[..], [Event::Released { ip, .. }] if ip == a100));
+        assert_eq!(s.declined.len(), 1);
+        assert_eq!(offered(&mut s, B, 3), Some(a101));
+        assert_eq!(s.stats().declines_refused, 2);
+    }
+
+    #[test]
+    fn declines_for_foreign_addresses_do_not_grow_the_table() {
+        let mut s = Server::new(cfg());
+        for i in 0..10_000u32 {
+            decline(&mut s, B, Ipv4Addr::from(0x0a00_0000 + i), 0);
+        }
+        assert!(s.declined.is_empty());
+        assert_eq!(s.stats().declines_refused, 10_000);
+    }
+
+    #[test]
+    fn a_discover_flood_cannot_hold_the_pool() {
+        let mut s = Server::new(cfg());
+        let (x, y): (Mac, Mac) = ([2, 0, 0, 0, 0, 0x1], [2, 0, 0, 0, 0, 0x2]);
+        assert!(offered(&mut s, x, 0).is_some());
+        assert!(offered(&mut s, y, 1).is_some());
+        // Pool of two, both offered: a real client takes over the oldest
+        // offer (x's) and gets it bound.
+        let got = dora(&mut s, A, None, 2);
+        assert_eq!(got, Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(s.stats().offers_reclaimed, 1);
+        // x's late REQUEST for it is refused.
+        let mut r = client_msg(x, MessageType::Request);
+        r.options.server_id = Some(SERVER);
+        r.options.requested_ip = Some(got);
+        assert_eq!(reply_of(&s.handle(3, &r.emit())).options.msg_type, Some(MessageType::Nak));
+        // Bound leases are never taken over: with A and B bound, a third
+        // client gets nothing and the counter says why.
+        assert_eq!(dora(&mut s, B, None, 4), Ipv4Addr::new(192, 168, 1, 101));
+        assert_eq!(offered(&mut s, [2, 0, 0, 0, 0, 0x3], 5), None);
+        assert_eq!(s.stats().pool_full, 1);
+        assert_eq!(s.stats().offers_reclaimed, 2, "y's offer was the one left to take");
+    }
+
+    #[test]
+    fn a_reservations_offer_is_not_taken_over() {
+        let mut s = Server::new(cfg());
+        assert_eq!(offered(&mut s, NAS, 0), Some(Ipv4Addr::new(192, 168, 1, 10)));
+        dora(&mut s, A, None, 1);
+        dora(&mut s, B, None, 1);
+        assert_eq!(offered(&mut s, [2, 0, 0, 0, 0, 0x3], 2), None);
+        assert!(s.leases.get(&NAS).is_some_and(|l| l.state == LeaseState::Offered));
+    }
+
+    #[test]
+    fn an_expired_lease_is_replaced_with_its_release_event() {
+        let mut s = Server::new(cfg());
+        let first = dora(&mut s, A, Some("old"), 0);
+        dora(&mut s, B, None, 0);
+        // A's lease ran out, no expire() pass yet: C may take the address,
+        // A's lease goes with it (its DNS name too).
+        let c: Mac = [2, 0, 0, 0, 0, 0xc];
+        let mut d = client_msg(c, MessageType::Discover);
+        d.options.requested_ip = Some(first);
+        let out = s.handle(3601, &d.emit());
+        assert_eq!(reply_of(&out).yiaddr, first);
+        assert!(matches!(&out.events[..], [Event::Released { mac, .. }] if *mac == A));
+        assert!(!s.leases.contains_key(&A));
+        assert_eq!(s.by_ip.get(&u32_of(first)), Some(&c));
+        assert_eq!(s.by_ip.len(), s.leases.len(), "one index entry per lease");
+    }
+
+    #[test]
+    fn the_address_index_follows_every_change() {
+        let mut s = Server::new(cfg());
+        let check = |s: &Server| {
+            assert_eq!(s.by_ip.len(), s.leases.len());
+            for (ip, mac) in &s.by_ip {
+                assert_eq!(u32_of(s.leases[mac].ip), *ip);
+            }
+        };
+        dora(&mut s, A, None, 0);
+        check(&s);
+        // A moves to the other address (INIT-REBOOT for .101).
+        let mut r = client_msg(A, MessageType::Request);
+        r.options.requested_ip = Some(Ipv4Addr::new(192, 168, 1, 101));
+        s.handle(1, &r.emit());
+        check(&s);
+        assert!(!s.by_ip.contains_key(&u32_of(Ipv4Addr::new(192, 168, 1, 100))));
+        dora(&mut s, B, None, 2);
+        check(&s);
+        let mut rel = client_msg(B, MessageType::Release);
+        rel.ciaddr = Ipv4Addr::new(192, 168, 1, 100);
+        s.handle(3, &rel.emit());
+        check(&s);
+        s.expire(10_000);
+        check(&s);
+        assert!(s.by_ip.is_empty());
+        let saved = [crate::v4::persist::Saved { mac: A, ip: Ipv4Addr::new(192, 168, 1, 100), hostname: None }];
+        s.restore(10_001, &saved);
+        check(&s);
+        let mut c = cfg();
+        c.range = (Ipv4Addr::new(192, 168, 1, 101), Ipv4Addr::new(192, 168, 1, 101));
+        s.reconfigure(10_002, c);
+        check(&s);
+        assert!(s.by_ip.is_empty(), "outside the new pool");
     }
 }
 

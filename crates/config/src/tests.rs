@@ -306,6 +306,15 @@ fn dhcp_checks() {
         invalid(r(ip(192, 168, 1, 50), ip(192, 168, 1, 40))),
         ["network.lan.dhcp.range"]
     );
+    // At most MAX_DHCP_POOL addresses (a /16 network: 4096 fit, 4097 do not).
+    let wide = |lo, hi| {
+        move |c: &mut Config| {
+            c.networks[0].ipv4 = "10.0.0.1/16".parse().unwrap();
+            c.networks[0].dhcp.range = Some([lo, hi]);
+        }
+    };
+    assert_eq!(issues(wide(ip(10, 0, 0, 100), ip(10, 0, 16, 99))), Vec::<String>::new());
+    assert_eq!(invalid(wide(ip(10, 0, 0, 100), ip(10, 0, 16, 100))), ["network.lan.dhcp.range"]);
     assert_eq!(
         invalid(|c| c.networks[0].dhcp.lease_secs = 59),
         ["network.lan.dhcp.lease_secs"]

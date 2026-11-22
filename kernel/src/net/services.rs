@@ -569,6 +569,12 @@ impl LanServices {
         (restored, saved.iter().map(|s| s.leases.len()).sum())
     }
 
+    /// The DHCP server's refusals and reclaimed offers on network `name`
+    /// (`None`: no DHCP there).
+    pub fn dhcp_stats(&self, name: &str) -> Option<dhcp::Stats> {
+        self.nets.iter().find(|n| n.cfg.name == name)?.dhcp.as_ref().map(|(s, _)| s.stats())
+    }
+
     /// Current DHCP leases with their network's name.
     pub fn leases_by_network(&self) -> impl Iterator<Item = (&str, &dhcp::Lease)> {
         self.nets.iter().flat_map(|n| {

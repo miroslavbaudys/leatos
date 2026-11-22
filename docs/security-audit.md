@@ -164,7 +164,68 @@ the LAN side), the rest are open.
    Counter `mgmt.refused.host`; same lab checks and negative control.
 3. **Unsigned upgrades** (P7): an attacker with the password, or one CSRF, installs a persistent kernel. Candidate fix: Ed25519 signature over the image, key compiled in, `image=golden` unaffected.
 4. **Remote panics in WAN parsers** (P1): `unwrap`/indexing/arithmetic in `proto-pppoe`, `proto-dhcp` v6, `proto-dns`, `fwd::wire` (release builds wrap on overflow: `overflow-checks` not set).
-5. **DHCP pool exhaustion** by one client with random MACs (A3/A4): 100 addresses per network.
+5. **FIXED a–c, f; d–e accepted (2026-11-22): DHCP pool exhaustion** (A3/A4: any
+   client on a network the server answers, guest networks included).
+   Measured on `proto_dhcp::v4::server` with the default pool (.100–.199,
+   12 h leases), a scratch test with forged `chaddr`s:
+   - a. **DISCOVER only:** 100 packets hold the pool for 60 s
+     (`OFFER_HOLD_SECS`); repeated every minute, nobody new gets an
+     address.
+   - b. **DECLINE from one MAC:** the server accepts a DECLINE for any
+     `requested_ip`, from any client, whether it was offered that address
+     or not; 100 packets take the whole pool out for 600 s
+     (`DECLINE_HOLD_SECS`).
+   - c. **DECLINE memory:** addresses outside the subnet are stored too:
+     1,000,000 DECLINEs grew the heap by 26 MB (26 B each), released only
+     by `expire()` after 600 s. At the rate `svc` takes datagrams this is
+     hundreds of MB per window, an allocation failure is a panic (reboot);
+     not measured in the kernel.
+   - d. **Full DORA:** 200 packets bind the pool for the lease time
+     (12 h). Inherent to DHCP (no client authentication); the usual answer
+     is switch port security, which a SOHO router's LAN lacks.
+   - e. **INIT-REBOOT:** a REQUEST naming a free address without a
+     DISCOVER binds it: 100 packets, same as d.
+   - f. **CPU:** `pick_address` scans the range and checks each address
+     against every lease, so a DISCOVER costs O(range × leases).
+     `dhcp.range` has no size limit: on a /16 pool with 16,000 addresses
+     taken, one DISCOVER took 178 ms on the development Mac (16,000 more
+     packets fill it, each bind also O(leases)); a full /16 is about 16×
+     that, seconds per packet on the apu4, past the 5 s cross-core
+     watchdog. The default /24 pool: well under a millisecond.
+   Fixes in `proto_dhcp::v4::server`:
+   - b, c: a DECLINE counts only for the address the declining MAC was
+     offered or holds (RFC 2131 §4.3.3); others are counted
+     (`declines_refused`) and ignored, so the declined table is bounded by
+     the pool and the reservations.
+   - a: a DISCOVER that finds the pool full takes over the oldest offer of
+     another MAC that was never requested (`offers_reclaimed`; reservations'
+     offers and bound leases are never taken). Oldest first: a flood takes
+     back its own offers before a real client's, which that client requests
+     at once.
+   - f: leases indexed by address (one lease per address; a new lease
+     replaces another MAC's expired one, with its `Released` event), so
+     checking an address is O(log n) and picking one at most a pass over
+     the pool; `dhcp.range` is capped at 4096 addresses
+     (`config::validate::MAX_DHCP_POOL`, the same as the lease snapshot's
+     per-network limit). The free-address set considered first was not
+     needed with the cap.
+   - Counters per network: `/api/status` `networks[].dhcp_stats`
+     (`pool_full`, `offers_reclaimed`, `declines_refused`).
+   The same probe afterwards: a, b and c no longer keep a new client out
+   (C: 0 bytes per DECLINE), d and e still do; f: 1.0 ms per DISCOVER with
+   16,000 taken (178 ms before), 0.24 ms at the 4096 cap. Host tests in
+   `server.rs` (decline, reclaim, reservation offers, expired-lease
+   replacement, the index after every change), config test for the cap,
+   `dhcp` fuzz target 10 min clean, `lease-test.sh` (aarch64, x86_64) and
+   the base lab pass.
+   d and e stay an accepted risk (no client authentication in DHCP; switch
+   port security is the usual answer): on guest networks prefer short
+   leases and a pool larger than the expected clients, and watch
+   `pool_full`.
+   Found on the way: `lease-test.sh` had failed its "listed after the
+   restart" checks since 206e9e2 (the lease JSON gained `ipv6` between `ip`
+   and `hostname`); its grep is fixed, negative control
+   `LEASE_TEST_NO_STORE=1` still fails.
 6. **Global 1 s login block** lets a LAN client lock the owner out by guessing continuously.
 7. **Router-client port pass-through** (§4.1): what A1 can send to 60000–65535 and UDP 68 and what smoltcp does with it.
 8. **PPPoE password in clear** on the SD card (A7).
