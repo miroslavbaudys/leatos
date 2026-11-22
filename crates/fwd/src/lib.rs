@@ -5,6 +5,7 @@
 //! - [`wire`]: header access and incremental checksums
 //! - [`route`]: longest-prefix-match table
 //! - [`neigh`]: ARP cache with a tiny bounded pending queue
+//! - [`nd`]: ARP / ND answers for the router's own addresses
 //! - [`conntrack`]: connections, NAPT with endpoint-independent mapping
 //! - [`forwarder`]: the per-packet pipeline → [`forwarder::Verdict`]
 //! - [`frag`]: IP fragments forwarded through NAT without reassembly
@@ -21,6 +22,7 @@ extern crate alloc;
 pub mod conntrack;
 pub mod forwarder;
 pub mod frag;
+pub mod nd;
 pub mod neigh;
 pub mod route;
 pub mod wire;

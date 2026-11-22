@@ -45,6 +45,9 @@ enum Op {
     Reply6 { flags: Option<u8> },
     /// Arbitrary bytes on an interface.
     Raw { ifx: u8, data: Vec<u8> },
+    /// ARP or neighbor discovery on interface `ifx % 3` for the router's
+    /// link layer (`fwd::nd`): built valid (checksum), then `edit`ed.
+    Nd { ifx: u8, kind: u8, target: u8, src: u8, mac: u8, hop: u8, edit: Option<(u8, u8)> },
     SetIpv6(bool),
     Tick(u16),
     Expire(u8),
@@ -309,6 +312,134 @@ fn nd_helpers(f: &[u8]) {
     }
 }
 
+/// The router's IPv4 address and prefix on interface `i` (as `router()`).
+fn addr4(i: usize) -> (Ipv4Addr, u8) {
+    [(Ipv4Addr::new(203, 0, 113, 10), 24), (Ipv4Addr::new(192, 168, 1, 1), 24), (Ipv4Addr::new(192, 168, 20, 1), 24)][i]
+}
+
+/// The router's IPv6 addresses on interface `i`: link-local, ULA, global.
+fn addrs6(i: usize) -> Vec<Ipv6Addr> {
+    let gua = if i == 0 { Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 2) } else { GUA[i] };
+    [wire::link_local(MACS[i]), ULA[i], gua].into_iter().filter(|a| !a.is_unspecified()).collect()
+}
+
+/// An ARP or ND frame toward interface `ifx`'s router addresses:
+/// `kind` % 6 = ARP request, ARP probe, NS to the group, unicast NS, DAD
+/// NS, NA; `target` picks one of ours (or another address), `src` the
+/// sender, `mac` the sender's MAC (ours, a client's, multicast), `hop`
+/// the hop limit (mostly 255), `edit` one byte changed after the
+/// checksum.
+fn nd_frame(ifx: usize, kind: u8, target: u8, src: u8, mac: u8, hop: u8, edit: Option<(u8, u8)>) -> Vec<u8> {
+    let smac = match mac % 4 {
+        0 => MACS[ifx],
+        1 => [0x01, 0, 0x5e, 0, 0, 1],
+        _ => [2, 0xcc, 0, 0, 0, mac],
+    };
+    let (a4, len) = addr4(ifx);
+    let mine6 = addrs6(ifx);
+    let t6 = match target % 5 {
+        4 => host6(ifx.max(1), true, 7),
+        n => mine6[usize::from(n) % mine6.len()],
+    };
+    let s6 = match src % 4 {
+        0 => mine6[0],
+        1 => host6(ifx.max(1), src & 4 != 0, u16::from(src)),
+        _ => wire::link_local(smac),
+    };
+    let mut f = match kind % 6 {
+        k @ (0 | 1) => {
+            let t4 = if target % 4 == 3 { Ipv4Addr::new(192, 168, 1, 77) } else { a4 };
+            let s4 = match (k, src % 3) {
+                (1, _) => Ipv4Addr::UNSPECIFIED,
+                (_, 0) => a4,
+                (_, 1) => Ipv4Addr::new(10, 9, 9, 9),
+                _ => Ipv4Addr::from(u32::from(a4) & (u32::MAX << (32 - u32::from(len))) | 0x50),
+            };
+            let mut b = [0u8; 60];
+            let n = wire::build_arp_request(&mut b, smac, s4, t4);
+            b[..n].to_vec()
+        }
+        k => {
+            let mut b = [0u8; wire::NS_LEN];
+            wire::build_ns(&mut b, smac, s6, t6);
+            let mut f = b.to_vec();
+            let ip = ETH_HDR;
+            match k {
+                3 => f[ip + 24..ip + 40].copy_from_slice(&t6.octets()),
+                4 => {
+                    f[ip + 8..ip + 24].copy_from_slice(&Ipv6Addr::UNSPECIFIED.octets());
+                    f.truncate(ip + 40 + 24);
+                    wire::put16(&mut f, ip + 4, 24);
+                }
+                5 => {
+                    f[ip + 40] = 136;
+                    f[ip + 40 + 24] = 2;
+                }
+                _ => {}
+            }
+            f[ip + 7] = if hop % 8 == 0 { hop } else { 255 };
+            fix_l4_checksum6(&mut f);
+            f
+        }
+    };
+    if let Some((at, v)) = edit {
+        let at = usize::from(at) % f.len();
+        f[at] ^= v;
+    }
+    f
+}
+
+/// The router's ARP / ND answers (`fwd::nd`) for a frame on interface
+/// `ifx`: a reply only to an ARP request or NS for one of its addresses,
+/// never to its own MAC, and well formed (ARP reply from us to the
+/// asker; NA for the target from the target with our MAC, valid
+/// checksum, hop limit 255, to the solicitor or all nodes).
+fn nd_answer(ifx: usize, f: &[u8]) {
+    let mine6 = addrs6(ifx);
+    let (a4, len) = addr4(ifx);
+    let me = fwd::nd::Link { mac: MACS[ifx], v4: Some((a4, len)), v6: &mine6 };
+    let mut out = [0u8; fwd::nd::REPLY_LEN];
+    let o = fwd::nd::answer(f, &me, fwd::nd::Config::default(), &mut out);
+    if let Some((ip, mac)) = o.conflict {
+        assert_ne!(mac, MACS[ifx], "our own MAC is no conflict");
+        match ip {
+            core::net::IpAddr::V4(ip) => assert_eq!(ip, a4),
+            core::net::IpAddr::V6(ip) => assert!(mine6.contains(&ip)),
+        }
+    }
+    let Some(n) = o.reply else { return };
+    let r = &out[..n];
+    assert_ne!(&f[6..12], &MACS[ifx], "answered ourselves");
+    assert_eq!(&r[6..12], &MACS[ifx], "reply from our MAC");
+    match wire::ethertype(f) {
+        Some(wire::ETHERTYPE_ARP) => {
+            let q = wire::parse_arp(f).expect("answered ARP parses");
+            assert_eq!((q.op, q.target_ip), (1, a4), "answered only requests for us");
+            let a = wire::parse_arp(r).expect("reply parses");
+            assert_eq!((a.op, a.sender_mac, a.sender_ip), (2, MACS[ifx], a4));
+            assert_eq!(&r[0..6], &q.sender_mac, "to the asker");
+            assert!(!wire::is_multicast_mac(&q.sender_mac));
+        }
+        Some(wire::ETHERTYPE_IPV6) => {
+            assert_eq!(f[ETH_HDR + 40], 135, "answered only NS");
+            assert_eq!(f[ETH_HDR + 7], 255, "on-link only");
+            let target = wire::get_ip6(f, ETH_HDR + 48);
+            assert!(mine6.contains(&target), "answered for ours only");
+            assert_eq!(wire::parse_nd(r), Some((target, MACS[ifx])), "valid NA (checksum, hop limit, TLLA)");
+            let v = wire::Ipv6View::parse(r, ETH_HDR).unwrap();
+            assert_eq!(v.src(r), target);
+            let src = wire::get_ip6(f, ETH_HDR + 8);
+            if src.is_unspecified() {
+                assert_eq!(v.dst(r), Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1));
+            } else {
+                assert_eq!(v.dst(r), src, "to the solicitor");
+                assert!(!wire::is_multicast_mac(&r[0..6].try_into().unwrap()));
+            }
+        }
+        t => panic!("reply to ethertype {t:?}"),
+    }
+}
+
 /// What the forwarder last sent: (egress, frame).
 struct Last {
     egress: u8,
@@ -512,10 +643,17 @@ fuzz_target!(|ops: Vec<Op>| {
                 fw.ipv6 = on;
                 continue;
             }
+            Op::Nd { ifx, kind, target, src, mac, hop, edit } => {
+                let ifx = usize::from(ifx % 3);
+                let f = nd_frame(ifx, kind, target, src, mac, hop, edit);
+                nd_answer(ifx, &f);
+                continue;
+            }
             Op::Raw { ifx, data } => {
                 let mut f = data;
                 f.truncate(1600);
                 nd_helpers(&f);
+                nd_answer(usize::from(ifx % 3), &f);
                 let n = f.len();
                 f.resize(n + TAIL, 0);
                 let ifx = ifx % 3;

@@ -1,7 +1,7 @@
 # LAN neighbors: one table per link (plan)
 
-Status: plan, 2026-11-22. Not started; the apu4 soak runs until 2026-11-25 and nothing here is
-deployed before it ends.
+Status (2026-11-22): step 0 done except the upstream report; step 1 done (`fwd::nd`, host tests,
+`fwd` fuzz target). Nothing is deployed before the apu4 soak ends (2026-11-25).
 
 ## 1. The problem
 

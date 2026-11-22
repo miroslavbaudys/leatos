@@ -7,5 +7,10 @@ description = "Forwarding plane: LPM routing table, neighbor cache, conntrack, N
 
 [dependencies]
 
+[dev-dependencies]
+# Tests check the ARP / ND replies (`nd`) with smoltcp's parsers; socket-icmp
+# only because smoltcp needs some socket type to build.
+smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-icmp"] }
+
 [lints]
 workspace = true

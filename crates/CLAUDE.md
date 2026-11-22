@@ -14,6 +14,11 @@ events out), host-tested with `cargo test`. Fuzz targets in `fuzz/` (fuzz/README
   `frag` like IPv4 (`Decision6`, no rewrite); `ipv6` off = dropped.
 - `route`: connected, default and static routes (`Forwarder::set_static_routes`), active while a
   connected subnet holds the router; routed subnets count as inside.
+- `nd`: the router's link layer for its own addresses (docs/lan-neighbors.md, step 1; not used by
+  the kernel yet): `nd::answer` gives the ARP reply / NA (R, S, O flags; DAD defended to all nodes;
+  unicast NS answered) and conflicts (another MAC claiming or probing for our address); RFC 4861
+  §7.1.1 checks; `Config` switches for the lab's negative controls (`nd_unicast=0`,
+  `na_router=0`). Tests parse every reply with smoltcp.
 - `neigh`: entries in use are probed at the end of their 300 s lifetime and kept meanwhile (RFC 4861
   PROBE); unused ones age out. Drops are drop reason `neighbor`, probes `/api/status`
   `neigh_probes`.

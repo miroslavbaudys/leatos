@@ -24,7 +24,7 @@ reveals a bug gets a host regression test in its crate before the fix.
 
 | Target | Code | Exposure | Beyond "no panic" it checks |
 |---|---|---|---|
-| `fwd` | `crates/fwd` forwarder, conntrack, NAT, firewall, fragments, split | every packet, WAN and LAN | forwarded frames inside the buffer; valid checksums in → valid out (NAT) |
+| `fwd` | `crates/fwd` forwarder, conntrack, NAT, firewall, fragments, split; `nd` (ARP / ND answers) | every packet, WAN and LAN | forwarded frames inside the buffer; valid checksums in → valid out (NAT); ARP / NA replies only to requests for our addresses, never to our own MAC, well formed |
 | `pppoe` | `crates/proto-pppoe` client + `wire` | WAN (the ISP's AC, anyone on the segment) | client frames are PPPoE from its MAC; TX queue bounded |
 | `dns` | `crates/proto-dns` resolver, cache, zone, `wire` | upstream answers (internet), LAN queries | replies only to clients that asked; queries only to upstreams |
 | `sntp` | `crates/proto-sntp` | WAN replies | requests only to configured servers |
