@@ -105,7 +105,7 @@ Columns: **Parser** = where untrusted bytes are first interpreted.
 | Entry point | Parser | Review notes |
 |---|---|---|
 | Serial CLI | `crates/cli` line editor + parser, `kernel/src/cli.rs` | no auth by design; still must not panic on long lines/escape sequences (no fuzz target yet); secrets masked on `config show` |
-| Store partition (SD / virtio-blk) | `crates/config-store` (MBR, header, A/B slots, CRC), `crates/config` TOML (`deny_unknown_fields`), `proto_dhcp::v4::persist` leases | P10; secrets on the card: `mgmt.password_hash` (PBKDF2, fine), **`wan.pppoe.password` in clear** (theft of the SD card leaks it) |
+| Store partition (SD / virtio-blk) | `crates/config-store` (MBR, header, A/B slots, CRC), `crates/config` TOML (`deny_unknown_fields`), `proto_dhcp::v4::persist` leases | P10; secrets on the card: `mgmt.password_hash` (PBKDF2, fine), **`wan.pppoe.password` in clear** (theft of the SD card leaks it; accepted, §5 item 8) |
 | Stored kernels (`images` area) | `boot-image` | the loader enters whatever the store says is current: an SD card written offline is a persistent compromise (A7, accepted unless signing is added) |
 | Boot arguments | `config.rs` parsers | from the bootloader config on the SD card (A7) or DTB; `mgmt_pass=` in clear there |
 | Firmware tables (DTB, PVH, Multiboot2, ACPI) | `platform/` | trusted (A7 / firmware), but parsers should still be bounds-checked (`phys.rs` one unsafe constructor) |
@@ -162,7 +162,20 @@ the LAN side), the rest are open.
    included. Names outside those domains that point at the router (a
    `[[dns.host]]` override of a public name) no longer open the interface.
    Counter `mgmt.refused.host`; same lab checks and negative control.
-3. **Unsigned upgrades** (P7): an attacker with the password, or one CSRF, installs a persistent kernel. Candidate fix: Ed25519 signature over the image, key compiled in, `image=golden` unaffected.
+3. **DEFERRED, accepted for now (2026-11-22): unsigned upgrades** (P7):
+   whoever holds the management password installs a kernel that survives
+   reboots (in RAM or persistent). Decided not to sign kernel images now:
+   OpenWrt does not require signed images for `sysupgrade` either, and
+   with the origin checks (item 1) and the per-source login backoff
+   (item 6) installing one takes the password itself, not a page the owner
+   visits or a guessing client. The attacker model is then A6, who has
+   full control by design. A design was tried and set aside, uncommitted:
+   an Ed25519 trailer after the ELF (signature over SHA-512 of a domain
+   prefix and the ELF, key id), verified in `upgrade::prepare` (both
+   upload paths and the loader), the public key embedded by
+   `kernel/build.rs` (a throwaway test key for QEMU builds), a `leatsign`
+   host tool. Revisit if management is ever reachable from outside the
+   LAN, or for other people's routers.
 4. **REVIEWED, none found (2026-11-22): remote panics in WAN parsers** (P1).
    Survey: clippy `indexing_slicing`, `unwrap_used`, `expect_used`,
    `panic`, `unreachable`, `arithmetic_side_effects` on `proto-pppoe`,
@@ -368,7 +381,24 @@ the LAN side), the rest are open.
    (8 port unreachables for 8 probes) and `dns_port_random=0` (1 port for
    10 queries); the capture from before the fix gives the same failures
    (538 port unreachables, one port 65005). Smoke test passes.
-8. **PPPoE password in clear** on the SD card (A7).
+8. **ACCEPTED (2026-11-22): PPPoE password in clear on the SD card** (A7).
+   `wan.pppoe.password` sits in the stored `config.toml` as written. Not
+   changed, because:
+   - reading it needs the card, and whoever has the card can also reflash
+     it with a kernel of their own, which is worse;
+   - most ISPs bind PPPoE to the subscriber's line (the access port), so
+     the credentials do not work elsewhere; the home ISP's PPPoE (VLAN 848)
+     has no authentication at all, so there is no secret;
+   - encrypting it with a key on the same device only obscures it; real
+     protection needs a hardware secret (a TPM: optional on the apu4, not
+     used by leatos);
+   - everywhere else it is already a secret: never shown by the API, the
+     CLI or exports (`Config::without_secrets`), kept when a save leaves it
+     out (`keep_secrets`), masked in logged command lines (`pppoe_pass=`,
+     `config::Redacted`).
+   Where it matters: an ISP that accepts the credentials from any line, or
+   whose PPPoE password is also the customer-portal password; a stolen
+   card then exposes that account. Advice: do not reuse it anywhere else.
 9. **DoT provider**: own RustCrypto glue in `proto-dot/src/provider.rs` is crypto code written here; review against rustls' provider requirements.
 10. **DONE (2026-11-22): missing fuzz targets.** Six new targets (fuzz/README.md):
     `cli` (line editor + parser: lines ≤ `MAX_LINE`, whole and split feeds
