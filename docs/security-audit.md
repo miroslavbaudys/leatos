@@ -94,8 +94,8 @@ Columns: **Parser** = where untrusted bytes are first interpreted.
 | Routes | 17 routes (`mgmt.rs` ~587); `/` and `GET /api/info` always public; others need auth when a password exists; without one reads public, changes refused (403) | verified in `on_head`: reads need auth only with a password, all changes, `/api/log` and login always; `/api/logout` has no check (harmless? confirm it only drops the presented token) |
 | Credentials | Basic `admin` + password → session token (`POST /api/login`), `Bearer` afterwards; `ct_eq` for the boot password, PBKDF2-SHA256 20000 iterations + verify cache for the stored hash; 1 s block after a failure (global) | plain HTTP: password and token visible to anyone sniffing the LAN (Wi-Fi is the AP's problem, but wired guests on a shared segment are not); the 1 s global block is also a DoS lever for A3 against the owner (each wrong guess blocks everyone) |
 | Session tokens | 8 sessions, 12 h idle; entropy from `entropy.rs` | token length/entropy at early boot; a 9th login evicts which one? |
-| CSRF (A5) | UI sends `Authorization: Bearer` from `localStorage` (cross-site forms cannot set it) | **Basic auth is still accepted**: a browser that ever cached Basic credentials (a non-UI request answered with `WWW-Authenticate`) attaches them to cross-site form POSTs. `POST /api/config` accepts TOML, i.e. `text/plain`, which a form can send. No `Origin`/`Host` check found (`grep origin mgmt.rs` empty) |
-| DNS rebinding (A5) | rebind protection in the forwarder (private answers for public names blocked) | covers clients that use the router's DNS; a client with its own resolver (DoH in the browser) is not covered, and without a password `GET /api/status` etc. are public: needs a `Host` check |
+| CSRF (A5) | UI sends `Authorization: Bearer` from `localStorage` (cross-site forms cannot set it); since 2026-11-22 cross-origin non-GETs are refused (§5 item 1) | was: **Basic auth is still accepted**: a browser that ever cached Basic credentials (a non-UI request answered with `WWW-Authenticate`) attaches them to cross-site form POSTs. `POST /api/config` accepts TOML, i.e. `text/plain`, which a form can send. No `Origin`/`Host` check found (`grep origin mgmt.rs` empty) |
+| DNS rebinding (A5) | rebind protection in the forwarder (private answers for public names blocked); since 2026-11-22 a `Host` check (§5 item 2) | was: covers clients that use the router's DNS; a client with its own resolver (DoH in the browser) is not covered, and without a password `GET /api/status` etc. are public: needs a `Host` check |
 | XSS (A3/A4 → owner's browser) | `esc()` (`mgmt.html` 494) escapes `& < > "`; ~30 `innerHTML` assignments | check every client-controlled string (DHCP host name, mDNS names, PPPoE AC name/messages, DNS names, log lines) passes `esc`; `'` is not escaped (fine only in `"`-quoted attributes) |
 | Security headers | none found (`Content-Security-Policy`, `X-Frame-Options`) | clickjacking of the config page; a CSP would contain any missed escape |
 | Upload | `POST /api/upgrade` streamed into the staging area; `boot-image` validates ELF64 + Multiboot2 + CRC-32 | **no signature**: P7 rests on the password alone; auth is checked on the request head, before any body byte is streamed (`on_head`, verified) |
@@ -126,7 +126,7 @@ the reason. 1 and 2 were checked on 2026-11-22 (65005d4, aarch64, HVF, QEMU
 user networking with `mgmt=wan` and a host port forward; same mgmt code as on
 the LAN side), the rest are open.
 
-1. **CONFIRMED (server side): CSRF via cached Basic credentials** (A5, §4.3).
+1. **FIXED (2026-11-22): CSRF via cached Basic credentials** (A5, §4.3).
    A request without `X-Leatos-UI` gets `401` + `WWW-Authenticate: Basic`, so a
    browser that opens any API URL directly prompts and caches the credentials.
    A cross-site `text/plain` POST to `/api/config` with them (`Origin:
@@ -138,21 +138,30 @@ the LAN side), the rest are open.
    port forwards, DNS upstreams); `/api/reboot` and `/api/upgrade` take the same
    path. That browsers attach cached Basic credentials to cross-site top-level
    form POSTs is standard behaviour, not re-checked here in a browser.
-   Fix direction: refuse requests whose `Origin` (or, without it,
-   `Sec-Fetch-Site: cross-site`) is not the router's own; accept only
-   `application/json` or `application/toml` bodies (forms cannot send these
-   without CORS preflight); consider dropping Basic for anything but
-   `/api/login` and scripts that send no `Origin`.
-2. **CONFIRMED: no `Host` check**, DNS rebinding reads the API when no password
+   Fix: `proto_http::check_browser_origin`, called by `net::mgmt` before
+   routing and auth: a request other than `GET` whose `Origin` is not the
+   `Host` it was sent to (or `null`), or without `Origin` with
+   `Sec-Fetch-Site: cross-site`/`same-site`, gets `403`. Scripts send
+   neither and pass, so Basic stays for them. The content-type restriction
+   considered at first was left out: the origin check already covers every
+   browser that sends `Origin` on POST (all current ones), and it would have
+   broken scripts (`curl --data-binary` sends a form type). Counter
+   `/api/status` `mgmt.refused.cross_site`. Lab: the client's `web origin`
+   checks (every mode); negative control `LAB_ROUTER_ARGS=mgmt_origin=0`.
+2. **FIXED (2026-11-22): no `Host` check**, DNS rebinding reads the API when no password
    is set (A5). With `Host: rebind.evil.example` and a matching `Origin`,
    `/api/status`, `/api/config` and `/api/config.json` answered `200` with
    content (leases, MACs, host names, the whole config without secrets);
    `/api/log` and all changes were refused (`403` without a password, as
    designed). The router's DNS rebind protection only helps clients that use
-   the router as their resolver (not browsers with DoH). Fix direction:
-   answer only when `Host` is the router's address (any of its networks',
-   v4 or `[v6]`, with an optional port) or a name in the router's own zone
-   (`router.<domain>`, configured names); else `421`/`403`.
+   the router as their resolver (not browsers with DoH). Fix: the same
+   check answers `421` unless `Host` is an IP address literal (an origin
+   that is an address cannot be rebound), `localhost`, a single label, or a
+   name under one of the router's DNS domains (`dns.domain` and the
+   networks' own, `config::local_domains`); every route, the page
+   included. Names outside those domains that point at the router (a
+   `[[dns.host]]` override of a public name) no longer open the interface.
+   Counter `mgmt.refused.host`; same lab checks and negative control.
 3. **Unsigned upgrades** (P7): an attacker with the password, or one CSRF, installs a persistent kernel. Candidate fix: Ed25519 signature over the image, key compiled in, `image=golden` unaffected.
 4. **Remote panics in WAN parsers** (P1): `unwrap`/indexing/arithmetic in `proto-pppoe`, `proto-dhcp` v6, `proto-dns`, `fwd::wire` (release builds wrap on overflow: `overflow-checks` not set).
 5. **DHCP pool exhaustion** by one client with random MACs (A3/A4): 100 addresses per network.

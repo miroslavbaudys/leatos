@@ -219,6 +219,36 @@ else
   fail "ping router"; $bb sed "s/^/    | /" /tmp/ping
 fi
 
+# --- web interface: DNS rebinding and CSRF (docs/security-audit.md §5) -----------
+# Raw requests as a browser sends them, with the Basic credentials a browser
+# may have cached. A Host that is not the router's (a name rebound to
+# 192.168.1.1) gets 421; the address and router.lan pass. A POST from another
+# origin gets 403 before auth; the same POST from the router's own origin or
+# without Origin (a script) gets past it (422 for the bad body, 501 without a
+# store). Negative control: LAB_ROUTER_ARGS=mgmt_origin=0 (the 421 and 403
+# checks fail).
+mreq() { # method path host origin body: the response's status code
+  { printf '%s %s HTTP/1.1\r\nHost: %s\r\nAuthorization: Basic YWRtaW46bGFiLXBhc3M=\r\n' "$1" "$2" "$3"
+    [ -n "$4" ] && printf 'Origin: %s\r\n' "$4"
+    printf 'Content-Type: text/plain\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' "${#5}" "$5"
+  } | $bb nc -w 5 192.168.1.1 80 2>/dev/null | $bb head -1 | $bb cut -d' ' -f2
+}
+mexpect() { # description expected-codes (space-separated) actual
+  case " $2 " in *" $3 "*) pass "web origin: $1 ($3)" ;; *) fail "web origin: $1: expected $2, got '$3'" ;; esac
+}
+mexpect "GET /api/status with Host 192.168.1.1" 200 "$(mreq GET /api/status 192.168.1.1 '' '')"
+mexpect "GET /api/status with Host router.lan" 200 "$(mreq GET /api/status router.lan '' '')"
+mexpect "GET /api/status with a rebound Host refused" 421 "$(mreq GET /api/status rebind.evil.example '' '')"
+mexpect "GET / with a rebound Host refused" 421 "$(mreq GET / rebind.evil.example:80 '' '')"
+mexpect "POST /api/config from another site refused" 403 \
+  "$(mreq POST /api/config 192.168.1.1 http://evil.example 'csrf=1')"
+mexpect "POST /api/config/revert from another site refused" 403 \
+  "$(mreq POST /api/config/revert 192.168.1.1 http://203.0.113.9 '')"
+mexpect "POST /api/config from the router's own origin passes" "422 501" \
+  "$(mreq POST /api/config router.lan http://router.lan 'csrf=1')"
+mexpect "POST /api/config from a script (no Origin) passes" "422 501" \
+  "$(mreq POST /api/config 192.168.1.1 '' 'csrf=1')"
+
 # --- forwarding, NAT, firewall (M4) -------------------------------------------
 $bx httpd -p 8080 -h /www   # target for the firewall probe from the ISP side
 

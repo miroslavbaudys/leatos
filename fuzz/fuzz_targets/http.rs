@@ -2,11 +2,13 @@
 //! reachable from the LAN before authentication. The same bytes are fed
 //! whole and in fuzzer-chosen pieces. Checks: the body never exceeds the
 //! limit or Content-Length; when both feeds complete, they agree on the
-//! head and the body. Also `basic_auth` and `json_str` on what was parsed.
+//! head and the body. Also `basic_auth`, `json_str` and
+//! `check_browser_origin` on what was parsed (the Host/Origin parsers run
+//! before auth): a GET with a foreign `Origin` is never refused as cross-site.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use proto_http::{Head, Parser, basic_auth, json_str};
+use proto_http::{Foreign, Head, Method, Parser, basic_auth, check_browser_origin, json_str};
 
 const MAX_HEAD: usize = 4096;
 const MAX_BODY: usize = 8192;
@@ -69,5 +71,9 @@ fuzz_target!(|input: (Vec<u8>, Vec<u8>)| {
         let _ = basic_auth(&r.0);
         let _ = json_str(&r.0.path);
         let _ = r.0.header("authorization");
+        let v = check_browser_origin(&r.0, &["lan", "guest.lan"]);
+        if r.0.method == Method::Get {
+            assert_ne!(v, Err(Foreign::CrossSite), "GET checked for its origin");
+        }
     }
 });

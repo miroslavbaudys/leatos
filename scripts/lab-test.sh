@@ -53,6 +53,13 @@
 #                        (forwarded fails)
 #   LAB_EXPECT_KBIT=N    what the client expects (default: LAB_SHAPE_KBIT);
 #                        set it with LAB_SHAPE_KBIT=0 as a negative control
+#                        The web interface's origin checks run in every mode
+#                        (docs/security-audit.md §5; the router always gets
+#                        mgmt_pass=lab-pass): a rebound Host gets 421, a
+#                        cross-site POST with Basic credentials 403, while
+#                        the address, router.lan and same-origin POSTs pass.
+#                        Negative control LAB_ROUTER_ARGS=mgmt_origin=0
+#                        (both refusal checks fail)
 #   LAB_ROUTER_ARGS="…"  extra router boot arguments, e.g. qdisc=codel (single
 #                        CoDel queue: the negative control for the flow-
 #                        isolation latency check), or dns_prefetch=0 (the
@@ -371,6 +378,9 @@ if [[ -n "$SWARM" ]]; then
   EXPECT_KBIT=0 # no single-download shaping phase
 fi
 ROUTER_ARGS="$ROUTER_ARGS ${LAB_ROUTER_ARGS:-}"
+# A password in every mode: live config changes (LAB_GUEST_LIVE, the recheck
+# check) and the web interface's CSRF check need it.
+[[ " ${LAB_ROUTER_ARGS:-} " == *" mgmt_pass="* ]] || ROUTER_ARGS="$ROUTER_ARGS mgmt_pass=lab-pass"
 [[ -n "$NEIGH" ]] && ROUTER_ARGS="$ROUTER_ARGS neigh_secs=${LAB_NEIGH_LIFETIME:-10}"
 # The first ntp= wins: only add the default when the caller sets none.
 [[ " ${LAB_ROUTER_ARGS:-} " == *" ntp="* ]] || ROUTER_ARGS="$ROUTER_ARGS ntp=ntp.isp.example"
@@ -667,8 +677,6 @@ CFG
     CLIENT_INITRD="$WORK/client-initrd.img"
   fi
   ROUTER_STORE="$WORK/store.img"
-  # Live config changes (LAB_GUEST_LIVE, the recheck check) need it.
-  ROUTER_ARGS="$ROUTER_ARGS mgmt_pass=lab-pass"
   echo "== router config${GUEST_LIVE:+ (added live by the client)}: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")$([[ "$REDIRECT" == 1 ]] && echo ", NTP redirect")$([[ "$GUEST_DOMAIN" == 1 ]] && echo ", domain guest.lan")$([[ -n "$MDNS" ]] && echo ", mdns reflect (enabled: $MDNS_RULES)")$([[ -n "$ROUTES" ]] && echo ", route lab-behind (enabled: $([[ "$ROUTES" == 1 ]] && echo yes || echo no))")$([[ -n "$DNS_VIEWS" ]] && echo ", dns views $([[ "$DNS_VIEWS" == 1 ]] && echo firewall || echo all), dns hosts $DNS_HOSTS")"
 fi
 

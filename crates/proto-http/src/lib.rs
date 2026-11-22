@@ -7,6 +7,8 @@
 //!   per connection (every response says `Connection: close`).
 //! - [`response`]: a complete response with `Content-Length`.
 //! - [`basic_auth`], [`ct_eq`]: HTTP Basic credentials, constant-time compare.
+//! - [`check_browser_origin`]: refuse DNS-rebound `Host`s and cross-site
+//!   requests (CSRF) that only a browser sends.
 //! - [`json_str`]: JSON string escaping for status output.
 //!
 //! `#![no_std]` + `alloc`, sans-IO: bytes in, events and bytes out.
@@ -206,6 +208,7 @@ pub fn reason(status: u16) -> &'static str {
         409 => "Conflict",
         411 => "Length Required",
         413 => "Content Too Large",
+        421 => "Misdirected Request",
         422 => "Unprocessable Content",
         431 => "Request Header Fields Too Large",
         501 => "Not Implemented",
@@ -278,6 +281,127 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// A request a browser may have been made to send by another site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Foreign {
+    /// `Host` names neither an IP address nor one of the router's own
+    /// names: a page whose name was rebound to the router (DNS rebinding).
+    Host,
+    /// A request other than `GET` from another site: `Origin` is not the
+    /// `Host` it was sent to (or `null`), or, without `Origin`,
+    /// `Sec-Fetch-Site` says `cross-site`/`same-site` (CSRF).
+    CrossSite,
+}
+
+/// Refuse what only a browser tricked by another site sends (security
+/// audit, docs/security-audit.md §5 items 1–2). Scripts (no `Origin`, no
+/// `Sec-Fetch-Site`, any `Host` that is an address) pass.
+///
+/// `Host` must be an IP address literal (an origin that is an address
+/// cannot be rebound), `localhost`, a single label (`router`), or a name in
+/// one of `local_domains` (the router's DNS domains, e.g. `lan`). A missing
+/// `Host` passes (HTTP/1.0; browsers always send one).
+///
+/// For methods other than `GET`, `Origin` (sent by browsers on every POST)
+/// must be the same origin as `Host`: `http://<host>[:port]` (or https
+/// with its port), compared without case, default ports filled in.
+pub fn check_browser_origin(head: &Head, local_domains: &[&str]) -> Result<(), Foreign> {
+    let host = match head.header("host") {
+        None => None,
+        Some(h) => {
+            let a = Authority::parse(h, 80).ok_or(Foreign::Host)?;
+            if !a.is_local(local_domains) {
+                return Err(Foreign::Host);
+            }
+            Some(a)
+        }
+    };
+    if head.method == Method::Get {
+        return Ok(());
+    }
+    if let Some(origin) = head.header("origin") {
+        let origin = origin.trim();
+        let (default, rest) = if let Some(r) = strip_prefix_ci(origin, "http://") {
+            (80, r)
+        } else if let Some(r) = strip_prefix_ci(origin, "https://") {
+            (443, r)
+        } else {
+            return Err(Foreign::CrossSite); // "null", other schemes
+        };
+        let o = Authority::parse(rest, default).ok_or(Foreign::CrossSite)?;
+        return match host {
+            Some(h) if h == o => Ok(()),
+            _ => Err(Foreign::CrossSite),
+        };
+    }
+    match head.header("sec-fetch-site").map(str::trim) {
+        Some(s) if s.eq_ignore_ascii_case("cross-site") || s.eq_ignore_ascii_case("same-site") => {
+            Err(Foreign::CrossSite)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then(|| &s[prefix.len()..])
+}
+
+/// `host[:port]` of a `Host` header or an origin, normalised.
+#[derive(Debug, PartialEq, Eq)]
+struct Authority {
+    /// Lower case, no trailing dot; IPv6 without brackets or zone.
+    name: String,
+    ip: bool,
+    port: u16,
+}
+
+impl Authority {
+    fn parse(s: &str, default_port: u16) -> Option<Self> {
+        let s = s.trim();
+        let (name, port, ip) = if let Some(rest) = s.strip_prefix('[') {
+            let (inner, after) = rest.split_once(']')?;
+            let addr = inner.split_once('%').map_or(inner, |(a, _)| a);
+            let addr: core::net::Ipv6Addr = addr.parse().ok()?;
+            (format!("{addr}"), after, true)
+        } else {
+            let (name, port) = s.find(':').map_or((s, ""), |i| s.split_at(i));
+            if port.len() > 1 && port[1..].contains(':') {
+                return None; // an IPv6 address without brackets
+            }
+            let name = name.strip_suffix('.').unwrap_or(name);
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
+            {
+                return None;
+            }
+            let ip = name.parse::<core::net::Ipv4Addr>().is_ok();
+            (name.to_ascii_lowercase(), port, ip)
+        };
+        let port = match port {
+            "" => default_port,
+            p => p.strip_prefix(':')?.parse().ok()?,
+        };
+        Some(Self { name, ip, port })
+    }
+
+    fn is_local(&self, local_domains: &[&str]) -> bool {
+        self.ip
+            || self.name == "localhost"
+            || !self.name.contains('.')
+            || local_domains.iter().any(|d| {
+                let d = d.trim_end_matches('.');
+                !d.is_empty()
+                    && (self.name.eq_ignore_ascii_case(d)
+                        || self.name.len() > d.len()
+                            && self.name.as_bytes()[self.name.len() - d.len() - 1] == b'.'
+                            && self.name[self.name.len() - d.len()..].eq_ignore_ascii_case(d))
+            })
+    }
+}
+
 /// Compare without an early exit on the first differing byte.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -320,6 +444,95 @@ mod tests {
         assert_eq!(s.body, b"0123456789", "trailing bytes ignored");
         assert!(s.done);
         assert_eq!(basic_auth(&h), Some(("admin".into(), "s3cret".into())));
+    }
+
+    fn req(method: Method, headers: &[(&str, &str)]) -> Head {
+        Head {
+            method,
+            path: "/api/config".into(),
+            content_length: 0,
+            headers: headers.iter().map(|(n, v)| (n.to_ascii_lowercase(), String::from(*v))).collect(),
+        }
+    }
+
+    const DOMAINS: &[&str] = &["lan", "guest.lan"];
+
+    #[test]
+    fn host_must_be_an_address_or_a_local_name() {
+        for ok in [
+            "192.168.1.1",
+            "192.168.1.1:80",
+            "127.0.0.1:18081",
+            "[fd13:34ac:fcc9::1]",
+            "[FE80::1%25eth0]:8080",
+            "localhost:8080",
+            "router",
+            "router.lan",
+            "ROUTER.LAN.",
+            "router.guest.lan",
+            "lan",
+        ] {
+            let h = req(Method::Get, &[("Host", ok)]);
+            assert_eq!(check_browser_origin(&h, DOMAINS), Ok(()), "{ok}");
+        }
+        for bad in [
+            "rebind.evil.example",
+            "evil.example:80",
+            "routerlan.evil",
+            "lan.evil.example",
+            "1.2.3.4.evil.example",
+            "fd13::1",
+            "[fd13::1",
+            "[nonsense]",
+            "router.lan:99999",
+            "router.lan:",
+            "",
+            "a b",
+        ] {
+            let h = req(Method::Get, &[("Host", bad)]);
+            assert_eq!(check_browser_origin(&h, DOMAINS), Err(Foreign::Host), "{bad:?}");
+        }
+        // `xlan` is a single label: allowed; `evil.xlan` is not under `lan`.
+        assert_eq!(check_browser_origin(&req(Method::Get, &[("Host", "evil.xlan")]), DOMAINS), Err(Foreign::Host));
+        // No domains configured: addresses and single labels only.
+        assert_eq!(check_browser_origin(&req(Method::Get, &[("Host", "router.lan")]), &[]), Err(Foreign::Host));
+        // No Host at all (HTTP/1.0 scripts).
+        assert_eq!(check_browser_origin(&req(Method::Post, &[]), DOMAINS), Ok(()));
+    }
+
+    #[test]
+    fn post_from_another_origin_is_refused() {
+        let post = |h: &[(&str, &str)]| check_browser_origin(&req(Method::Post, h), DOMAINS);
+        // The page's own requests.
+        assert_eq!(post(&[("Host", "192.168.1.1"), ("Origin", "http://192.168.1.1")]), Ok(()));
+        assert_eq!(post(&[("Host", "192.168.1.1:80"), ("Origin", "http://192.168.1.1")]), Ok(()));
+        assert_eq!(post(&[("Host", "Router.lan"), ("Origin", "http://router.LAN:80")]), Ok(()));
+        assert_eq!(post(&[("Host", "localhost:8080"), ("Origin", "http://localhost:8080")]), Ok(()));
+        assert_eq!(post(&[("Host", "[fd00::1]"), ("Origin", "http://[fd00::1]")]), Ok(()));
+        // Scripts: no Origin, no Sec-Fetch-Site.
+        assert_eq!(post(&[("Host", "192.168.1.1")]), Ok(()));
+        assert_eq!(post(&[("Host", "192.168.1.1"), ("Sec-Fetch-Site", "same-origin")]), Ok(()));
+        assert_eq!(post(&[("Host", "192.168.1.1"), ("Sec-Fetch-Site", "none")]), Ok(()));
+        // Other sites.
+        for (o, why) in [
+            ("http://evil.example", "another name"),
+            ("http://203.0.113.9", "another address"),
+            ("http://192.168.1.1:8080", "another port"),
+            ("https://192.168.1.1", "another scheme (port 443)"),
+            ("null", "opaque origin"),
+            ("file://", "other scheme"),
+            ("http://", "empty"),
+        ] {
+            assert_eq!(post(&[("Host", "192.168.1.1"), ("Origin", o)]), Err(Foreign::CrossSite), "{why}");
+        }
+        assert_eq!(post(&[("Origin", "http://192.168.1.1")]), Err(Foreign::CrossSite), "Origin without Host");
+        assert_eq!(post(&[("Host", "192.168.1.1"), ("Sec-Fetch-Site", "cross-site")]), Err(Foreign::CrossSite));
+        assert_eq!(post(&[("Host", "192.168.1.1"), ("Sec-Fetch-Site", "same-site")]), Err(Foreign::CrossSite));
+        // A foreign Host is reported as such, before the origin.
+        assert_eq!(post(&[("Host", "evil.example"), ("Origin", "http://evil.example")]), Err(Foreign::Host));
+        // GET is not checked for the origin (responses are not readable cross-site).
+        let get = req(Method::Get, &[("Host", "192.168.1.1"), ("Origin", "http://evil.example")]);
+        assert_eq!(check_browser_origin(&get, DOMAINS), Ok(()));
     }
 
     #[test]

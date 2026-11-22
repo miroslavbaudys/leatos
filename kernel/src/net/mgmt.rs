@@ -56,6 +56,13 @@
 //! (PBKDF2-SHA256, checked once per login; scripts' repeats are cached).
 //! A wrong password blocks password attempts for a second. A saved `mgmt.password` (clear text, from the form or the
 //! CLI) is hashed before it is stored, and ends all sessions.
+//! Before routing or auth, [`check_origin`] refuses what only a browser
+//! made to by another site sends (docs/security-audit.md §5): a `Host`
+//! that is neither an address nor a name in the router's DNS domains
+//! (DNS rebinding: 421) and a non-GET whose `Origin` is not that `Host`,
+//! or whose `Sec-Fetch-Site` is cross-site (CSRF with cached Basic
+//! credentials: 403). Scripts send neither header and pass; counters in
+//! `/api/status` `mgmt.refused`; `mgmt_origin=0` turns it off.
 //! Listens on the LAN; on the WAN too only with `mgmt=wan` (development:
 //! a router's management belongs on the LAN). Plain HTTP: the password
 //! crosses the network unencrypted, acceptable on a lab network only.
@@ -74,7 +81,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use config_store::{RecordHeader, Slot};
 use proto_http::{Error as HttpError, Head, Method, Parser, json_str, response};
@@ -322,6 +329,36 @@ impl Trial {
                     .as_secs()
             ),
             None => String::from("null"),
+        }
+    }
+}
+
+/// Requests refused by [`check_origin`] (`/api/status` `mgmt.refused`).
+static REFUSED_HOST: AtomicU64 = AtomicU64::new(0);
+static REFUSED_CROSS_SITE: AtomicU64 = AtomicU64::new(0);
+
+/// Refuse what only a browser made to by another site sends: a `Host`
+/// that is not the router's (DNS rebinding) and a POST from another
+/// origin (CSRF), before routing or auth (docs/security-audit.md §5).
+/// Boot argument `mgmt_origin=0` turns it off (the lab's negative control).
+fn check_origin(head: &Head) -> Result<(), (u16, &'static str)> {
+    if !config::mgmt_origin() {
+        return Ok(());
+    }
+    let domains = config::local_domains();
+    let domains: Vec<&str> = domains.iter().map(String::as_str).collect();
+    match proto_http::check_browser_origin(head, &domains) {
+        Ok(()) => Ok(()),
+        Err(proto_http::Foreign::Host) => {
+            REFUSED_HOST.fetch_add(1, Ordering::Relaxed);
+            Err((
+                421,
+                "Host is not this router: open it by its address or a name in its DNS domain (router.<domain>)",
+            ))
+        }
+        Err(proto_http::Foreign::CrossSite) => {
+            REFUSED_CROSS_SITE.fetch_add(1, Ordering::Relaxed);
+            Err((403, "cross-site request refused (Origin is not this router)"))
         }
     }
 }
@@ -582,7 +619,7 @@ impl Mgmt {
     fn on_head(&mut self, i: usize, head: Head) {
         crate::entropy::mix(head.path.as_bytes());
         self.conns[i].no_prompt = head.header("x-leatos-ui").is_some();
-        let route = match (head.method, head.path.as_str()) {
+        let route = check_origin(&head).and(match (head.method, head.path.as_str()) {
             (Method::Get, "/" | "/index.html") => Ok(Route::Index),
             (Method::Get, "/api/info") => Ok(Route::Info),
             (Method::Get, "/api/status") => Ok(Route::Status),
@@ -612,7 +649,7 @@ impl Mgmt {
                 Err((405, "method not allowed"))
             }
             _ => Err((404, "not found")),
-        };
+        });
         let route = route.and_then(|r| {
             let changes_config =
                 matches!(r, Route::ConfigPut | Route::ConfigConfirm | Route::ConfigRevert);
@@ -1173,7 +1210,7 @@ fn status_json(
         "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"tx_failed\":{},\"vlan_drops\":{},\"conntrack\":{},\"early_drops\":{},\"conntrack_pass_us\":{{\"last\":{},\"max\":{}}},\"housekeeping_us\":{{\"last\":{},\"max\":{}}},\"revoked\":{},\"rejected\":{},\"icmp_errors\":{},\"unreachable6\":{},\"neigh_probes\":{},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free},{heap_ops}}},\"cpu\":{cpu},\"temp\":{temp},\"memory\":{memory},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
-         \"fragments\":{{\"forwarded\":{},\"parked\":{},\"park_drops\":{},\"split\":{},\"split_drops\":{}}},\"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{}}},\"interfaces\":[",
+         \"fragments\":{{\"forwarded\":{},\"parked\":{},\"park_drops\":{},\"split\":{},\"split_drops\":{}}},\"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{},\"origin_check\":{},\"refused\":{{\"host\":{},\"cross_site\":{}}}}},\"interfaces\":[",
         json_str(env!("CARGO_PKG_VERSION")),
         json_str(env!("LEATOS_BUILD")),
         json_str(if cfg!(target_arch = "x86_64") {
@@ -1235,6 +1272,9 @@ fn status_json(
         mgmt.auth_configured()
             && mgmt.has_store
             && (mgmt.staging.is_some() || mgmt.uploader.is_some()),
+        config::mgmt_origin(),
+        REFUSED_HOST.load(Ordering::Relaxed),
+        REFUSED_CROSS_SITE.load(Ordering::Relaxed),
     );
     for (n, nif) in sh.ports.iter().enumerate() {
         let snap = *nif.snap.lock();

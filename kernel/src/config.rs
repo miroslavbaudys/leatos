@@ -1343,6 +1343,27 @@ pub fn arp_hints() -> bool {
     arg_u64(bootargs(), "arp_hints") != Some(0)
 }
 
+/// The management interface refuses DNS-rebound `Host`s and cross-site
+/// requests (`proto_http::check_browser_origin`, docs/security-audit.md);
+/// boot argument `mgmt_origin=0` turns that off (the lab's negative control).
+pub fn mgmt_origin() -> bool {
+    arg_u64(bootargs(), "mgmt_origin") != Some(0)
+}
+
+/// The router's own DNS domains (`dns.domain` and the networks' own):
+/// names under them may reach the management interface as `Host`.
+pub fn local_domains() -> Vec<String> {
+    let c = get();
+    let mut v = alloc::vec![c.dns.domain.clone()];
+    for n in &c.networks {
+        let d = n.domain(&c.dns);
+        if !v.iter().any(|x| x.eq_ignore_ascii_case(d)) {
+            v.push(String::from(d));
+        }
+    }
+    v
+}
+
 /// DNS over TCP from clients (port 53, RFC 7766); boot argument
 /// `dns_tcp=0` serves UDP only (the lab's negative control).
 pub fn dns_tcp() -> bool {
