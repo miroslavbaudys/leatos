@@ -25,6 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Boot arguments and LAB_* variables documented (docs/boot-arguments.md,
+      # scripts/lab-test.sh header); cheap, so first.
+      - name: doc check
+        run: scripts/doc-check.sh
       # rust-toolchain.toml pins the channel, both kernel targets and clippy.
       - run: rustup toolchain install # installs what rust-toolchain.toml names
       - uses: Swatinem/rust-cache@v2

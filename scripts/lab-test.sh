@@ -15,6 +15,13 @@
 #   LAB_PCAP_DIR=dir     capture router WAN/LAN traffic to pcap
 #   LAB_KEEP_LOGS=1      keep console logs (path printed)
 #   LAB_TIMEOUT=150      seconds before giving up
+#   LAB_EXPECT_UP_CORE=N the core dp_up must run on (default 1 with
+#                        QEMU_SMP >= 3, else 0)
+#   LAB_SWARM_UP_KBIT=20000 the upload rate during a LAB_SWARM run
+#   Set by the script itself (internal): LAB_LAN_PORT, LAB_WAN_PORT and
+#                        LAB_LAN1_PORT (UDP link ports handed to
+#                        scripts/qemu-run.sh), LAB_INITRD_KEA (the ISP initrd
+#                        gets Kea, for LAB_IPV6)
 #   QEMU_ACCEL=tcg       run without hardware acceleration
 #   LEATOS_ARCH=x86_64  run the x86_64 router kernel (QEMU q35, TCG); the
 #                        client and ISP VMs stay aarch64
