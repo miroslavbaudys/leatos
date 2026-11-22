@@ -1,7 +1,8 @@
 # LAN neighbors: one table per link (plan)
 
-Status (2026-11-22): step 0 done except the upstream report; step 1 done (`fwd::nd`, host tests,
-`fwd` fuzz target). Nothing is deployed before the apu4 soak ends (2026-11-25).
+Status (2026-11-22): step 0 done except the upstream report (lab check `LAB_ND_FLOOD=1` for its
+WAN fix); step 1 done (`fwd::nd`, host tests, `fwd` fuzz target); step 2 done (`fwd::local`,
+`Datapath::send_local` / `set_local_link`, not called yet). Nothing is deployed before the apu4 soak ends (2026-11-25).
 
 ## 1. The problem
 

@@ -9,6 +9,9 @@ Docs: architecture, bufferbloat-cake, ipv6, dns-over-tls, dns-views, mdns, secur
 - `datapath.rs`: NIC RX → VLAN check/untag → PPPoE decap → `fwd::Forwarder` → (from the WAN: the
   ingress qdisc, `drain_ingress`) → neighbor (PPPoE: the AC) → qdisc → PPPoE encap → VLAN tag → NIC
   TX. PPPoE control frames → `ctrl_rx`.
+- `Datapath::send_local` / `set_local_link` (docs/lan-neighbors.md step 2, not called yet): the
+  router stack's own packets on a link without a link layer, next hop by `fwd::local`, then the
+  same neighbor table and qdisc as forwarded packets; `LOCAL_NO_ROUTE` counts the rest.
 - `stack.rs`: port bring-up + the **datapath direction tasks** `dp_down`/`dp_up` (`run_dir`):
   NAPI-style IRQ loop. Lock order NIC → forwarder shard → neighbor table → qdisc.
 - Queues: CAKE is the default qdisc on both ports' egress and in the WAN ingress stage

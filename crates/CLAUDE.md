@@ -19,6 +19,10 @@ events out), host-tested with `cargo test`. Fuzz targets in `fuzz/` (fuzz/README
   unicast NS answered) and conflicts (another MAC claiming or probing for our address); RFC 4861
   §7.1.1 checks; `Config` switches for the lab's negative controls (`nd_unicast=0`,
   `na_router=0`). Tests parse every reply with smoltcp.
+- `local`: the next hop of the router's own packets on a link without a link layer
+  (docs/lan-neighbors.md step 2): `LocalLink::next_hop` = a fixed MAC (broadcast, directed
+  broadcast, IPv4 / IPv6 multicast mapping) or a neighbor (on the link, or a `[[route]]`'s
+  gateway), else `NoRoute` (no default route on a LAN).
 - `neigh`: entries in use are probed at the end of their 300 s lifetime and kept meanwhile (RFC 4861
   PROBE); unused ones age out. Drops are drop reason `neighbor`, probes `/api/status`
   `neigh_probes`.

@@ -96,6 +96,9 @@ pub type Touched = [bool; MAX_PORTS];
 /// Counters for diagnostics (read by the self-test / stats output).
 pub static FORWARDED: AtomicU64 = AtomicU64::new(0);
 pub static DROPPED: AtomicU64 = AtomicU64::new(0);
+/// The router stack's packets on a link without a link layer that had no
+/// next hop there ([`Datapath::send_local`]).
+pub static LOCAL_NO_ROUTE: AtomicU64 = AtomicU64::new(0);
 /// The forwarder's drops by reason (`fwd::forwarder::DropReason::index`),
 /// part of `DROPPED` (the web interface's firewall page).
 pub static DROP_REASONS: [AtomicU64; fwd::forwarder::DROP_REASONS] =
@@ -274,6 +277,10 @@ pub struct Datapath {
     neigh6: Vec<Mutex<NeighTable<PacketBuf, Ipv6Addr>>>,
     /// Per link: the interface address (the WAN one changes with the lease).
     addrs: Vec<Mutex<Option<(Ipv4Addr, u8)>>>,
+    /// Per link: the router stack's addresses and routes there, for its
+    /// own packets on a link without a link layer ([`Self::send_local`],
+    /// docs/lan-neighbors.md).
+    local: Vec<Mutex<fwd::local::LocalLink>>,
     /// Which link a frame belongs to and what `shard_of` needs: replaced
     /// whole by [`Self::apply`], read once per batch.
     topo: Mutex<alloc::sync::Arc<Topo>>,
@@ -445,6 +452,7 @@ impl Datapath {
                 .map(|_| Mutex::new(neigh6_table()))
                 .collect(),
             addrs: ifaces.iter().map(|i| Mutex::new(i.addr)).collect(),
+            local: ifaces.iter().map(|_| Mutex::new(fwd::local::LocalLink::default())).collect(),
             topo: Mutex::new(alloc::sync::Arc::new(Topo::default())),
             hk: Mutex::new(Hk {
                 next_housekeeping: 0,
@@ -588,6 +596,45 @@ impl Datapath {
         {
             DROPPED.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// The router stack's addresses and routes on link `ifx`
+    /// ([`Self::send_local`]).
+    #[allow(dead_code)] // wired in docs/lan-neighbors.md step 3
+    pub fn set_local_link(&self, ifx: IfIndex, l: fwd::local::LocalLink) {
+        if let Some(m) = self.local.get(ifx as usize) {
+            *m.lock() = l;
+        }
+    }
+
+    /// A packet from the router's own stack on link `ifx`, whose stack has
+    /// no link layer (smoltcp on `Medium::Ip`, docs/lan-neighbors.md):
+    /// `pkt` is 14 bytes of Ethernet header (EtherType set) and the IP
+    /// packet. Broadcast and multicast go out at once; unicast goes to the
+    /// destination or a `[[route]]`'s gateway through the neighbor table,
+    /// as forwarded packets do (waiting in its bounded pending queue while
+    /// resolved). Called from the services task; takes the link's lock,
+    /// then the neighbor table's and the qdisc's (the datapath's order).
+    /// Returns false if it was dropped for want of a next hop.
+    #[allow(dead_code)] // wired in docs/lan-neighbors.md step 3
+    pub fn send_local(&self, ifx: IfIndex, mut pkt: PacketBuf, touched: &mut Touched) -> bool {
+        let Some(link) = self.local.get(ifx as usize) else {
+            return false;
+        };
+        let hop = link.lock().next_hop(pkt.data());
+        pkt.meta.wire_len = pkt.len() as u32;
+        pkt.meta.enqueue_ts = now_ns();
+        let now = now_ms();
+        match hop {
+            fwd::local::NextHop::Mac(mac) => self.send_resolved(ifx, mac, pkt, touched),
+            fwd::local::NextHop::Neighbor4(a) => self.to_next_hop(ifx, a, pkt, now, touched),
+            fwd::local::NextHop::Neighbor6(a) => self.to_next_hop6(ifx, a, pkt, now, touched),
+            fwd::local::NextHop::NoRoute => {
+                LOCAL_NO_ROUTE.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+        true
     }
 
     /// Fill in the Ethernet addresses and queue for transmission.
