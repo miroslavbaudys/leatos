@@ -100,6 +100,9 @@ pub static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// part of `DROPPED` (the web interface's firewall page).
 pub static DROP_REASONS: [AtomicU64; fwd::forwarder::DROP_REASONS] =
     [const { AtomicU64::new(0) }; fwd::forwarder::DROP_REASONS];
+/// Requests sent to neighbors in use past their lifetime (`fwd::neigh`
+/// probes), both families.
+pub static NEIGH_PROBES: AtomicU64 = AtomicU64::new(0);
 /// Packets the NIC refused after `can_transmit` (part of `DROPPED`).
 pub static TX_FAILED: AtomicU64 = AtomicU64::new(0);
 /// Received frames with the wrong VLAN tag for their port (or none).
@@ -295,6 +298,34 @@ pub struct FlushResult {
 /// Print per-port qdisc statistics every this many ms (only if there was traffic).
 const STATS_MS: u64 = 10_000;
 
+fn neigh_table() -> NeighTable<PacketBuf> {
+    let (ms, probe) = crate::config::neigh_timing();
+    NeighTable::new().with_timing(ms, probe)
+}
+
+fn neigh6_table() -> NeighTable<PacketBuf, Ipv6Addr> {
+    let (ms, probe) = crate::config::neigh_timing();
+    NeighTable::with_incomplete_cap(NEIGH6_INCOMPLETE).with_timing(ms, probe)
+}
+
+/// Packets a neighbor table dropped (`dropped` went from `before` to
+/// `after`): the drop reason `neighbor`.
+fn poll_neigh<A: Copy + Ord>(n: &mut NeighTable<PacketBuf, A>, now: u64) -> Vec<(IfIndex, A)> {
+    let (dropped, probes) = (n.dropped, n.probes);
+    let r = n.poll(now);
+    count_neigh_drops(dropped, n.dropped);
+    NEIGH_PROBES.fetch_add(n.probes - probes, Ordering::Relaxed);
+    r
+}
+
+fn count_neigh_drops(before: u64, after: u64) {
+    let n = after.saturating_sub(before);
+    if n > 0 {
+        DROPPED.fetch_add(n, Ordering::Relaxed);
+        DROP_REASONS[DropReason::Neighbor.index()].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
 fn now_ms() -> u64 {
     timer::uptime().as_millis() as u64
 }
@@ -396,11 +427,11 @@ impl Datapath {
             shards,
             neigh: ifaces
                 .iter()
-                .map(|_| Mutex::new(NeighTable::new()))
+                .map(|_| Mutex::new(neigh_table()))
                 .collect(),
             neigh6: ifaces
                 .iter()
-                .map(|_| Mutex::new(NeighTable::with_incomplete_cap(NEIGH6_INCOMPLETE)))
+                .map(|_| Mutex::new(neigh6_table()))
                 .collect(),
             addrs: ifaces.iter().map(|i| Mutex::new(i.addr)).collect(),
             topo: Mutex::new(alloc::sync::Arc::new(Topo::default())),
@@ -478,8 +509,8 @@ impl Datapath {
             *self.addrs[i].lock() = addr;
             link.set(want.is_some(), port, vid);
             if changed {
-                *self.neigh[i].lock() = NeighTable::new();
-                *self.neigh6[i].lock() = NeighTable::with_incomplete_cap(NEIGH6_INCOMPLETE);
+                *self.neigh[i].lock() = neigh_table();
+                *self.neigh6[i].lock() = neigh6_table();
             }
         }
         let mut revoked = 0;
@@ -955,7 +986,13 @@ impl Datapath {
             }
             return;
         }
-        let r = self.neigh6[egress as usize].lock().resolve(egress, next_hop, pkt, now);
+        let r = {
+            let mut n = self.neigh6[egress as usize].lock();
+            let before = n.dropped;
+            let r = n.resolve(egress, next_hop, pkt, now);
+            count_neigh_drops(before, n.dropped);
+            r
+        };
         match r {
             Resolve::Ready(mac, pkt) => self.send_resolved(egress, mac, pkt, touched),
             Resolve::Queued { send_arp: true } => self.send_ns(egress, next_hop, touched),
@@ -1005,9 +1042,13 @@ impl Datapath {
             }
             return;
         }
-        let r = self.neigh[egress as usize]
-            .lock()
-            .resolve(egress, next_hop, pkt, now);
+        let r = {
+            let mut n = self.neigh[egress as usize].lock();
+            let before = n.dropped;
+            let r = n.resolve(egress, next_hop, pkt, now);
+            count_neigh_drops(before, n.dropped);
+            r
+        };
         match r {
             Resolve::Ready(mac, pkt) => self.send_resolved(egress, mac, pkt, touched),
             Resolve::Queued { send_arp: true } => self.send_arp_request(egress, next_hop, touched),
@@ -1112,14 +1153,14 @@ impl Datapath {
             FRAGS_PARK_DROPS.fetch_add(1, Ordering::Relaxed);
         }
         for (i, n) in self.neigh.iter().enumerate() {
-            let retries = n.lock().poll(now);
+            let retries = poll_neigh(&mut n.lock(), now);
             for (ifx, ip) in retries {
                 debug_assert_eq!(ifx as usize, i);
                 self.send_arp_request(ifx, ip, touched);
             }
         }
         for n in &self.neigh6 {
-            let retries = n.lock().poll(now);
+            let retries = poll_neigh(&mut n.lock(), now);
             for (ifx, ip) in retries {
                 self.send_ns(ifx, ip, touched);
             }

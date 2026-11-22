@@ -847,6 +847,45 @@ pub fn build_arp_request(
     len
 }
 
+/// Bytes of an ARP neighbor hint ([`ipv4_neighbor_hint`]).
+pub const ARP_HINT_LEN: usize = ETH_HDR + 28;
+
+/// For a host IPv4 stack that learns neighbors only from ARP aimed at it
+/// and forgets them after a minute (smoltcp 0.14): an IPv4 unicast frame
+/// from a neighbor as an ARP reply from that neighbor (its address and
+/// MAC as the sender) to the frame's destination, so the stack records
+/// the neighbor without answering and can answer the frame without first
+/// resolving it (dropping the answer while it does). Returns the
+/// neighbor's address and MAC, written to `out` ([`ARP_HINT_LEN`] bytes).
+pub fn ipv4_neighbor_hint(frame: &[u8], out: &mut [u8; ARP_HINT_LEN]) -> Option<(Ipv4Addr, Mac)> {
+    if ethertype(frame) != Some(ETHERTYPE_IPV4) || frame.len() < ETH_HDR + 20 || frame[ETH_HDR] >> 4 != 4 {
+        return None;
+    }
+    let (src, dst) = (get_ip(frame, ETH_HDR + 12), get_ip(frame, ETH_HDR + 16));
+    let mut smac = [0u8; 6];
+    smac.copy_from_slice(&frame[6..12]);
+    let mut dmac = [0u8; 6];
+    dmac.copy_from_slice(&frame[0..6]);
+    let unicast = |a: Ipv4Addr| !(a.is_unspecified() || a.is_broadcast() || a.is_multicast());
+    if !unicast(src) || !unicast(dst) || is_multicast_mac(&smac) || is_multicast_mac(&dmac) {
+        return None;
+    }
+    out.fill(0);
+    set_macs(out, dmac, smac);
+    put16(out, 12, ETHERTYPE_ARP);
+    let a = &mut out[ETH_HDR..];
+    put16(a, 0, 1);
+    put16(a, 2, ETHERTYPE_IPV4);
+    a[4] = 6;
+    a[5] = 4;
+    put16(a, 6, 2); // reply: recorded, not answered
+    a[8..14].copy_from_slice(&smac);
+    put_ip(a, 14, src);
+    a[18..24].copy_from_slice(&dmac);
+    put_ip(a, 24, dst);
+    Some((src, smac))
+}
+
 /// IPv4 fragmentation (RFC 791 §2.3): how a packet too large for the
 /// next link is cut. Data goes in pieces of a multiple of 8 bytes; each
 /// piece gets a copy of the header with its own offset and length. A
@@ -1105,6 +1144,31 @@ mod tests {
         let m = v6_frame([0x33, 0x33, 0, 0, 0, 1], CMAC, c, "ff02::1".parse().unwrap(), PROTO_UDP, &[0; 8]);
         for g in [&ns[..], &m[..], &f[..50]] {
             assert_eq!(ipv6_neighbor_hint(g, &mut out), None);
+        }
+    }
+
+    #[test]
+    fn arp_hint_is_a_reply_from_the_sender() {
+        let c = Ipv4Addr::new(192, 168, 1, 100);
+        let r = Ipv4Addr::new(192, 168, 1, 1);
+        let mut f = test_util::ipv4_frame(c, r, PROTO_UDP, 64, &[0u8; 8]);
+        set_macs(&mut f, RMAC, CMAC);
+        let mut out = [0u8; ARP_HINT_LEN];
+        assert_eq!(ipv4_neighbor_hint(&f, &mut out), Some((c, CMAC)));
+        assert_eq!((&out[0..6], &out[6..12], ethertype(&out)), (&RMAC[..], &CMAC[..], Some(ETHERTYPE_ARP)));
+        let a = parse_arp(&out).unwrap();
+        assert_eq!(a, Arp { op: 2, sender_mac: CMAC, sender_ip: c, target_ip: r });
+        assert_eq!(&out[ETH_HDR + 18..ETH_HDR + 24], &RMAC, "target MAC = ours");
+        // Not for broadcast or multicast, a source of 0.0.0.0 (DHCP), ARP
+        // itself, or a short frame.
+        let mut b = test_util::ipv4_frame(c, Ipv4Addr::BROADCAST, PROTO_UDP, 64, &[0; 8]);
+        set_macs(&mut b, BROADCAST_MAC, CMAC);
+        let mut z = test_util::ipv4_frame(Ipv4Addr::UNSPECIFIED, r, PROTO_UDP, 64, &[0; 8]);
+        set_macs(&mut z, RMAC, CMAC);
+        let mut m = test_util::ipv4_frame(c, Ipv4Addr::new(224, 0, 0, 251), PROTO_UDP, 255, &[0; 8]);
+        set_macs(&mut m, [1, 0, 0x5e, 0, 0, 0xfb], CMAC);
+        for g in [&b[..], &z[..], &m[..], &out[..], &f[..30]] {
+            assert_eq!(ipv4_neighbor_hint(g, &mut [0u8; ARP_HINT_LEN]), None);
         }
     }
 

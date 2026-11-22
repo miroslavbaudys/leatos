@@ -1299,6 +1299,23 @@ pub fn fw_split() -> bool {
     arg_u64(bootargs(), "fw_split") != Some(0)
 }
 
+/// The forwarder's neighbor entries: lifetime in ms (boot argument
+/// `neigh_secs=`, default `fwd::neigh::REACHABLE_MS`; tests shorten it)
+/// and whether entries in use are probed at its end instead of dropped
+/// (`neigh_probe=0`: dropped, as before 2026-11-22, the lab's negative
+/// control).
+pub fn neigh_timing() -> (u64, bool) {
+    let ms = arg_u64(bootargs(), "neigh_secs").filter(|&s| s > 0).map_or(fwd::neigh::REACHABLE_MS, |s| s * 1000);
+    (ms, arg_u64(bootargs(), "neigh_probe") != Some(0))
+}
+
+/// smoltcp's IPv4 neighbors from the frames clients send it (ARP hints,
+/// `net::device::NdHints`); boot argument `arp_hints=0` turns them off
+/// (the lab's negative control).
+pub fn arp_hints() -> bool {
+    arg_u64(bootargs(), "arp_hints") != Some(0)
+}
+
 /// DNS over TCP from clients (port 53, RFC 7766); boot argument
 /// `dns_tcp=0` serves UDP only (the lab's negative control).
 pub fn dns_tcp() -> bool {

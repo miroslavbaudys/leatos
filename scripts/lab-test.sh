@@ -37,6 +37,20 @@
 #                        shaping phase is skipped. Negative control
 #                        LAB_ROUTER_ARGS=queue_pkts=384 (the old limit: the
 #                        queue fills by packet count, overflow decides)
+#   LAB_NEIGH=1          neighbors (apu4, 2026-11-22: wired hosts lost
+#                        packets every 5 min, DNS answers got lost):
+#                        unshaped unless LAB_SHAPE_KBIT is set, router
+#                        neigh_secs=10 (LAB_NEIGH_LIFETIME). The client pins
+#                        the router's MAC, pings the router from
+#                        LAB_NEIGH_HOSTS (40) addresses of its own, 3 rounds,
+#                        without loss (round 1 = first contact: smoltcp's ARP
+#                        hints; rounds 2-3: its neighbor cache holds them
+#                        all), then downloads for LAB_NEIGH_SECS (35) with
+#                        no `neighbor` drops and some probes. Negative
+#                        controls LAB_ROUTER_ARGS=arp_hints=0 (round 1
+#                        fails), LAB_NEIGH_CACHE=8 (smoltcp's default cache:
+#                        rounds 2-3 fail), LAB_ROUTER_ARGS=neigh_probe=0
+#                        (forwarded fails)
 #   LAB_EXPECT_KBIT=N    what the client expects (default: LAB_SHAPE_KBIT);
 #                        set it with LAB_SHAPE_KBIT=0 as a negative control
 #   LAB_ROUTER_ARGS="…"  extra router boot arguments, e.g. qdisc=codel (single
@@ -330,7 +344,20 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TIMEOUT="${LAB_TIMEOUT:-150}"
-SHAPE_KBIT="${LAB_SHAPE_KBIT:-10000}"
+NEIGH="${LAB_NEIGH:-}"
+NEIGH_HOSTS="${LAB_NEIGH_HOSTS:-40}"
+NEIGH_SECS="${LAB_NEIGH_SECS:-35}"
+if [[ -n "$NEIGH" ]]; then
+  SHAPE_KBIT="${LAB_SHAPE_KBIT:-0}"
+  [[ -z "${LAB_TIMEOUT:-}" ]] && TIMEOUT=$((TIMEOUT + NEIGH_HOSTS * 3 + NEIGH_SECS + 30))
+fi
+KERNEL_FEATURES=""
+case "${LAB_NEIGH_CACHE:-}" in
+  "") ;;
+  8) KERNEL_FEATURES="--no-default-features" ;;
+  *) echo "LAB_NEIGH_CACHE: only 8 (smoltcp's default) is a control" >&2; exit 2 ;;
+esac
+SHAPE_KBIT="${LAB_SHAPE_KBIT:-${SHAPE_KBIT:-10000}}"
 EXPECT_KBIT="${LAB_EXPECT_KBIT:-$SHAPE_KBIT}"
 ROUTER_ARGS=""
 [[ "$SHAPE_KBIT" != 0 ]] && ROUTER_ARGS="shape_up=$SHAPE_KBIT shape_down=$SHAPE_KBIT"
@@ -344,6 +371,7 @@ if [[ -n "$SWARM" ]]; then
   EXPECT_KBIT=0 # no single-download shaping phase
 fi
 ROUTER_ARGS="$ROUTER_ARGS ${LAB_ROUTER_ARGS:-}"
+[[ -n "$NEIGH" ]] && ROUTER_ARGS="$ROUTER_ARGS neigh_secs=${LAB_NEIGH_LIFETIME:-10}"
 # The first ntp= wins: only add the default when the caller sets none.
 [[ " ${LAB_ROUTER_ARGS:-} " == *" ntp="* ]] || ROUTER_ARGS="$ROUTER_ARGS ntp=ntp.isp.example"
 ISP_VLAN="${LAB_VLAN:-}"
@@ -436,7 +464,7 @@ lab_cpu_flags
 
 echo "== build"
 ARCH="${LEATOS_ARCH:-aarch64}"
-cargo build -q -p leatos-kernel --target "$ARCH-unknown-none"
+cargo build -q -p leatos-kernel --target "$ARCH-unknown-none" $KERNEL_FEATURES
 MODLOOP=""
 [[ -n "$ISP_VLAN$ISP_PPPOE$GUEST" ]] && MODLOOP=modloop
 ALPINE_DIR=$(scripts/lab/fetch-alpine.sh $MODLOOP ${LAB_INITRD_KEA:+kea} | tail -1)
@@ -678,7 +706,7 @@ PIDS+=($!)
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
   VM_NIC2="${PORTS:+52:54:00:00:00:11 $((LAN1_PORT + 1)) $LAN1_PORT}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${ACK:+ lab_ack=1}${SWARM:+ lab_swarm=$SWARM lab_swarm_kbit=$SWARM_KBIT lab_swarm_secs=${LAB_SWARM_SECS:-15} lab_swarm_mtu=${LAB_SWARM_MTU:-680} lab_swarm_ovf=${LAB_SWARM_OVF:-10}} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN lab_guest_v6=$GUEST_IPV6}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${NEIGH:+ lab_neigh=1 lab_neigh_hosts=$NEIGH_HOSTS lab_neigh_secs=$NEIGH_SECS}${ACK:+ lab_ack=1}${SWARM:+ lab_swarm=$SWARM lab_swarm_kbit=$SWARM_KBIT lab_swarm_secs=${LAB_SWARM_SECS:-15} lab_swarm_mtu=${LAB_SWARM_MTU:-680} lab_swarm_ovf=${LAB_SWARM_OVF:-10}} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN lab_guest_v6=$GUEST_IPV6}${GUEST_LIVE:+ lab_guest_live=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so

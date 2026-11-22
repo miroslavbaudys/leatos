@@ -846,6 +846,7 @@ const DROP_TEXT = {
   "input": "to the router, refused by the zone's input policy",
   "spoofed": "from the WAN with a source in one of our networks or loopback (forged)",
   "host-limit": "new connection from a host already holding its limit of answered connections (conn_per_host)",
+  "neighbor": "waiting for the next hop's address (ARP / neighbor discovery): more than 3 queued, or never answered",
   "clash": "new connection whose addresses and ports a tracked one already uses (or a fragmented datagram whose IP ID another one already uses through NAT)",
 };
 let savedReboot = false;

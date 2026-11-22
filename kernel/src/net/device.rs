@@ -228,9 +228,23 @@ pub struct PortDevice<'a> {
 /// neighbor. And unicast solicitations (reachability probes), which
 /// smoltcp ignores, go to the solicited-node group instead
 /// ([`fwd::wire::ipv6_ns_to_solicited`]), so it answers them.
+///
+/// IPv4 the same way: smoltcp learns new neighbors only from ARP aimed at
+/// it (traffic only refreshes entries it still has), and a client that
+/// knows our MAC sends none, so the first answer (DNS, ping, the web
+/// interface) to an address it has not seen, or evicted, or forgot when
+/// the interface was readdressed, was dropped while it asked, and other
+/// clients' answers in that second too (one rate limit for the whole
+/// cache). Before such a client's frame, smoltcp gets an ARP reply from it
+/// ([`fwd::wire::ipv4_neighbor_hint`]: recorded, not answered), at most
+/// every [`Self::EVERY_NS`] per client. Boot argument `arp_hints=0` turns
+/// that off. The cache itself is sized for a home LAN (kernel feature
+/// `neigh-cache-256`; smoltcp's default of 8 evicted entries constantly).
 #[derive(Default)]
 pub struct NdHints {
-    recent: alloc::vec::Vec<(core::net::Ipv6Addr, [u8; 6], u64)>,
+    recent: alloc::vec::Vec<(core::net::IpAddr, [u8; 6], u64)>,
+    /// IPv4 hints on (`config::arp_hints`, read once).
+    arp: Option<bool>,
     /// The last Router Advertisement the link received (the WAN's:
     /// `net::wan6`).
     last_ra: Option<alloc::vec::Vec<u8>>,
@@ -246,10 +260,11 @@ impl NdHints {
 impl NdHints {
     /// Within smoltcp's 60 s neighbor lifetime.
     const EVERY_NS: u64 = 20_000_000_000;
-    const MAX: usize = 32;
+    /// Clients remembered per link, both families (the oldest is forgotten).
+    const MAX: usize = 128;
 
     /// `ip` at `mac` should be told (again) at `now_ns`.
-    fn due(&mut self, ip: core::net::Ipv6Addr, mac: [u8; 6], now_ns: u64) -> bool {
+    fn due(&mut self, ip: core::net::IpAddr, mac: [u8; 6], now_ns: u64) -> bool {
         if let Some(e) = self.recent.iter_mut().find(|e| e.0 == ip) {
             if e.1 == mac && now_ns.saturating_sub(e.2) < Self::EVERY_NS {
                 return false;
@@ -361,12 +376,28 @@ impl Device for PortDevice<'_> {
             fwd::wire::ipv6_ns_to_solicited(pkt.data_mut());
             let mut hint = [0u8; fwd::wire::NEIGHBOR_HINT_LEN];
             if let Some((ip, mac)) = fwd::wire::ipv6_neighbor_hint(pkt.data(), &mut hint)
-                && nd.due(ip, mac, self.now_ns)
+                && nd.due(ip.into(), mac, self.now_ns)
                 && let Some(mut h) = PacketBuf::alloc()
             {
                 h.set_len(hint.len());
                 h.data_mut().copy_from_slice(&hint);
                 // The frame itself comes next.
+                self.link.local_rx.lock().push_front(pkt);
+                pkt = h;
+            }
+        }
+        if let Some(nd) = self.nd.as_deref_mut()
+            && !self.port.is_pppoe()
+            && fwd::wire::ethertype(pkt.data()) == Some(fwd::wire::ETHERTYPE_IPV4)
+            && *nd.arp.get_or_insert_with(crate::config::arp_hints)
+        {
+            let mut hint = [0u8; fwd::wire::ARP_HINT_LEN];
+            if let Some((ip, mac)) = fwd::wire::ipv4_neighbor_hint(pkt.data(), &mut hint)
+                && nd.due(ip.into(), mac, self.now_ns)
+                && let Some(mut h) = PacketBuf::alloc()
+            {
+                h.set_len(hint.len());
+                h.data_mut().copy_from_slice(&hint);
                 self.link.local_rx.lock().push_front(pkt);
                 pkt = h;
             }

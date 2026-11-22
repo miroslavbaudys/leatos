@@ -439,6 +439,80 @@ if $bb grep -q 'lab_routes=' /proc/cmdline; then
   $bb ip addr del 10.30.0.5/32 dev lo
 fi
 
+# --- neighbors (lab_neigh=1, scripts/lab-test.sh LAB_NEIGH=1) -------------------------
+# Wired hosts whose own ARP entry for the router stays fresh never ARP for
+# it (apu4, 2026-11-22: Twitch pauses every few minutes, DNS answers lost).
+# The client pins the router's MAC (a permanent entry: it sends no ARP of
+# its own) and:
+# B) pings the router from lab_neigh_hosts (40) addresses of its own, one
+#    ping each, 3 rounds. Round 1 is first contact: smoltcp has never seen
+#    them, and without the router's ARP hints (negative control
+#    arp_hints=0) it drops each answer while it asks. Rounds 2-3 need
+#    them all in smoltcp's neighbor cache (negative control
+#    LAB_NEIGH_CACHE=8, its default size: evicted, answers dropped);
+# A) downloads unshaped from the ISP for lab_neigh_secs (35) across several
+#    neighbor lifetimes (the router's neigh_secs=10): entries in use are
+#    probed, so no packet is dropped as `neighbor` (negative control
+#    neigh_probe=0: dropped and resolved anew each lifetime).
+if $bb grep -q 'lab_neigh=1' /proc/cmdline; then
+  now_ms() { $bb awk '{printf "%d", $1 * 1000}' /proc/uptime; }
+  nst() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null; }
+  ndrops() { echo "$1" | $bb grep -o '"neighbor":[0-9]*' | $bb head -1 | $bb cut -d: -f2; }
+  nprobes() { echo "$1" | $bb grep -o '"neigh_probes":[0-9]*' | $bb cut -d: -f2; }
+  nhosts=$($bb sed -n 's/.*lab_neigh_hosts=\([0-9]*\).*/\1/p' /proc/cmdline); nhosts=${nhosts:-40}
+  [ "$nhosts" -gt 54 ] && nhosts=54 # .200-.253
+  dsecs=$($bb sed -n 's/.*lab_neigh_secs=\([0-9]*\).*/\1/p' /proc/cmdline); dsecs=${dsecs:-35}
+  $bb ping -c 1 -W 2 192.168.1.1 >/dev/null 2>&1
+  rmac=$($bb awk '$1 == "192.168.1.1" { print $4 }' /proc/net/arp)
+  $bb arp -s 192.168.1.1 "$rmac" 2>/dev/null || ip neigh replace 192.168.1.1 lladdr "$rmac" nud permanent dev eth0 2>/dev/null
+  flags=$($bb awk '$1 == "192.168.1.1" { print $3 }' /proc/net/arp)
+  if [ -z "$rmac" ] || [ "$flags" != 0x6 ]; then
+    fail "neighbors: INVALID, could not pin the router's MAC '$rmac' (flags '$flags')"
+  else
+    # B: router-local answers (smoltcp) to many hosts.
+    i=0; added=0
+    while [ $i -lt "$nhosts" ]; do
+      $bb ip addr add "192.168.1.$((200 + i))/24" dev eth0 2>/dev/null && added=$((added + 1))
+      i=$((i + 1))
+    done
+    lost=""
+    for round in 1 2 3; do
+      l=0; i=0
+      while [ $i -lt "$nhosts" ]; do
+        $bb ping -c 1 -W 1 -I "192.168.1.$((200 + i))" 192.168.1.1 >/dev/null 2>&1 || l=$((l + 1))
+        i=$((i + 1))
+      done
+      lost="$lost $l"
+    done
+    set -- $lost
+    what="lost$lost of $nhosts per round (first contact, then twice more) with the router's MAC pinned"
+    if [ "$added" != "$nhosts" ]; then fail "neighbors router: INVALID, added $added of $nhosts addresses ($what)"
+    elif [ "$1" != 0 ]; then fail "neighbors router: first contact lost (ARP hints): $what"
+    elif [ "$2" != 0 ] || [ "$3" != 0 ]; then fail "neighbors router: answers lost later (neighbor cache): $what"
+    else pass "neighbors router: $what"; fi
+    i=0
+    while [ $i -lt "$nhosts" ]; do
+      $bb ip addr del "192.168.1.$((200 + i))/24" dev eth0 2>/dev/null
+      i=$((i + 1))
+    done
+    # A: forwarded traffic (the forwarder's neighbor table).
+    s0=$(nst); t0=$(now_ms); bytes=0; n=0
+    while [ $(( $(now_ms) - t0 )) -lt $((dsecs * 1000)) ]; do
+      b=$($bb wget -q -T 10 -O - "http://$ISP/5mb" 2>/dev/null | $bb wc -c)
+      bytes=$((bytes + b)); n=$((n + 1))
+    done
+    $bb sleep 2 # one more housekeeping pass
+    s1=$(nst)
+    d0=$(ndrops "$s0"); d1=$(ndrops "$s1"); p0=$(nprobes "$s0"); p1=$(nprobes "$s1")
+    what="$n downloads, $((bytes / 1048576)) MB in ${dsecs} s; neighbor drops ${d0:-?} -> ${d1:-?}, probes ${p0:-?} -> ${p1:-?}"
+    if [ -z "$d1" ] || [ -z "$p1" ]; then fail "neighbors forwarded: no counters in /api/status ($what)"
+    elif [ "$bytes" -lt $((dsecs * 1048576)) ]; then fail "neighbors forwarded: INVALID, under 8 Mbit/s moved ($what)"
+    elif [ "$d1" = "$d0" ] && [ "$p1" -gt "$p0" ]; then pass "neighbors forwarded: probed, none dropped: $what"
+    else fail "neighbors forwarded: $what"; fi
+  fi
+  $bb arp -d 192.168.1.1 2>/dev/null || ip neigh del 192.168.1.1 dev eth0 2>/dev/null
+fi
+
 # --- shaping (M6): throughput ~ shaped rate, latency stays low under load ------------
 want=$($bb sed -n 's/.*lab_shape_kbit=\([0-9]*\).*/\1/p' /proc/cmdline)
 # lab_ack=1 (scripts/lab-test.sh LAB_ACK=1): the upload is shaped far below

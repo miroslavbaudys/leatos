@@ -407,9 +407,13 @@ pub enum DropReason {
     /// A new connection from a host that holds its limit of connections
     /// (`conntrack::Budget::with_host_limit`), none of them early-droppable.
     HostLimit,
+    /// Waiting for the next hop's address (ARP / neighbor discovery) and
+    /// pushed out of its small queue, or never answered (`neigh`; counted
+    /// by the datapath, not the forwarder).
+    Neighbor,
 }
 
-pub const DROP_REASONS: usize = 15;
+pub const DROP_REASONS: usize = 16;
 
 impl DropReason {
     pub fn index(self) -> usize {
@@ -432,6 +436,7 @@ impl DropReason {
             Self::Spoofed => "spoofed",
             Self::Clash => "clash",
             Self::HostLimit => "host-limit",
+            Self::Neighbor => "neighbor",
         }
     }
     pub fn all() -> [DropReason; DROP_REASONS] {
@@ -452,6 +457,7 @@ impl DropReason {
             Spoofed,
             Clash,
             HostLimit,
+            Neighbor,
         ]
     }
 }

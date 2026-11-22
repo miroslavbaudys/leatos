@@ -9,6 +9,15 @@
 //! [`NeighTable::with_incomplete_cap`] at most that many neighbors are
 //! being resolved at once (RFC 6583: a scan of an IPv6 /64 must not fill
 //! the table); a packet to another unknown one is dropped.
+//!
+//! An entry lives [`REACHABLE_MS`] from when it was learned. One that was
+//! used in that time is not dropped then: it is **probed** (RFC 4861 §7.3
+//! PROBE, Linux's STALE → PROBE) and packets keep going to the known MAC
+//! while up to [`MAX_TRIES`] requests ask for it again; an answer makes it
+//! reachable anew, none removes it. Hosts that never ARP for the router
+//! (wired ones whose own entry for us stays fresh) would otherwise lose a
+//! burst of packets every [`REACHABLE_MS`] while being resolved again.
+//! Unused entries age out as before.
 
 use crate::IfIndex;
 use crate::wire::Mac;
@@ -17,7 +26,7 @@ use alloc::vec::Vec;
 use core::net::Ipv4Addr;
 
 pub const MAX_PENDING: usize = 3;
-const REACHABLE_MS: u64 = 300_000;
+pub const REACHABLE_MS: u64 = 300_000;
 const RETRY_MS: u64 = 1_000;
 const MAX_TRIES: u8 = 3;
 
@@ -25,7 +34,11 @@ enum Entry<P> {
     Reachable {
         mac: Mac,
         learned: u64,
+        /// A packet went to it since it was learned.
+        used: bool,
     },
+    /// Past its lifetime while in use: still sent to while asked again.
+    Probe { mac: Mac, last_try: u64, tries: u8 },
     Incomplete {
         pending: VecDeque<P>,
         last_try: u64,
@@ -49,6 +62,10 @@ pub struct NeighTable<P, A = Ipv4Addr> {
     /// Packets dropped because [`Self::max_incomplete`] was reached (also
     /// in `dropped`).
     pub incomplete_drops: u64,
+    /// Requests sent to entries in use past their lifetime (probes).
+    pub probes: u64,
+    reachable_ms: u64,
+    probe: bool,
 }
 
 impl<P, A> Default for NeighTable<P, A> {
@@ -59,6 +76,9 @@ impl<P, A> Default for NeighTable<P, A> {
             incomplete: 0,
             max_incomplete: usize::MAX,
             incomplete_drops: 0,
+            probes: 0,
+            reachable_ms: REACHABLE_MS,
+            probe: true,
         }
     }
 }
@@ -76,18 +96,40 @@ impl<P, A: Copy + Ord> NeighTable<P, A> {
         }
     }
 
+    /// An entry's lifetime (default [`REACHABLE_MS`]), and whether entries
+    /// in use are probed at its end (default) or dropped.
+    pub fn with_timing(self, reachable_ms: u64, probe: bool) -> Self {
+        Self {
+            reachable_ms: reachable_ms.max(1),
+            probe,
+            ..self
+        }
+    }
+
     pub fn lookup(&self, ifx: IfIndex, ip: A, now: u64) -> Option<Mac> {
         match self.entries.get(&(ifx, ip)) {
-            Some(Entry::Reachable { mac, learned }) if now < learned + REACHABLE_MS => Some(*mac),
+            Some(Entry::Reachable { mac, learned, used }) if self.usable(*learned, *used, now) => Some(*mac),
+            Some(Entry::Probe { mac, .. }) => Some(*mac),
             _ => None,
         }
     }
 
+    /// A reachable entry still sent to: in its lifetime, or past it in use
+    /// until [`Self::poll`] starts the probe.
+    fn usable(&self, learned: u64, used: bool, now: u64) -> bool {
+        now < learned + self.reachable_ms || (self.probe && used)
+    }
+
     /// Learn `ip → mac`; returns packets that were waiting for it.
     pub fn learn(&mut self, ifx: IfIndex, ip: A, mac: Mac, now: u64) -> Vec<P> {
-        let old = self
-            .entries
-            .insert((ifx, ip), Entry::Reachable { mac, learned: now });
+        let old = self.entries.insert(
+            (ifx, ip),
+            Entry::Reachable {
+                mac,
+                learned: now,
+                used: false,
+            },
+        );
         match old {
             Some(Entry::Incomplete { pending, .. }) => {
                 self.incomplete -= 1;
@@ -99,42 +141,45 @@ impl<P, A: Copy + Ord> NeighTable<P, A> {
 
     /// Resolve the next hop for `pkt`.
     pub fn resolve(&mut self, ifx: IfIndex, ip: A, pkt: P, now: u64) -> Resolve<P> {
-        if let Some(mac) = self.lookup(ifx, ip, now) {
-            return Resolve::Ready(mac, pkt);
-        }
+        let (reachable_ms, probe) = (self.reachable_ms, self.probe);
         match self.entries.get_mut(&(ifx, ip)) {
+            Some(Entry::Reachable { mac, learned, used }) if now < *learned + reachable_ms || (probe && *used) => {
+                *used = true;
+                return Resolve::Ready(*mac, pkt);
+            }
+            Some(Entry::Probe { mac, .. }) => return Resolve::Ready(*mac, pkt),
             Some(Entry::Incomplete { pending, .. }) => {
                 if pending.len() >= MAX_PENDING {
                     pending.pop_front();
                     self.dropped += 1;
                 }
                 pending.push_back(pkt);
-                Resolve::Queued { send_arp: false }
+                return Resolve::Queued { send_arp: false };
             }
-            _ => {
-                if self.incomplete >= self.max_incomplete {
-                    self.dropped += 1;
-                    self.incomplete_drops += 1;
-                    return Resolve::Queued { send_arp: false };
-                }
-                self.incomplete += 1;
-                let mut pending = VecDeque::with_capacity(MAX_PENDING);
-                pending.push_back(pkt);
-                self.entries.insert(
-                    (ifx, ip),
-                    Entry::Incomplete {
-                        pending,
-                        last_try: now,
-                        tries: 1,
-                    },
-                );
-                Resolve::Queued { send_arp: true }
-            }
+            _ => {}
         }
+        if self.incomplete >= self.max_incomplete {
+            self.dropped += 1;
+            self.incomplete_drops += 1;
+            return Resolve::Queued { send_arp: false };
+        }
+        self.incomplete += 1;
+        let mut pending = VecDeque::with_capacity(MAX_PENDING);
+        pending.push_back(pkt);
+        self.entries.insert(
+            (ifx, ip),
+            Entry::Incomplete {
+                pending,
+                last_try: now,
+                tries: 1,
+            },
+        );
+        Resolve::Queued { send_arp: true }
     }
 
-    /// Retry or give up on unresolved neighbors and age out stale entries.
-    /// Returns the (interface, address) pairs to send ARP requests for.
+    /// Retry or give up on unresolved neighbors, probe entries in use past
+    /// their lifetime and age out the others. Returns the (interface,
+    /// address) pairs to send ARP requests for.
     pub fn poll(&mut self, now: u64) -> Vec<(IfIndex, A)> {
         let mut retry = Vec::new();
         let mut dead = Vec::new();
@@ -155,7 +200,29 @@ impl<P, A: Copy + Ord> NeighTable<P, A> {
                         retry.push(k);
                     }
                 }
-                Entry::Reachable { learned, .. } if now >= *learned + REACHABLE_MS => dead.push(k),
+                Entry::Probe { last_try, tries, .. } if now >= *last_try + RETRY_MS => {
+                    if *tries >= MAX_TRIES {
+                        dead.push(k);
+                    } else {
+                        *tries += 1;
+                        *last_try = now;
+                        self.probes += 1;
+                        retry.push(k);
+                    }
+                }
+                Entry::Reachable { mac, learned, used } if now >= *learned + self.reachable_ms => {
+                    if self.probe && *used {
+                        *e = Entry::Probe {
+                            mac: *mac,
+                            last_try: now,
+                            tries: 1,
+                        };
+                        self.probes += 1;
+                        retry.push(k);
+                    } else {
+                        dead.push(k);
+                    }
+                }
                 _ => {}
             }
         }
@@ -234,5 +301,72 @@ mod tests {
         n.learn(0, IP, MAC, 0);
         assert!(n.lookup(0, IP, REACHABLE_MS - 1).is_some());
         assert!(n.lookup(0, IP, REACHABLE_MS).is_none());
+        assert!(n.poll(REACHABLE_MS).is_empty(), "unused: no probe");
+        assert!(matches!(
+            n.resolve(0, IP, 1, REACHABLE_MS),
+            Resolve::Queued { send_arp: true }
+        ));
+    }
+
+    const R: u64 = REACHABLE_MS;
+
+    #[test]
+    fn entries_in_use_are_probed_not_dropped() {
+        let mut n: NeighTable<u32> = NeighTable::new();
+        n.learn(0, IP, MAC, 0);
+        assert!(matches!(n.resolve(0, IP, 1, 10), Resolve::Ready(..)));
+        // Past the lifetime, before the poll: still sent to.
+        assert!(matches!(n.resolve(0, IP, 2, R + 1), Resolve::Ready(m, 2) if m == MAC));
+        assert_eq!(n.poll(R + 5), [(0, IP)], "probe");
+        assert_eq!(n.probes, 1);
+        assert!(matches!(n.resolve(0, IP, 3, R + 500), Resolve::Ready(m, 3) if m == MAC));
+        // The answer: reachable again, nothing more to send.
+        assert!(n.learn(0, IP, MAC, R + 600).is_empty());
+        assert!(n.poll(R + 2000).is_empty());
+        assert_eq!((n.dropped, n.probes), (0, 1));
+    }
+
+    #[test]
+    fn an_unanswered_probe_removes_the_entry() {
+        let mut n: NeighTable<u32> = NeighTable::new();
+        n.learn(0, IP, MAC, 0);
+        n.resolve(0, IP, 1, 1);
+        assert_eq!(n.poll(R), [(0, IP)]);
+        assert!(n.poll(R + 999).is_empty());
+        assert_eq!(n.poll(R + 1000), [(0, IP)]);
+        assert_eq!(n.poll(R + 2000), [(0, IP)]);
+        assert!(matches!(n.resolve(0, IP, 2, R + 2500), Resolve::Ready(..)), "kept while probing");
+        assert!(n.poll(R + 3000).is_empty(), "third probe failed: gone");
+        assert!(n.lookup(0, IP, R + 3000).is_none());
+        assert_eq!(n.probes, 3);
+        assert!(matches!(
+            n.resolve(0, IP, 3, R + 3001),
+            Resolve::Queued { send_arp: true }
+        ));
+    }
+
+    #[test]
+    fn without_probing_entries_in_use_expire() {
+        let mut n: NeighTable<u32> = NeighTable::new().with_timing(10_000, false);
+        n.learn(0, IP, MAC, 0);
+        n.resolve(0, IP, 1, 1);
+        assert!(n.lookup(0, IP, 10_000).is_none());
+        assert!(n.poll(10_000).is_empty());
+        assert!(matches!(
+            n.resolve(0, IP, 2, 10_000),
+            Resolve::Queued { send_arp: true }
+        ));
+        assert_eq!(n.probes, 0);
+    }
+
+    #[test]
+    fn a_new_mac_replaces_a_probed_entry() {
+        let mut n: NeighTable<u32> = NeighTable::new();
+        n.learn(0, IP, MAC, 0);
+        n.resolve(0, IP, 1, 1);
+        n.poll(R);
+        let other: Mac = [2, 0, 0, 0, 0, 7];
+        n.learn(0, IP, other, R + 100);
+        assert_eq!(n.lookup(0, IP, R + 101), Some(other));
     }
 }

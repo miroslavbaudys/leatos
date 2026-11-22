@@ -13,6 +13,14 @@ test = false
 bench = false
 
 [features]
+default = ["neigh-cache-256"]
+# smoltcp's neighbor cache per network (IPv4 and IPv6 together; its
+# default is 8): a home LAN with ~20 devices and several IPv6 addresses
+# each evicted entries all the time, and answers to evicted ones (DNS,
+# DHCP, ping, the web interface) were dropped while smoltcp asked again
+# (apu4, 2026-11-22). `--no-default-features` builds the old size: the
+# lab's negative control (LAB_NEIGH_CACHE=8).
+neigh-cache-256 = ["smoltcp/iface-neighbor-cache-count-256"]
 # Print the boot report, then power off via PSCI so QEMU exits (used by scripts/smoke-test.sh).
 smoke-test = []
 # Idle by spinning instead of `wfi`: lowest timer latency on hypervisors
