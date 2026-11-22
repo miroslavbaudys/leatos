@@ -262,7 +262,13 @@ fn mgmt(c: &Config, x: &mut Issues) {
         && !h.is_empty()
         && !auth::is_hash(h)
     {
-        x.add("mgmt.password_hash", "not a password hash (set mgmt.password instead)");
+        x.add(
+            "mgmt.password_hash",
+            alloc::format!(
+                "not a password hash, or more than {} iterations (set mgmt.password instead)",
+                auth::MAX_ITERATIONS
+            ),
+        );
     }
     if let Some(p) = &m.password {
         if !(8..=128).contains(&p.chars().count()) {

@@ -1324,6 +1324,14 @@ fn only_bridges_reboot() {
 }
 
 #[test]
+fn a_password_hash_with_too_many_iterations_is_refused() {
+    // docs/security-audit.md §5 item 11.
+    let with = |n: u32| alloc::format!("pbkdf2-sha256${n}${}${}", "ab".repeat(16), "cd".repeat(32));
+    assert_eq!(issues(|c| c.mgmt.password_hash = Some(with(auth::ITERATIONS))), Vec::<String>::new());
+    assert_eq!(invalid(|c| c.mgmt.password_hash = Some(with(10_000_000))), ["mgmt.password_hash"]);
+}
+
+#[test]
 fn management_password_is_hashed_and_secret() {
     let mut pool = auth::Pool::new(b"t");
     let mut c = Config::default().with_assignment(r#"mgmt.password = "correct horse""#).unwrap();

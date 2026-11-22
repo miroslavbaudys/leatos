@@ -37,6 +37,11 @@ use sha2::{Digest, Sha256};
 /// PBKDF2 iterations for new hashes: about 0.1 s on the apu4 (1 GHz
 /// Jaguar), once per login.
 pub const ITERATIONS: u32 = 20_000;
+/// The most a stored hash may ask for (docs/security-audit.md §5 item 11):
+/// verification runs in the router's services task, so a hash with
+/// millions of iterations would stall it for seconds per login check,
+/// past the 5 s cross-core watchdog; this is about 0.5 s on the apu4.
+pub const MAX_ITERATIONS: u32 = 5 * ITERATIONS;
 const SALT: usize = 16;
 const HASH: usize = 32;
 const PREFIX: &str = "pbkdf2-sha256";
@@ -90,7 +95,7 @@ fn decode(encoded: &str) -> Option<(u32, Vec<u8>, Vec<u8>)> {
     let iterations: u32 = it.next()?.parse().ok()?;
     let salt = unhex(it.next()?)?;
     let hash = unhex(it.next()?)?;
-    if it.next().is_some() || !(1..=10_000_000).contains(&iterations) || salt.is_empty() || hash.len() != HASH {
+    if it.next().is_some() || !(1..=MAX_ITERATIONS).contains(&iterations) || salt.is_empty() || hash.len() != HASH {
         return None;
     }
     Some((iterations, salt, hash))
@@ -408,6 +413,19 @@ mod tests {
         for bad in ["", "pbkdf2-sha256$1000$zz$00", "md5$1$00$00", &a[..a.len() - 2], &alloc::format!("{a}$x")] {
             assert!(!is_hash(bad) && !verify("s3cret", bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn iterations_above_the_cap_are_not_a_hash() {
+        // docs/security-audit.md §5 item 11: a stored hash's iterations are
+        // spent in the services task on every uncached login check.
+        let with = |n: u32| alloc::format!("pbkdf2-sha256${n}${}${}", "ab".repeat(16), "cd".repeat(32));
+        assert!(is_hash(&with(1)) && is_hash(&with(ITERATIONS)) && is_hash(&with(MAX_ITERATIONS)));
+        for n in [MAX_ITERATIONS + 1, 10_000_000, u32::MAX] {
+            assert!(!is_hash(&with(n)), "{n}");
+            assert!(!verify("pw", &with(n)), "{n}: refused before any PBKDF2");
+        }
+        assert!(!is_hash(&with(0)));
     }
 
     #[test]

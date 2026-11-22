@@ -400,14 +400,22 @@ the LAN side), the rest are open.
     eight lines, reachable only after a TLS handshake) and the 16-byte-key
     AEAD suites (rustls gives them 16-byte keys, the fuzzer cannot build
     one through the public API).
-11. **OPEN: PBKDF2 iterations in a stored hash** (found writing the `auth`
+11. **FIXED (2026-11-22): PBKDF2 iterations in a stored hash** (found writing the `auth`
     target). `auth::decode` accepts up to 10,000,000 iterations, and the web
     interface spends them in the services task on a login: 20,000 take
     about 5 ms under HVF, so the maximum is seconds per check, past the 5 s
     cross-core watchdog on the apu4. Only someone who can save a config
-    (A6) or write the store (A7) sets the hash. Fix direction: accept at
-    most a small multiple of `ITERATIONS` (e.g. 200,000) in `decode`, so a
-    config with more is refused on load and save.
+    (A6) or write the store (A7) sets the hash. Fix: `auth::MAX_ITERATIONS`
+    = 5 × `ITERATIONS` = 100,000 (about 0.5 s on the apu4 by the 20,000 ≈
+    0.1 s figure): `decode` refuses more, so `is_hash` (config validation:
+    such a config is refused on save and on load) and `verify` (refused
+    before any PBKDF2) both do. Tests: `iterations_above_the_cap_are_not_a_hash`
+    (fails with the old 10,000,000 limit) and the config test
+    `a_password_hash_with_too_many_iterations_is_refused`. The apu4 uses
+    `mgmt_pass=`, no stored hash. Still to measure on the apu4: the real
+    cost of 20,000 iterations, which with the global budget of 4 checks a
+    second (§5 item 6) bounds how much of `svc`'s core a password-guessing
+    flood can take.
 
 ## 6. Next steps
 
