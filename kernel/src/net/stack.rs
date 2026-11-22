@@ -287,10 +287,16 @@ pub fn bring_up(
             d.df,
             EthernetAddress(mac),
             match irq {
-                Some((irq, kind)) => match tx_irq {
-                    Some(t) => alloc::format!("intid {}{kind}, tx intid {}", irq.intid, t.intid),
-                    None => alloc::format!("intid {}{kind}", irq.intid),
-                },
+                Some((irq, kind)) => {
+                    let mut s = alloc::format!("intid {}{kind}", irq.intid);
+                    if let Some(t) = tx_irq {
+                        s += &alloc::format!(", tx intid {}", t.intid);
+                    }
+                    if let Some(us) = dev.rx_moderation_us() {
+                        s += &alloc::format!(", rx moderation {us} us");
+                    }
+                    s
+                }
                 None => alloc::string::String::from("(no irq: polling)"),
             }
         );
@@ -716,6 +722,7 @@ fn poll_links(ports: &[Port], sh: &Shared) {
         let mut g = port.dev.lock();
         let Some(dev) = g.as_mut() else { continue };
         let changed = dev.link_changed();
+        dev.update_stats();
         let stats = dev.stats();
         drop(g);
         let mut link = port.link.lock();

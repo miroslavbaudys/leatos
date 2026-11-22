@@ -776,11 +776,58 @@ QEMU's 82576 is not the i211: the apu4 numbers (90/18, `dev_irqs` per core
 and CPU in `/api/status`, `scripts/bufferbloat.sh`) are still to be taken,
 after the soak run that ends 2026-11-25.
 
-**Open: step 5, interrupt moderation (`EITR`).** `EITR0`/`EITR1` are at
-the 1 µs minimum: no moderation. At 90/18 Mbit/s (~7.5 kpps down plus the ACKs up) forwarding a
-packet takes far less than the ~130 µs between packets, so the NAPI poll
-rarely finds more than one: about one interrupt, wakeup and poll per packet.
-This is the likely bulk of the ~21 % / 33 % CPU measured above.
+**Step 5, RX interrupt moderation (`EITR`): implemented, apu4 measurement
+open.** Boot argument `igb_itr_us=N` sets `EITR0` (`config::igb_itr_us`,
+default `config::IGB_ITR_US` = 0 = none, i.e. the 1 µs minimum, until the apu4 measurement below picks a value); `EITR1`
+(TX) stays at the minimum. With it: `RX_RING` 64 → 256, and the NIC's own
+RX drops (`MPC` = receive FIFO full + `RQDPC0` = ring full) are counted
+once a second in the link poll and shown as `rx_missed` per interface in
+`/api/status` and on the interfaces page. The boot log shows
+`rx moderation N us` per igb port.
+
+*Why at all.* Nothing is broken without it: this is CPU efficiency, and
+the saving is unproven on the hardware. Without moderation, each received
+packet can cost a full interrupt cycle (interrupt, wake the datapath task,
+often from `hlt`, a poll that finds one packet, re-arm). NAPI batching only
+helps when packets arrive faster than one cycle takes. At 90/18
+(~7.5 kpps down, one packet per ~130 µs, forwarding takes far less) the
+poll nearly always finds one, which is likely much of the 21 % / 33 % CPU
+above. It matters more with higher packet rates (a faster line, unshaped
+LAN-to-LAN traffic at up to gigabit, small-packet floods), with future CPU
+work (WireGuard, M12), and for idle power and temperature. At today's 90/18
+the apu4 has ~3× headroom, so it buys headroom, not a fix users notice.
+Cost: ≤ N µs extra wait for packets within N µs of the previous interrupt
+(25 µs = 0.5 % of CAKE's 5 ms target; one 1500 B packet takes ~670 µs on
+the 18 Mbit/s upload), and ~760 more packet buffers held by the RX rings
+(4 NICs × 255 of 8192). The wait is in the RX ring for microseconds, not a
+FIFO that grows.
+
+*What Linux does* (`drivers/net/ethernet/intel/igb`, `igb_update_ring_itr`
+/ `igb_set_itr`; OpenWrt on an apu runs the same): default
+`IGB_DEFAULT_ITR = 3`, dynamic "conservative". Each vector starts at
+`IGB_START_ITR` 648 (~6000/s, ~160 µs). With one vector per queue (MSI-X,
+the i211's normal case) the interval follows the average frame size since
+the last interrupt (+24 B, capped at 3000; /2, or /3 for 300–1200 B
+frames), never below `IGB_20K_ITR` (~50 µs) in conservative mode:
+
+| Traffic | Linux interval | Max interrupts/s |
+|---|---|---|
+| Full-size frames (bulk) | ~190 µs | ~5000 |
+| ~600 B frames | ~52 µs | ~19000 |
+| Small frames (ACKs, games, DNS) | floor ~50 µs | 20000 |
+| Link below 1 Gbit/s | fixed ~250 µs (`IGB_4K_ITR` 980) | 4000 |
+
+With one shared vector (`igb_set_itr`) it switches between ~14 µs
+(`IGB_70K_ITR` 56), ~50 µs (196) and ~250 µs (980) by bytes and packets
+per interrupt (conservative mode never uses ~14 µs). `ethtool -C
+rx-usecs`: 0 = off (written 0x4), 1 = dynamic, 3 = dynamic conservative
+(default), 10–10000 = fixed. Linux CAKE routers on i211s run with these
+defaults (≥ 50 µs, up to ~190–250 µs under bulk) and still grade A+, which
+supports the datasheet's point that moderation costs little latency. Our
+fixed interval is smaller than Linux's floor; Linux needs its adaptive
+part because its intervals are large (the sparse-traffic level keeps
+~250 µs off pings), while a small fixed interval plus the NIC's
+"interrupt at once after a quiet interval" gives most of that without it.
 - *The register* (I210/I211 datasheet rev. 3.7, §8.8.14, one `EITR` per
   MSI-X vector, 5 vectors on the I211): Interval = bits 14:2 in 1 µs
   steps, so the value is `µs << 2` (max 8191 µs); 0 is not valid.
@@ -799,24 +846,34 @@ This is the likely bulk of the ~21 % / 33 % CPU measured above.
   is capped at 1/interval. A fixed interval is therefore enough: no need
   for Linux's adaptive ITR. With auto-mask, re-arming `EIMS` after the
   counter ran out fires immediately.
-- *Change:* `EITR0 = (µs << 2) | CNT_INGR` for RX, 25–50 µs (≤ 40k–20k
-  interrupts/s; ≤ 50 µs is ~1 % of CAKE's 5 ms target). `EITR1` (TX)
-  stays at 0x4: it is armed only when blocked, and a later wakeup there
-  idles the line (allowed with auto-mask, Table 7-53 note 4). A boot
-  argument (e.g. `igb_itr_us=`, `0` = 0x4) makes the comparison and the
-  negative control a reboot apart.
 - *QEMU:* the delay is `(value & 0x7FFE) × 1024 ns`, about 4× the
   hardware's (50 µs = value 200 waits ~205 µs). QEMU only shows it works;
   latency and CPU numbers come from the apu4.
-- *RX ring together with it:* while the interrupt waits, the 64-entry RX
-  ring must hold the burst. At 1500 B, 50 µs at line rate is ~4 frames,
-  but 64 B frames at gigabit are ~74, more than the 63 the device owns,
-  and `SRRCTL_DROP_EN` drops them. Raise `RX_RING` to 256 (four NICs ×
-  256 buffers from the 8192-buffer pool; check the pool's headroom).
-- *Measure (validity):* the same load before and after (bufferbloat.sh at
-  90/18 on the apu4, valid runs only), comparing `dev_irqs` per core, the
-  datapath tasks' CPU and the queue delay / grade, which must not get
-  worse. RX drops must be visible first: add the NIC's missed-packets
-  counter (`MPC`, or the RX no-descriptor drops) next to
-  `rx_dropped_no_buf` in `/api/status`, and show it stays 0 (negative
-  control: a large interval with the 64-entry ring should make it rise).
+
+*apu4 test plan* (after the soak run, 2026-11-25 ~12:24):
+1. Prerequisite: per-core device interrupts (`irq::dev_irqs`) are only in
+   the 10 s `cpu` log line today (RAM log, `GET /api/log`); add them to
+   `/api/status` `cpu` so a recorder can sample them with the rest.
+2. Same line, same shaping (90/18, `shape_overhead=20`), same Waveform /
+   `scripts/bufferbloat.sh` run per setting, a router-side recorder
+   polling `/api/status` every 2 s as in the CPU run above. Settings via
+   `scripts/apu-upload.sh --cmdline "... igb_itr_us=N"` (in RAM, so a
+   reboot returns to the stored kernel): `igb_itr_us=0` (baseline, = the
+   behaviour before step 5 apart from the bigger ring), `25`, `50`
+   (Linux's floor); optionally `100`/`200` to see where latency starts to
+   show.
+3. Per setting, over the loaded phases: device interrupts per core and per
+   forwarded packet, CPU of `dp_down` / `dp_up` (`cpu.tasks`), the
+   router's queue delay (`delay` per queue and in `ingress`), the grade
+   and added latency, throughput, and `rx_missed` / `rx_no_buf` on every
+   port.
+4. Valid only if the load happened in every run: CAKE drops or marks in
+   both directions, throughput near the shaped rates, a similar number of
+   forwarded packets; otherwise INVALID.
+5. Pass: CPU and interrupts lower than `igb_itr_us=0`; queue delay and
+   grade not worse; `rx_missed` stays 0. Negative control for `rx_missed`:
+   a very large interval (e.g. `igb_itr_us=8000`) under the LAN-to-LAN
+   load must make it rise (on the hardware: QEMU's igb probably holds
+   packets back in its backend instead of dropping them; not verified).
+6. Then set `config::IGB_ITR_US` from the data (or keep 0 if nothing is
+   saved) and record the numbers here.

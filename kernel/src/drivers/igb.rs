@@ -17,8 +17,10 @@
 //! CAKE requirements (docs/bufferbloat-cake.md §3.1): pull-based TX
 //! ([`Igb::can_transmit`] first), a BQL-style in-flight byte limit, no
 //! queue inside the driver, and NAPI-style interrupts (masked while
-//! `net::stack` polls, unmasked once drained). No interrupt moderation
-//! (`EITR` at its 1 µs minimum): masking during the poll already batches.
+//! `net::stack` polls, unmasked once drained). RX interrupt moderation:
+//! `EITR0` = `config::igb_itr_us` (an interrupt at once after a quiet
+//! interval, at most one per interval under load); TX (`EITR1`) at its
+//! 1 µs minimum, since it is armed only when blocked.
 //!
 //! Interrupts: INTx (aarch64 `virt`; `ICR`/`IMS`: the IRQ action masks the
 //! line, the poll reads `ICR` to de-assert it) or MSI-X vector 0 (x86_64;
@@ -46,8 +48,10 @@ use alloc::boxed::Box;
 use core::time::Duration;
 
 /// RX descriptors. One is always held back (`RDT` never reaches `RDH`), so
-/// the device owns at most `RX_RING - 1` buffers.
-const RX_RING: usize = 64;
+/// the device owns at most `RX_RING - 1` buffers. Sized for RX moderation:
+/// 50 µs of 64 B frames at 1 Gbit/s is ~74 frames, and with
+/// `SRRCTL_DROP_EN` a full ring drops (`rx_missed`).
+const RX_RING: usize = 256;
 /// TX descriptors. In practice the byte limit binds first.
 const TX_RING: usize = 64;
 const DESC: usize = 16;
@@ -62,6 +66,8 @@ const STATUS: usize = 0x0008;
 const CTRL_EXT: usize = 0x0018;
 const MDIC: usize = 0x0020;
 const ICR: usize = 0x00c0;
+/// Missed packets (receive FIFO full), read-to-clear.
+const MPC: usize = 0x4010;
 const IMS: usize = 0x00d0;
 const IMC: usize = 0x00d8;
 const RCTL: usize = 0x0100;
@@ -85,6 +91,8 @@ const SRRCTL0: usize = 0xc00c;
 const RDH0: usize = 0xc010;
 const RDT0: usize = 0xc018;
 const RXDCTL0: usize = 0xc028;
+/// Queue 0's drops for lack of descriptors (`SRRCTL_DROP_EN`); wraps.
+const RQDPC0: usize = 0xc030;
 const TDBAL0: usize = 0xe000;
 const TDBAH0: usize = 0xe004;
 const TDLEN0: usize = 0xe008;
@@ -127,6 +135,8 @@ const GPIE_PBA: u32 = 1 << 31;
 const IVAR_VALID: u32 = 0x80;
 /// `EITR` interval of 1 µs (the field is bits 14:2, in µs).
 const EITR_MIN: u32 = 1 << 2;
+/// `EITR` write leaves the counters alone (82576 and newer).
+const EITR_CNT_INGR: u32 = 1 << 31;
 /// Extended interrupt bits: vector 0 = RX (and TX without a TX vector), 1 = TX.
 const EI_RX: u32 = 1 << 0;
 const EI_TX: u32 = 1 << 1;
@@ -207,6 +217,10 @@ pub struct Igb {
     msix: bool,
     /// TX completions on their own MSI-X vector (1), armed on demand.
     tx_vector: bool,
+    /// RX interrupt moderation in µs (`EITR0`), 0 = none.
+    itr_us: u32,
+    /// Last `RQDPC0` reading (the register wraps instead of clearing).
+    rqdpc_last: u32,
     pub model: &'static str,
     pub stats: Stats,
 }
@@ -247,10 +261,15 @@ impl Igb {
             link_reported: None,
             msix: false,
             tx_vector: false,
+            itr_us: 0,
+            rqdpc_last: 0,
             model,
             stats: Stats::default(),
         };
         nic.reset()?;
+        // Counters left by an earlier kernel (a kexec) or firmware.
+        let _ = nic.regs.read32(MPC);
+        nic.rqdpc_last = nic.regs.read32(RQDPC0);
         nic.mac = nic.read_mac().ok_or(Error::BadMac)?;
         nic.power_up_phy();
         nic.setup_rx()?;
@@ -394,13 +413,16 @@ impl Igb {
     /// Route queue 0 to interrupt vector 0 and unmask it: MSI-X mode when
     /// `msix` (the PCI MSI-X capability is already enabled), else INTx.
     /// `tx_vector` (MSI-X only, table entry 1 routed): TX queue 0 on vector
-    /// 1, left masked until [`Self::arm_tx_irq`].
-    pub fn enable_irq(&mut self, msix: bool, tx_vector: bool) {
+    /// 1, left masked until [`Self::arm_tx_irq`]. `itr_us`: RX interrupt
+    /// moderation (`EITR0`), 0 = none.
+    pub fn enable_irq(&mut self, msix: bool, tx_vector: bool, itr_us: u32) {
         let tx_vector = msix && tx_vector;
-        // No moderation: the shortest interval, 1 µs (bits 14:2; 0 "is not
-        // a valid setting", datasheet §8.8.14).
-        self.regs.write32(EITR0, EITR_MIN);
-        self.regs.write32(EITR1, EITR_MIN);
+        // Interval = bits 14:2 in µs; 0 "is not a valid setting" (datasheet
+        // §8.8.14), so "none" is the 1 µs minimum. TX: always the minimum.
+        self.itr_us = itr_us.min(0x1fff);
+        let itr = if self.itr_us == 0 { EITR_MIN } else { self.itr_us << 2 };
+        self.regs.write32(EITR0, itr | EITR_CNT_INGR);
+        self.regs.write32(EITR1, EITR_MIN | EITR_CNT_INGR);
         // IVAR0: byte 0 = RX queue 0 → vector 0, byte 1 = TX queue 0 →
         // vector 0, or 1 with a TX vector.
         self.regs
@@ -423,6 +445,22 @@ impl Igb {
 
     pub fn mac(&self) -> [u8; 6] {
         self.mac
+    }
+
+    /// RX interrupt moderation in µs (0 = none).
+    pub fn itr_us(&self) -> u32 {
+        self.itr_us
+    }
+
+    /// Fold the NIC's RX drop counters into [`Stats::rx_missed`]: `MPC`
+    /// (receive FIFO full) and `RQDPC0` (ring full). Two non-posted reads:
+    /// call it rarely (the link poll, once a second).
+    pub fn update_stats(&mut self) {
+        let mpc = self.regs.read32(MPC);
+        let rqdpc = self.regs.read32(RQDPC0);
+        let dropped = rqdpc.wrapping_sub(self.rqdpc_last);
+        self.rqdpc_last = rqdpc;
+        self.stats.rx_missed += mpc as u64 + dropped as u64;
     }
 
     /// Link state: (up, speed in Mbit/s, full duplex).

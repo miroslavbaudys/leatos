@@ -1267,7 +1267,7 @@ fn status_json(
         let _ = write!(
             s,
             "{}{{\"name\":{},\"model\":{},\"mac\":{},\"vlan\":{vlan},\"link\":{link},\"addrs\":[{}],\
-             \"rx_packets\":{},\"rx_bytes\":{},\"rx_no_buf\":{},\"tx_packets\":{},\"tx_bytes\":{},\
+             \"rx_packets\":{},\"rx_bytes\":{},\"rx_no_buf\":{},\"rx_missed\":{},\"tx_packets\":{},\"tx_bytes\":{},\
              \"qdisc\":{{\"shaped_kbit\":{rate},\"limit_bytes\":{limit},\"ack_drops\":{ack_drops},\"sent\":{},\"dropped\":{},\"aqm_drops\":{aqm_drops},\"blue_drops\":{blue_drops},\"overflow_drops\":{overflow_drops},\"ecn_marked\":{},\"backlog_packets\":{},\"delay\":{delay}}}}}",
             if n > 0 { "," } else { "" },
             json_str(nif.name),
@@ -1277,6 +1277,7 @@ fn status_json(
             st.rx_packets,
             st.rx_bytes,
             st.rx_dropped_no_buf,
+            st.rx_missed,
             st.tx_packets,
             st.tx_bytes,
             q.dequeued,

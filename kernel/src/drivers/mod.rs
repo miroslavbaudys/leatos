@@ -25,6 +25,9 @@ pub struct Stats {
     pub rx_packets: u64,
     pub rx_bytes: u64,
     pub rx_dropped_no_buf: u64,
+    /// Frames the NIC itself dropped: its receive FIFO or RX ring was full
+    /// (igb `MPC` + `RQDPC`; updated by `Nic::update_stats`).
+    pub rx_missed: u64,
     pub tx_packets: u64,
     pub tx_bytes: u64,
 }
@@ -80,10 +83,28 @@ impl Nic {
 
     /// Unmask the device's interrupts once the line or vector is set up;
     /// `tx_vector`: MSI-X table entry 1 is routed too ([`Self::has_tx_vector`]).
+    /// igb: RX interrupt moderation from `config::igb_itr_us`.
     pub fn enable_irq(&mut self, msix: bool, tx_vector: bool) {
         match self {
             Self::Virtio(_) => {} // virtio-drivers enables queue interrupts at init
-            Self::Igb(n) => n.enable_irq(msix, tx_vector),
+            Self::Igb(n) => n.enable_irq(msix, tx_vector, crate::config::igb_itr_us()),
+        }
+    }
+
+    /// RX interrupt moderation in µs, if the NIC has it (igb; 0 = none).
+    pub fn rx_moderation_us(&self) -> Option<u32> {
+        match self {
+            Self::Virtio(_) => None,
+            Self::Igb(n) => Some(n.itr_us()),
+        }
+    }
+
+    /// Read the device's own counters into [`Self::stats`] (rarely: they
+    /// cost register reads).
+    pub fn update_stats(&mut self) {
+        match self {
+            Self::Virtio(_) => {}
+            Self::Igb(n) => n.update_stats(),
         }
     }
 

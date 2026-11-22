@@ -1324,6 +1324,18 @@ pub fn neigh_timing() -> (u64, bool) {
     (ms, arg_u64(bootargs(), "neigh_probe") != Some(0))
 }
 
+/// igb RX interrupt moderation: the minimum time between two RX interrupts
+/// of a NIC, in µs (`EITR0`; boot argument `igb_itr_us=`, `0` = none, at
+/// most 8191). The NIC still interrupts at once for a packet that arrives
+/// after a quiet interval, so sparse traffic is not delayed; under load the
+/// interrupt rate is capped at 1/interval (docs/bufferbloat-cake.md §7,
+/// "igb (i211) interrupts").
+pub const IGB_ITR_US: u32 = 0;
+
+pub fn igb_itr_us() -> u32 {
+    arg_u64(bootargs(), "igb_itr_us").map_or(IGB_ITR_US, |us| us.min(8191) as u32)
+}
+
 /// smoltcp's IPv4 neighbors from the frames clients send it (ARP hints,
 /// `net::device::NdHints`); boot argument `arp_hints=0` turns them off
 /// (the lab's negative control).

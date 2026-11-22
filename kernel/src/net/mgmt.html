@@ -899,7 +899,7 @@ async function refresh() {
   $("ifs").innerHTML = "<tr><th>Port</th><th>NIC</th><th>MAC</th><th>Link</th><th>Addresses</th><th class=num>RX</th><th class=num>TX</th><th class=num>Now in / out</th></tr>" +
     st.interfaces.map((i) => { const r = ifRates[i.name]; return `<tr><td><b>${esc(i.name)}</b>${i.vlan ? `<br><span class="muted">VLAN ${i.vlan.id}, PCP ${i.vlan.pcp}</span>` : ""}</td><td>${esc(i.model)}</td><td>${esc(i.mac)}</td>` +
       `<td>${i.link === null ? "–" : i.link.up ? `<span class="up">up ${i.link.mbps} Mbit/s${i.link.full_duplex ? "" : " half"}</span>` : '<span class="down">down</span>'}</td>` +
-      `<td>${i.addrs.map(esc).join("<br>") || "–"}</td><td class=num>${n(i.rx_packets)} pkts<br><span class="muted">${bytes(i.rx_bytes)}</span>${i.rx_no_buf ? `<br><span class="warn">${n(i.rx_no_buf)} no buffer</span>` : ""}</td>` +
+      `<td>${i.addrs.map(esc).join("<br>") || "–"}</td><td class=num>${n(i.rx_packets)} pkts<br><span class="muted">${bytes(i.rx_bytes)}</span>${i.rx_no_buf ? `<br><span class="warn">${n(i.rx_no_buf)} no buffer</span>` : ""}${i.rx_missed ? `<br><span class="warn">${n(i.rx_missed)} missed (NIC)</span>` : ""}</td>` +
       `<td class=num>${n(i.tx_packets)} pkts<br><span class="muted">${bytes(i.tx_bytes)}</span></td><td class=num>${r ? bits(r.rx) + "<br>" + bits(r.tx) : "–"}</td></tr>`; }).join("");
   // The download is shaped where it arrives (WAN ingress stage); lan0's
   // egress is then unshaped, so traffic between networks is not capped.
