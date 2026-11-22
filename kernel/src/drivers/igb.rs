@@ -16,13 +16,18 @@
 //!
 //! CAKE requirements (docs/bufferbloat-cake.md §3.1): pull-based TX
 //! ([`Igb::can_transmit`] first), a BQL-style in-flight byte limit, no
-//! queue inside the driver, and NAPI-style interrupts (the IRQ action masks
-//! the line, `net::stack` acks, polls and unmasks). No interrupt
-//! moderation (`EITR` = 0): masking during the poll already batches.
+//! queue inside the driver, and NAPI-style interrupts (masked while
+//! `net::stack` polls, unmasked once drained). No interrupt moderation
+//! (`EITR` = 0): masking during the poll already batches.
 //!
-//! Interrupts: INTx (aarch64 `virt`; `ICR`/`IMS`) or MSI-X vector 0
-//! (x86_64; `GPIE.MSIX_MODE`, `EIMS`). RX queue 0 and TX queue 0 both map
-//! to vector 0 through `IVAR0`.
+//! Interrupts: INTx (aarch64 `virt`; `ICR`/`IMS`: the IRQ action masks the
+//! line, the poll reads `ICR` to de-assert it) or MSI-X vector 0 (x86_64;
+//! `GPIE.MSIX_MODE`, `EIMS`). RX queue 0 and TX queue 0 both map to vector
+//! 0 through `IVAR0`. With MSI-X the device masks itself: `EIAM` clears the
+//! vector's `EIMS` bit when the message goes out and `EIAC` clears its
+//! `EICR` bit, so the IRQ action only signals, no `ICR` read is needed (a
+//! non-posted PCIe read), and [`Igb::unmask_irq`] re-arms it with one
+//! posted `EIMS` write; a cause that came in meanwhile fires at once.
 
 use crate::drivers::Stats;
 use crate::mm::dma::{self, DmaRegion};
@@ -58,6 +63,7 @@ const GPIE: usize = 0x1514;
 const EIMS: usize = 0x1524;
 const EIMC: usize = 0x1528;
 const EIAC: usize = 0x152c;
+const EIAM: usize = 0x1530;
 const EITR0: usize = 0x1680;
 const IVAR0: usize = 0x1700;
 const RLPML: usize = 0x5004;
@@ -183,6 +189,8 @@ pub struct Igb {
     mac: [u8; 6],
     /// Last reported link state (for [`Self::link_changed`]).
     link_reported: Option<(bool, u32, bool)>,
+    /// MSI-X mode ([`Self::enable_irq`]): the device masks itself.
+    msix: bool,
     pub model: &'static str,
     pub stats: Stats,
 }
@@ -221,6 +229,7 @@ impl Igb {
             tx_byte_limit: DEFAULT_TX_BYTE_LIMIT,
             mac: [0; 6],
             link_reported: None,
+            msix: false,
             model,
             stats: Stats::default(),
         };
@@ -362,10 +371,12 @@ impl Igb {
         self.regs.write32(EITR0, 0);
         // IVAR0: byte 0 = RX queue 0, byte 1 = TX queue 0 → vector 0.
         self.regs.write32(IVAR0, IVAR_VALID | IVAR_VALID << 8);
+        self.msix = msix;
         if msix {
             self.regs
                 .write32(GPIE, GPIE_NSICR | GPIE_MSIX_MODE | GPIE_EIAME | GPIE_PBA);
             self.regs.write32(EIAC, 1); // auto-clear EICR bit 0 on the message
+            self.regs.write32(EIAM, 1); // and auto-mask it (EIMS bit 0)
             self.regs.write32(EIMS, 1);
         } else {
             self.regs.write32(GPIE, GPIE_NSICR);
@@ -398,10 +409,23 @@ impl Igb {
         })
     }
 
-    /// Clear the interrupt cause (read-to-clear; with `GPIE.NSICR` this
-    /// also de-asserts INTx).
+    /// INTx: clear the interrupt cause (read-to-clear; with `GPIE.NSICR`
+    /// this also de-asserts the line). MSI-X: nothing to do (`EIAC`).
     pub fn ack_interrupt(&mut self) {
-        let _ = self.regs.read32(ICR);
+        if !self.msix {
+            let _ = self.regs.read32(ICR);
+        }
+    }
+
+    /// MSI-X: the device masked vector 0 when it fired (`EIAM`); re-arm it.
+    pub fn unmask_irq(&mut self) {
+        self.regs.write32(EIMS, 1);
+    }
+
+    /// The device masks its own interrupt (MSI-X with `EIAM`) and is
+    /// re-armed by [`Self::unmask_irq`], not at the interrupt controller.
+    pub fn self_masking(&self) -> bool {
+        self.msix
     }
 
     /// Put `buf` into RX descriptor `i`. The device owns it once `RDT`

@@ -95,6 +95,24 @@ impl Nic {
         }
     }
 
+    /// The device masks its own interrupt when it fires (igb with MSI-X):
+    /// the IRQ action then only signals, and the poll re-arms it with
+    /// [`Self::unmask_irq`] instead of at the interrupt controller.
+    pub fn self_masking(&self) -> bool {
+        match self {
+            Self::Virtio(_) => false,
+            Self::Igb(n) => n.self_masking(),
+        }
+    }
+
+    /// Re-arm a [`Self::self_masking`] device's interrupt.
+    pub fn unmask_irq(&mut self) {
+        match self {
+            Self::Virtio(_) => {}
+            Self::Igb(n) => n.unmask_irq(),
+        }
+    }
+
     pub fn ack_interrupt(&mut self) {
         match self {
             Self::Virtio(n) => n.ack_interrupt(),
