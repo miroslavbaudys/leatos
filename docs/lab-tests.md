@@ -1,0 +1,248 @@
+# Tests
+
+Which test covers what, how to run it, and its negative controls. Every check needs a negative
+control (a setting under which it must fail), and a measurement without proof that the load
+happened is INVALID. The per-variable reference of the lab is the header of `scripts/lab-test.sh`;
+`scripts/doc-check.sh` (CI) fails when a `LAB_*` variable the lab scripts read is missing there.
+Which test to run after which change: the table in CLAUDE.md.
+
+Variables that work with any QEMU-based script:
+
+- `QEMU_ACCEL=tcg`: run without hardware acceleration.
+- `QEMU_SMP=4`: four cores. The smoke boot case then requires all cores online and the SMP self-test
+  (negative control: `QEMU_APPEND=cores=1`).
+- `QEMU_NIC=igb`: router NICs are QEMU's 82576 instead of virtio-net.
+- `LEATOS_ARCH=x86_64`: the x86_64 kernel (TCG; the client and ISP VMs stay aarch64).
+- `QEMU_STORE=img`: attach a store image as virtio-blk, or as an SD card with `QEMU_STORE_BUS=sd`
+  (written in place).
+- `QEMU_DISK=img scripts/qemu-run.sh`: boot any disk image.
+- `QEMU_APPEND`: boot arguments (docs/boot-arguments.md).
+
+## Smoke test: `scripts/smoke-test.sh`
+
+- Cases: boot (DHCP + ping), fault-wx, fault-stack, panic (reboots), wdt-task (cross-core watchdog,
+  2+ cores), wdt-hw (i6300esb with `cores=1`).
+- Negative controls: `QEMU_APPEND=panic=halt`, `QEMU_APPEND=watchdog=0`, `QEMU_WDT=0`. QEMU gets
+  `-device i6300esb` unless `QEMU_WDT=0`.
+- `LEATOS_BOOT=limine scripts/smoke-test.sh` boots the apu4 image through SeaBIOS + Limine.
+
+## Lab: `scripts/lab-test.sh`
+
+A client VM, the router and an ISP VM (Alpine; overlays in `lab/client/`, `lab/isp/`, downloads in
+`lab/cache/`, pinned by SHA-256 in `scripts/lab/fetch-alpine.sh`). The router always gets
+`mgmt_pass=lab-pass`; `LAB_ROUTER_ARGS` adds boot arguments, `LAB_VERBOSE=1` prints the consoles.
+
+### Default checks
+
+- DHCP, DNS, NAT, ICMP, traceroute.
+- DNS cache prefetch: ISP TTL 12 s; negative control `LAB_ROUTER_ARGS=dns_prefetch=0`.
+- Serve-stale with the ISP's DNS stopped (via `cgi-bin/dns` / `lab-dns`), plus EDE 3 on a crafted
+  EDNS query; negative control `LAB_ROUTER_ARGS=dns_stale=0`.
+- DNS over TCP: big.isp.example (850 B TXT from the ISP's cacheless dnsmasq in front of dnsd)
+  truncated over UDP, whole over TCP; negative control `LAB_ROUTER_ARGS=dns_tcp=0`.
+- Full-size ICMP: `LAB_BIG_PING=1473 LAB_ROUTER_ARGS=fw_frag=0` is its negative control.
+  Fragmented `ping -s 3000` both ways; negative control `LAB_ROUTER_ARGS=fw_frag=0`.
+- Web interface origin checks, raw requests from the client: a rebound `Host` gets 421, a cross-site
+  POST with Basic 403; address, `router.lan`, same-origin and script requests pass. Negative control
+  `LAB_ROUTER_ARGS=mgmt_origin=0`.
+- Web interface lockout: a second client address guesses wrong passwords while the client's own
+  logs in (always answered); 8 idle connections from it, the client is still answered and
+  `mgmt.throttle.evicted` rises. Negative controls `LAB_MGMT_SAME_SOURCE=1`,
+  `LAB_ROUTER_ARGS=mgmt_evict=0`.
+- Firewall end to end.
+- Client ports, from the router's WAN capture: the ISP's UDP probes to unbound client ports and 68
+  draw no port unreachable; upstream DNS queries use many ports. Negative controls
+  `LAB_ROUTER_ARGS=fw_client_ports=0`, `dns_port_random=0`.
+- WAN input silent to the ISP's probes (TCP 22, 80, 61000, ping). Negative controls
+  `LAB_ROUTER_ARGS=mgmt=wan`, `LAB_WAN_OPEN=1` (a rule accepting wan → router).
+- Router-side ECN per direction, from the router's counters (`LAB_EXPECT_ECN=U:D` for the negative
+  control).
+- SNTP from the ISP's ntpd, ±5 s of the host; negative control `LAB_ROUTER_ARGS=ntp=203.0.113.99`.
+- Per-task CPU split (`dp_down`, `dp_up` vs `svc`, over the client's load phase, from `/api/status`
+  `cpu.tasks`) and core placement.
+
+### WAN variants
+
+- `LAB_WAN_STATIC=1`: the ISP runs no DHCP server; the router gets
+  `wan_mode=static wan_ip=203.0.113.60/24 …`: static line + NATed source 203.0.113.60, all checks
+  through it. Negative control `LAB_ROUTER_ARGS=wan_mode=dhcp`.
+- `LAB_PPPOE=pap|chap|none`: the ISP is rp-pppoe `pppoe-server` only (user mode). `none` = no
+  authentication and no router user name (negative control `LAB_PPPOE=pap LAB_PPPOE_ANON=1`).
+  - All checks run through the session, plus a reconnect after the ISP ends it.
+  - The ISP's IPv6CP offer is logged by the router (negative control `LAB_PPPOE_IPV6=0`).
+  - With `LAB_IPV6=1`, IPv6 over the session instead (docs/ipv6.md step 4: pppd `ipv6-up` routes
+    the prefixes over ppp0 and starts Kea there): IPv6CP line, PD, all IPv6 WAN checks, prefix
+    change, IPv6 back after the reconnect. Negative controls `LAB_PPPOE_IPV6=0`, `LAB_IPV6_PD=0`.
+  - The router splits the 1500 B fragments, checked by `fragments.split`; negative control
+    `fw_split=0`.
+  - Negative controls `LAB_ROUTER_ARGS=pppoe_pass=wrong` / `wan_mode=dhcp`, `LAB_PPPOE_KICK=stop`,
+    `LAB_BIG_PING=1465 LAB_ROUTER_ARGS=fw_frag=0` (1465 alone passes: the client's DF ping learns
+    MTU 1492 and fragments itself).
+  - Combines with `LAB_VLAN=848`.
+- `LAB_VLAN=N`: the ISP VM on VLAN N only (8021q from `modloop-virt`, `fetch-alpine.sh modloop`),
+  the router on `wan_vlan=N`. Negative controls `LAB_ROUTER_ARGS=wan_vlan=0` / another VID.
+
+### `LAB_DOT=1`: DNS over TLS (docs/dns-over-tls.md)
+
+- The router boots from a store with `dns.tls`, upstream the ISP's stunnel + dnsmasq on :853 (a CA
+  made per run, in `dns.tls_ca`).
+- The client resolves `dot.isp.example` (DoT server only), not `plain.isp.example` (plain dnsd
+  only); the router's connection and the ISP's query log are checked.
+- Negative controls `LAB_DOT_NAME=wrong.example`, `LAB_DOT_CA=0`, `LAB_ROUTER_ARGS=dns_tls=0`.
+- Certificate dates before SNTP: the RTC on x86_64, the issue time on aarch64 (`LAB_EXPECT_DATES`).
+  RTC control: `LEATOS_ARCH=x86_64 QEMU_EXTRA="-rtc base=2040-01-01" LAB_EXPECT_DATES=expired`
+  (DNS keeps working, the RTC is corrected after SNTP).
+
+### `LAB_GUEST=1`: networks, zones, rules, forwards
+
+The router boots from a store with a second network (VLAN 20, zone guest) and two rules; the client
+adds eth0.20.
+
+- Guest lease, ISP, allowed DNS and ping, blocked web interface, refused main LAN (router firewall
+  drop counter).
+- Rule guest-ping-nas (accept, hit counter) and guest-no-isp-web (reject guest TCP 80 to the WAN).
+- Port forward lab-web (WAN :8080 → the client): the ISP fetches through it
+  (`lab/isp/www/cgi-bin/fetch`), the client through the WAN address (hairpin).
+- The guest network's own DNS domain `guest.lan`: lease domain, `labguest.guest.lan`,
+  `router.guest.lan`, `labclient.guest.lan` NXDOMAIN.
+- Redirect lab-ntp (UDP 123 → 192.168.1.101, a second client address running `busybox ntpd -l`):
+  NTP to 203.0.113.99 answered from the main LAN and from the guest, hit counter.
+- Forward target out: forward lab-src (WAN :8090 → client :8090); a connection from the client's
+  :8090 reaches the ISP (`cgi-bin/srcport`) from the WAN's :8090 and survives a live rule change
+  (`cgi-bin/slow`; negative control `LAB_FWD_CUT=1`).
+- Anti-spoofing: the ISP connects to the forward from the forged source 192.168.1.77
+  (`cgi-bin/spoof`): dropped as `spoofed`, forward hits unchanged.
+- Reject: the refused guest HTTP fails at once with a RST (`rejected` counter).
+- Recheck: a running guest ping stops when a live config takes the guest zone's internet away
+  (`revoked`).
+- LAN to guest (WAN ingress shaping): eth0.20 moves into its own network namespace and serves 5 MB
+  to the main LAN through rule lab-lan-to-guest (TCP 8081), faster than twice the download rate.
+- Negative controls:
+  - `LAB_ROUTER_ARGS=shape_ingress=0`: LAN to guest fails (held to the download rate).
+  - `LAB_GUEST_ZONE=lan`: isolation fails.
+  - `LAB_GUEST_RULES=0`: both rule checks fail.
+  - `LAB_GUEST_REJECT=drop`: the reject check fails.
+  - `LAB_ROUTER_ARGS=fw_recheck=0`: the recheck check fails.
+  - `LAB_ROUTER_ARGS=wan_antispoof=0`: the anti-spoofing check fails.
+  - `LAB_FORWARD=0`: forward, hairpin and forward-target-out fail.
+  - `LAB_REDIRECT=0`: both redirect checks fail.
+  - `LAB_GUEST_DOMAIN=0`: lease domain, labguest and router checks fail.
+- `LAB_GUEST_LIVE=1`: the router boots with the main LAN only and the client adds the rest live
+  through `/api/config` (combines with the controls).
+
+Modes that imply `LAB_GUEST=1`:
+
+- `LAB_DNS_VIEWS=1` (docs/dns-views.md): `dns.views = "firewall"` + `[[dns.host]]` split.lan per
+  network (its entries' hits rise) + files.isp.example overridden for the LAN. From the guest,
+  labclient.lan and its PTR are NXDOMAIN (`hidden` counter); nas.lan still resolves (rule
+  guest-ping-nas). Negative controls `LAB_DNS_VIEWS=0`, `LAB_DNS_HOSTS=0`, `LAB_GUEST_RULES=0`.
+- `LAB_MDNS=1` (docs/mdns.md): rule guest-printers reflects `_ipp._tcp` guest → lan. The client
+  announces on VLAN 20 (crafted, `nc -u`), checked by the router's counters and on the LAN capture
+  (copy from 192.168.1.1, TTL 255, `_ipp` only; IGMP joins on both networks). Negative control
+  `LAB_MDNS_RULES=0`.
+- `LAB_ROUTES=1`: `[[route]]` lab-behind 10.30.0.0/24 via the client, 10.30.0.5 on its loopback:
+  option 121 (route + default), NAT to the ISP and ping to the router from 10.30.0.5, `/api/status`
+  `routes`, the ISP forging 10.30.0.5 dropped as `spoofed` (`cgi-bin/spoof?8080&src=`). Negative
+  control `LAB_ROUTES=0` (route disabled).
+- `LAB_PORTS=1`: the router gets a third NIC (`lan1`, `LAB_LAN1_PORT`), network wired 10.40.0.1/24
+  untagged on it; the client's second NIC (`VM_NIC2` in `scripts/lab/common.sh`) moves into a
+  network namespace: lease, ping router and ISP, `/api/status` wired on lan1, lan0 → lan1 above
+  twice the download rate. Negative control `LAB_PORTS_NET=lan0` (VLAN 40 on lan0: no lease on the
+  lan1 wire). With `LAB_GUEST_LIVE=1` the network is added live.
+
+### `LAB_IPV6=1`: IPv6 (docs/ipv6.md)
+
+- Prefix delegation (step 3): the ISP VM runs dnsmasq RAs + Kea (`lab-kea`, `fetch-alpine.sh kea`,
+  `LAB_INITRD_KEA`); the router gets `ipv6=1 wan_mtu=1400` only. Checks the delegated
+  2001:db8:100::/56 and a prefix change to 2001:db8:200::/56 (`cgi-bin/pd?change`: new address, old
+  deprecated, ping through it). Negative control `LAB_IPV6_PD=0`.
+- Step 5a: WAN address + router source in status; the router's DNS over IPv6 via the ISP's
+  IPv6-only resolver with its IPv4 DNS stopped (negative control `LAB_IPV6_DNS6=0`). With a store
+  (`LAB_GUEST=1`) the prefix is kept across a reboot while Kea forgot it (`cgi-bin/pd?fresh`;
+  negative control `LAB_ROUTER_ARGS=pd_keep=0`; router-side checks read the log up to that
+  reboot).
+- Step 1 (router `ipv6=1`): SLAAC address from the main LAN's ULA /64, no default route (router
+  lifetime 0), ping the router's ULA and link-local, `router.lan` AAAA over IPv6, web interface on
+  the ULA, RA counters. With `LAB_GUEST=1`: the guest's ULA, DNS over IPv6 allowed, web refused, RS
+  answered. Negative controls `LAB_ROUTER_ARGS=ipv6=0` (every IPv6 check fails),
+  `LAB_GUEST_ZONE=lan` (guest web-refused fails).
+- The WAN side (step 2b): the ISP VM gets 2001:db8:ffff::1/64 and routes 2001:db8:100::/56 to the
+  router (`wan6_ip=… wan6_gw=… lan6_prefix=… wan_mtu=1400`, IPv4 big ping 1372).
+  - Global SLAAC + default route, ping6/HTTP to the ISP, the ISP sees the client's own address,
+    traceroute6.
+  - Inbound refused (`cgi-bin/fetch` back to `[::]:8086`), Packet Too Big (`icmp_errors` rises), a
+    forged source `spoofed`, the guest's global address out, fragmented `ping6 -s 3000` both ways
+    (negative control `LAB_ROUTER_ARGS=fw_frag=0`).
+  - Negative controls `LAB_IPV6_OPEN=1` (a wan → lan accept rule: inbound reaches the client),
+    `LAB_ROUTER_ARGS=wan_mtu=1500` (no PTB), `LAB_ROUTER_ARGS=lan_antispoof=0`.
+  - An unused /64 of the prefix is unreachable at the router (`/api/status` `unreachable6`);
+    negative control `LAB_ROUTER_ARGS=v6_unreachable=0`.
+- `LAB_IPV6=static`: step 2b's boot arguments.
+- `LAB_GUEST_IPV6=0` (with `LAB_GUEST=1`): the guest network has `ipv6 = false`: no IPv6 reported
+  there, no SLAAC address, its IPv6 dropped as `unsupported`. Negative control
+  `LAB_GUEST_IPV6_CONTROL=1`.
+
+### `LAB_NEIGH=1`: neighbor tables
+
+Unshaped unless `LAB_SHAPE_KBIT` is set; router `neigh_secs=10`. The client pins the router's MAC
+(never ARPs) and pings the router from `LAB_NEIGH_HOSTS` (40) addresses of its own, 3 rounds,
+without loss (round 1 = first contact: ARP hints; rounds 2–3: smoltcp's cache holds them all), then
+downloads for `LAB_NEIGH_SECS` (35) across several neighbor lifetimes with no `neighbor` drops and
+some probes. Negative controls `LAB_ROUTER_ARGS=arp_hints=0` (round 1), `LAB_NEIGH_CACHE=8` (kernel
+built `--no-default-features`: rounds 2–3), `LAB_ROUTER_ARGS=neigh_probe=0` (forwarded).
+
+### `LAB_ACK=1`: ACK filter
+
+CAKE's ACK filter on an asymmetric line (upload `LAB_ACK_UP_KBIT`, default 150 kbit/s, with
+`ack_filter=1`; download 10 Mbit/s): the client runs only the download, whose ACKs queue on the
+upload; checks the router's wan0 `ack drops` and the download arriving whole. Negative control
+`LAB_ACK_FILTER=0`.
+
+### `LAB_SWARM=1`: many flows
+
+256 flows (`LAB_SWARM=N` for N; 64 are too few to fill the queue at the lab's ~1 ms RTT): a
+torrent-like download, shaped at `LAB_SWARM_KBIT` (98000), N parallel loops of 256 KB HTTP
+downloads with MTU `LAB_SWARM_MTU` (680) for `LAB_SWARM_SECS` (15), HVF only (TCG cannot reach the
+rate: INVALID). The ingress queue's `overflow_drops` must stay ≤ `LAB_SWARM_OVF` (10) % of its drops
+(`/api/status` `ingress`); invalid unless the queue was pushed and half the rate moved. The usual
+shaping phase is skipped. Negative control `LAB_ROUTER_ARGS=queue_pkts=384`.
+
+## Feature tests
+
+- `scripts/store-test.sh` (also `LEATOS_ARCH=x86_64`): store read at boot, config save via the web
+  interface + reboot, trials (confirm, timeout, revert, kill during the trial), corruption negative
+  controls. Also with `QEMU_STORE_BUS=sd` (and `STORE_MIB=4096` for SDHC).
+- `scripts/lease-test.sh` (also `LEATOS_ARCH=x86_64`, `QEMU_STORE_BUS=sd`): router + lab client:
+  leases listed and resolvable after a power cut (router killed after its periodic save) and after
+  `POST /api/reboot`. Negative control `LEASE_TEST_NO_STORE=1`.
+- `scripts/cli-test.sh` (also `LEATOS_ARCH=x86_64`, `QEMU_STORE_BUS=sd`): types into the UART via a
+  FIFO on QEMU's stdin. Runs with the RAM log (the other scripts get `log=console` from
+  `qemu-run.sh`). Negative controls `CLI_TEST_SKIP_SAVE=1`, `CLI_TEST_LOG=console`.
+- `scripts/pppoe-test.sh` (also `LEATOS_ARCH=x86_64`): the ISP VM as a PPPoE-only AC, the router
+  driven over the CLI: DHCP → PPPoE live (password never printed), PADT at reboot + PPPoE from the
+  store, back to DHCP. Negative control `PPPOE_TEST_SKIP_SAVE=1`.
+- `scripts/vlan-test.sh` (also `LEATOS_ARCH=x86_64`): WAN VLAN changed live through the CLI (lease
+  lost when tagged against slirp, regained when untagged; shaper overhead +4 B and back), then a
+  static WAN live (10.0.2.50 on slirp, the gateway pings answer) and back to DHCP. Negative control
+  `VLAN_TEST_SKIP_SAVE=1`.
+- `scripts/upgrade-test.sh`: the in-RAM upgrade end to end in QEMU (401/422/404 negative controls,
+  two chained upgrades, reboot).
+- `scripts/persist-test.sh` (also `QEMU_STORE_BUS=sd`): persistent upgrades, confirm, rollbacks
+  (panic, hang, no confirm, revert, kill), `image=golden`, corrupt record. Negative control
+  `PERSIST_TEST_CONTROL=no-confirm`.
+
+## Measurements
+
+- `scripts/bufferbloat.sh [--label X]`: latency idle vs. under download/upload load, throughput and
+  grade. Runs are INVALID if the load failed; results go to `lab/cache/bufferbloat.csv`.
+- `scripts/soak-test.sh [--host H] [--hours 72] [--interval 60] [--label X]` (M9): polls
+  `/api/status` into `lab/cache/soak-LABEL.csv`. FAIL on a reboot, a rising heap minimum or a
+  falling free-pool maximum (first vs. last window after warm-up), INVALID without enough forwarded
+  packets or coverage; `--report CSV` judges a run so far. It only observes: the load comes from
+  real use (the apu4) or another driver.
+
+## Fuzzing
+
+`cd fuzz && cargo +nightly fuzz run <target> -- -max_total_time=600` (own workspace, nightly;
+fuzz/README.md). Run the targets of crates you changed, and `cargo +nightly fuzz build` after
+changing a fuzzed crate's API. A crash becomes a host regression test in its crate before the fix.

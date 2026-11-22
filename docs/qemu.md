@@ -20,7 +20,7 @@ Requirements: QEMU ≥ 8 (`brew install qemu`) and the Rust toolchain. The
 | `LEATOS_ARCH=x86_64 scripts/lab-test.sh` | the lab with an x86_64 router (client and ISP VMs stay aarch64) |
 | `scripts/unsafe-report.sh` | list modules allowed to use `unsafe` and count unsafe constructs |
 | `scripts/lab-test.sh` | end-to-end test with client + ISP VMs: DHCP, DNS, NAT, firewall, shaping, … (see below) |
-| `scripts/store-test.sh`, `lease-test.sh`, `cli-test.sh`, `pppoe-test.sh`, `vlan-test.sh`, `upgrade-test.sh`, `persist-test.sh` | feature tests; when to run each is listed in `CLAUDE.md` "Commands" |
+| `scripts/store-test.sh`, `lease-test.sh`, `cli-test.sh`, `pppoe-test.sh`, `vlan-test.sh`, `upgrade-test.sh`, `persist-test.sh` | feature tests; what each covers: docs/lab-tests.md; when to run it: the table in `CLAUDE.md` |
 
 `scripts/qemu-run.sh` boots either architecture. It reads the ELF's
 machine type: x86-64 kernels boot on `-machine q35` through PVH (`-kernel`),
@@ -105,7 +105,7 @@ releases, so on a mismatch, review and update the pins.
 Checks run by the client (`lab/client/init`), each printed as `LAB PASS/FAIL`.
 The table lists the base set; the full list with every option
 (`LAB_PPPOE`, `LAB_VLAN`, `LAB_GUEST`, `LAB_MDNS`, `LAB_DOT`, …) and its
-negative controls is in `CLAUDE.md` "Commands":
+negative controls is in docs/lab-tests.md:
 
 | Area | Check |
 |---|---|
