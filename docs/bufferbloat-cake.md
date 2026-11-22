@@ -743,7 +743,24 @@ five costs. Four are fixed; interrupt moderation (step 5) is open.
    message goes out, the IRQ action only signals, re-arming is one posted
    `EIMS` write, and the MSI-X table lock is off the per-packet path.
 
-INTx (aarch64 QEMU) and virtio-net keep the old scheme.
+INTx (aarch64 QEMU) and virtio-net keep the old scheme. Since then also:
+`EITR` "off" is its 1 µs minimum (0x4), not 0, which the datasheet calls
+invalid; and `disable_irqs` (reset, `Drop` before a kexec) clears `EIAM`,
+`EIAC`, `GPIE` and `EICR`. Those survive even `CTRL.DEV_RST`, so a kernel
+kexec'd from this one that never writes `EIAM` (older than `ed6e10f`)
+would have had its RX vector mask itself on the first interrupt for good.
+
+**QEMU is not the hardware here** (`hw/net/igb_core.c`): it ignores `EIAM`
+and `GPIE.EIAME`, so in QEMU the RX vector is never masked during a poll
+and an armed TX vector stays armed. The QEMU counts above are an upper
+bound, and the masked path (EIMS re-arm with a pending cause, §8.8.5) is
+first exercised on the apu4.
+Any non-zero `EITR` also adds interrupts in QEMU: its throttle timer
+sends the vector's message when it expires
+(`igb_intrmgr_on_msix_throttling_timer`, no cause or mask check). The same
+lab run with `EITR` 0x4 instead of 0: 19342 vs 13090 device interrupts,
+datapath CPU about the same (4353 vs 4262 ms). Compare QEMU interrupt
+counts only at the same `EITR`.
 
 QEMU x86_64, `QEMU_NIC=igb QEMU_SMP=4 scripts/lab-test.sh`, load phase,
 before vs. after 1+2 (both with 3+4):
@@ -759,21 +776,38 @@ QEMU's 82576 is not the i211: the apu4 numbers (90/18, `dev_irqs` per core
 and CPU in `/api/status`, `scripts/bufferbloat.sh`) are still to be taken,
 after the soak run that ends 2026-11-25.
 
-**Open: step 5, interrupt moderation (`EITR`).** `EITR0`/`EITR1` are 0: no
-moderation. At 90/18 Mbit/s (~7.5 kpps down plus the ACKs up) forwarding a
+**Open: step 5, interrupt moderation (`EITR`).** `EITR0`/`EITR1` are at
+the 1 µs minimum: no moderation. At 90/18 Mbit/s (~7.5 kpps down plus the ACKs up) forwarding a
 packet takes far less than the ~130 µs between packets, so the NAPI poll
 rarely finds more than one: about one interrupt, wakeup and poll per packet.
 This is the likely bulk of the ~21 % / 33 % CPU measured above.
-- *Change:* a small `EITR0` interval (RX), 20–50 µs (≤ 50k interrupts/s).
-  The added latency, ≤ 50 µs, is ~1 % of CAKE's 5 ms target, so it fits
-  the latency-first rule. Probably no moderation for `EITR1` (TX): it is
-  armed only when blocked, and a later wakeup there idles the line.
-  Check the interval's units and field (`ITR_INTERVAL`, bits 14:2; the
-  `CNT_INGR` bit) in the i210/i211 datasheet before choosing the value;
-  a boot argument (e.g. `igb_itr_us=`, `0` = off) makes the comparison and
-  the negative control a reboot apart. Linux's adaptive ITR (low interval
-  for sparse traffic, higher under bulk) is the refinement if a fixed one
-  costs latency on sparse traffic.
+- *The register* (I210/I211 datasheet rev. 3.7, §8.8.14, one `EITR` per
+  MSI-X vector, 5 vectors on the I211): Interval = bits 14:2 in 1 µs
+  steps, so the value is `µs << 2` (max 8191 µs); 0 is not valid.
+  Bit 15 `LLI_EN` and bits 20:16 = low latency interrupts (matching
+  packets bypass moderation, credit-limited, §7.3.6); bits 30:21 the
+  down counter; bit 31 `CNT_INGR` = the write leaves the counters alone.
+  Not reset by `CTRL.DEV_RST`. No link-speed dependence documented (Linux
+  fixes 4k/s below gigabit as its own policy). Linux's values agree:
+  `IGB_20K_ITR` 196 (49 µs), `IGB_70K_ITR` 56, `IGB_4K_ITR` 980, ethtool
+  `rx-usecs << 2`, "off" written as 0x4.
+- *Behaviour* (§7.3.5): the counter is loaded when an interrupt is sent
+  and counts down; if it reaches zero with no cause, it stays at zero and
+  the next packet interrupts at once ("Case B"). So sparse traffic (pings,
+  DNS, games) is never delayed; only packets within the interval after the
+  previous interrupt wait, at most the interval, and under load the rate
+  is capped at 1/interval. A fixed interval is therefore enough: no need
+  for Linux's adaptive ITR. With auto-mask, re-arming `EIMS` after the
+  counter ran out fires immediately.
+- *Change:* `EITR0 = (µs << 2) | CNT_INGR` for RX, 25–50 µs (≤ 40k–20k
+  interrupts/s; ≤ 50 µs is ~1 % of CAKE's 5 ms target). `EITR1` (TX)
+  stays at 0x4: it is armed only when blocked, and a later wakeup there
+  idles the line (allowed with auto-mask, Table 7-53 note 4). A boot
+  argument (e.g. `igb_itr_us=`, `0` = 0x4) makes the comparison and the
+  negative control a reboot apart.
+- *QEMU:* the delay is `(value & 0x7FFE) × 1024 ns`, about 4× the
+  hardware's (50 µs = value 200 waits ~205 µs). QEMU only shows it works;
+  latency and CPU numbers come from the apu4.
 - *RX ring together with it:* while the interrupt waits, the 64-entry RX
   ring must hold the burst. At 1500 B, 50 µs at line rate is ~4 frames,
   but 64 B frames at gigabit are ~74, more than the 63 the device owns,

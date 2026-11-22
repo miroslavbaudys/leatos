@@ -18,7 +18,7 @@
 //! ([`Igb::can_transmit`] first), a BQL-style in-flight byte limit, no
 //! queue inside the driver, and NAPI-style interrupts (masked while
 //! `net::stack` polls, unmasked once drained). No interrupt moderation
-//! (`EITR` = 0): masking during the poll already batches.
+//! (`EITR` at its 1 µs minimum): masking during the poll already batches.
 //!
 //! Interrupts: INTx (aarch64 `virt`; `ICR`/`IMS`: the IRQ action masks the
 //! line, the poll reads `ICR` to de-assert it) or MSI-X vector 0 (x86_64;
@@ -125,6 +125,8 @@ const GPIE_MSIX_MODE: u32 = 1 << 4;
 const GPIE_EIAME: u32 = 1 << 30;
 const GPIE_PBA: u32 = 1 << 31;
 const IVAR_VALID: u32 = 0x80;
+/// `EITR` interval of 1 µs (the field is bits 14:2, in µs).
+const EITR_MIN: u32 = 1 << 2;
 /// Extended interrupt bits: vector 0 = RX (and TX without a TX vector), 1 = TX.
 const EI_RX: u32 = 1 << 0;
 const EI_TX: u32 = 1 << 1;
@@ -256,9 +258,18 @@ impl Igb {
         Ok(nic)
     }
 
+    /// Mask everything and undo the MSI-X setup. `EIMS`, `EIAC` and `EIAM`
+    /// survive even `CTRL.DEV_RST` (datasheet §8.8.5–8.8.8), and a kexec'd
+    /// kernel inherits them: one that never writes `EIAM` (before
+    /// self-masking) would see its RX vector mask itself on the first
+    /// interrupt and never be re-armed.
     fn disable_irqs(&mut self) {
         self.regs.write32(IMC, u32::MAX);
         self.regs.write32(EIMC, u32::MAX);
+        self.regs.write32(EIAM, 0);
+        self.regs.write32(EIAC, 0);
+        self.regs.write32(GPIE, 0);
+        self.regs.write32(EICR, u32::MAX); // write-1-to-clear
         let _ = self.regs.read32(ICR);
     }
 
@@ -386,8 +397,10 @@ impl Igb {
     /// 1, left masked until [`Self::arm_tx_irq`].
     pub fn enable_irq(&mut self, msix: bool, tx_vector: bool) {
         let tx_vector = msix && tx_vector;
-        self.regs.write32(EITR0, 0);
-        self.regs.write32(EITR1, 0);
+        // No moderation: the shortest interval, 1 µs (bits 14:2; 0 "is not
+        // a valid setting", datasheet §8.8.14).
+        self.regs.write32(EITR0, EITR_MIN);
+        self.regs.write32(EITR1, EITR_MIN);
         // IVAR0: byte 0 = RX queue 0 → vector 0, byte 1 = TX queue 0 →
         // vector 0, or 1 with a TX vector.
         self.regs
