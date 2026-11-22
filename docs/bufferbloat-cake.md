@@ -719,3 +719,70 @@ allocation failures. Window rates above the shaped 90/18 are timing error
   cache effects grow with rate) puts the single-core limit near
   300 Mbit/s combined, and the split one near 400 Mbit/s download.
 - Not measured: gigabit (needs a faster line or a LAN test host).
+
+### igb (i211) interrupts (2026-11-22)
+An analysis of the i211's interrupt use on the apu4 (MSI-X, x86_64) found
+five costs. Four are fixed; interrupt moderation (step 5) is open.
+
+**Done** (`drivers/igb.rs`, `net/stack.rs`, `net/datapath.rs::flush_port`):
+1. *TX completions on their own vector* (`12a65e8`). Before, RX and TX of
+   a NIC shared one vector, delivered to the receiving core: each batch
+   sent to the LAN interrupted `dp_up` on core 1, which polled an empty RX
+   ring and woke `dp_down` on core 0 with an IPI to free the packets (the
+   reverse for uploads on wan0). Now TX queue 0 is on MSI-X entry/vector 1,
+   delivered to the transmitting core.
+2. *TX interrupt only when blocked* (`12a65e8`). The vector stays masked and
+   is armed (`Nic::arm_tx_irq`) only while the qdisc has a backlog and the
+   ring or the 8 × 1514 B in-flight limit is full: clear `EICR` bit 1,
+   flush the write with a read, reap, then `EIMS` (a completion after the
+   reap fires; no lost wakeup). Otherwise the next flush reaps. The 1 ms
+   fallback poll remains only for NICs without a TX vector.
+3. *No `ICR` read per interrupt in MSI-X mode* (`ed6e10f`): `EIAC` clears
+   the cause; the read was a wasted non-posted PCIe read (~0.5–1 µs).
+4. *Self-masking via `EIAM`* (`ed6e10f`): the NIC masks its vector when the
+   message goes out, the IRQ action only signals, re-arming is one posted
+   `EIMS` write, and the MSI-X table lock is off the per-packet path.
+
+INTx (aarch64 QEMU) and virtio-net keep the old scheme.
+
+QEMU x86_64, `QEMU_NIC=igb QEMU_SMP=4 scripts/lab-test.sh`, load phase,
+before vs. after 1+2 (both with 3+4):
+
+| | before | after |
+|---|---|---|
+| Device interrupts, core 0 / core 1 | 12819 / 13095 | 6554 / 6463 |
+| `dp_down` + `dp_up` CPU | 5673 ms | 4317 ms |
+| Shaped down / up | 9554 / 9275 kbit/s | 9554 / 9275 kbit/s |
+| Download packets' queue wait | 8.9 ms | 9.0 ms |
+
+QEMU's 82576 is not the i211: the apu4 numbers (90/18, `dev_irqs` per core
+and CPU in `/api/status`, `scripts/bufferbloat.sh`) are still to be taken,
+after the soak run that ends 2026-11-25.
+
+**Open: step 5, interrupt moderation (`EITR`).** `EITR0`/`EITR1` are 0: no
+moderation. At 90/18 Mbit/s (~7.5 kpps down plus the ACKs up) forwarding a
+packet takes far less than the ~130 µs between packets, so the NAPI poll
+rarely finds more than one: about one interrupt, wakeup and poll per packet.
+This is the likely bulk of the ~21 % / 33 % CPU measured above.
+- *Change:* a small `EITR0` interval (RX), 20–50 µs (≤ 50k interrupts/s).
+  The added latency, ≤ 50 µs, is ~1 % of CAKE's 5 ms target, so it fits
+  the latency-first rule. Probably no moderation for `EITR1` (TX): it is
+  armed only when blocked, and a later wakeup there idles the line.
+  Check the interval's units and field (`ITR_INTERVAL`, bits 14:2; the
+  `CNT_INGR` bit) in the i210/i211 datasheet before choosing the value;
+  a boot argument (e.g. `igb_itr_us=`, `0` = off) makes the comparison and
+  the negative control a reboot apart. Linux's adaptive ITR (low interval
+  for sparse traffic, higher under bulk) is the refinement if a fixed one
+  costs latency on sparse traffic.
+- *RX ring together with it:* while the interrupt waits, the 64-entry RX
+  ring must hold the burst. At 1500 B, 50 µs at line rate is ~4 frames,
+  but 64 B frames at gigabit are ~74, more than the 63 the device owns,
+  and `SRRCTL_DROP_EN` drops them. Raise `RX_RING` to 256 (four NICs ×
+  256 buffers from the 8192-buffer pool; check the pool's headroom).
+- *Measure (validity):* the same load before and after (bufferbloat.sh at
+  90/18 on the apu4, valid runs only), comparing `dev_irqs` per core, the
+  datapath tasks' CPU and the queue delay / grade, which must not get
+  worse. RX drops must be visible first: add the NIC's missed-packets
+  counter (`MPC`, or the RX no-descriptor drops) next to
+  `rx_dropped_no_buf` in `/api/status`, and show it stays 0 (negative
+  control: a large interval with the 64-entry ring should make it rise).
