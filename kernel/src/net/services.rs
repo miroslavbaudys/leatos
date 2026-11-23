@@ -859,12 +859,25 @@ impl LanServices {
                 Action::Reply { to, data, tcp: false } => {
                     // The client's network: its IPv4 subnet, or its IPv6
                     // address in the network's ULA /64 (a client asking the
-                    // router's ULA asks from its own ULA, RFC 6724).
+                    // router's ULA asks from its own ULA, RFC 6724); else
+                    // the network whose `[[route]]` leads to it (a host
+                    // behind a router there).
+                    let ula64 = |n: &Net, ip: Ipv6Addr| n.cfg.ula.is_some_and(|u| u128::from(u) >> 64 == u128::from(ip) >> 64);
                     let mine = |n: &&Net| match to.ip() {
-                        IpAddr::V4(ip) => n.cfg.contains(ip),
-                        IpAddr::V6(ip) => n.cfg.ula.is_some_and(|u| u128::from(u) >> 64 == u128::from(ip) >> 64),
+                        IpAddr::V4(ip) => n.cfg.reaches(ip),
+                        IpAddr::V6(ip) => ula64(n, ip),
                     };
-                    let Some(net) = self.nets.iter().find(mine) else {
+                    let net = self.nets.iter().find(mine).or_else(|| {
+                        let IpAddr::V6(ip) = to.ip() else {
+                            return None;
+                        };
+                        let via = crate::config::static_routes6().into_iter().find(|&(dst, len, _)| {
+                            let m = if len == 0 { 0 } else { u128::MAX << (128 - u32::from(len.min(128))) };
+                            u128::from(ip) & m == u128::from(dst) & m
+                        })?;
+                        self.nets.iter().find(|n| ula64(n, via.2))
+                    });
+                    let Some(net) = net else {
                         continue;
                     };
                     let ep = IpEndpoint::new(to.ip().into(), to.port());

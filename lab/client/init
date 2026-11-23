@@ -502,6 +502,26 @@ if $bb grep -q 'lab_routes=' /proc/cmdline; then
   else
     fail "routes: ping 192.168.1.1 from 10.30.0.5"; $bb tail -2 /tmp/rping | $bb sed "s/^/    | /"
   fi
+  # The router's own UDP and TCP answers over the route too
+  # (docs/lan-neighbors.md §4: its stack has no link layer on the LAN, the
+  # datapath picks the route's gateway): a DNS query for router.lan
+  # (crafted: ID 0x5678, RD, A) and GET /api/info from 10.30.0.5. None of
+  # the router's packets may lack a next hop (lan_nd.local_no_route).
+  nnr() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb sed -n 's/.*"local_no_route":\([0-9]*\).*/\1/p'; }
+  nr0=$(nnr)
+  rdns=$($bb printf '\126\170\001\000\000\001\000\000\000\000\000\000\006router\003lan\000\000\001\000\001' \
+    | $bb nc -u -w 3 -s 10.30.0.5 192.168.1.1 53 2>/dev/null | $bb od -An -tx1 | $bb tr -s ' \n' ' ')
+  rhttp=$(printf 'GET /api/info HTTP/1.0\r\nHost: 192.168.1.1\r\n\r\n' | $bb nc -w 5 -s 10.30.0.5 192.168.1.1 80 2>/dev/null | $bb head -1 | $bb cut -d' ' -f2)
+  nr1=$(nnr)
+  case "$rdns" in
+    " 56 78 "*" c0 a8 01 01"*) pass "routes: the router's DNS answers 10.30.0.5 (router.lan -> 192.168.1.1)" ;;
+    *) fail "routes: no DNS answer to 10.30.0.5:${rdns:- (none)}" ;;
+  esac
+  if [ "$rhttp" = 200 ]; then pass "routes: the router's web interface answers 10.30.0.5 over TCP"
+  else fail "routes: GET /api/info from 10.30.0.5: '${rhttp:-no answer}'"; fi
+  if [ -z "$nr0" ] || [ -z "$nr1" ]; then fail "routes: no lan_nd.local_no_route in /api/status"
+  elif [ "$nr1" = "$nr0" ]; then pass "routes: no router packet without a next hop ($nr0 -> $nr1)"
+  else fail "routes: router packets without a next hop: $nr0 -> $nr1"; fi
   rst=$($bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb sed -n 's/.*"routes":\[\([^]]*\)\].*/\1/p')
   if echo "$rst" | $bb grep -q '"dst":"10.30.0.0/24","via":"192.168.1.100","dev":"lan","kind":"static","name":"lab-behind","active":true'; then
     pass "routes: /api/status lists lab-behind in use on lan"
@@ -574,6 +594,86 @@ if $bb grep -q 'lab_neigh=1' /proc/cmdline; then
     elif [ "$1" != 0 ]; then fail "neighbors router: first contact lost (ARP hints): $what"
     elif [ "$2" != 0 ] || [ "$3" != 0 ]; then fail "neighbors router: answers lost later (neighbor cache): $what"
     else pass "neighbors router: $what"; fi
+    # C: readdressing keeps neighbors (docs/lan-neighbors.md §4; needs the
+    # store and IPv6: LAB_GUEST=1 or LAB_GUEST_LIVE=1, with LAB_IPV6=1):
+    # the LAN's ULA prefix moved to fd99:1:2::/48 and back by two live
+    # saves (what a new delegated prefix does too), so the LAN interface's
+    # addresses change twice; its IPv4 neighbors must stay, a fourth round
+    # right after loses nothing. INVALID unless the router showed the new
+    # ULA in between. Negative control LAB_ROUTER_ARGS="lan_medium=eth
+    # arp_hints=0": smoltcp empties its cache on every address update
+    # (update_ip_addrs) and nothing refills it.
+    if $bb grep -q 'lab_guest=' /proc/cmdline && $bb grep -q 'lab_ipv6=' /proc/cmdline; then
+      rpost() { $bb wget -q -T 20 -O - --header "Content-Type: application/toml" --post-data="$($bb cat "$1")" \
+        "http://admin:lab-pass@192.168.1.1/api/config" 2>&1; }
+      $bb wget -q -T 5 -O /tmp/ncfg-orig.toml "http://admin:lab-pass@192.168.1.1/api/config" 2>/dev/null
+      if $bb grep -q '^ula_prefix' /tmp/ncfg-orig.toml; then
+        $bb sed 's#^ula_prefix = .*#ula_prefix = "fd99:1:2::/48"#' /tmp/ncfg-orig.toml >/tmp/ncfg-moved.toml
+      elif $bb grep -q '^\[ipv6\]' /tmp/ncfg-orig.toml; then
+        $bb sed 's#^\[ipv6\]$#[ipv6]\nula_prefix = "fd99:1:2::/48"#' /tmp/ncfg-orig.toml >/tmp/ncfg-moved.toml
+      else
+        { $bb cat /tmp/ncfg-orig.toml; printf '\n[ipv6]\nula_prefix = "fd99:1:2::/48"\n'; } >/tmp/ncfg-moved.toml
+      fi
+      r1=$(rpost /tmp/ncfg-moved.toml); $bb sleep 1
+      moved=$(nst | $bb grep -c 'fd99:1:2:')
+      r2=$(rpost /tmp/ncfg-orig.toml); $bb sleep 1
+      # (Our SLAAC address in the moved prefix stays, deprecated: the
+      # router announces a retired prefix that way for 2 h.)
+      l=0; i=0
+      while [ $i -lt "$nhosts" ]; do
+        $bb ping -c 1 -W 1 -I "192.168.1.$((200 + i))" 192.168.1.1 >/dev/null 2>&1 || l=$((l + 1))
+        i=$((i + 1))
+      done
+      case "$r1$r2" in
+        *'"applied":true'*'"applied":true'*)
+          if [ "$moved" = 0 ]; then fail "neighbors readdress: INVALID, the router never showed the ULA fd99:1:2::/48"
+          elif [ "$l" = 0 ]; then pass "neighbors readdress: none of $nhosts lost after the LAN's ULA moved and back (live)"
+          else fail "neighbors readdress: lost $l of $nhosts after the LAN's ULA moved and back (neighbors forgotten)"; fi ;;
+        *) fail "neighbors readdress: INVALID, config not applied: $r1 / $r2" ;;
+      esac
+    fi
+    # D: address conflicts (docs/lan-neighbors.md §4): the datapath answers
+    # ARP for the router, so it sees another MAC claim or probe for its
+    # address (lan_nd.conflicts). An RFC 5227 probe (sender 0.0.0.0) is
+    # answered (the address defended) and counted; a gratuitous claim
+    # (sender 192.168.1.1, our MAC) counted; the router still answers ARP
+    # afterwards. Not counted: a claim for another address, and one from
+    # the router's own MAC (eth0 set to it for a moment; skipped if the
+    # NIC cannot change its MAC live). On lan_medium=eth smoltcp answers
+    # ARP and nothing is counted (INFO).
+    ncf() { nst | $bb sed -n 's/.*"lan_nd":{[^}]*"conflicts":\([0-9]*\).*/\1/p'; }
+    if nst | $bb grep -q '"lan_nd":{"medium":"eth"'; then
+      echo "LAB INFO: neighbors conflict: not counted on lan_medium=eth (smoltcp answers ARP)"
+    else
+      echo 1 >/proc/sys/net/ipv4/ip_nonlocal_bind
+      c0=$(ncf)
+      $bb arping -q -U -c 2 -w 3 -I eth0 -s 192.168.1.250 192.168.1.250 >/dev/null 2>&1
+      c1=$(ncf)
+      probe=$($bb arping -D -c 2 -w 3 -I eth0 192.168.1.1 2>&1 | $bb sed -n 's/^Received \([0-9]*\) .*/\1/p')
+      $bb arping -q -U -c 2 -w 3 -I eth0 -s 192.168.1.1 192.168.1.1 >/dev/null 2>&1
+      c2=$(ncf)
+      after=$($bb arping -c 2 -w 3 -I eth0 192.168.1.1 2>&1 | $bb sed -n 's/^Received \([0-9]*\) .*/\1/p')
+      what="conflicts ${c0:-?} -> ${c1:-?} (other address) -> ${c2:-?} (probe + claim); probe answered ${probe:-?}, ARP after ${after:-?} of 2"
+      if [ -z "$c0" ] || [ -z "$c2" ]; then fail "neighbors conflict: no lan_nd.conflicts in /api/status ($what)"
+      elif [ "$c1" != "$c0" ]; then fail "neighbors conflict: a claim for another address counted ($what)"
+      elif [ $((c2 - c1)) -lt 2 ]; then fail "neighbors conflict: probe and claim not counted ($what)"
+      elif [ "${probe:-0}" -lt 1 ] || [ "${after:-0}" -lt 1 ]; then fail "neighbors conflict: the router stopped answering ($what)"
+      else pass "neighbors conflict: $what"; fi
+      # The router's own MAC: a looped-back frame, not a conflict.
+      # (Counters read with our own MAC: the router answers that one.)
+      cmac=$($bb cat /sys/class/net/eth0/address)
+      c3=$(ncf)
+      if $bb ip link set dev eth0 address "$rmac" 2>/dev/null; then
+        $bb arping -q -U -c 2 -w 3 -I eth0 -s 192.168.1.1 192.168.1.1 >/dev/null 2>&1
+        $bb ip link set dev eth0 address "$cmac"
+        c4=$(ncf)
+        if [ -n "$c3" ] && [ "$c3" = "$c4" ]; then pass "neighbors conflict: a claim from the router's own MAC not counted ($c3 -> $c4)"
+        else fail "neighbors conflict: a claim from the router's own MAC counted (${c3:-?} -> ${c4:-?})"; fi
+      else
+        echo "LAB INFO: neighbors conflict: own-MAC control skipped (eth0 cannot change its MAC while up)"
+      fi
+      echo 0 >/proc/sys/net/ipv4/ip_nonlocal_bind
+    fi
     i=0
     while [ $i -lt "$nhosts" ]; do
       $bb ip addr del "192.168.1.$((200 + i))/24" dev eth0 2>/dev/null
@@ -888,6 +988,13 @@ if [ -n "$v6on" ]; then
       else
         fail "routes6: ping6 $r6 from fd00:30::5"; $bb tail -2 /tmp/p6r | $bb sed 's/^/    | /'
       fi
+      # Its DNS answer too (UDP replies pick the network by the route).
+      r6dns=$($bb printf '\126\171\001\000\000\001\000\000\000\000\000\000\006router\003lan\000\000\001\000\001' \
+        | $bb nc -u -w 3 -s fd00:30::5 "$r6" 53 2>/dev/null | $bb od -An -tx1 | $bb tr -s ' \n' ' ')
+      case "$r6dns" in
+        " 56 79 "*" c0 a8 01 01"*) pass "routes6: the router's DNS answers fd00:30::5" ;;
+        *) fail "routes6: no DNS answer to fd00:30::5:${r6dns:- (none)}" ;;
+      esac
       r6s=$(v6st | $bb sed -n 's/.*"routes6":\[\([^]]*\)\].*/\1/p')
       if echo "$r6s" | $bb grep -q '"name":"lab-behind6","dst":"fd00:30::/64","via":"fd13:34ac:fcc9:0:5054:ff:fe00:10","active":true'; then
         pass "routes6: /api/status lists lab-behind6 active"
@@ -967,7 +1074,7 @@ if [ -n "$v6on" ]; then
       # unique local addresses (the router learned them from neighbor
       # discovery, named by our DHCP lease), and the PTR of the global
       # one. Negative control LAB_ROUTER_ARGS=dns_aaaa=0.
-      ula6=$($bb ip -6 addr show dev eth0 scope global | $bb sed -n 's/.*inet6 \(fd[0-9a-f:]*:5054:ff:fe00:10\)\/64.*/\1/p' | $bb head -1)
+      ula6=$($bb ip -6 addr show dev eth0 scope global | $bb grep -v deprecated | $bb sed -n 's/.*inet6 \(fd[0-9a-f:]*:5054:ff:fe00:10\)\/64.*/\1/p' | $bb head -1)
       aaaa=""
       for i in $($bb seq 1 15); do
         aaaa=$($bb nslookup -type=AAAA labclient.lan 192.168.1.1 2>&1)

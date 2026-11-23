@@ -142,8 +142,9 @@ Modes that imply `LAB_GUEST=1`:
   `LAB_MDNS_RULES=0`.
 - `LAB_ROUTES=1`: `[[route]]` lab-behind 10.30.0.0/24 via the client, 10.30.0.5 on its loopback:
   option 121 (route + default), NAT to the ISP and ping to the router from 10.30.0.5, `/api/status`
-  `routes`, the ISP forging 10.30.0.5 dropped as `spoofed` (`cgi-bin/spoof?8080&src=`). Negative
-  control `LAB_ROUTES=0` (route disabled).
+  `routes`, the ISP forging 10.30.0.5 dropped as `spoofed` (`cgi-bin/spoof?8080&src=`); the
+  router's own answers to 10.30.0.5 over UDP (DNS `router.lan`) and TCP (`GET /api/info`) with
+  `lan_nd.local_no_route` unchanged. Negative control `LAB_ROUTES=0` (route disabled).
 - `LAB_PORTS=1`: the router gets a third NIC (`lan1`, `LAB_LAN1_PORT`), network wired 10.40.0.1/24
   untagged on it; the client's second NIC (`VM_NIC2` in `scripts/lab/common.sh`) moves into a
   network namespace: lease, ping router and ISP, `/api/status` wired on lan1, lan0 → lan1 above
@@ -206,6 +207,18 @@ table (no hints, no smoltcp cache on the LANs). Negative controls
 `LAB_ROUTER_ARGS="lan_medium=eth arp_hints=0"` (the old path without hints: round 1 fails),
 `LAB_NEIGH_CACHE=8` with `lan_medium=eth` (kernel built `--no-default-features`: rounds 2–3),
 `LAB_ROUTER_ARGS=neigh_probe=0` (forwarded).
+
+Two more parts (docs/lan-neighbors.md §4):
+
+- **Readdress** (with `LAB_GUEST=1` or `LAB_GUEST_LIVE=1` for the store, and `LAB_IPV6=1`): the
+  LAN's ULA prefix moved to fd99:1:2::/48 and back by two live `/api/config` saves (as a new
+  delegated prefix would), then a fourth IPv4 round loses nothing; INVALID unless the router showed
+  the new ULA. Negative control `LAB_ROUTER_ARGS="lan_medium=eth arp_hints=0"` (smoltcp empties
+  its cache on every address update: 40 of 40 lost).
+- **Conflicts** (`lan_nd.conflicts`): an RFC 5227 probe for 192.168.1.1 is answered and counted, a
+  gratuitous claim from the client's MAC counted, the router still answers ARP after; a claim
+  for another address and one from the router's own MAC (eth0 set to it for a moment) are the
+  controls that must not count. Skipped (INFO) on `lan_medium=eth`.
 
 ### `LAB_ACK=1`: ACK filter
 

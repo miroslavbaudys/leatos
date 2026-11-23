@@ -1,9 +1,10 @@
 # LAN neighbors: one table per link (plan)
 
-Status (2026-11-22): step 0 done except the upstream report (lab check `LAB_ND_FLOOD=1` for its
+Status (2026-11-23): step 0 done except the upstream report (lab check `LAB_ND_FLOOD=1` for its
 WAN fix); step 1 done (`fwd::nd`, host tests, `fwd` fuzz target); step 2 done (`fwd::local`,
 `Datapath::send_local` / `set_local_link`); step 3 in QEMU (LAN links IP-only by default,
-`lan_medium=eth` fallback, lab checks for unicast NS and the Router flag). Nothing is deployed before the apu4 soak ends (2026-11-25).
+`lan_medium=eth` fallback), all §4 lab checks in place (unicast NS, Router flag, readdress, local
+traffic over a `[[route]]`, conflicts). Nothing is deployed before the apu4 soak ends (2026-11-25).
 
 ## 1. The problem
 
@@ -148,14 +149,20 @@ sleeping and waking, IPv6 privacy addresses):
   ignores unicast NS, as smoltcp did) → FAILED.
 - **New: router flag.** After NS / NA exchanges the client keeps its IPv6 default route via the
   router (`LAB_IPV6=1`). Negative control: `na_router=0` (NAs without R) → the route disappears.
-- **New: readdress keeps neighbors.** A live `/api/config` change to a network (`LAB_GUEST_LIVE=1`)
-  and a prefix change (`LAB_IPV6=1`, `cgi-bin/pd?change`): pings to the router from the
-  `LAB_NEIGH` addresses lose nothing afterwards. Negative control: `lan_medium=eth arp_hints=0`.
-- **New: local traffic over a `[[route]]`.** `LAB_ROUTES=1`: the router answers 10.30.0.5 (ping,
-  DNS) through the client as next hop. Negative control: `LAB_ROUTES=0`.
-- **ARP / ND conflict:** the client claims the router's address with `arping -U` from a second
-  MAC: `nd_conflicts` rises, the router keeps answering. Negative control: the claim from the
-  router's own MAC does not count.
+- **New: readdress keeps neighbors.** `LAB_NEIGH=1 LAB_GUEST=1 LAB_IPV6=1`: the LAN's ULA prefix
+  moved and back by two live `/api/config` saves (the LAN interface's addresses change, as with a
+  new delegated prefix; another network's change does not touch the LAN interface even on the old
+  path), then pings to the router from the `LAB_NEIGH` addresses lose nothing. Negative control:
+  `lan_medium=eth arp_hints=0` (40 of 40 lost).
+- **New: local traffic over a `[[route]]`.** `LAB_ROUTES=1` (+ `LAB_IPV6=1`): the router answers
+  10.30.0.5 (ping, DNS over UDP, `GET /api/info` over TCP) and fd00:30::5 (ping, DNS) through the
+  client as next hop, `local_no_route` unchanged. Negative control: `LAB_ROUTES=0`. This found a
+  bug older than this plan: UDP DNS replies picked their network by the client's subnet only, so
+  hosts behind a `[[route]]` got none (`Lan::reaches`, services.rs).
+- **ARP conflict** (`LAB_NEIGH=1`): an RFC 5227 probe and a gratuitous claim (`arping -D`, `-U`)
+  for 192.168.1.1 from the client's MAC: `lan_nd.conflicts` rises by both, the probe is answered,
+  ARP still answered after. Controls: a claim for another address and one from the router's own
+  MAC (eth0 set to it for a moment) do not count. ND (DAD / NA) conflicts: host tests only.
 - Everything else unchanged and run as the CLAUDE.md table says for device, datapath, services,
   IPv6 and DHCP changes: lab default, `LAB_GUEST` (+ `LAB_GUEST_LIVE`), `LAB_PORTS`, `LAB_IPV6`,
   `LAB_ROUTES`, `LAB_MDNS` (multicast mapping), `LAB_DNS_VIEWS`, `LAB_DOT`, `LAB_PPPOE=pap`

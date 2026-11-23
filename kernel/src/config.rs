@@ -584,6 +584,15 @@ impl Lan {
         let m = u32::from(self.netmask());
         u32::from(ip) & m == u32::from(self.addr) & m
     }
+
+    /// `ip` is on this network or behind one of its `[[route]]`s.
+    pub fn reaches(&self, ip: Ipv4Addr) -> bool {
+        self.contains(ip)
+            || self.routes.iter().any(|&(dst, len, _)| {
+                let m = if len == 0 { 0 } else { u32::MAX << (32 - u32::from(len.min(32))) };
+                u32::from(ip) & m == u32::from(dst) & m
+            })
+    }
 }
 
 /// Zone names by index: `wan` is 0, then `lan` (built in or defined), then

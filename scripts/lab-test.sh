@@ -60,7 +60,15 @@
 #                        LAB_ROUTER_ARGS="lan_medium=eth arp_hints=0" (round
 #                        1 fails), LAB_NEIGH_CACHE=8 with lan_medium=eth
 #                        (smoltcp's default cache: rounds 2-3 fail),
-#                        LAB_ROUTER_ARGS=neigh_probe=0 (forwarded fails)
+#                        LAB_ROUTER_ARGS=neigh_probe=0 (forwarded fails).
+#                        With LAB_GUEST(_LIVE)=1 and LAB_IPV6=1 also a
+#                        readdress: the LAN's ULA prefix moved and back
+#                        live, a fourth round loses nothing (control:
+#                        lan_medium=eth arp_hints=0).
+#                        Conflicts: an ARP probe / claim for 192.168.1.1
+#                        counted (lan_nd.conflicts), the router still
+#                        answers; one for another address or from the
+#                        router's own MAC not counted
 #   LAB_EXPECT_KBIT=N    what the client expects (default: LAB_SHAPE_KBIT);
 #                        set it with LAB_SHAPE_KBIT=0 as a negative control
 #                        The web interface's origin checks run in every mode
@@ -286,7 +294,9 @@
 #                        the default), 10.30.0.5 reaches the ISP through
 #                        NAT and the router itself, /api/status lists the
 #                        route, the ISP forging 10.30.0.5 is dropped as
-#                        spoofed. Negative control: LAB_ROUTES=0 (the route
+#                        spoofed, the router's DNS and web interface answer
+#                        10.30.0.5 (no local_no_route). Negative control:
+#                        LAB_ROUTES=0 (the route
 #                        disabled: every check fails). With LAB_IPV6=1 also
 #                        lab-behind6 = fd00:30::/64 via the client's ULA:
 #                        the router answers fd00:30::5 on the client's
@@ -395,7 +405,7 @@ NEIGH_HOSTS="${LAB_NEIGH_HOSTS:-40}"
 NEIGH_SECS="${LAB_NEIGH_SECS:-35}"
 if [[ -n "$NEIGH" ]]; then
   SHAPE_KBIT="${LAB_SHAPE_KBIT:-0}"
-  [[ -z "${LAB_TIMEOUT:-}" ]] && TIMEOUT=$((TIMEOUT + NEIGH_HOSTS * 3 + NEIGH_SECS + 30))
+  [[ -z "${LAB_TIMEOUT:-}" ]] && TIMEOUT=$((TIMEOUT + NEIGH_HOSTS * 4 + NEIGH_SECS + 60))
 fi
 KERNEL_FEATURES=""
 case "${LAB_NEIGH_CACHE:-}" in
