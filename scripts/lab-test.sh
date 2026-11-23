@@ -44,6 +44,12 @@
 #                        shaping phase is skipped. Negative control
 #                        LAB_ROUTER_ARGS=queue_pkts=384 (the old limit: the
 #                        queue fills by packet count, overflow decides)
+#   LAB_UPLOAD=N         N parallel TCP uploads for LAB_UPLOAD_SECS (30) through
+#                        the upload shaped at LAB_UPLOAD_KBIT (18000, the home
+#                        line; download 98000), as macOS networkQuality on the
+#                        apu4 (2026-11-23); info only: prints the router's
+#                        qdisc wan0 lines (max sojourn, drops); the usual
+#                        shaping phase is skipped
 #   LAB_NEIGH=1          neighbors (apu4, 2026-11-22: wired hosts lost
 #                        packets every 5 min, DNS answers got lost):
 #                        unshaped unless LAB_SHAPE_KBIT is set, router
@@ -426,6 +432,11 @@ if [[ -n "$SWARM" ]]; then
   ROUTER_ARGS="shape_up=${LAB_SWARM_UP_KBIT:-20000} shape_down=$SWARM_KBIT"
   EXPECT_KBIT=0 # no single-download shaping phase
 fi
+UPLOAD="${LAB_UPLOAD:-}"
+if [[ -n "$UPLOAD" ]]; then
+  ROUTER_ARGS="shape_up=${LAB_UPLOAD_KBIT:-18000} shape_down=98000"
+  EXPECT_KBIT=0 # no single-download shaping phase
+fi
 ROUTER_ARGS="$ROUTER_ARGS ${LAB_ROUTER_ARGS:-}"
 # A password in every mode: live config changes (LAB_GUEST_LIVE, the recheck
 # check) and the web interface's CSRF check need it.
@@ -518,7 +529,7 @@ WORK=$(mktemp -d -t leatos-lab)
 PCAP_DIR="${LAB_PCAP_DIR:-}"
 [[ -n "$MDNS" && -z "$PCAP_DIR" ]] && PCAP_DIR="$WORK/pcap"
 # The client-port checks read the WAN capture (not in swarm mode: its rate).
-[[ -z "$SWARM" && -z "$PCAP_DIR" ]] && PCAP_DIR="$WORK/pcap"
+[[ -z "$SWARM$UPLOAD" && -z "$PCAP_DIR" ]] && PCAP_DIR="$WORK/pcap"
 PIDS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null || true; done
@@ -785,7 +796,7 @@ PIDS+=($!)
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
   VM_NIC2="${PORTS:+52:54:00:00:00:11 $((LAN1_PORT + 1)) $LAN1_PORT}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${NEIGH:+ lab_neigh=1 lab_neigh_hosts=$NEIGH_HOSTS lab_neigh_secs=$NEIGH_SECS}${ACK:+ lab_ack=1}${SWARM:+ lab_swarm=$SWARM lab_swarm_kbit=$SWARM_KBIT lab_swarm_secs=${LAB_SWARM_SECS:-15} lab_swarm_mtu=${LAB_SWARM_MTU:-680} lab_swarm_ovf=${LAB_SWARM_OVF:-10}} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN lab_guest_v6=$GUEST_IPV6}${GUEST_LIVE:+ lab_guest_live=1}${LAB_MGMT_SAME_SOURCE:+ lab_mgmt_same=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}${ND_FLOOD:+ lab_nd_flood=1}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${NEIGH:+ lab_neigh=1 lab_neigh_hosts=$NEIGH_HOSTS lab_neigh_secs=$NEIGH_SECS}${ACK:+ lab_ack=1}${SWARM:+ lab_swarm=$SWARM lab_swarm_kbit=$SWARM_KBIT lab_swarm_secs=${LAB_SWARM_SECS:-15} lab_swarm_mtu=${LAB_SWARM_MTU:-680} lab_swarm_ovf=${LAB_SWARM_OVF:-10}}${UPLOAD:+ lab_upload=$UPLOAD lab_upload_secs=${LAB_UPLOAD_SECS:-30}} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN lab_guest_v6=$GUEST_IPV6}${GUEST_LIVE:+ lab_guest_live=1}${LAB_MGMT_SAME_SOURCE:+ lab_mgmt_same=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}${ND_FLOOD:+ lab_nd_flood=1}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so
@@ -819,8 +830,13 @@ tr -d '\r' <"$WORK/client.log" | grep -E "^LAB (PASS|FAIL|INFO|WARN)|^    \|" | 
 # egress, download = the WAN ingress stage (LAN egress with
 # shape_ingress=0).
 router_fails=0
+# Parallel uploads (LAB_UPLOAD): info only, the WAN queue every 10 s.
+if [[ -n "$UPLOAD" ]]; then
+  echo "  LAB INFO: upload, $UPLOAD flows, wan0 every 10 s (max sojourn, overflow drops):"
+  cat "$RLOG" | grep "qdisc wan0 " | sed -n 's/.*flows \([0-9]* new + [0-9]* old\).*overflow drops \([0-9]*\), backlog \([0-9]*\) pkts, max sojourn \(.*\)$/    \4, overflow \2, backlog \3, flows \1/p'
+fi
 # Swarm mode has no upload phase: its check is the client's.
-if [[ "$SHAPE_KBIT" != 0 && -z "$SWARM" ]]; then
+if [[ "$SHAPE_KBIT" != 0 && -z "$SWARM$UPLOAD" ]]; then
   bootarg() { echo " $ROUTER_ARGS " | sed -n "s/.* $1=\([0-9]*\) .*/\1/p"; }
   all=$(bootarg ecn)
   up=$(bootarg ecn_up); up=${up:-${all:-0}}
@@ -1085,7 +1101,7 @@ fi
 # unreachable, and the router's upstream DNS queries leave from many ports.
 # Negative controls: LAB_ROUTER_ARGS=fw_client_ports=0 (port unreachable
 # again), LAB_ROUTER_ARGS=dns_port_random=0 (one port).
-if [[ -z "$SWARM" ]]; then
+if [[ -z "$SWARM$UPLOAD" ]]; then
   if ! command -v tcpdump >/dev/null || [[ ! -f "$PCAP_DIR/wan.pcap" ]]; then
     echo "  LAB FAIL: client ports: INVALID, no WAN capture or no tcpdump to read it"; router_fails=$((router_fails + 1))
   else

@@ -828,6 +828,36 @@ fi
 # decided. Validity: the queue was pushed (AQM or overflow drops > 0) and
 # the swarm moved at least half the shaped rate. Negative control:
 # LAB_ROUTER_ARGS=queue_pkts=384.
+# --- parallel uploads (lab_upload=N): N TCP uploads to the ISP's sink for -----------
+# lab_upload_secs, as macOS networkQuality's 16 flows on the apu4
+# (2026-11-23: the WAN queue's max sojourn ~500 ms for ~40 s at 18 Mbit/s).
+# Info only: scripts/lab-test.sh prints the router's qdisc wan0 lines.
+upl=$($bb sed -n 's/.*lab_upload=\([0-9]*\).*/\1/p' /proc/cmdline)
+if [ -n "$upl" ] && [ "$upl" != 0 ]; then
+  usecs=$($bb sed -n 's/.*lab_upload_secs=\([0-9]*\).*/\1/p' /proc/cmdline); usecs=${usecs:-30}
+  # wan0 is the first interface: its queue is the first "qdisc" object.
+  wq() { echo "$1" | $bb grep -o '"qdisc":{[^}]*' | $bb head -1 | $bb grep -o "\"$2\":[0-9]*" | $bb cut -d: -f2; }
+  st() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null; }
+  u0=$(st)
+  echo "LAB INFO: upload: $upl flows for $usecs s start"
+  i=0; ups=""
+  while [ $i -lt "$upl" ]; do
+    ( $bb head -c 1000000000 /dev/zero | $bb nc -w 2 "$ISP" 5001 >/dev/null 2>&1 ) &
+    ups="$ups $!"
+    i=$((i + 1))
+  done
+  $bb sleep "$usecs"
+  for p in $ups; do $bb kill "$p" 2>/dev/null; done
+  $bb pkill -f "nc -w 2 $ISP 5001" 2>/dev/null
+  $bb sleep 2
+  for i in 1 2 3 4 5 6; do u1=$(st); [ -n "$u1" ] && break; done
+  for k in sent aqm_drops blue_drops overflow_drops ack_drops; do
+    a=$(wq "$u0" $k); b=$(wq "$u1" $k)
+    eval "u_$k=$(( ${b:-0} - ${a:-0} ))"
+  done
+  echo "LAB INFO: upload: done; wan0 sent $u_sent, aqm drops $u_aqm_drops (blue $u_blue_drops), overflow drops $u_overflow_drops, ack drops $u_ack_drops"
+fi
+
 swarm=$($bb sed -n 's/.*lab_swarm=\([0-9]*\).*/\1/p' /proc/cmdline)
 if [ -n "$swarm" ] && [ "$swarm" != 0 ]; then
   srate=$($bb sed -n 's/.*lab_swarm_kbit=\([0-9]*\).*/\1/p' /proc/cmdline)

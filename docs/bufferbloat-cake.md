@@ -511,8 +511,24 @@ The limit itself holds (total bytes ≤ `limit_bytes`, backlog ≤ 171 pkts), so
 are packets of flows that wait for their DRR turn: with n bulk flows (here up to 20, 5 hosts) a
 packet's sojourn is bounded by about n × limit / rate, not limit / rate. The Waveform-like case
 improved (148 vs 355 ms); under 16 parallel flows, CoDel did not bring the per-flow sojourn down
-for ~40 s (aqm drops ~1700 per 10 s, no ECN). Open: reproduce 16 flows in the host
-simulation (`rate_based_limit_caps_the_slow_start_spike` has 1 and 4) and compare with Linux CAKE.
+for ~40 s (aqm drops ~1700 per 10 s, no ECN).
+
+Follow-up the same day, max sojourn per 10 s on `wan0`:
+
+| Upload load | Peak sojourn | Overflow drops |
+|---|---|---|
+| host simulation, 16 Reno-like flows, RTT 30 / 80 ms, also with a 2nd host | 34–78 ms after a 127–164 ms start | start only |
+| QEMU lab `LAB_UPLOAD=16` (Linux senders), `ack_filter` 0 and 1 | 118–120 ms, then 43–46 ms | ~60, start only |
+| apu4, Mac mini wired, `networkQuality -d` (16 flows), quiet home | 207 / 502 / 514 ms | ~1,170 |
+| apu4, Mac mini, 16 × `curl` upload (speed.cloudflare.com) | 462 / 484 / 496 ms | ~4,240 (~250/s) |
+| apu4, Mac mini, 1 × `curl` upload | 81 / 63 / 27 ms | 0 |
+
+So it is not `networkQuality` and not the ACK filter: many parallel macOS TCP uploads on the
+real line keep the queue at its limit (overflow drops as many as AQM drops), and a few flows
+with long per-flow queues wait ~500 ms for their 1/16 share. Linux senders back off and the
+queue settles. Not separated yet: the line's ~28 ms RTT (the lab has almost none). To try after
+the soak: `ecn_up=1` (marks instead of drops; macOS supports ECN) and `blue_after=0`
+(overflows count toward BLUE at once).
 
 ### ACK filter (2026-11-19)
 On an asymmetric line the download's ACKs take a real share of the

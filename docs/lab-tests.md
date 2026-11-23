@@ -236,6 +236,14 @@ rate: INVALID). The ingress queue's `overflow_drops` must stay ≤ `LAB_SWARM_OV
 (`/api/status` `ingress`); invalid unless the queue was pushed and half the rate moved. The usual
 shaping phase is skipped. Negative control `LAB_ROUTER_ARGS=queue_pkts=384`.
 
+### `LAB_UPLOAD=N`: parallel uploads (info only)
+
+N parallel TCP uploads from the client to the ISP's byte sink (port 5001) for `LAB_UPLOAD_SECS`
+(30), upload shaped at `LAB_UPLOAD_KBIT` (18000, the home line), download 98000; the usual shaping
+phase is skipped. No check: prints the router's `qdisc wan0` lines (max sojourn, overflow drops,
+backlog, flows) and the client's `/api/status` deltas, to compare with the apu4
+(docs/bufferbloat-cake.md, 2026-11-23: 16 macOS uploads ~500 ms there, Linux ~45 ms here).
+
 ## Feature tests
 
 - `scripts/store-test.sh` (also `LEATOS_ARCH=x86_64`): store read at boot, config save via the web
