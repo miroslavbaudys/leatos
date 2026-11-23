@@ -498,8 +498,21 @@ overflow drops): PASS. Negative control `LAB_ROUTER_ARGS=queue_ms=0`:
 **419 ms**: FAIL. All other checks pass in both runs (shaper 9.5/9.4
 Mbit/s, latency under load avg 2 ms, ECN per direction).
 
-Not yet measured on the apu4: the upload start-up spike at 90/18 with the
-new limit (expected ≤ ~100 ms instead of 355 ms).
+**apu4, 2026-11-23** (457cb97, home line, shaper 98/18, `limit_bytes`
+219530 ≈ 98 ms; peak = the 10 s `qdisc wan0` log line's max sojourn):
+
+| Upload load | Shaper held? | Overflow drops | Peak sojourn | Client view |
+|---|---|---|---|---|
+| 2026-11-14, Waveform, Windows, fixed 384-pkt limit | yes | 130 | 355 ms | A+ |
+| Waveform, Mac on Wi-Fi, tab in the background | yes (66 overflows) | 66 | 148 ms, then 93 / 65 / 68 | A, +9 ms up, 12.0 Mbit/s |
+| `networkQuality -d`, Mac mini wired, 16 flows | yes, 18.06 Mbit/s | 577 | 241 / **589** / 553 / 470 / 589 ms | responsiveness Low (1.97 s) |
+
+The limit itself holds (total bytes ≤ `limit_bytes`, backlog ≤ 171 pkts), so the long sojourns
+are packets of flows that wait for their DRR turn: with n bulk flows (here up to 20, 5 hosts) a
+packet's sojourn is bounded by about n × limit / rate, not limit / rate. The Waveform-like case
+improved (148 vs 355 ms); under 16 parallel flows, CoDel did not bring the per-flow sojourn down
+for ~40 s (aqm drops ~1700 per 10 s, no ECN). Open: reproduce 16 flows in the host
+simulation (`rate_based_limit_caps_the_slow_start_spike` has 1 and 4) and compare with Linux CAKE.
 
 ### ACK filter (2026-11-19)
 On an asymmetric line the download's ACKs take a real share of the
