@@ -742,16 +742,27 @@ if [ -n "$want" ] && [ "$want" != 0 ]; then
     case "$resp" in "ok 120000 "*) okc=$((okc + 1)) ;; esac
   done
   t1=$(now_ms)
-  kbit=$(( 20 * 120000 * 8 / (t1 - t0) ))
+  pkbit=$(( 20 * 120000 * 8 / (t1 - t0) ))
   if [ "$okc" != 20 ]; then
     fail "shaper up: only $okc/20 uploads arrived intact (last response: $(echo $resp | $bb head -c 80))"
-  elif [ "$kbit" -ge "$lo" ] && [ "$kbit" -le "$hi" ]; then pass "shaper up: $kbit kbit/s over 20 x 120 KB (shaped $want)"
-  else fail "shaper up: $kbit kbit/s, expected $lo..$hi"; fi
+  else
+    pass "uploads: 20 x 120 KB arrived intact ($pkbit kbit/s with each request's setup)"
+  fi
   # One long upload connection (3 MB), so the AQM acts on the WAN egress
   # queue (short POSTs end before CoDel's 100 ms interval). The router's
-  # marks/drops for it are checked by scripts/lab-test.sh.
+  # marks/drops for it are checked by scripts/lab-test.sh. Its rate is the
+  # upload shaper's: the 20 POSTs above each pay for a process, a TCP
+  # handshake, slow start and a CGI, ~15 % under TCG (7966-8135 kbit/s
+  # against 9500 on HVF at 10000, 2026-11-23), which is not the shaper.
+  t0=$(now_ms)
   got=$($bb head -c 3000000 /dev/zero | $bb nc -w 5 "$ISP" 5001 2>&1 | $bb tr -d ' ')
-  echo "LAB INFO: long upload: ISP sink reports '${got}' bytes"
+  t1=$(now_ms)
+  if [ "$got" != 3000000 ]; then fail "shaper up: the ISP's sink got '${got}' of 3000000 bytes"
+  else
+    kbit=$(( 3000000 * 8 / (t1 - t0) ))
+    if [ "$kbit" -ge "$lo" ] && [ "$kbit" -le "$hi" ]; then pass "shaper up: $kbit kbit/s over one 3 MB upload (shaped $want)"
+    else fail "shaper up: $kbit kbit/s over one 3 MB upload, expected $lo..$hi"; fi
+  fi
   fi
   cpu1=$($bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null)
   load=""
@@ -796,9 +807,15 @@ if [ -n "$want" ] && [ "$want" != 0 ]; then
   # scripts/lab-test.sh can check that a full queue's delay follows the
   # rate (shaping.queue_ms). After the CPU sample: it is not part of the
   # task split's load phase.
+  # nc returns once it has sent; the router's queue still holds ~100 ms
+  # of it. Wait until it has drained: the next checks ask /api/status at
+  # once (the IPv6 ones), and on a single core building it (~25 ms under
+  # TCG, 2026-11-23) stops the datapath, which the full queue's worst
+  # delay would count (167-203 ms with IPv6 under TCG, 93 ms on 4 cores).
   if [ "$ackmode" != 1 ]; then
     $bb head -c 2500000 /dev/zero | $bb nc -u -w 1 "$ISP" 9 >/dev/null 2>&1
     echo "LAB INFO: upload burst sent (2.5 MB UDP)"
+    $bb sleep 1
   fi
 fi
 
