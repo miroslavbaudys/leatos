@@ -1,8 +1,10 @@
 # Split-horizon local DNS (design)
 
-Status (2026-11-18): all five steps of §12 done in QEMU; open: a visual
-check of the web page in a browser (the Claude in Chrome extension cannot
-open the router's page) and the apu4.
+Status (2026-11-23): all five steps of §12 done in QEMU; on the apu4
+(457cb97, `views = "firewall"`, home config) the DNS page and its "Local
+names" card render in Chrome without console errors, and from `lan` the
+iot-only override `time.evrythng.com` gets the public answer (NXDOMAIN)
+while iot uses 192.168.1.238 (1,725 hits).
 - Step 1: `crates/proto-dns` `Zone` has views (`View`, records per
   network, `Lookup::Hidden`, overrides; a newer record takes over only its
   networks from older ones of its source) and `Resolver::handle_query_in`
