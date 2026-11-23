@@ -412,8 +412,9 @@ pub fn ipv6_neighbor_hint(frame: &[u8], out: &mut [u8; NEIGHBOR_HINT_LEN]) -> Op
 
 /// A unicast Neighbor Solicitation (a reachability probe, RFC 4861 §7.3.3)
 /// readdressed to its target's solicited-node group, for a host stack that
-/// answers only those (smoltcp 0.14): the destination address and MAC and
-/// the checksum change, nothing else. Returns whether it did.
+/// answers only those (thought true of smoltcp 0.14, which answers both):
+/// the destination address and MAC and the checksum change, nothing else.
+/// Returns whether it did.
 pub fn ipv6_ns_to_solicited(frame: &mut [u8]) -> bool {
     let ip = ETH_HDR;
     let m = ip + 40;

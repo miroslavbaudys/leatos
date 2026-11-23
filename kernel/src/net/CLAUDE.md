@@ -49,7 +49,7 @@ smoltcp `Device` behind the datapath: RX from `local_rx`, TX into the qdisc.
 - The WAN (Ethernet on DHCP / static) keeps smoltcp's ND and the hints below.
 - IPv6: notes RS (`LinkShared::rs_seen`) and helps smoltcp 0.14's ND: `NdHints` feed it a
   solicitation from each client (`fwd::wire::ipv6_neighbor_hint`), unicast NS go to the
-  solicited-node group (`ipv6_ns_to_solicited`); docs/ipv6.md §2.
+  solicited-node group (`ipv6_ns_to_solicited`: not needed, smoltcp answers them); docs/ipv6.md §2.
 - IPv4 the same: an ARP reply from each client (`fwd::wire::ipv4_neighbor_hint`, `arp_hints=0` off),
   so the first answer to an address smoltcp has not seen (or evicted) is not dropped.
 - smoltcp's neighbor cache is 256 per network (kernel feature `neigh-cache-256`, default; smoltcp's

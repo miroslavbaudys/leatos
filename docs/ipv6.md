@@ -199,8 +199,9 @@ New or changed (2026-11-20):
   packet that makes it resolve one; clients know our MAC from the RA and
   never solicit us, so the first answer after a quiet minute (its 60 s
   entry lifetime) was lost (the first ping of six, the first DNS query).
-  And it answers only solicitations to a solicited-node group, not the
-  unicast reachability probes of RFC 4861 §7.3.3. `net::device` fixes
+  (It was also thought to ignore unicast reachability probes, RFC 4861
+  §7.3.3; it answers them, checked 2026-11-23, docs/lan-neighbors.md §3
+  step 0: the readdressing below is not needed.) `net::device` fixes
   both at its input, with two pure functions in `fwd::wire`: before a
   client's frame smoltcp gets a solicitation from that client to our
   unicast address (`ipv6_neighbor_hint`: recorded, not answered), at most

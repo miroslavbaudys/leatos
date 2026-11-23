@@ -280,9 +280,10 @@ pub struct PortDevice<'a> {
 /// Before such a client's frame, smoltcp gets a neighbor solicitation
 /// from it ([`fwd::wire::ipv6_neighbor_hint`]: to our unicast address,
 /// so recorded, not answered), at most every [`Self::EVERY_NS`] per
-/// neighbor. And unicast solicitations (reachability probes), which
-/// smoltcp ignores, go to the solicited-node group instead
-/// ([`fwd::wire::ipv6_ns_to_solicited`]), so it answers them.
+/// neighbor. And unicast solicitations (reachability probes) go to the
+/// solicited-node group instead ([`fwd::wire::ipv6_ns_to_solicited`]):
+/// not needed after all (smoltcp 0.14 answers them, docs/lan-neighbors.md
+/// step 0), harmless; goes with the other LAN workarounds in step 4.
 ///
 /// IPv4 the same way: smoltcp learns new neighbors only from ARP aimed at
 /// it (traffic only refreshes entries it still has), and a client that

@@ -24,7 +24,7 @@ workarounds (all checked in its source):
 |---|---|---|
 | 1 | Learns IPv4 neighbors only from ARP aimed at it; traffic refreshes only entries it still has (upstream removed learning from traffic on purpose: a broadcast had poisoned its cache) | ARP replies synthesised from clients' frames (`fwd::wire::ipv4_neighbor_hint`, `NdHints`, `arp_hints=`) |
 | 2 | The same for IPv6 (ND only) | NS synthesised from clients' frames (`ipv6_neighbor_hint`) |
-| 3 | Answers an NS only when it went to the solicited-node group (`iface/interface/ipv6.rs:490`); unicast reachability probes go unanswered (RFC 4861 §7.2.4) | unicast NS readdressed to the group (`ipv6_ns_to_solicited`) |
+| 3 | Was thought to answer an NS only when sent to the solicited-node group (`iface/interface/ipv6.rs:490`). Wrong (2026-11-23): unicast probes are answered, though only because `has_solicited_node` compares just the low 16 bits | unicast NS readdressed to the group (`ipv6_ns_to_solicited`): not needed, harmless |
 | 4 | One request rate limit for the whole cache (`silent_until`, 1 s); the packet that needed the lookup is dropped | 1 and 2 avoid lookups |
 | 5 | 8 entries by default | feature `neigh-cache-256` |
 | 6 | `update_ip_addrs` empties the cache (`iface/interface/mod.rs:400`) | 1 and 2 refill it |
@@ -93,7 +93,10 @@ Each step is testable on its own; the full matrix (§4) runs before a step is do
 - docs/security-audit.md: why the WAN's remaining hints do not reintroduce the cache poisoning
   upstream removed (only frames to the router, no broadcast / multicast, smoltcp's own subnet
   check `iface/interface/ipv4.rs:288`, no worse than ARP spoofing).
-- Report workaround 3 (unicast NS) upstream with a test; it is an RFC bug for hosts too.
+- Report workaround 3 (unicast NS) upstream with a test. Checked 2026-11-23: smoltcp answers
+  unicast NS (its own test harness, and the lab with the readdressing off: 6 probes, 6 NAs). The
+  real bug is `has_solicited_node`: low 16 bits only, no group prefix check (also accepts e.g.
+  `ff02::2` without joining); report drafted with tests and a fix that keeps unicast NS answered.
 
 ### Step 1: responder and builders in `crates/fwd` (no kernel change)
 
@@ -146,7 +149,7 @@ sleeping and waking, IPv6 privacy addresses):
 - **New: unicast NS probe.** The client sets its entry for the router to STALE
   (`ip -6 neigh change … nud stale`) and sends traffic; Linux probes with a unicast NS; the entry
   must become REACHABLE (`ip -6 neigh show`). Negative control: `nd_unicast=0` (the responder
-  ignores unicast NS, as smoltcp did) → FAILED.
+  ignores unicast NS) → FAILED.
 - **New: router flag.** After NS / NA exchanges the client keeps its IPv6 default route via the
   router (`LAB_IPV6=1`). Negative control: `na_router=0` (NAs without R) → the route disappears.
 - **New: readdress keeps neighbors.** `LAB_NEIGH=1 LAB_GUEST=1 LAB_IPV6=1`: the LAN's ULA prefix
