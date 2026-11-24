@@ -22,6 +22,7 @@
 //! place they wait. Everything here is `spin::Mutex` or atomics, so the two
 //! tasks can later run on different cores unchanged (M11).
 
+use crate::cpuload::HISTORY;
 use crate::drivers;
 use crate::irq::{self, IrqEvent};
 use crate::net::device::PortQdisc;
@@ -52,6 +53,70 @@ pub struct PortSnap {
     pub link: Option<(bool, u32, bool)>,
 }
 
+/// A port's throughput over the last [`HISTORY`] samples (one per
+/// `poll_links`, ~1 s), for the status page's chart: history from boot,
+/// not from when the page was opened.
+///
+/// Lock-free, single writer (the primary datapath task) and single reader
+/// (svc). Each slot packs both directions into one `AtomicU64`, so a pair
+/// is never torn; a push during a read can at worst show the newest sample
+/// in the oldest slot, for one poll.
+pub struct RateRing {
+    /// `(rx_kbit << 32) | tx_kbit`, kbit/s.
+    slots: [AtomicU64; HISTORY],
+    /// Samples written so far.
+    written: AtomicUsize,
+    /// The writer's previous reading (rx bytes, tx bytes, timer ticks);
+    /// `at` = 0: none yet.
+    last_rx: AtomicU64,
+    last_tx: AtomicU64,
+    last_at: AtomicU64,
+}
+
+impl RateRing {
+    pub const fn new() -> Self {
+        Self {
+            slots: [const { AtomicU64::new(0) }; HISTORY],
+            written: AtomicUsize::new(0),
+            last_rx: AtomicU64::new(0),
+            last_tx: AtomicU64::new(0),
+            last_at: AtomicU64::new(0),
+        }
+    }
+
+    /// Writer: the port's byte counters at `at` (timer ticks). The first
+    /// reading only sets the baseline; a counter that went backwards (NIC
+    /// reset) gives 0 for that sample.
+    pub fn record(&self, rx_bytes: u64, tx_bytes: u64, at: u64) {
+        let r = Ordering::Relaxed;
+        let (prx, ptx, pat) = (self.last_rx.load(r), self.last_tx.load(r), self.last_at.load(r));
+        self.last_rx.store(rx_bytes, r);
+        self.last_tx.store(tx_bytes, r);
+        self.last_at.store(at, r);
+        if pat == 0 || at <= pat {
+            return;
+        }
+        let us = crate::timer::ticks_to_duration(at - pat).as_micros().max(1) as u64;
+        // bytes * 8 / µs = Mbit/s; * 1000 = kbit/s.
+        let kbit = |now: u64, prev: u64| {
+            (now.saturating_sub(prev).saturating_mul(8000) / us).min(u64::from(u32::MAX))
+        };
+        let w = self.written.load(r);
+        let slot = kbit(rx_bytes, prx) << 32 | kbit(tx_bytes, ptx);
+        self.slots[w % HISTORY].store(slot, r);
+        self.written.store(w + 1, Ordering::Release);
+    }
+
+    /// Reader: (rx, tx) kbit/s, oldest first.
+    pub fn for_each(&self, mut f: impl FnMut(u32, u32)) {
+        let w = self.written.load(Ordering::Acquire);
+        for i in w.saturating_sub(HISTORY)..w {
+            let v = self.slots[i % HISTORY].load(Ordering::Relaxed);
+            f((v >> 32) as u32, v as u32);
+        }
+    }
+}
+
 pub struct PortShared {
     pub name: &'static str,
     pub model: &'static str,
@@ -60,6 +125,8 @@ pub struct PortShared {
     /// every link on the port.
     pub qdisc: Mutex<PortQdisc>,
     pub snap: Mutex<PortSnap>,
+    /// Throughput history, written with `snap`.
+    pub rates: RateRing,
     /// 802.1Q tag of the port ([`Self::vlan`]): `VLAN_SET | TCI`, 0 =
     /// untagged. The datapath removes it on RX and adds it on TX; svc
     /// changes it when a saved config changes `[wan]`.

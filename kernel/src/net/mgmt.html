@@ -184,7 +184,7 @@
       <div class="tile"><span>Time (UTC)</span><b id="t-time">–</b><small id="t-time2"></small></div>
     </div>
     <div class="card"><h3>WAN throughput</h3>
-      <div class="legend"><span><i style="background:var(--s1)"></i>Download</span><span><i style="background:var(--s2)"></i>Upload</span><span>since this page was opened, every 2 s</span></div>
+      <div class="legend"><span><i style="background:var(--s1)"></i>Download</span><span><i style="background:var(--s2)"></i>Upload</span><span>last 5 minutes, every second</span></div>
       <div class="chart"><svg id="ratechart" role="img" aria-label="WAN throughput"></svg><div id="ratetip" class="tip" hidden></div></div>
     </div>
     <div class="card"><h3 id="cpuhead">CPU load per core</h3>
@@ -778,10 +778,15 @@ function showCpu(cpu) {
   $("cputab").innerHTML = `<tr><th>Seconds ago</th>${head}</tr>` + rows10.join("");
 }
 
-// ================= Throughput (from byte counters between polls) =================
-const RATE_N = 150;
+// ================= Throughput =================
+// The chart: the kernel's history of the WAN port (rate_history_kbit, one
+// [rx, tx] per ~1 s since boot, last 5 min), so it is full when the page
+// opens. The interface table's current rates: byte counters between polls.
+const RATE_N = 300, RATE_STEP_S = 1;
 let rateHist = [], prevIfs = null, rateEv = null, ifRates = {};
 function trackRates(st) {
+  const h = st.interfaces[0] && st.interfaces[0].rate_history_kbit;
+  rateHist = h ? h.slice(-RATE_N).map(([rx, tx]) => [rx * 1000, tx * 1000]) : [];
   const now = performance.now(), cur = {};
   for (const i of st.interfaces) cur[i.name] = { rx: i.rx_bytes, tx: i.tx_bytes };
   if (prevIfs && now > prevIfs.t) {
@@ -790,15 +795,13 @@ function trackRates(st) {
       const p = prevIfs.v[name];
       if (p && c.rx >= p.rx && c.tx >= p.tx) ifRates[name] = { rx: (c.rx - p.rx) * 8 / dt, tx: (c.tx - p.tx) * 8 / dt };
     }
-    const wan = st.interfaces[0] && ifRates[st.interfaces[0].name];
-    if (wan) { rateHist.push([wan.rx, wan.tx]); if (rateHist.length > RATE_N) rateHist.shift(); }
   }
   prevIfs = { t: now, v: cur };
 }
 function niceMax(v) { if (v <= 0) return 1e6; const e = 10 ** Math.floor(Math.log10(v)), m = v / e; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * e; }
 function drawRate() {
   const svg = $("ratechart"), s = rateHist;
-  const W = Math.max(svg.clientWidth, 200), H = 150, L = 64, R = 6, T = 8, B = 20;
+  const W = Math.max(svg.clientWidth, 200), H = 150, L = 80, R = 6, T = 8, B = 20;
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   const max = niceMax(Math.max(0, ...s.flat()));
   const x = (i) => L + (W - L - R) * (RATE_N - s.length + i) / (RATE_N - 1);
@@ -822,7 +825,7 @@ function rateHover(ev) {
   if (!m || !s.length) return;
   const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) * m.W / r.width;
   const i = Math.max(0, Math.min(s.length - 1, Math.round((px - m.L) / (m.W - m.L - m.R) * (RATE_N - 1)) - (RATE_N - s.length)));
-  const hx = m.x(i), h = $("ratehair"), ago = (s.length - 1 - i) * 2;
+  const hx = m.x(i), h = $("ratehair"), ago = (s.length - 1 - i) * RATE_STEP_S;
   h.setAttribute("x1", hx); h.setAttribute("x2", hx); h.setAttribute("visibility", "visible");
   tipLines($("ratetip"), [[null, ago ? `${ago} s ago` : "now"], ["var(--s1)", "Download: " + bits(s[i][0])], ["var(--s2)", "Upload: " + bits(s[i][1])]]);
   placeTip($("ratetip"), hx, r, m.W);

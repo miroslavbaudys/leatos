@@ -1389,9 +1389,22 @@ fn status_json(
         let rate = rate
             .map(|r| format!("{}", r.bits_per_sec / 1000))
             .unwrap_or_else(|| String::from("null"));
+        // Throughput history ([rx, tx] kbit/s per ~1 s, oldest first), so
+        // the chart has the last 5 minutes when the page opens. Only the
+        // WAN's (the one charted): ~5 KiB per port and poll otherwise.
+        let mut rates = String::new();
+        if n == 0 {
+            rates.push_str(",\"rate_history_kbit\":[");
+            let mut first = true;
+            nif.rates.for_each(|rx, tx| {
+                let _ = write!(rates, "{}[{rx},{tx}]", if first { "" } else { "," });
+                first = false;
+            });
+            rates.push(']');
+        }
         let _ = write!(
             s,
-            "{}{{\"name\":{},\"model\":{},\"mac\":{},\"vlan\":{vlan},\"link\":{link},\"addrs\":[{}],\
+            "{}{{\"name\":{},\"model\":{},\"mac\":{},\"vlan\":{vlan},\"link\":{link},\"addrs\":[{}]{rates},\
              \"rx_packets\":{},\"rx_bytes\":{},\"rx_no_buf\":{},\"rx_missed\":{},\"tx_packets\":{},\"tx_bytes\":{},\
              \"qdisc\":{{\"shaped_kbit\":{rate},\"limit_bytes\":{limit},\"ack_drops\":{ack_drops},\"sent\":{},\"dropped\":{},\"aqm_drops\":{aqm_drops},\"blue_drops\":{blue_drops},\"overflow_drops\":{overflow_drops},\"ecn_marked\":{},\"backlog_packets\":{},\"delay\":{delay}}}}}",
             if n > 0 { "," } else { "" },

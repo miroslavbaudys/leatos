@@ -220,6 +220,7 @@ pub fn bring_up(
             mac,
             qdisc: Mutex::new(qdisc),
             snap: Mutex::new(PortSnap::default()),
+            rates: shared::RateRing::new(),
             vlan: PortShared::vlan_atomic(if i == 0 { crate::config::wan_tci() } else { None }),
             pppoe_mode: AtomicBool::new(pppoe),
             pppoe_session: AtomicU64::new(0),
@@ -808,6 +809,7 @@ fn poll_links(ports: &[Port], sh: &Shared) {
             None => {}
         }
         *sp.snap.lock() = PortSnap { stats, link: *link };
+        sp.rates.record(stats.rx_bytes, stats.tx_bytes, timer::ticks());
     }
 }
 

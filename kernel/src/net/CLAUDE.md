@@ -27,7 +27,9 @@ Docs: architecture, bufferbloat-cake, ipv6, dns-over-tls, dns-views, mdns, secur
 
 The only coupling between the datapath and the services:
 
-- Per port: locked qdisc + PPPoE `ctrl_rx`/`pppoe_session`, stats snapshot.
+- Per port: locked qdisc + PPPoE `ctrl_rx`/`pppoe_session`, stats snapshot, `RateRing` (lock-free
+  throughput history, 1 s × 5 min, written by `poll_links`; the WAN's is `/api/status`
+  `interfaces[0].rate_history_kbit`, the overview chart).
 - Per **link** `local_rx` (`LinkShared`): link 0 = WAN on port 0, links 1..`MAX_LINKS` = network
   slots on `lan0`, created at boot, switched on/retagged/readdressed live (`assign_slots`,
   `Networks` → `Datapath::apply`). Forwarder interfaces, ARP tables and smoltcp interfaces are per
