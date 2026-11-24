@@ -6,7 +6,7 @@
 #   MacBook ──bridgeN (vmnet-host, 192.168.1.2)── [leatos LAN 192.168.1.1]
 #                                                 [leatos WAN] ──udp── [ISP VM 203.0.113.1]
 #   Mac route:     203.0.113.0/24 via 192.168.1.1   (removed on exit)
-#   Mac resolvers: /etc/resolver/{lan,example} -> 192.168.1.1   (removed on exit)
+#   Mac resolvers: /etc/resolver/{home.arpa,example} -> 192.168.1.1   (removed on exit)
 #
 # Usage (run in Terminal: sudo will ask for your password once):
 #   scripts/mac-lab.sh           start, run checks, stay up until Ctrl-C
@@ -109,7 +109,10 @@ sudo -n route -n add -net "$ISP/24" "$ROUTER_LAN" >/dev/null
 ROUTE_ADDED=1
 echo "  route 203.0.113.0/24 via $ROUTER_LAN"
 sudo -n mkdir -p /etc/resolver
-for domain in lan example; do
+# /etc/resolver/lan: left by mac-lab runs from before home.arpa
+f=/etc/resolver/lan
+if head -1 "$f" 2>/dev/null | grep -qF -e "$MARKER" -e "$OLD_MARKER"; then sudo -n rm -f "$f" && echo "  removed old $f"; fi
+for domain in home.arpa example; do
   f="/etc/resolver/$domain"
   if [[ -e "$f" ]] && ! head -1 "$f" | grep -qF -e "$MARKER" -e "$OLD_MARKER"; then
     info "$f exists and is not ours: left untouched (*.$domain won't use leatos)"
@@ -124,12 +127,12 @@ done
 echo "== checks (from this Mac)"
 if ping -c 2 -t 3 "$ROUTER_LAN" >/dev/null 2>&1; then pass "ping leatos $ROUTER_LAN"; else fail "ping leatos"; fi
 
-a=$(dig +short +time=2 +tries=1 @"$ROUTER_LAN" nas.lan A 2>/dev/null | head -1)
-[[ "$a" == "192.168.1.10" ]] && pass "dns: dig @leatos nas.lan -> $a" || fail "dns: nas.lan -> '$a'"
+a=$(dig +short +time=2 +tries=1 @"$ROUTER_LAN" nas.home.arpa A 2>/dev/null | head -1)
+[[ "$a" == "192.168.1.10" ]] && pass "dns: dig @leatos nas.home.arpa -> $a" || fail "dns: nas.home.arpa -> '$a'"
 a=$(dig +short +time=2 +tries=1 @"$ROUTER_LAN" isp.example A 2>/dev/null | head -1)
 [[ "$a" == "203.0.113.80" ]] && pass "dns: upstream isp.example -> $a (forwarded to the ISP)" || fail "dns: isp.example -> '$a'"
-a=$(dscacheutil -q host -a name router.lan 2>/dev/null | awk '/ip_address/{print $2; exit}')
-[[ "$a" == "$ROUTER_LAN" ]] && pass "dns: macOS resolver (/etc/resolver/lan) router.lan -> $a" || info "macOS resolver router.lan -> '$a' (cache? try: sudo killall -HUP mDNSResponder)"
+a=$(dscacheutil -q host -a name router.home.arpa 2>/dev/null | awk '/ip_address/{print $2; exit}')
+[[ "$a" == "$ROUTER_LAN" ]] && pass "dns: macOS resolver (/etc/resolver/home.arpa) router.home.arpa -> $a" || info "macOS resolver router.home.arpa -> '$a' (cache? try: sudo killall -HUP mDNSResponder)"
 
 body=$(curl -s -m 5 "http://$ISP/" || true)
 [[ "$body" == "leatos-lab-isp" ]] && pass "tcp: curl http://$ISP/ through NAT" || fail "tcp: curl http://$ISP/ ('$body')"
@@ -168,7 +171,7 @@ Try:
   curl http://$ISP/                    # web server behind leatos's NAT
   curl http://$ISP/cgi-bin/ip          # what the ISP sees (leatos's WAN address)
   ping $ISP ; traceroute -n $ISP
-  dig @$ROUTER_LAN nas.lan ; ping router.lan
+  dig @$ROUTER_LAN nas.home.arpa ; ping router.home.arpa
   sudo tcpdump -ni $MAC_IF             # watch leatos's LAN traffic (or Wireshark on $MAC_IF)
   tail -f $WORK/router.log      # leatos console
 Your normal internet still uses your usual interface. Ctrl-C to stop and clean up.

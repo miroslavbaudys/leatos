@@ -43,8 +43,8 @@ A client VM, the router and an ISP VM (Alpine; overlays in `lab/client/`, `lab/i
 - Full-size ICMP: `LAB_BIG_PING=1473 LAB_ROUTER_ARGS=fw_frag=0` is its negative control.
   Fragmented `ping -s 3000` both ways; negative control `LAB_ROUTER_ARGS=fw_frag=0`.
 - Web interface origin checks, raw requests from the client: a rebound `Host` gets 421, a cross-site
-  POST with Basic 403; address, `router.lan`, same-origin and script requests pass. Negative control
-  `LAB_ROUTER_ARGS=mgmt_origin=0`.
+  POST with Basic 403; address, `router.home.arpa`, same-origin and script requests pass.
+  Negative control `LAB_ROUTER_ARGS=mgmt_origin=0`.
 - Web interface lockout: a second client address guesses wrong passwords while the client's own
   logs in (always answered); 8 idle connections from it, the client is still answered and
   `mgmt.throttle.evicted` rises. Negative controls `LAB_MGMT_SAME_SOURCE=1`,
@@ -103,8 +103,8 @@ adds eth0.20.
 - Rule guest-ping-nas (accept, hit counter) and guest-no-isp-web (reject guest TCP 80 to the WAN).
 - Port forward lab-web (WAN :8080 → the client): the ISP fetches through it
   (`lab/isp/www/cgi-bin/fetch`), the client through the WAN address (hairpin).
-- The guest network's own DNS domain `guest.lan`: lease domain, `labguest.guest.lan`,
-  `router.guest.lan`, `labclient.guest.lan` NXDOMAIN.
+- The guest network's own DNS domain `guest.home.arpa`: lease domain, `labguest.guest.home.arpa`,
+  `router.guest.home.arpa`, `labclient.guest.home.arpa` NXDOMAIN.
 - Redirect lab-ntp (UDP 123 → 192.168.1.101, a second client address running `busybox ntpd -l`):
   NTP to 203.0.113.99 answered from the main LAN and from the guest, hit counter.
 - Forward target out: forward lab-src (WAN :8090 → client :8090); a connection from the client's
@@ -132,10 +132,11 @@ adds eth0.20.
 
 Modes that imply `LAB_GUEST=1`:
 
-- `LAB_DNS_VIEWS=1` (docs/dns-views.md): `dns.views = "firewall"` + `[[dns.host]]` split.lan per
-  network (its entries' hits rise) + files.isp.example overridden for the LAN. From the guest,
-  labclient.lan and its PTR are NXDOMAIN (`hidden` counter); nas.lan still resolves (rule
-  guest-ping-nas). Negative controls `LAB_DNS_VIEWS=0`, `LAB_DNS_HOSTS=0`, `LAB_GUEST_RULES=0`.
+- `LAB_DNS_VIEWS=1` (docs/dns-views.md): `dns.views = "firewall"` + `[[dns.host]]`
+  split.home.arpa per network (its entries' hits rise) + files.isp.example overridden for the
+  LAN. From the guest, labclient.home.arpa and its PTR are NXDOMAIN (`hidden` counter);
+  nas.home.arpa still resolves (rule guest-ping-nas). Negative controls `LAB_DNS_VIEWS=0`,
+  `LAB_DNS_HOSTS=0`, `LAB_GUEST_RULES=0`.
 - `LAB_MDNS=1` (docs/mdns.md): rule guest-printers reflects `_ipp._tcp` guest → lan. The client
   announces on VLAN 20 (crafted, `nc -u`), checked by the router's counters and on the LAN capture
   (copy from 192.168.1.1, TTL 255, `_ipp` only; IGMP joins on both networks). Negative control
@@ -143,7 +144,7 @@ Modes that imply `LAB_GUEST=1`:
 - `LAB_ROUTES=1`: `[[route]]` lab-behind 10.30.0.0/24 via the client, 10.30.0.5 on its loopback:
   option 121 (route + default), NAT to the ISP and ping to the router from 10.30.0.5, `/api/status`
   `routes`, the ISP forging 10.30.0.5 dropped as `spoofed` (`cgi-bin/spoof?8080&src=`); the
-  router's own answers to 10.30.0.5 over UDP (DNS `router.lan`) and TCP (`GET /api/info`) with
+  router's own answers to 10.30.0.5 over UDP (DNS `router.home.arpa`) and TCP (`GET /api/info`) with
   `lan_nd.local_no_route` unchanged. Negative control `LAB_ROUTES=0` (route disabled).
 - `LAB_PORTS=1`: the router gets a third NIC (`lan1`, `LAB_LAN1_PORT`), network wired 10.40.0.1/24
   untagged on it; the client's second NIC (`VM_NIC2` in `scripts/lab/common.sh`) moves into a
@@ -163,9 +164,9 @@ Modes that imply `LAB_GUEST=1`:
   negative control `LAB_ROUTER_ARGS=pd_keep=0`; router-side checks read the log up to that
   reboot).
 - Step 1 (router `ipv6=1`): SLAAC address from the main LAN's ULA /64, no default route (router
-  lifetime 0), ping the router's ULA and link-local, `router.lan` AAAA over IPv6, web interface on
-  the ULA, RA counters. With `LAB_GUEST=1`: the guest's ULA, DNS over IPv6 allowed, web refused, RS
-  answered. Negative controls `LAB_ROUTER_ARGS=ipv6=0` (every IPv6 check fails),
+  lifetime 0), ping the router's ULA and link-local, `router.home.arpa` AAAA over IPv6, web
+  interface on the ULA, RA counters. With `LAB_GUEST=1`: the guest's ULA, DNS over IPv6 allowed,
+  web refused, RS answered. Negative controls `LAB_ROUTER_ARGS=ipv6=0` (every IPv6 check fails),
   `LAB_GUEST_ZONE=lan` (guest web-refused fails).
 - The WAN side (step 2b): the ISP VM gets 2001:db8:ffff::1/64 and routes 2001:db8:100::/56 to the
   router (`wan6_ip=… wan6_gw=… lan6_prefix=… wan_mtu=1400`, IPv4 big ping 1372).

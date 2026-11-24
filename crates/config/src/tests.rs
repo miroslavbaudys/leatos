@@ -171,7 +171,7 @@ fn defaults_are_valid_and_match_the_kernel() {
         Dns {
             cache_entries: 4096,
             rebind_protection: true,
-            domain: "lan".into(),
+            domain: "home.arpa".into(),
             hosts: vec![],
             ..Dns::default()
         }
@@ -188,7 +188,7 @@ fn sparse_files_fill_in_defaults() {
     assert_eq!(c.shaping.down_kbit, None);
     assert_eq!(c.networks, Config::default().networks);
     let c = parse(&lan_doc("10.0.0.1/16", "")).unwrap();
-    assert_eq!(c.dns.domain, "lan");
+    assert_eq!(c.dns.domain, "home.arpa");
     assert_eq!(c.networks[0].dhcp_range(), (ip(10, 0, 0, 100), ip(10, 0, 0, 199)));
 }
 
@@ -1226,7 +1226,7 @@ fn cli_edits_list_entries_by_name() {
     assert_eq!(l.networks[0].ipv4, Cidr::new(ip(10, 9, 0, 1), 24));
     let d = l.with_assignment(r#"lan.domain = "home""#).unwrap();
     assert_eq!(d.dns.domain, "home");
-    assert_eq!(d.without("lan.domain").unwrap().dns.domain, "lan");
+    assert_eq!(d.without("lan.domain").unwrap().dns.domain, "home.arpa");
     assert!(l.with_assignment("lan = 5").is_err());
     // Unset: entries go, fields return to their type's default.
     assert_eq!(g2.without("network.guest.vlan").unwrap().network("guest").unwrap().vlan, 0);
@@ -1497,7 +1497,7 @@ fn network_domain() {
     assert_eq!(parse(&c.to_toml()).unwrap(), c);
     assert_eq!(parse_json(&c.to_json()).unwrap(), c);
     // Not written when unset.
-    assert!(!Config::default().to_toml().contains("\ndomain = \"lan\"\n[[network"));
+    assert!(!Config::default().to_toml().contains("\ndomain = \"home.arpa\"\n[[network"));
     assert!(!parse(FULL_V2).unwrap().to_toml().contains("guest.home"));
     // Validation and editing by path.
     for bad in ["", "a b", "-x.home", "x..home", "x_y"] {

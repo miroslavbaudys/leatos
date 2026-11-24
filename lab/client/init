@@ -62,8 +62,8 @@ if $bb grep -q 'lab_leases=1' /proc/cmdline; then
     # The lease's IPv6 addresses sit between ip and hostname (206e9e2).
     if st | $bb grep -q "\"ip\":\"$1\",\"ipv6\":\[[^]]*\],\"hostname\":\"$2\",\"bound\":true"; then pass "leases: $3: $2 $1 listed after the restart"
     else fail "leases: $3: $2 $1 not listed after the restart"; fi
-    if $bb nslookup "$2.lan" 192.168.1.1 2>&1 | $bb grep -v "^Server" | $bb grep -q "$1\$"; then pass "leases: $3: $2.lan resolves"
-    else fail "leases: $3: $2.lan does not resolve"; fi
+    if $bb nslookup "$2.home.arpa" 192.168.1.1 2>&1 | $bb grep -v "^Server" | $bb grep -q "$1\$"; then pass "leases: $3: $2.home.arpa resolves"
+    else fail "leases: $3: $2.home.arpa does not resolve"; fi
   }
   mark
   echo "LAB leases: lease $ip, waiting for the router to restart"
@@ -99,11 +99,11 @@ lookup() { # name expect-substring description
   out=$($bb nslookup "$1" 192.168.1.1 2>&1)
   if echo "$out" | $bb grep -q "$2"; then pass "dns $3"; else fail "dns $3"; echo "$out" | $bb sed 's/^/    | /'; fi
 }
-lookup nas.lan        "192.168.1.10"   "static host nas.lan -> 192.168.1.10"
-lookup router.lan     "192.168.1.1"    "router.lan -> 192.168.1.1"
-lookup labclient.lan  "$ip"            "dhcp hostname labclient.lan -> $ip"
-lookup 192.168.1.10   "nas.lan"        "reverse 192.168.1.10 -> nas.lan"
-lookup ghost.lan      "NXDOMAIN\|can't find\|server can't" "unknown local name -> NXDOMAIN"
+lookup nas.home.arpa        "192.168.1.10"   "static host nas.home.arpa -> 192.168.1.10"
+lookup router.home.arpa     "192.168.1.1"    "router.home.arpa -> 192.168.1.1"
+lookup labclient.home.arpa  "$ip"            "dhcp hostname labclient.home.arpa -> $ip"
+lookup 192.168.1.10   "nas.home.arpa"        "reverse 192.168.1.10 -> nas.home.arpa"
+lookup ghost.home.arpa      "NXDOMAIN\|can't find\|server can't" "unknown local name -> NXDOMAIN"
 
 # Upstream: the router forwards to the ISP's DNS server (from the WAN lease).
 lookup isp.example    "203.0.113.80"   "upstream isp.example -> 203.0.113.80 (via ISP dnsd)"
@@ -223,7 +223,7 @@ fi
 # --- web interface: DNS rebinding and CSRF (docs/security-audit.md §5) -----------
 # Raw requests as a browser sends them, with the Basic credentials a browser
 # may have cached. A Host that is not the router's (a name rebound to
-# 192.168.1.1) gets 421; the address and router.lan pass. A POST from another
+# 192.168.1.1) gets 421; the address and router.home.arpa pass. A POST from another
 # origin gets 403 before auth; the same POST from the router's own origin or
 # without Origin (a script) gets past it (422 for the bad body, 501 without a
 # store). Negative control: LAB_ROUTER_ARGS=mgmt_origin=0 (the 421 and 403
@@ -238,7 +238,7 @@ mexpect() { # description expected-codes (space-separated) actual
   case " $2 " in *" $3 "*) pass "web origin: $1 ($3)" ;; *) fail "web origin: $1: expected $2, got '$3'" ;; esac
 }
 mexpect "GET /api/status with Host 192.168.1.1" 200 "$(mreq GET /api/status 192.168.1.1 '' '')"
-mexpect "GET /api/status with Host router.lan" 200 "$(mreq GET /api/status router.lan '' '')"
+mexpect "GET /api/status with Host router.home.arpa" 200 "$(mreq GET /api/status router.home.arpa '' '')"
 mexpect "GET /api/status with a rebound Host refused" 421 "$(mreq GET /api/status rebind.evil.example '' '')"
 mexpect "GET / with a rebound Host refused" 421 "$(mreq GET / rebind.evil.example:80 '' '')"
 mexpect "POST /api/config from another site refused" 403 \
@@ -246,7 +246,7 @@ mexpect "POST /api/config from another site refused" 403 \
 mexpect "POST /api/config/revert from another site refused" 403 \
   "$(mreq POST /api/config/revert 192.168.1.1 http://203.0.113.9 '')"
 mexpect "POST /api/config from the router's own origin passes" "422 501" \
-  "$(mreq POST /api/config router.lan http://router.lan 'csrf=1')"
+  "$(mreq POST /api/config router.home.arpa http://router.home.arpa 'csrf=1')"
 mexpect "POST /api/config from a script (no Origin) passes" "422 501" \
   "$(mreq POST /api/config 192.168.1.1 '' 'csrf=1')"
 
@@ -504,17 +504,17 @@ if $bb grep -q 'lab_routes=' /proc/cmdline; then
   fi
   # The router's own UDP and TCP answers over the route too
   # (docs/lan-neighbors.md §4: its stack has no link layer on the LAN, the
-  # datapath picks the route's gateway): a DNS query for router.lan
+  # datapath picks the route's gateway): a DNS query for router.home.arpa
   # (crafted: ID 0x5678, RD, A) and GET /api/info from 10.30.0.5. None of
   # the router's packets may lack a next hop (lan_nd.local_no_route).
   nnr() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb sed -n 's/.*"local_no_route":\([0-9]*\).*/\1/p'; }
   nr0=$(nnr)
-  rdns=$($bb printf '\126\170\001\000\000\001\000\000\000\000\000\000\006router\003lan\000\000\001\000\001' \
+  rdns=$($bb printf '\126\170\001\000\000\001\000\000\000\000\000\000\006router\004home\004arpa\000\000\001\000\001' \
     | $bb nc -u -w 3 -s 10.30.0.5 192.168.1.1 53 2>/dev/null | $bb od -An -tx1 | $bb tr -s ' \n' ' ')
   rhttp=$(printf 'GET /api/info HTTP/1.0\r\nHost: 192.168.1.1\r\n\r\n' | $bb nc -w 5 -s 10.30.0.5 192.168.1.1 80 2>/dev/null | $bb head -1 | $bb cut -d' ' -f2)
   nr1=$(nnr)
   case "$rdns" in
-    " 56 78 "*" c0 a8 01 01"*) pass "routes: the router's DNS answers 10.30.0.5 (router.lan -> 192.168.1.1)" ;;
+    " 56 78 "*" c0 a8 01 01"*) pass "routes: the router's DNS answers 10.30.0.5 (router.home.arpa -> 192.168.1.1)" ;;
     *) fail "routes: no DNS answer to 10.30.0.5:${rdns:- (none)}" ;;
   esac
   if [ "$rhttp" = 200 ]; then pass "routes: the router's web interface answers 10.30.0.5 over TCP"
@@ -1036,7 +1036,7 @@ if [ -n "$v6on" ]; then
         fail "routes6: ping6 $r6 from fd00:30::5"; $bb tail -2 /tmp/p6r | $bb sed 's/^/    | /'
       fi
       # Its DNS answer too (UDP replies pick the network by the route).
-      r6dns=$($bb printf '\126\171\001\000\000\001\000\000\000\000\000\000\006router\003lan\000\000\001\000\001' \
+      r6dns=$($bb printf '\126\171\001\000\000\001\000\000\000\000\000\000\006router\004home\004arpa\000\000\001\000\001' \
         | $bb nc -u -w 3 -s fd00:30::5 "$r6" 53 2>/dev/null | $bb od -An -tx1 | $bb tr -s ' \n' ' ')
       case "$r6dns" in
         " 56 79 "*" c0 a8 01 01"*) pass "routes6: the router's DNS answers fd00:30::5" ;;
@@ -1052,8 +1052,8 @@ if [ -n "$v6on" ]; then
     fi
     ll=$(v6st | $bb sed 's/.*"name":"lan0"//' | $bb grep -o 'fe80::[0-9a-f:]*' | $bb head -1)
     if [ -n "$ll" ] && $bb ping6 -c 1 -W 2 "$ll%eth0" >/tmp/p6 2>&1; then pass "ipv6: ping router link-local $ll%eth0"; else fail "ipv6: ping router link-local '$ll%eth0'"; $bb tail -2 /tmp/p6 | $bb sed 's/^/    | /'; fi
-    out=$($bb nslookup -type=AAAA router.lan "$r6" 2>&1)
-    if echo "$out" | $bb grep -v "^Server" | $bb grep -q "$r6"; then pass "ipv6: dns over ipv6: router.lan AAAA $r6"; else fail "ipv6: dns router.lan AAAA via $r6"; echo "$out" | $bb sed 's/^/    | /'; fi
+    out=$($bb nslookup -type=AAAA router.home.arpa "$r6" 2>&1)
+    if echo "$out" | $bb grep -v "^Server" | $bb grep -q "$r6"; then pass "ipv6: dns over ipv6: router.home.arpa AAAA $r6"; else fail "ipv6: dns router.home.arpa AAAA via $r6"; echo "$out" | $bb sed 's/^/    | /'; fi
     if $bb wget -q -T 5 -O - "http://[$r6]/api/info" 2>/dev/null | $bb grep -q '"auth"'; then pass "ipv6: web interface on http://[$r6]/"; else fail "ipv6: web interface on http://[$r6]/"; fi
     ra=$(v6st | $bb grep -o '"ra":{"sent":[0-9]*,"solicits":[0-9]*}' | $bb sed -n '1s/.*"sent":\([0-9]*\),"solicits":\([0-9]*\)}/\1 \2/p')
     if [ "${ra%% *}" -gt 0 ] 2>/dev/null; then pass "ipv6: router sent ${ra%% *} RAs, ${ra##* } solicitations seen"; else fail "ipv6: router RA counters '$ra'"; fi
@@ -1117,22 +1117,22 @@ if [ -n "$v6on" ]; then
         fi
         $bb ip -6 addr del "$other/64" dev eth0 2>/dev/null
       fi
-      # Our name over IPv6 (step 5b): labclient.lan AAAA = our global and
+      # Our name over IPv6 (step 5b): labclient.home.arpa AAAA = our global and
       # unique local addresses (the router learned them from neighbor
       # discovery, named by our DHCP lease), and the PTR of the global
       # one. Negative control LAB_ROUTER_ARGS=dns_aaaa=0.
       ula6=$($bb ip -6 addr show dev eth0 scope global | $bb grep -v deprecated | $bb sed -n 's/.*inet6 \(fd[0-9a-f:]*:5054:ff:fe00:10\)\/64.*/\1/p' | $bb head -1)
       aaaa=""
       for i in $($bb seq 1 15); do
-        aaaa=$($bb nslookup -type=AAAA labclient.lan 192.168.1.1 2>&1)
+        aaaa=$($bb nslookup -type=AAAA labclient.home.arpa 192.168.1.1 2>&1)
         echo "$aaaa" | $bb grep -q "$ag" && echo "$aaaa" | $bb grep -q "${ula6:-none}" && break
         $bb sleep 1
       done
       ptr=$($bb nslookup "$ag" 192.168.1.1 2>&1)
-      if echo "$aaaa" | $bb grep -q "$ag" && [ -n "$ula6" ] && echo "$aaaa" | $bb grep -q "$ula6" && echo "$ptr" | $bb grep -q 'labclient.lan'; then
-        pass "ipv6 names: labclient.lan AAAA $ag and $ula6, PTR back to labclient.lan"
+      if echo "$aaaa" | $bb grep -q "$ag" && [ -n "$ula6" ] && echo "$aaaa" | $bb grep -q "$ula6" && echo "$ptr" | $bb grep -q 'labclient.home.arpa'; then
+        pass "ipv6 names: labclient.home.arpa AAAA $ag and $ula6, PTR back to labclient.home.arpa"
       else
-        fail "ipv6 names: labclient.lan AAAA ($ag, ${ula6:-no ULA}): $(echo "$aaaa" | $bb grep -i 'address\|answer\|NXDOMAIN' | $bb tr '\n' ' ') / PTR: $(echo "$ptr" | $bb grep -i 'name\|NXDOMAIN' | $bb tr '\n' ' ')"
+        fail "ipv6 names: labclient.home.arpa AAAA ($ag, ${ula6:-no ULA}): $(echo "$aaaa" | $bb grep -i 'address\|answer\|NXDOMAIN' | $bb tr '\n' ' ') / PTR: $(echo "$ptr" | $bb grep -i 'name\|NXDOMAIN' | $bb tr '\n' ' ')"
       fi
       # The Clients page: our lease in /api/status lists the same two
       # addresses (`ipv6`, from neighbor discovery by MAC). Checked
@@ -1255,13 +1255,13 @@ if [ -n "$guest" ]; then
     out=$($bb nslookup isp.example 10.20.0.1 2>&1)
     if echo "$out" | $bb grep -q "203.0.113.80"; then pass "guest: dns via 10.20.0.1 (allowed)"; else fail "guest: dns via 10.20.0.1"; echo "$out" | $bb sed 's/^/    | /'; fi
     if $bb ping -c 1 -W 2 10.20.0.1 >/dev/null 2>&1; then pass "guest: ping router (allowed)"; else fail "guest: ping 10.20.0.1"; fi
-    # The guest network's own DNS domain (lab_guest_domain=1: guest.lan,
-    # nested in the LAN's lan); lab_guest_domain=0 is the negative control.
+    # The guest network's own DNS domain (lab_guest_domain=1: guest.home.arpa,
+    # nested in the LAN's home.arpa); lab_guest_domain=0 is the negative control.
     gl() { $bb nslookup "$1" 10.20.0.1 2>&1; }
-    if [ "$gdomain" = guest.lan ]; then pass "guest: lease domain guest.lan"; else fail "guest: lease domain '$gdomain', expected guest.lan"; fi
-    if gl labguest.guest.lan | $bb grep -q "$gip"; then pass "guest: dns labguest.guest.lan -> $gip"; else fail "guest: dns labguest.guest.lan"; gl labguest.guest.lan | $bb sed 's/^/    | /'; fi
-    if gl router.guest.lan | $bb grep -v "^Server" | $bb grep -q "10.20.0.1$"; then pass "guest: dns router.guest.lan -> 10.20.0.1"; else fail "guest: dns router.guest.lan"; gl router.guest.lan | $bb sed 's/^/    | /'; fi
-    if gl labclient.guest.lan | $bb grep -q "NXDOMAIN\|can't find"; then pass "guest: dns labclient.guest.lan -> NXDOMAIN (lan host, other domain)"; else fail "guest: labclient.guest.lan resolved"; gl labclient.guest.lan | $bb sed 's/^/    | /'; fi
+    if [ "$gdomain" = guest.home.arpa ]; then pass "guest: lease domain guest.home.arpa"; else fail "guest: lease domain '$gdomain', expected guest.home.arpa"; fi
+    if gl labguest.guest.home.arpa | $bb grep -q "$gip"; then pass "guest: dns labguest.guest.home.arpa -> $gip"; else fail "guest: dns labguest.guest.home.arpa"; gl labguest.guest.home.arpa | $bb sed 's/^/    | /'; fi
+    if gl router.guest.home.arpa | $bb grep -v "^Server" | $bb grep -q "10.20.0.1$"; then pass "guest: dns router.guest.home.arpa -> 10.20.0.1"; else fail "guest: dns router.guest.home.arpa"; gl router.guest.home.arpa | $bb sed 's/^/    | /'; fi
+    if gl labclient.guest.home.arpa | $bb grep -q "NXDOMAIN\|can't find"; then pass "guest: dns labclient.guest.home.arpa -> NXDOMAIN (lan host, other domain)"; else fail "guest: labclient.guest.home.arpa resolved"; gl labclient.guest.home.arpa | $bb sed 's/^/    | /'; fi
     # IPv6 on the guest network: its own ULA /64; DNS allowed, the web
     # interface refused by the zone (negative control LAB_GUEST_ZONE=lan).
     guest_v6=$($bb sed -n 's/.*lab_guest_v6=\([01]\).*/\1/p' /proc/cmdline)
@@ -1290,8 +1290,8 @@ if [ -n "$guest" ]; then
         fail "guest ipv6: the router reports no IPv6 address on the guest network"
       else
         if a6g=$(v6slaac eth0.20 "${g6%::1}"); then pass "guest ipv6: slaac address $a6g on VLAN 20"; else fail "guest ipv6: no slaac address under ${g6%::1}::/64"; fi
-        out=$($bb nslookup -type=AAAA router.guest.lan "$g6" 2>&1)
-        if echo "$out" | $bb grep -v "^Server" | $bb grep -q "$g6"; then pass "guest ipv6: dns over ipv6 (allowed): router.guest.lan AAAA $g6"; else fail "guest ipv6: dns via $g6"; echo "$out" | $bb sed 's/^/    | /'; fi
+        out=$($bb nslookup -type=AAAA router.guest.home.arpa "$g6" 2>&1)
+        if echo "$out" | $bb grep -v "^Server" | $bb grep -q "$g6"; then pass "guest ipv6: dns over ipv6 (allowed): router.guest.home.arpa AAAA $g6"; else fail "guest ipv6: dns via $g6"; echo "$out" | $bb sed 's/^/    | /'; fi
         if $bb wget -q -T 3 -O /dev/null "http://[$g6]/api/info" 2>/dev/null; then fail "guest ipv6: web interface reachable on http://[$g6]/ (zone input)"; else pass "guest ipv6: web interface refused on http://[$g6]/"; fi
         gg=$(v6global 2)
         if [ -n "$gg" ]; then
@@ -1313,37 +1313,37 @@ if [ -n "$guest" ]; then
     fi
     # Split-horizon DNS (docs/dns-views.md, LAB_DNS_VIEWS): what each
     # network may resolve. lab_dns_views=1: dns.views = "firewall" (0 = the
-    # negative control, "all"); lab_dns_hosts=1: split.lan per network and
+    # negative control, "all"); lab_dns_hosts=1: split.home.arpa per network and
     # files.isp.example overridden for the LAN (0 = the control: none).
     dviews=$($bb sed -n 's/.*lab_dns_views=\([01]\).*/\1/p' /proc/cmdline)
     if [ -n "$dviews" ]; then
       nx() { echo "$1" | $bb grep -q "NXDOMAIN\|can't find"; }
       dnsstat; hid0=$(dnsc hidden)
-      out=$(gl labclient.lan)
-      if nx "$out"; then pass "views: labclient.lan hidden from the guest (NXDOMAIN)"; else fail "views: labclient.lan resolved from the guest"; echo "$out" | $bb sed 's/^/    | /'; fi
+      out=$(gl labclient.home.arpa)
+      if nx "$out"; then pass "views: labclient.home.arpa hidden from the guest (NXDOMAIN)"; else fail "views: labclient.home.arpa resolved from the guest"; echo "$out" | $bb sed 's/^/    | /'; fi
       # Its AAAA too (step 5b): the same view as the A record.
       if [ -n "$v6on" ]; then
-        out=$($bb nslookup -type=AAAA labclient.lan 10.20.0.1 2>&1)
-        if nx "$out"; then pass "views: labclient.lan AAAA hidden from the guest"; else fail "views: labclient.lan AAAA answered to the guest"; echo "$out" | $bb sed 's/^/    | /'; fi
+        out=$($bb nslookup -type=AAAA labclient.home.arpa 10.20.0.1 2>&1)
+        if nx "$out"; then pass "views: labclient.home.arpa AAAA hidden from the guest"; else fail "views: labclient.home.arpa AAAA answered to the guest"; echo "$out" | $bb sed 's/^/    | /'; fi
       fi
       out=$(gl 192.168.1.100)
       if nx "$out"; then pass "views: PTR of 192.168.1.100 hidden from the guest"; else fail "views: PTR of 192.168.1.100 answered to the guest"; echo "$out" | $bb sed 's/^/    | /'; fi
       dnsstat; hid1=$(dnsc hidden)
       if [ -n "$hid1" ] && [ "$hid1" -ge $((${hid0:-0} + 2)) ]; then pass "views: router hidden counter ${hid0:-?} -> $hid1"; else fail "views: router hidden counter ${hid0:-?} -> ${hid1:-?} (expected +2)"; fi
-      out=$(gl nas.lan)
-      if echo "$out" | $bb grep -v "^Server" | $bb grep -q "192.168.1.10$"; then pass "views: nas.lan visible to the guest (rule guest-ping-nas reaches it)"; else fail "views: nas.lan from the guest"; echo "$out" | $bb sed 's/^/    | /'; fi
-      out=$($bb nslookup labclient.lan 192.168.1.1 2>&1)
-      if echo "$out" | $bb grep -q "$ip"; then pass "views: labclient.lan still resolves on the LAN"; else fail "views: labclient.lan on the LAN"; echo "$out" | $bb sed 's/^/    | /'; fi
-      # Hits of the split.lan entries (/api/status dns.hosts), summed.
+      out=$(gl nas.home.arpa)
+      if echo "$out" | $bb grep -v "^Server" | $bb grep -q "192.168.1.10$"; then pass "views: nas.home.arpa visible to the guest (rule guest-ping-nas reaches it)"; else fail "views: nas.home.arpa from the guest"; echo "$out" | $bb sed 's/^/    | /'; fi
+      out=$($bb nslookup labclient.home.arpa 192.168.1.1 2>&1)
+      if echo "$out" | $bb grep -q "$ip"; then pass "views: labclient.home.arpa still resolves on the LAN"; else fail "views: labclient.home.arpa on the LAN"; echo "$out" | $bb sed 's/^/    | /'; fi
+      # Hits of the split.home.arpa entries (/api/status dns.hosts), summed.
       splith() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb sed -n 's/.*"hosts":\[\([^]]*\)\].*/\1/p' | $bb tr '{' '\n' | $bb grep '"name":"split"' | $bb sed -n 's/.*"hits":\([0-9]*\).*/\1/p' | $bb awk '{t+=$1} END {print t+0}'; }
       sh0=$(splith)
-      out_l=$($bb nslookup split.lan 192.168.1.1 2>&1); out_g=$(gl split.lan)
+      out_l=$($bb nslookup split.home.arpa 192.168.1.1 2>&1); out_g=$(gl split.home.arpa)
       sh1=$(splith)
-      if [ "${sh1:-0}" -ge $((${sh0:-0} + 2)) ]; then pass "views: split.lan entries' hits ${sh0:-0} -> $sh1"; else fail "views: split.lan entries' hits ${sh0:-0} -> ${sh1:-0} (expected +2)"; fi
+      if [ "${sh1:-0}" -ge $((${sh0:-0} + 2)) ]; then pass "views: split.home.arpa entries' hits ${sh0:-0} -> $sh1"; else fail "views: split.home.arpa entries' hits ${sh0:-0} -> ${sh1:-0} (expected +2)"; fi
       if echo "$out_l" | $bb grep -q "192.168.1.50" && echo "$out_g" | $bb grep -q "10.20.0.50" && ! echo "$out_g" | $bb grep -q "192.168.1.50"; then
-        pass "views: split.lan -> 192.168.1.50 on the LAN, 10.20.0.50 on the guest"
+        pass "views: split.home.arpa -> 192.168.1.50 on the LAN, 10.20.0.50 on the guest"
       else
-        fail "views: split.lan per network"; { echo "$out_l"; echo "$out_g"; } | $bb sed 's/^/    | /'
+        fail "views: split.home.arpa per network"; { echo "$out_l"; echo "$out_g"; } | $bb sed 's/^/    | /'
       fi
       out_l=$($bb nslookup files.isp.example 192.168.1.1 2>&1); out_g=$(gl files.isp.example)
       if echo "$out_l" | $bb grep -v "^Server" | $bb grep -q "192.168.1.100$" && echo "$out_g" | $bb grep -q "203.0.113.83"; then

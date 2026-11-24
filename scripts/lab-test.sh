@@ -81,7 +81,7 @@
 #                        (docs/security-audit.md §5; the router always gets
 #                        mgmt_pass=lab-pass): a rebound Host gets 421, a
 #                        cross-site POST with Basic credentials 403, while
-#                        the address, router.lan and same-origin POSTs pass.
+#                        the address, router.home.arpa and same-origin POSTs pass.
 #                        Negative control LAB_ROUTER_ARGS=mgmt_origin=0
 #                        (both refusal checks fail). Lockouts (§5 item 6):
 #                        a second client address guesses wrong passwords
@@ -210,9 +210,9 @@
 #                        redirect's hit counter must rise. Negative control:
 #                        LAB_REDIRECT=0 (no redirect: both fail).
 #                        DNS domain: the guest network has its own,
-#                        guest.lan (nested in the LAN's lan); checks: the
-#                        guest lease's domain, labguest.guest.lan and
-#                        router.guest.lan resolve, labclient.guest.lan is
+#                        guest.home.arpa (nested in the LAN's home.arpa); checks: the
+#                        guest lease's domain, labguest.guest.home.arpa and
+#                        router.guest.home.arpa resolve, labclient.guest.home.arpa is
 #                        NXDOMAIN. Negative control: LAB_GUEST_DOMAIN=0
 #                        (no domain line: the first three fail).
 #   LAB_GUEST_IPV6=0     (with LAB_IPV6) the guest network with
@@ -238,20 +238,20 @@
 #                        rule disabled: every mDNS check fails).
 #   LAB_DNS_VIEWS=1      (implies LAB_GUEST=1) split-horizon local DNS
 #                        (docs/dns-views.md): dns.views = "firewall", a
-#                        name with one address per network (split.lan:
+#                        name with one address per network (split.home.arpa:
 #                        .50 on each) and an override of a public name for
 #                        the LAN only (files.isp.example -> the client).
-#                        Checks: from the guest, labclient.lan and its PTR
+#                        Checks: from the guest, labclient.home.arpa and its PTR
 #                        are NXDOMAIN (the guest zone cannot reach the LAN)
-#                        and the router's "hidden" counter rises, nas.lan
+#                        and the router's "hidden" counter rises, nas.home.arpa
 #                        still resolves (rule guest-ping-nas reaches it);
-#                        split.lan answers per network (and its entries'
+#                        split.home.arpa answers per network (and its entries'
 #                        hits in /api/status dns.hosts rise); files.isp.example
 #                        is the client on the LAN and the ISP's answer on
 #                        the guest network. Negative controls:
 #                        LAB_DNS_VIEWS=0 (views "all": the hiding checks
 #                        fail), LAB_DNS_HOSTS=0 (no [[dns.host]]: split,
-#                        its hits and override fail), LAB_GUEST_RULES=0 (nas.lan hidden).
+#                        its hits and override fail), LAB_GUEST_RULES=0 (nas.home.arpa hidden).
 #   LAB_DOT=1            DNS over TLS, strict (docs/dns-over-tls.md): the
 #                        router boots from a store with dns.tls, upstream
 #                        203.0.113.1#dns.isp.example and a CA made for this
@@ -334,7 +334,7 @@
 #                        address with another id, and again after the
 #                        prefix change. Negative control
 #                        LAB_IPV6_PINHOLE=0.
-#                        labclient.lan answers AAAA with the client's
+#                        labclient.home.arpa answers AAAA with the client's
 #                        global and ULA addresses (neighbor discovery x
 #                        its DHCP lease) and the PTR of the global one;
 #                        negative control LAB_ROUTER_ARGS=dns_aaaa=0.
@@ -346,7 +346,7 @@
 #                        1; router ipv6=1): the client gets a SLAAC
 #                        address from the main LAN's ULA /64, no default
 #                        route (router lifetime 0), pings the router's ULA
-#                        and link-local address, resolves router.lan AAAA
+#                        and link-local address, resolves router.home.arpa AAAA
 #                        over IPv6 and opens the web interface on the ULA;
 #                        the router's RA counters; /api/status routes
 #                        lists the ULA /64 (with a global prefix also that
@@ -614,7 +614,7 @@ name = "guest"
 vlan = 20
 ipv4 = "10.20.0.1/24"
 zone = "$GUEST_ZONE"
-$([[ "$GUEST_DOMAIN" == 1 ]] && echo 'domain = "guest.lan"')
+$([[ "$GUEST_DOMAIN" == 1 ]] && echo 'domain = "guest.home.arpa"')
 $([[ "$GUEST_IPV6" == 0 && -z "${LAB_GUEST_IPV6_CONTROL:-}" ]] && echo 'ipv6 = false')
 
 [[zone]]
@@ -759,7 +759,7 @@ CFG
     CLIENT_INITRD="$WORK/client-initrd.img"
   fi
   ROUTER_STORE="$WORK/store.img"
-  echo "== router config${GUEST_LIVE:+ (added live by the client)}: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")$([[ "$REDIRECT" == 1 ]] && echo ", NTP redirect")$([[ "$GUEST_DOMAIN" == 1 ]] && echo ", domain guest.lan")$([[ -n "$MDNS" ]] && echo ", mdns reflect (enabled: $MDNS_RULES)")$([[ -n "$ROUTES" ]] && echo ", route lab-behind (enabled: $([[ "$ROUTES" == 1 ]] && echo yes || echo no))")$([[ -n "$DNS_VIEWS" ]] && echo ", dns views $([[ "$DNS_VIEWS" == 1 ]] && echo firewall || echo all), dns hosts $DNS_HOSTS")"
+  echo "== router config${GUEST_LIVE:+ (added live by the client)}: networks lan + guest (VLAN 20, zone $GUEST_ZONE)$([[ "$GUEST_RULES" == 1 ]] && echo ", 2 rules")$([[ "$FORWARD" == 1 ]] && echo ", port forward")$([[ "$REDIRECT" == 1 ]] && echo ", NTP redirect")$([[ "$GUEST_DOMAIN" == 1 ]] && echo ", domain guest.home.arpa")$([[ -n "$MDNS" ]] && echo ", mdns reflect (enabled: $MDNS_RULES)")$([[ -n "$ROUTES" ]] && echo ", route lab-behind (enabled: $([[ "$ROUTES" == 1 ]] && echo yes || echo no))")$([[ -n "$DNS_VIEWS" ]] && echo ", dns views $([[ "$DNS_VIEWS" == 1 ]] && echo firewall || echo all), dns hosts $DNS_HOSTS")"
 fi
 
 if [[ -n "$DOT" && -z "$GUEST" ]]; then

@@ -41,7 +41,7 @@ while iot uses 192.168.1.238 (1,725 hits).
 - Every network's DNS socket reaches it (the zone input policy only decides
   whether a network may query at all; the guest zone may).
 - A network's own `domain` only decides where its names live:
-  `labclient.guest.lan` is NXDOMAIN, but `labclient.lan` asked from the
+  `labclient.guest.home.arpa` is NXDOMAIN, but `labclient.home.arpa` asked from the
   guest network answers the LAN address.
 - The reverse zones of all subnets are local, so a guest can PTR-sweep
   `10.10.0.1–254` and list every LAN host name.
@@ -50,7 +50,7 @@ while iot uses 192.168.1.238 (1,725 hits).
 
 ## 2. Goals
 1. **Visibility:** a name is answered only to some networks; the others get
-   NXDOMAIN (`nas.lan` on the LAN, not on the guest network).
+   NXDOMAIN (`nas.home.arpa` on the LAN, not on the guest network).
 2. **Different answers per network:** the same name, another address
    (a server with a leg on two VLANs).
 3. **Override of a public name inside:** `files.example.com` → an internal
@@ -177,17 +177,17 @@ On the DNS page:
   - Version 1 configs still load.
 - Lab, `LAB_GUEST=1 LAB_DNS_VIEWS=1` (router with `views = "firewall"`).
   From `eth0.20` (guest):
-  - `labclient.lan` and its PTR → NXDOMAIN.
-  - `nas.lan` → resolves (rule `guest-ping-nas`; check the lab config has a
+  - `labclient.home.arpa` and its PTR → NXDOMAIN.
+  - `nas.home.arpa` → resolves (rule `guest-ping-nas`; check the lab config has a
     `nas` reservation, add it if not).
-  - `labguest.guest.lan` → resolves.
+  - `labguest.guest.home.arpa` → resolves.
   - From `eth0`: all resolve.
   - Override `www.isp.example`: internal address on the LAN, the ISP's on
     the guest network.
   - `hidden` counter rises.
   - Negative controls:
     - `LAB_DNS_VIEWS=0` (`all`): the hiding checks fail.
-    - `LAB_GUEST_RULES=0`: `nas.lan` fails too.
+    - `LAB_GUEST_RULES=0`: `nas.home.arpa` fails too.
     - `LAB_DNS_HOSTS=0` (no `[[dns.host]]`): the split and override checks fail.
   - Also with `LAB_GUEST_LIVE=1`, `LAB_DOT=1`, `LEATOS_ARCH=x86_64`,
     `QEMU_ACCEL=tcg`.

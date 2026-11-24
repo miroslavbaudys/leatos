@@ -253,8 +253,8 @@ h2=$(echo "$tr_out" | awk '$1=="2"{print $2}')
 [[ "$h1" == "$ROUTER_LAN" ]] && pass "traceroute: hop1 $h1 (leatos), hop2 ${h2:-?} (home router: $HOME_GW)" || fail "traceroute hop1='$h1' hop2='$h2'"
 a=$(dig +short +time=3 +tries=1 example.com A 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
 [[ -n "$a" ]] && pass "dns: system resolver example.com -> $a (via leatos)" || fail "dns: example.com"
-a=$(dig +short +time=2 +tries=1 @"$ROUTER_LAN" router.lan A 2>/dev/null | head -1)
-[[ "$a" == "$ROUTER_LAN" ]] && pass "dns: router.lan -> $a" || fail "dns: router.lan -> '$a'"
+a=$(dig +short +time=2 +tries=1 @"$ROUTER_LAN" router.home.arpa A 2>/dev/null | head -1)
+[[ "$a" == "$ROUTER_LAN" ]] && pass "dns: router.home.arpa -> $a" || fail "dns: router.home.arpa -> '$a'"
 code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 https://example.com/ || true)
 [[ "$code" == 200 ]] && pass "https://example.com/ -> HTTP $code" || fail "https://example.com/ -> '$code'"
 for probe in 1.1.1.1 9.9.9.9; do

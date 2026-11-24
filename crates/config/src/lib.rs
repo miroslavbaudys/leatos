@@ -584,7 +584,7 @@ impl Default for Dns {
             rebind_protection: true,
             prefetch: true,
             stale_secs: DEFAULT_STALE_SECS,
-            domain: "lan".into(),
+            domain: "home.arpa".into(),
             views: DnsViews::All,
             hosts: Vec::new(),
             upstreams: Vec::new(),

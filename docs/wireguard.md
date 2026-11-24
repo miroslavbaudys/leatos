@@ -214,7 +214,7 @@ datapath cores (arch work, out of scope here).
 - Lab `LAB_WG=1 scripts/lab-test.sh`: the router boots from a store with
   `[wireguard]` and one peer; the ISP VM is that peer (outside, like a
   phone on mobile data): handshake, ping the router's `wg0` address,
-  reach the client VM on the LAN, resolve `labclient.lan` through the
+  reach the client VM on the LAN, resolve `labclient.home.arpa` through the
   tunnel, reach the ISP's web server back through the tunnel (NAT),
   `/api/status` counters. First check whether Alpine's virt kernel ships
   `wireguard.ko` in the modloop (it lacks `pppoe.ko`); otherwise

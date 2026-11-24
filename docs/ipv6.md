@@ -300,7 +300,7 @@ fail while its SLAAC address is still tentative (the lab waits for DAD).
 - Web interface on IPv6 (link-local + ULA). Input policy per zone applies
   to IPv6 too: a guest zone without the `mgmt` service cannot reach it.
 - Lab: the client gets a SLAAC ULA, `ping6` to the router, resolves
-  `router.lan` AAAA over IPv6, fetches the web page over the ULA. With
+  `router.home.arpa` AAAA over IPv6, fetches the web page over the ULA. With
   `LAB_GUEST=1` the guest gets its own ULA /64 and cannot open the web
   interface over IPv6. Negative control `LAB_ROUTER_ARGS=ipv6=0` (no
   address, checks fail). Also `LEATOS_ARCH=x86_64`, `QEMU_NIC=igb`.
@@ -572,7 +572,7 @@ at once, a /60 delegated, no RA seen yet), these were added:
   discovery per link (`LinkShared::neigh6`, 128, no allocation per
   packet). The services join them by MAC with leases and reservations
   (`Zone::add_host6_in`, AAAA + ip6.arpa PTR, the A record's view;
-  forgotten after 30 min unseen). Lab: `labclient.lan` AAAA global + ULA,
+  forgotten after 30 min unseen). Lab: `labclient.home.arpa` AAAA global + ULA,
   PTR; hidden from the guest with views. Negative control
   `dns_aaaa=0`.
 - **Config addresses:** `dns.upstreams` take IPv6 servers (UDP and DoT;

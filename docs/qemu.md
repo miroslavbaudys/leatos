@@ -110,7 +110,7 @@ negative controls is in docs/lab-tests.md:
 | Area | Check |
 |---|---|
 | DHCP | lease from leatos (address, router, DNS, domain) |
-| DNS | `nas.lan` (static), `router.lan`, own DHCP hostname, reverse PTR, NXDOMAIN for unknown `.lan`, **upstream** `isp.example` via the ISP's dnsd |
+| DNS | `nas.home.arpa` (static), `router.home.arpa`, own DHCP hostname, reverse PTR, NXDOMAIN for unknown `.home.arpa`, **upstream** `isp.example` via the ISP's dnsd |
 | Router | ping 192.168.1.1 |
 | NAT | HTTP to the ISP; the ISP sees the router's **WAN address** as source (`/cgi-bin/ip`) |
 | ICMP | ping through NAT (echo identifier translation) |
@@ -134,7 +134,7 @@ MacBook ──bridgeN (vmnet-host)── [leatos LAN 192.168.1.1]
 ```
 The Mac joins leatos's LAN through macOS **vmnet-host**. **Only lab traffic
 goes through leatos:** the script adds one route (203.0.113.0/24 via
-192.168.1.1) and scoped DNS resolvers for `*.lan` / `*.example`
+192.168.1.1) and scoped DNS resolvers for `*.home.arpa` / `*.example`
 (`/etc/resolver/`). Your normal internet keeps using Wi-Fi or Ethernet.
 Everything is removed on exit (Ctrl-C), including VMs, the route, and the
 resolver files it created (marked with a header line).
@@ -152,8 +152,8 @@ scripts/mac-lab.sh --check   # start + checks, tear down; exit 1 on failure
   Mac is therefore statically addressed on this LAN; leatos's DHCP server is
   tested by the VM lab.
 - The script refuses to start if the Mac already uses 192.168.1.0/24 or 203.0.113.0/24.
-- Checks from the Mac: ping leatos; `dig` for `nas.lan` and upstream
-  `isp.example`; the macOS resolver for `router.lan`; curl through NAT; the
+- Checks from the Mac: ping leatos; `dig` for `nas.home.arpa` and upstream
+  `isp.example`; the macOS resolver for `router.home.arpa`; curl through NAT; the
   NATed source as seen by the ISP; ping and traceroute through NAT. A
   firewall probe into the Mac is informational only (the macOS application
   firewall could also block it; the VM lab has the rigorous check).
@@ -202,7 +202,7 @@ scripts/mac-internet.sh --restore        # undo a previous run (after a crash, k
   - a **watchdog** restores the network if leatos exits or stops answering for ~15 s.
 - **Checks:** the route for 1.1.1.1 goes via leatos; traceroute hop 1 =
   leatos, hop 2 = home router; system DNS resolves through leatos;
-  `router.lan`; HTTPS to example.com; ping 1.1.1.1.
+  `router.home.arpa`; HTTPS to example.com; ping 1.1.1.1.
 - **Known limits:**
   - IPv6 traffic bypasses leatos unless you use `--ipv4-only`;
   - DNS rebind protection refuses home-LAN names that resolve to private addresses;

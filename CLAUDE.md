@@ -147,7 +147,8 @@ Keep them current when you change what they describe; keep this file to the map 
     restarted: its trial is confirmed only if it runs the uploaded build).
 - Mac:
   - `scripts/mac-lab.sh [--check]`: put the Mac on leatos's LAN (vmnet-host, needs sudo, so run it
-    in Terminal); only 203.0.113.0/24 and `*.lan`/`*.example` DNS go via leatos; cleans up on exit.
+    in Terminal); only 203.0.113.0/24 and `*.home.arpa`/`*.example` DNS go via leatos; cleans up
+    on exit.
   - `scripts/mac-internet.sh [--check] [--wan-if enX] [--ipv4-only] [--release] [--shape U:D]
     [--kernel-args "..."] | --restore`: route the Mac's real IPv4 internet + DNS through leatos
     (WAN vmnet-bridged); state saved before changes, watchdog + `--restore` undo.

@@ -4,7 +4,7 @@
 //! Thin glue between smoltcp UDP sockets and the sans-IO crates
 //! (`proto_dhcp::v4::server`, `proto_dns::resolver`): receive datagrams, feed
 //! them in with the current time, and send what comes out. DHCP lease events
-//! update the DNS zone (`host.lan`). The DNS upstreams are `dns.upstreams`
+//! update the DNS zone (`host.home.arpa`). The DNS upstreams are `dns.upstreams`
 //! if set, else the WAN lease's (DHCP or PPPoE); with `dns.tls` they are
 //! asked over TLS only (`net::dot`), never in plain text.
 //!

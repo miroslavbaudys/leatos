@@ -168,7 +168,7 @@ ip = "10.10.0.10"
 hostname = "nas"
 
 [dns]
-domain = "lan"
+domain = "home.arpa"
 cache_entries = 4096
 rebind_protection = true
 

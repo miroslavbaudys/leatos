@@ -374,7 +374,8 @@ default `all` lets every network resolve every local name. Design, rules
 and lab check (`LAB_DNS_VIEWS=1`): docs/dns-views.md.
 
 ### `[dns] domain`
-The default local domain (version 1's `lan.domain`, default `lan`): DHCP
+The default local domain (version 1's `lan.domain`, default `home.arpa`, the
+special-use domain for home networks, RFC 8375; before 2026-11-23 `lan`): DHCP
 clients of a network without its own `domain` are `<hostname>.<domain>`.
 A network with `domain` set (`iot.home.arpa`) serves that domain to its
 DHCP clients, and its reservations and leases resolve there only. Every
@@ -382,7 +383,7 @@ domain in use is local (never forwarded, exempt from rebind protection)
 and has `router.<domain>` = the address of the first network using it.
 Domains may nest (`home.arpa`, `iot.home.arpa`): a name belongs to the
 longest local domain it ends in (`crates/proto-dns` `Zone`). Lab check:
-`LAB_GUEST=1 scripts/lab-test.sh` (guest network `guest.lan`; negative
+`LAB_GUEST=1 scripts/lab-test.sh` (guest network `guest.home.arpa`; negative
 control `LAB_GUEST_DOMAIN=0`).
 
 ### `[ipv6]` (M7 step 1, docs/ipv6.md)

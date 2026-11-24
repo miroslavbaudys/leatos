@@ -299,7 +299,7 @@
     <form class="card cfg" autocomplete="off"><h3>Network</h3>
       <div class="form">
         <label>Router address / prefix<input data-net="ipv4" data-path="network.lan.ipv4" placeholder="192.168.1.1/24"></label>
-        <label>Local domain (also for networks without their own)<input data-path="dns.domain" placeholder="lan"></label>
+        <label>Local domain (also for networks without their own)<input data-path="dns.domain" placeholder="home.arpa"></label>
         <label class="check"><input data-net="ipv6" data-path="network.lan.ipv6" data-default="true" type="checkbox">IPv6 on this network (while IPv6 is on under System)</label>
       </div>
       <p class="hint">Changing the router address boots as a trial: open the page at the new address and confirm, or the router goes back.</p>
@@ -929,7 +929,7 @@ async function refresh() {
     + (t.dropped ? `, ${n(t.dropped)} dropped while failing` : "") + (t.error ? ` · last error: ${esc(t.error)}` : "")]);
   const views = cfgOrig?.dns?.views === "firewall" ? "by the firewall" : "all networks see all";
   $("dnsst").innerHTML = rows([["Upstream", ups], ...tls,
-    ["Local names", `DHCP host names, reservations and ${n((cfgOrig?.dns?.host ?? []).length)} record(s), as <i>name</i>.${esc(cfgOrig?.dns?.domain ?? "lan")}; ${views}`],
+    ["Local names", `DHCP host names, reservations and ${n((cfgOrig?.dns?.host ?? []).length)} record(s), as <i>name</i>.${esc(cfgOrig?.dns?.domain ?? "home.arpa")}; ${views}`],
     ...(d ? [["Answers", `${n(d.local)} local · ${n(d.hidden ?? 0)} hidden from the asking network · ${n(d.cache_hits)} from the cache · ${n(d.forwarded)} forwarded`],
       ["Over TCP", d.tcp ? `${n(d.tcp.queries)} queries · ${n(d.tcp.accepted)} connections (${n(d.tcp.open)} open)` : "off"]] : [])]);
 
@@ -1134,7 +1134,7 @@ function fillForm(c) {
   renderRoutes(c.route ?? []);
   renderMdns(c.mdns?.reflect ?? []);
   renderHosts(c.dns?.host ?? []);
-  $("dnsdom").textContent = c.dns?.domain ?? "lan";
+  $("dnsdom").textContent = c.dns?.domain ?? "home.arpa";
 }
 function readForm() {
   const c = structuredClone(cfgOrig);
@@ -1269,7 +1269,7 @@ function netDetail(n) {
       field("lo", "Pool, first address (empty = automatic)", d.range?.[0], { placeholder: "automatic" }),
       field("hi", "Pool, last address", d.range?.[1], { placeholder: "automatic" }),
       field("lease", "Lease time, hours", d.lease_secs === undefined ? "" : +(d.lease_secs / 3600).toFixed(4), { type: "number", min: 0.02, step: "any", placeholder: "12" }),
-      field("domain", "DNS domain (empty = the LAN page's)", n.domain, { placeholder: cfgOrig?.dns?.domain ?? "lan" })]),
+      field("domain", "DNS domain (empty = the LAN page's)", n.domain, { placeholder: cfgOrig?.dns?.domain ?? "home.arpa" })]),
     el("div", { className: "hint", textContent: "Reservations: always the same address for a device." }), statics,
     el("div", { className: "row" }, [el("button", { type: "button", className: "plain", textContent: "Add reservation",
       onclick: () => { netStaticRow(statics, {}); netPaths(); updatePending(); } })])]);
@@ -1784,7 +1784,7 @@ function readHosts() {
 }
 // Before saving: names outside the local domains override public names.
 function renderHostWarn(c) {
-  const doms = [c.dns?.domain ?? "lan", ...(c.network ?? []).map((x) => x.domain).filter((d) => d)].map((d) => d.toLowerCase());
+  const doms = [c.dns?.domain ?? "home.arpa", ...(c.network ?? []).map((x) => x.domain).filter((d) => d)].map((d) => d.toLowerCase());
   const out = [];
   for (const h of c.dns?.host ?? []) {
     const name = (h.name ?? "").toLowerCase();

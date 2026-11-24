@@ -505,7 +505,7 @@ fn apply_bootargs(c: &mut schema::Config, args: &str) {
 }
 
 /// Without a stored config, on a virtual machine: the lab's `nas` reservation (host .10, MAC
-/// 52:54:00:00:00:05), which `scripts/lab-test.sh` resolves as `nas.lan`.
+/// 52:54:00:00:00:05), which `scripts/lab-test.sh` resolves as `nas.home.arpa`.
 fn add_lab_reservation(c: &mut schema::Config) {
     let Some(lan) = c.networks.first_mut() else { return };
     let ip = lan.ipv4.host(10);

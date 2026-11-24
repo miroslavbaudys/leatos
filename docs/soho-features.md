@@ -103,7 +103,7 @@ route (docs/config-v2.md `[[route]]`). Open: conflict probe, option 42
 - Lease persistence: in memory, flushed periodically and on shutdown. Batch
   writes to limit flash wear. ✅
 - Optional ARP or ICMP probe before handing out an address.
-- Emit `LeaseAdded{mac, ip, hostname}` so the DNS zone resolves `host.lan`.
+- Emit `LeaseAdded{mac, ip, hostname}` so the DNS zone resolves `host.home.arpa`.
 - One pool per LAN or VLAN. ✅
 
 ### DHCPv4 client (WAN, non-PPPoE ISPs)
@@ -127,7 +127,7 @@ upstreams.
 
 ## DNS
 Crate: `crates/proto-dns`. **Status (M3): forwarder implemented** (15
-tests, including fuzzing): local `.lan` zone (router, static hosts, DHCP
+tests, including fuzzing): local `.home.arpa` zone (router, static hosts, DHCP
 hostnames, PTR for the LAN subnet; never forwarded), bounded cache with
 TTL aging and negative caching, upstreams from the WAN lease, random
 transaction IDs, response validation (server + question), merging of
@@ -194,7 +194,7 @@ in the schema, refused by the kernel so far).
 |---|---|
 | Forwarder + cache on LAN IPs, UDP **and** TCP port 53; TTLs, negative caching (RFC 2308), deduplicate in-flight queries | required |
 | Upstreams from IPCP/DHCP or config; failover and health tracking | required |
-| Local zone `.lan`: DHCP hostnames, static hosts, `router.lan`, PTR records for LAN subnets | required |
+| Local zone `.home.arpa`: DHCP hostnames, static hosts, `router.home.arpa`, PTR records for LAN subnets | required |
 | **Never resolve for the WAN side** (bind to LAN only, plus a firewall rule) | required |
 | DNS rebind protection (drop public answers that contain private IPs) | recommended |
 | Bounded LRU cache (memory cap) | recommended |
@@ -275,7 +275,7 @@ prefix_hint = 56
 
 [lan]
 ipv4 = "192.168.1.1/24"
-domain = "lan"
+domain = "home.arpa"
 
 [lan.dhcp]
 range = ["192.168.1.100", "192.168.1.250"]

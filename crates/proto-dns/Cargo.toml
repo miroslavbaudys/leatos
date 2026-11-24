@@ -3,7 +3,7 @@ name = "proto-dns"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "DNS: forwarder with cache, local .lan zone fed by DHCP leases, rebind protection."
+description = "DNS: forwarder with cache, local zone (home.arpa) fed by DHCP leases, rebind protection."
 
 [dependencies]
 

@@ -1,4 +1,4 @@
-//! DNS for the LAN: forwarder with cache, local `.lan` zone fed by DHCP
+//! DNS for the LAN: forwarder with cache, local zone (`home.arpa`, RFC 8375) fed by DHCP
 //! leases, rebind protection.
 //!
 //! - [`wire`]: message parsing/building (bounds-checked, fuzz-tested)
