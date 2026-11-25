@@ -105,6 +105,12 @@ pub static LOCAL_NO_ROUTE: AtomicU64 = AtomicU64::new(0);
 pub static ARP_REPLIES: AtomicU64 = AtomicU64::new(0);
 pub static NA_SENT: AtomicU64 = AtomicU64::new(0);
 pub static ND_CONFLICTS: AtomicU64 = AtomicU64::new(0);
+/// The router stack's unicast packets on those links that waited in the
+/// neighbor table's pending queue (the neighbor was not resolved), and the
+/// packets the table dropped when one was queued (that one, or an older
+/// pending one: forwarded or local) ([`Datapath::send_local`]).
+pub static LOCAL_QUEUED: AtomicU64 = AtomicU64::new(0);
+pub static LOCAL_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// The forwarder's drops by reason (`fwd::forwarder::DropReason::index`),
 /// part of `DROPPED` (the web interface's firewall page).
 pub static DROP_REASONS: [AtomicU64; fwd::forwarder::DROP_REASONS] =
@@ -343,12 +349,22 @@ fn poll_neigh<A: Copy + Ord>(n: &mut NeighTable<PacketBuf, A>, now: u64) -> Vec<
     r
 }
 
-fn count_neigh_drops(before: u64, after: u64) {
+fn count_neigh_drops(before: u64, after: u64) -> u64 {
     let n = after.saturating_sub(before);
     if n > 0 {
         DROPPED.fetch_add(n, Ordering::Relaxed);
         DROP_REASONS[DropReason::Neighbor.index()].fetch_add(n, Ordering::Relaxed);
     }
+    n
+}
+
+/// What [`Datapath::to_next_hop`] / [`Datapath::to_next_hop6`] did with a
+/// packet: it waits for its neighbor, and how many packets the neighbor
+/// table dropped meanwhile (it or an older pending one).
+#[derive(Clone, Copy, Default)]
+struct Hop {
+    queued: bool,
+    dropped: u64,
 }
 
 fn now_ms() -> u64 {
@@ -635,14 +651,23 @@ impl Datapath {
         pkt.meta.wire_len = pkt.len() as u32;
         pkt.meta.enqueue_ts = now_ns();
         let now = now_ms();
-        match hop {
-            fwd::local::NextHop::Mac(mac) => self.send_resolved(ifx, mac, pkt, touched),
+        let h = match hop {
+            fwd::local::NextHop::Mac(mac) => {
+                self.send_resolved(ifx, mac, pkt, touched);
+                Hop::default()
+            }
             fwd::local::NextHop::Neighbor4(a) => self.to_next_hop(ifx, a, pkt, now, touched),
             fwd::local::NextHop::Neighbor6(a) => self.to_next_hop6(ifx, a, pkt, now, touched),
             fwd::local::NextHop::NoRoute => {
                 LOCAL_NO_ROUTE.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
+        };
+        if h.queued {
+            LOCAL_QUEUED.fetch_add(1, Ordering::Relaxed);
+        }
+        if h.dropped > 0 {
+            LOCAL_DROPPED.fetch_add(h.dropped, Ordering::Relaxed);
         }
         true
     }
@@ -1091,7 +1116,7 @@ impl Datapath {
 
     /// [`Self::to_next_hop`] for IPv6: neighbor discovery. Not over PPPoE
     /// yet (IPv6CP: docs/ipv6.md step 4).
-    fn to_next_hop6(&self, egress: IfIndex, next_hop: Ipv6Addr, pkt: PacketBuf, now: u64, touched: &mut Touched) {
+    fn to_next_hop6(&self, egress: IfIndex, next_hop: Ipv6Addr, pkt: PacketBuf, now: u64, touched: &mut Touched) -> Hop {
         let out = &self.sh.ports[self.sh.links[egress as usize].port()];
         if out.is_pppoe() {
             // Point to point, as for IPv4: no neighbor discovery.
@@ -1101,20 +1126,26 @@ impl Datapath {
                     PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            return;
+            return Hop::default();
         }
-        let r = {
+        let (r, dropped) = {
             let mut n = self.neigh6[egress as usize].lock();
             let before = n.dropped;
             let r = n.resolve(egress, next_hop, pkt, now);
-            count_neigh_drops(before, n.dropped);
-            r
+            (r, count_neigh_drops(before, n.dropped))
         };
-        match r {
-            Resolve::Ready(mac, pkt) => self.send_resolved(egress, mac, pkt, touched),
-            Resolve::Queued { send_arp: true } => self.send_ns(egress, next_hop, touched),
-            Resolve::Queued { send_arp: false } => {}
-        }
+        let queued = match r {
+            Resolve::Ready(mac, pkt) => {
+                self.send_resolved(egress, mac, pkt, touched);
+                false
+            }
+            Resolve::Queued { send_arp: true } => {
+                self.send_ns(egress, next_hop, touched);
+                true
+            }
+            Resolve::Queued { send_arp: false } => true,
+        };
+        Hop { queued, dropped }
     }
 
     /// A neighbor solicitation for `target` from our link-local address.
@@ -1147,7 +1178,7 @@ impl Datapath {
 
     /// To the next hop: the PPPoE AC, or through the neighbor table, into
     /// the egress qdisc.
-    fn to_next_hop(&self, egress: IfIndex, next_hop: Ipv4Addr, pkt: PacketBuf, now: u64, touched: &mut Touched) {
+    fn to_next_hop(&self, egress: IfIndex, next_hop: Ipv4Addr, pkt: PacketBuf, now: u64, touched: &mut Touched) -> Hop {
         let out = &self.sh.ports[self.sh.links[egress as usize].port()];
         if out.is_pppoe() {
             // Point to point: the access concentrator is the only neighbor.
@@ -1157,20 +1188,26 @@ impl Datapath {
                     PPPOE_DROPS.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            return;
+            return Hop::default();
         }
-        let r = {
+        let (r, dropped) = {
             let mut n = self.neigh[egress as usize].lock();
             let before = n.dropped;
             let r = n.resolve(egress, next_hop, pkt, now);
-            count_neigh_drops(before, n.dropped);
-            r
+            (r, count_neigh_drops(before, n.dropped))
         };
-        match r {
-            Resolve::Ready(mac, pkt) => self.send_resolved(egress, mac, pkt, touched),
-            Resolve::Queued { send_arp: true } => self.send_arp_request(egress, next_hop, touched),
-            Resolve::Queued { send_arp: false } => {}
-        }
+        let queued = match r {
+            Resolve::Ready(mac, pkt) => {
+                self.send_resolved(egress, mac, pkt, touched);
+                false
+            }
+            Resolve::Queued { send_arp: true } => {
+                self.send_arp_request(egress, next_hop, touched);
+                true
+            }
+            Resolve::Queued { send_arp: false } => true,
+        };
+        Hop { queued, dropped }
     }
 
     /// Release what the WAN ingress stage's shaper allows now to the

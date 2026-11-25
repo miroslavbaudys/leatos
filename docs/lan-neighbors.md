@@ -1,10 +1,11 @@
 # LAN neighbors: one table per link (plan)
 
-Status (2026-11-23): step 0 done except the upstream report (lab check `LAB_ND_FLOOD=1` for its
+Status (2026-11-25): step 0 done except the upstream report (lab check `LAB_ND_FLOOD=1` for its
 WAN fix); step 1 done (`fwd::nd`, host tests, `fwd` fuzz target); step 2 done (`fwd::local`,
 `Datapath::send_local` / `set_local_link`); step 3 in QEMU (LAN links IP-only by default,
 `lan_medium=eth` fallback), all §4 lab checks in place (unicast NS, Router flag, readdress, local
-traffic over a `[[route]]`, conflicts). Nothing is deployed before the apu4 soak ends (2026-11-25).
+traffic over a `[[route]]`, conflicts, the local queue counters). The apu4 soak ended 2026-11-25;
+next: §5 on the apu4 (457cb97 baseline taken).
 
 ## 1. The problem
 
@@ -124,8 +125,10 @@ Each step is testable on its own; the full matrix (§4) runs before a step is do
   keeps them from `local_rx`.
 - Boot argument `lan_medium=eth`: the old path, unchanged (smoltcp Ethernet + hints), as a fallback
   and A/B for one deployment cycle on the apu4; a row in docs/boot-arguments.md.
-- Counters in `/api/status` (`neighbor`): `arp_replies`, `na_sent`, `nd_conflicts`,
-  `local_no_route`, local packets queued / dropped in `fwd::neigh`.
+- Counters in `/api/status` `lan_nd`: `medium`, `arp_replies`, `na_sent`, `conflicts`,
+  `local_no_route`, `local_queued` (the router's packets that waited for a neighbor) and
+  `local_dropped` (what the neighbor table dropped when one was queued: it, or an older pending
+  packet, forwarded or local).
 
 ### Step 4: remove the LAN workarounds
 
@@ -176,19 +179,42 @@ sleeping and waking, IPv6 privacy addresses):
 
 ## 5. On the apu4
 
-After the soak (2026-11-25), in RAM first (`apu-upload.sh`), then `--persist`:
+In RAM first (`apu-upload.sh`), for a day; then `--persist`. **Decide on the fallback before
+persisting:** a stored kernel boots with the boot partition's command line and `--persist` refuses
+`X-Cmdline` (docs/upgrades.md), so `lan_medium=eth` is a quick A/B only while the kernel runs in
+RAM (`apu-upload.sh --cmdline "mgmt_pass=… lan_medium=eth"`); after `--persist` the way back is a
+rollback or an edit of the SD card's Limine config.
 
-- `/api/status` neighbor counters, `neighbor` drop reason, local queued / dropped over a day.
-- The symptoms that started this (2026-11-22, the Twitch pauses): none.
-- iPhone / Mac: IPv6 default route stays (R flag); a sleeping phone gets DNS answers at once after
-  waking.
-- A/B for a day with `lan_medium=eth` if anything looks off; the fallback goes in step 4.
+**Baseline** (457cb97, the old path, `/api/status` after 72.3 h, 2026-11-25; saved in
+`lab/cache/apu4-baseline/`): `neighbor` drops 2923 (~40/h), `neigh_probes` 22201 (~310/h),
+`rx_no_buf` 0 on every port. The same upload carries the igb interrupt changes
+(docs/bufferbloat-cake.md §7): a LAN fault that stays with `lan_medium=eth` is theirs.
+
+Over the day (sample `/api/status`, e.g. `scripts/soak-test.sh --hours 24`, and read `lan_nd`):
+
+| Check | Pass |
+|---|---|
+| `lan_nd.medium` | `ip` |
+| `arp_replies`, `na_sent` | rising (clients re-resolve the router every few minutes) |
+| `conflicts` | 0 (else a real address clash, or a responder bug: look at the log) |
+| `local_no_route` | flat |
+| `local_queued` / `local_dropped` | queued rises a little (first answers, phones); dropped ≈ 0 |
+| `neighbor` drops, `neigh_probes` | per hour no higher than the baseline |
+| DHCP, all three networks (VLANs 2, 3) | leases renew; the IoT devices stay online |
+| iPhone / Mac, IPv6 | default route stays (`netstat -rn -f inet6`); DNS at once after waking |
+| mDNS between networks | still works (multicast now through `send_local`) |
+| Web interface, `apu-upload.sh` over the tunnel | still work |
+| The 2026-11-22 symptom (Twitch pauses) | none (fixed in 457cb97 already: a regression check) |
+
+Anything off: A/B with `lan_medium=eth` (in RAM) for a day before persisting. Step 4 starts a week
+after `--persist` without the fallback.
 
 ## 6. Risks and open questions
 
 - **Local packets share the pending queue with forwarded ones** (3 per neighbor): a burst of
   answers to a neighbor not yet resolved loses the oldest. Today smoltcp drops the packet and
-  stops all lookups for 1 s, so this is no worse; measured by the local queued / dropped counters.
+  stops all lookups for 1 s, so this is no worse; measured by `lan_nd.local_queued` /
+  `local_dropped`.
 - **svc calls into the datapath:** `send_local` must stay short (two locks, no allocation beyond
   what the datapath already does) and never wait. Its cost on the svc core is measured with
   `cpu.tasks` in the lab's load phase.

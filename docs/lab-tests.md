@@ -220,6 +220,10 @@ Two more parts (docs/lan-neighbors.md §4):
   gratuitous claim from the client's MAC counted, the router still answers ARP after; a claim
   for another address and one from the router's own MAC (eth0 set to it for a moment) are the
   controls that must not count. Skipped (INFO) on `lan_medium=eth`.
+- **Local queue** (`lan_nd.local_queued` / `local_dropped`): in round 1 the router's first answer to
+  each new address waits for ARP, so `local_queued` rises by at least one per address and
+  `local_dropped` stays; rounds 2–3 are INFO. Skipped (INFO) on `lan_medium=eth`. Negative control
+  (2026-11-25, a one-off build without the `LOCAL_QUEUED` increment): FAIL "not counted".
 
 ### `LAB_ACK=1`: ACK filter
 

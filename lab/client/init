@@ -579,6 +579,11 @@ if $bb grep -q 'lab_neigh=1' /proc/cmdline; then
       $bb ip addr add "192.168.1.$((200 + i))/24" dev eth0 2>/dev/null && added=$((added + 1))
       i=$((i + 1))
     done
+    # The router never saw ARP from these addresses (its MAC is pinned
+    # here), so its first answer to each waits in the datapath's neighbor
+    # queue (lan_nd.local_queued, docs/lan-neighbors.md §5) while it ARPs.
+    lq() { echo "$1" | $bb sed -n "s/.*\"lan_nd\":{[^}]*\"local_$2\":\([0-9]*\).*/\1/p"; }
+    s0=$(nst)
     lost=""
     for round in 1 2 3; do
       l=0; i=0
@@ -587,13 +592,32 @@ if $bb grep -q 'lab_neigh=1' /proc/cmdline; then
         i=$((i + 1))
       done
       lost="$lost $l"
+      [ $round = 1 ] && s1=$(nst)
     done
+    s3=$(nst)
     set -- $lost
     what="lost$lost of $nhosts per round (first contact, then twice more) with the router's MAC pinned"
     if [ "$added" != "$nhosts" ]; then fail "neighbors router: INVALID, added $added of $nhosts addresses ($what)"
     elif [ "$1" != 0 ]; then fail "neighbors router: first contact lost (ARP hints): $what"
     elif [ "$2" != 0 ] || [ "$3" != 0 ]; then fail "neighbors router: answers lost later (neighbor cache): $what"
     else pass "neighbors router: $what"; fi
+    # B2: the router's own packets to unresolved neighbors are counted
+    # (local_queued at least one per new address in round 1, none dropped).
+    # Rounds 2-3 find them resolved (INFO: an entry idle past neigh_secs in
+    # a slow run is resolved anew). Negative control: the counter's
+    # increment removed (docs/lab-tests.md). Skipped on lan_medium=eth.
+    if echo "$s0" | $bb grep -q '"lan_nd":{"medium":"eth"'; then
+      echo "LAB INFO: neighbors local queue: not used on lan_medium=eth (smoltcp resolves)"
+    else
+      q0=$(lq "$s0" queued); q1=$(lq "$s1" queued); q3=$(lq "$s3" queued)
+      d0=$(lq "$s0" dropped); d3=$(lq "$s3" dropped)
+      what="queued ${q0:-?} -> ${q1:-?} (round 1) -> ${q3:-?}, dropped ${d0:-?} -> ${d3:-?}, $added new addresses"
+      if [ -z "$q0" ] || [ -z "$q1" ] || [ -z "$q3" ] || [ -z "$d0" ] || [ -z "$d3" ]; then
+        fail "neighbors local queue: no lan_nd.local_queued / local_dropped in /api/status"
+      elif [ $((q1 - q0)) -lt "$added" ]; then fail "neighbors local queue: router packets to unresolved neighbors not counted ($what)"
+      elif [ "$d3" != "$d0" ]; then fail "neighbors local queue: router packets dropped ($what)"
+      else pass "neighbors local queue: $what"; fi
+    fi
     # C: readdressing keeps neighbors (docs/lan-neighbors.md §4; needs the
     # store and IPv6: LAB_GUEST=1 or LAB_GUEST_LIVE=1, with LAB_IPV6=1):
     # the LAN's ULA prefix moved to fd99:1:2::/48 and back by two live
