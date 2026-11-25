@@ -275,9 +275,12 @@ backlog, flows) and the client's `/api/status` deltas, to compare with the apu4
   grade. Runs are INVALID if the load failed; results go to `lab/cache/bufferbloat.csv`.
 - `scripts/soak-test.sh [--host H] [--hours 72] [--interval 60] [--label X]` (M9): polls
   `/api/status` into `lab/cache/soak-LABEL.csv`. FAIL on a reboot, a rising heap minimum or a
-  falling free-pool maximum (first vs. last window after warm-up), INVALID without enough forwarded
-  packets or coverage; `--report CSV` judges a run so far. It only observes: the load comes from
-  real use (the apu4) or another driver.
+  falling free-pool maximum (first vs. last window after warm-up and once the DNS cache is full:
+  it grows once to `dns.cache_entries`), INVALID without enough forwarded packets, coverage or room
+  for both windows; `--report CSV` judges a run so far. It only observes: the load comes from real
+  use (the apu4) or another driver. Negative controls (on the 457cb97 apu4 CSV with a synthetic
+  `dns_cached`): a 50 KiB/h heap leak and a cache full from the start FAIL, a cache filling until
+  the last window is INVALID.
 
 ## Fuzzing
 

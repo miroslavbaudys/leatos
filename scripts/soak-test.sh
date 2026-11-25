@@ -12,13 +12,18 @@
 #   heap     the *lowest* heap use in the last window is not above the lowest
 #            in the first window (after warm-up) by more than 5 % + 256 KiB.
 #            Heap use follows the connection count, so the quiet-time minimum
-#            is what a leak raises.
+#            is what a leak raises. The first window starts only once the
+#            DNS cache has filled (reached 99 % of its largest size in the
+#            run): with serve-stale it grows to its cap (dns.cache_entries,
+#            ~400 B per entry) and stays there, so a busy evening raises the
+#            heap by MBs once (the 457cb97 apu4 soak: +1.6 MB at 31 h).
 #   pool     the *highest* free packet count in the last window is not below
 #            the first window's by more than 1 %: buffers that never come
 #            back lower the idle maximum.
 # and reports the run INVALID (not passed) unless it covered at least 90 %
-# of the planned time with samples and forwarded at least --min-forwarded
-# packets (the load actually happened).
+# of the planned time with samples, forwarded at least --min-forwarded
+# packets (the load actually happened) and left room for both windows after
+# the warm-up and the cache fill (no leak check, no pass).
 #
 # Usage:
 #   scripts/soak-test.sh [--host H] [--hours 72] [--interval 60] [--label NAME]
@@ -52,7 +57,7 @@ while [[ $# -gt 0 ]]; do
     --window-hours) WINDOW_H="$2"; shift ;;
     --min-forwarded) MIN_FWD="$2"; shift ;;
     --report) REPORT="$2"; shift ;;
-    -h | --help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,34p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -91,10 +96,19 @@ for a, r in zip(rows, rows[1:]):
 seg.append(cur)
 run = max(seg, key=len)
 s0 = int(run[0]["ts"]) + warm_h * 3600
+# The DNS cache fills once to its cap: start the baseline after that (older
+# CSVs have no dns_cached column: warm-up only).
+dns = [(int(r["ts"]), num(r, "dns_cached")) for r in run if r.get("dns_cached") not in (None, "", "null")]
+if dns:
+    peak = max(c for _, c in dns)
+    full = next(t for t, c in dns if c >= peak * 0.99)
+    notes.append(f"DNS cache: {peak} entries, full after {(full - int(run[0]['ts'])) / 3600:.1f} h")
+    s0 = max(s0, full)
 first = [r for r in run if s0 <= int(r["ts"]) < s0 + win_h * 3600]
 last = [r for r in run if int(r["ts"]) >= int(run[-1]["ts"]) - win_h * 3600]
-if not first or not last or int(last[0]["ts"]) < s0 + win_h * 3600:
-    notes.append(f"leak checks skipped: need warm-up {warm_h} h + two {win_h} h windows without a reboot")
+leak_checked = bool(first and last and int(last[0]["ts"]) >= s0 + win_h * 3600)
+if not leak_checked:
+    notes.append(f"leak checks skipped: need warm-up {warm_h} h (and a full DNS cache) + two {win_h} h windows without a reboot")
 else:
     h0 = min(num(r, "heap_used") for r in first)
     h1 = min(num(r, "heap_used") for r in last)
@@ -122,6 +136,8 @@ if span_h < 0.9 * hours:
     invalid.append(f"covered {span_h:.1f} h of {hours:g} h")
 if fwd < min_fwd:
     invalid.append(f"forwarded {fwd} < {min_fwd} packets (no load)")
+if not leak_checked:
+    invalid.append("no leak check")
 if fails:
     print("SOAK: FAIL"); sys.exit(1)
 if invalid:
@@ -144,7 +160,7 @@ AUTH=()
 mkdir -p lab/cache
 CSV="lab/cache/soak-$LABEL.csv"
 [[ -e "$CSV" ]] && { echo "$CSV exists: pick another --label" >&2; exit 2; }
-echo "ts,uptime_s,build,heap_used,heap_free,pool_free,pool_cap,pool_fail,conntrack,early_drops,forwarded,dropped,pass_us_max,temp_mc,hk_us_max,heap_live,alloc_n,alloc_avg_ns,alloc_max_ns,dealloc_n,dealloc_avg_ns,dealloc_max_ns" >"$CSV"
+echo "ts,uptime_s,build,heap_used,heap_free,pool_free,pool_cap,pool_fail,conntrack,early_drops,forwarded,dropped,pass_us_max,temp_mc,hk_us_max,heap_live,alloc_n,alloc_avg_ns,alloc_max_ns,dealloc_n,dealloc_avg_ns,dealloc_max_ns,dns_cached" >"$CSV"
 
 sample() {
   local now json
@@ -163,10 +179,11 @@ try:
     a, f = h.get("alloc") or {}, h.get("dealloc") or {}
     v += [(d.get("housekeeping_us") or {}).get("max", ""), h.get("live", ""),
           a.get("count", ""), a.get("avg_ns", ""), a.get("max_ns", ""),
-          f.get("count", ""), f.get("avg_ns", ""), f.get("max_ns", "")]
+          f.get("count", ""), f.get("avg_ns", ""), f.get("max_ns", ""),
+          (d.get("dns") or {}).get("cached", "")]
     print(",".join([now] + ["%s" % x for x in v]))
 except Exception:
-    print(now + "," * 21)
+    print(now + "," * 22)
 ' "$now" >>"$CSV"
 }
 
@@ -185,7 +202,7 @@ echo "soak: $HOST for $HOURS h, every $INTERVAL s -> $CSV (Ctrl-C for the report
 while [[ $(date +%s) -lt $END ]]; do
   sample
   tail -1 "$CSV" | awk -F, '$2 == "" { print "  no answer"; next }
-    { printf "  up %ds  heap %d KiB  pool %d/%d  conns %d  fwd %d\n", $2, $4 / 1024, $6, $7, $9, $11 }'
+    { printf "  up %ds  heap %d KiB  pool %d/%d  conns %d  dns %s  fwd %d\n", $2, $4 / 1024, $6, $7, $9, $23, $11 }'
   sleep "$INTERVAL" &
   wait $! || true
 done
