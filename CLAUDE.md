@@ -45,8 +45,8 @@ Keep them current when you change what they describe; keep this file to the map 
 - `docs/`: design and reference. Start with architecture.md and roadmap.md;
   **boot-arguments.md** (every kernel option), **lab-tests.md** (every test and its negative
   controls), safety-and-portability, smp, config-and-storage, config-v2, upgrades, ipv6,
-  security-audit, lan-neighbors (plan: LAN links on `Medium::Ip`, one neighbor table), proxmox
-  (plan: leatos as a KVM / Proxmox guest), …
+  security-audit, lan-neighbors (plan: LAN links on `Medium::Ip`, one neighbor table), local-stack
+  (plan: smoltcp for TCP only), proxmox (plan: leatos as a KVM / Proxmox guest), …
 
 ## Rules
 
