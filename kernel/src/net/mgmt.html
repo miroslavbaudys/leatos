@@ -1019,7 +1019,10 @@ function showLeases() {
   const v6 = (d) => (d.ipv6 ?? []).map((a) => `<br><small class="v6">${esc(a)}${/^f[cd]/i.test(a) ? " (ULA)" : ""}</small>`).join("");
   $("leases").innerHTML = st.dhcp_leases.length
     ? "<tr><th>Name</th><th>IP address</th><th>Network</th><th>MAC</th><th>State</th><th>Expires in</th><th></th></tr>" + ls.map((d) =>
-        `<tr><td>${esc(d.hostname ?? "–")}</td><td>${esc(d.ip)}${v6(d)}</td><td>${esc(d.network ?? "")}</td><td>${esc(d.mac)}</td><td>${d.bound ? "bound" : "offered"}</td><td>${dur(d.expires_in_s)}</td>` +
+        `<tr><td>${esc(d.hostname ?? "–")}</td><td>${esc(d.ip)}${v6(d)}</td><td>${esc(d.network ?? "")}</td><td>${esc(d.mac)}</td><td>${d.bound ? "bound" : "offered"}</td>` +
+        // Restored after a restart, not renewed since: the router's expiry
+        // is an upper bound (a full lease time from the restart).
+        (d.restored ? `<td title="Restored after the router restarted; not renewed since. The device's own lease ends earlier and it renews at half its lease time.">≤ ${dur(d.expires_in_s)} <span class="muted">(restored)</span></td>` : `<td>${dur(d.expires_in_s)}</td>`) +
         `<td>${reserved.has(macKey(d.mac)) ? '<span class="pill">reserved</span>' : `<button class="plain" data-reserve="${esc(d.mac)}">Reserve</button>`}</td></tr>`).join("")
     : rows([["Leases", "none"]]);
 }

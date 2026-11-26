@@ -64,6 +64,13 @@ if $bb grep -q 'lab_leases=1' /proc/cmdline; then
     else fail "leases: $3: $2 $1 not listed after the restart"; fi
     if $bb nslookup "$2.home.arpa" 192.168.1.1 2>&1 | $bb grep -v "^Server" | $bb grep -q "$1\$"; then pass "leases: $3: $2.home.arpa resolves"
     else fail "leases: $3: $2.home.arpa does not resolve"; fi
+    # Restored, not renewed: the Clients page shows its expiry as an upper
+    # bound until we ask for the lease again, then the real one.
+    if st | $bb grep -q "\"ip\":\"$1\",[^}]*\"restored\":true"; then pass "leases: $3: $2 marked restored"
+    else fail "leases: $3: $2 not marked restored"; fi
+    if $bb udhcpc -i eth0 -n -q -t 10 -T 1 -x hostname:"$2" -s /udhcpc.sh && st | $bb grep -q "\"ip\":\"$1\",[^}]*\"restored\":false"; then
+      pass "leases: $3: $2 no longer restored once renewed"
+    else fail "leases: $3: $2 still restored after a renewal"; fi
   }
   mark
   echo "LAB leases: lease $ip, waiting for the router to restart"

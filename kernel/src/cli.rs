@@ -595,11 +595,12 @@ fn leases(ctx: &Ctx) {
     for (_, l, v6) in svc.leases_with_ipv6(ctx.sh, timer::uptime().as_millis() as u64) {
         n += 1;
         println!(
-            "{:<15} {}  {:<20} {} {}",
+            "{:<15} {}  {:<20} {} {}{}",
             l.ip,
             schema::Mac(l.mac),
             l.hostname.as_deref().unwrap_or("-"),
             if l.state == proto_dhcp::v4::server::LeaseState::Bound { "bound, expires in" } else { "offered, expires in" },
+            if l.restored { "at most " } else { "" },
             dur(l.expires.saturating_sub(now))
         );
         // The IPv6 addresses its MAC was seen at (neighbor discovery).

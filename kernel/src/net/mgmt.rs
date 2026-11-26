@@ -1457,7 +1457,7 @@ fn status_json(
             let ipv6: Vec<String> = v6.iter().map(|a| format!("\"{a}\"")).collect();
             let _ = write!(
                 s,
-                "{}{{\"network\":{},\"mac\":{},\"ip\":{},\"ipv6\":[{}],\"hostname\":{},\"bound\":{},\"expires_in_s\":{}}}",
+                "{}{{\"network\":{},\"mac\":{},\"ip\":{},\"ipv6\":[{}],\"hostname\":{},\"bound\":{},\"restored\":{},\"expires_in_s\":{}}}",
                 if n > 0 { "," } else { "" },
                 json_str(net),
                 // aa:bb:… like the config's reservations (the page compares them).
@@ -1469,6 +1469,8 @@ fn status_json(
                     .map(json_str)
                     .unwrap_or_else(|| String::from("null")),
                 l.state == proto_dhcp::v4::server::LeaseState::Bound,
+                // Not renewed since the restart: expires_in_s is an upper bound.
+                l.restored,
                 l.expires.saturating_sub(now),
             );
         }

@@ -76,6 +76,10 @@ pub struct Lease {
     pub state: LeaseState,
     /// Absolute expiry (seconds, same clock as `now`).
     pub expires: u64,
+    /// Restored after a restart ([`Server::restore`]) and not renewed
+    /// since: `expires` is then an upper bound (a full lease time from the
+    /// restore), the client's own lease ends earlier.
+    pub restored: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -340,6 +344,7 @@ impl Server {
             hostname: hostname.clone(),
             state: LeaseState::Bound,
             expires,
+            restored: false,
         };
         let prev = self.put_lease(lease, out);
         // Report changes only: a renewal with the same address and name is silent.
@@ -404,6 +409,7 @@ impl Server {
                         hostname,
                         state: LeaseState::Offered,
                         expires: now + OFFER_HOLD_SECS,
+                        restored: false,
                     };
                     self.put_lease(offer, &mut out);
                 }
@@ -590,6 +596,7 @@ impl Server {
                 hostname: hostname.clone(),
                 state: LeaseState::Bound,
                 expires: now + u64::from(self.cfg.lease_secs),
+                restored: true,
             };
             self.put_lease(lease, &mut out);
             out.events.push(Event::Bound {
@@ -693,6 +700,7 @@ mod tests {
         assert!(ev.contains(&Event::Bound { mac: A, ip: ip_a, hostname: Some("laptop".into()) }));
         let a = s.leases().find(|l| l.mac == A).unwrap();
         assert_eq!((a.ip, a.state, a.expires), (ip_a, LeaseState::Bound, 5 + 3600), "a full lease time again");
+        assert!(a.restored, "an upper bound until the client renews");
         // The address stays the client's: B gets the other one.
         assert_ne!(dora(&mut s, B, None, 6), ip_a);
         // Restoring twice changes nothing.
@@ -842,6 +850,22 @@ mod tests {
         assert_eq!(reply_of(&out).options.msg_type, Some(MessageType::Ack));
         assert!(out.events.is_empty(), "renewal must not re-announce");
         assert_eq!(s.leases().next().unwrap().expires, 1800 + 3600);
+    }
+
+    #[test]
+    fn renewal_after_a_restore_gives_the_real_expiry() {
+        use crate::v4::persist::Saved;
+        let mut s = Server::new(cfg());
+        let ip = Ipv4Addr::new(192, 168, 1, 100);
+        s.restore(0, &[Saved { mac: A, ip, hostname: Some("pc".into()) }]);
+        assert!(s.leases().next().unwrap().restored);
+        let mut r = client_msg(A, MessageType::Request);
+        r.ciaddr = ip;
+        r.options.hostname = Some("pc".to_string());
+        let out = s.handle(600, &r.emit());
+        assert_eq!(reply_of(&out).options.msg_type, Some(MessageType::Ack));
+        let l = s.leases().next().unwrap();
+        assert_eq!((l.restored, l.expires), (false, 600 + 3600));
     }
 
     #[test]
@@ -1117,6 +1141,7 @@ mod reconfigure_tests {
                 hostname: Some(host.to_string()),
                 state: LeaseState::Bound,
                 expires: 1000,
+                restored: false,
             },
         );
     }

@@ -256,7 +256,9 @@ backlog, flows) and the client's `/api/status` deltas, to compare with the apu4
   controls. Also with `QEMU_STORE_BUS=sd` (and `STORE_MIB=4096` for SDHC).
 - `scripts/lease-test.sh` (also `LEATOS_ARCH=x86_64`, `QEMU_STORE_BUS=sd`): router + lab client:
   leases listed and resolvable after a power cut (router killed after its periodic save) and after
-  `POST /api/reboot`. Negative control `LEASE_TEST_NO_STORE=1`.
+  `POST /api/reboot`; each one `"restored":true` in `/api/status` (expiry an upper bound) until the
+  client asks for it again, then `false`. Negative control `LEASE_TEST_NO_STORE=1`; a restore that
+  leaves the flag clear fails the "marked restored" checks.
 - `scripts/cli-test.sh` (also `LEATOS_ARCH=x86_64`, `QEMU_STORE_BUS=sd`): types into the UART via a
   FIFO on QEMU's stdin. Runs with the RAM log (the other scripts get `log=console` from
   `qemu-run.sh`). Negative controls `CLI_TEST_SKIP_SAVE=1`, `CLI_TEST_LOG=console`.
