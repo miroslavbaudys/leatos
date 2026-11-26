@@ -35,6 +35,7 @@ pub struct Stats {
 /// A supported NIC. Same contract for every model: pull-based TX
 /// (`can_transmit` before `transmit`), RX refills itself from the packet
 /// pool, NAPI-style interrupts (`ack_interrupt`, then poll until empty).
+#[allow(clippy::large_enum_variant)] // one per port, built once at boot and kept in place
 pub enum Nic {
     // Boxed: virtio-drivers' queue state is large (~2.4 KiB).
     Virtio(alloc::boxed::Box<virtio_net::VirtioNet>),
@@ -178,10 +179,20 @@ impl Nic {
         }
     }
 
+    /// Queue a frame; it may wait in the ring until [`Self::kick_tx`].
     pub fn transmit(&mut self, pkt: PacketBuf) -> Result<(), PacketBuf> {
         match self {
             Self::Virtio(n) => n.transmit(pkt),
             Self::Igb(n) => n.transmit(pkt),
+        }
+    }
+
+    /// Send what [`Self::transmit`] queued (igb: one `TDT` write per batch).
+    /// Every batch of transmits ends with it.
+    pub fn kick_tx(&mut self) {
+        match self {
+            Self::Virtio(_) => {} // virtio-drivers notifies per frame
+            Self::Igb(n) => n.kick_tx(),
         }
     }
 

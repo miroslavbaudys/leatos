@@ -889,6 +889,64 @@ if [ -n "$upl" ] && [ "$upl" != 0 ]; then
   echo "LAB INFO: upload: done; wan0 sent $u_sent, aqm drops $u_aqm_drops (blue $u_blue_drops), overflow drops $u_overflow_drops, ack drops $u_ack_drops"
 fi
 
+# --- both directions at once (lab_bidir=N): N downloads (the ISP's zero ---------
+# source, port 5002) and N uploads (its sink, 5001) for lab_bidir_secs,
+# unshaped, so both datapath cores work on the same NICs at once (each
+# port's NIC lock: RX by one direction, TX by the other, docs/smp.md).
+# Info only: rates, packets forwarded, the NIC lock waits and the
+# datapath tasks' CPU time; INVALID if a direction did not move.
+bidir=$($bb sed -n 's/.*lab_bidir=\([0-9]*\).*/\1/p' /proc/cmdline)
+if [ -n "$bidir" ] && [ "$bidir" != 0 ]; then
+  bsecs=$($bb sed -n 's/.*lab_bidir_secs=\([0-9]*\).*/\1/p' /proc/cmdline); bsecs=${bsecs:-20}
+  now_ms() { $bb awk '{printf "%d", $1 * 1000}' /proc/uptime; }
+  st() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null; }
+  # A port's counter: the first "$2" after the port's name.
+  pv() { echo "$1" | $bb grep -o "\"name\":\"$2\".*" | $bb grep -o "\"$3\":[0-9]*" | $bb head -1 | $bb cut -d: -f2; }
+  lw() { echo "$1" | $bb grep -o '"nic_lock_waits":{[^}]*}' | $bb grep -o "\"$2\":[0-9]*" | $bb cut -d: -f2; }
+  fwd() { echo "$1" | $bb grep -o '"forwarded":[0-9]*' | $bb head -1 | $bb cut -d: -f2; }
+  task_ms() { echo "$1" | $bb grep -o "\"name\":\"$2\",\"core\":[0-9]*,\"ms\":[0-9]*" | $bb sed 's/.*"ms"://'; }
+  b0=$(st)
+  echo "LAB INFO: bidir: $bidir downloads + $bidir uploads for $bsecs s start"
+  t0=$(now_ms)
+  i=0
+  while [ $i -lt "$bidir" ]; do
+    ( $bb sleep $((bsecs + 5)) | $bb nc "$ISP" 5002 >/dev/null 2>&1 ) &
+    ( $bb head -c 1000000000 /dev/zero | $bb nc -w 2 "$ISP" 5001 >/dev/null 2>&1 ) &
+    i=$((i + 1))
+  done
+  $bb sleep "$bsecs"
+  $bb pkill -f "nc $ISP 5002" 2>/dev/null
+  $bb pkill -f "nc -w 2 $ISP 5001" 2>/dev/null
+  $bb pkill -f "sleep $((bsecs + 5))" 2>/dev/null
+  t1=$(now_ms)
+  # After the flows: a status read under full load can time out halfway.
+  $bb sleep 1
+  for i in 1 2 3 4 5 6; do
+    b1=$(st); echo "$b1" | $bb grep -q '"nic_lock_waits"' && break; $bb sleep 1
+  done
+  ms=$((t1 - t0)); [ "$ms" -gt 0 ] || ms=1
+  if ! echo "$b0" | $bb grep -q '"nic_lock_waits"' || ! echo "$b1" | $bb grep -q '"nic_lock_waits"'; then
+    fail "bidir: INVALID, no /api/status before or after"
+  else
+    down=$(( ($(pv "$b1" lan0 tx_bytes) - $(pv "$b0" lan0 tx_bytes)) * 8 / ms ))
+    up=$(( ($(pv "$b1" wan0 tx_bytes) - $(pv "$b0" wan0 tx_bytes)) * 8 / ms ))
+    pk=$(( $(fwd "$b1") - $(fwd "$b0") ))
+    w=""
+    for k in rx rx_us tx tx_us; do w="$w $k=$(( $(lw "$b1" $k) - $(lw "$b0" $k) ))"; done
+    load=""
+    for t in dp_down dp_up svc; do
+      a=$(task_ms "$b0" $t); b=$(task_ms "$b1" $t)
+      [ -n "$a" ] && [ -n "$b" ] && load="$load $t=$((b - a))ms"
+    done
+    echo "LAB INFO: bidir: down $down kbit/s, up $up kbit/s, $pk packets forwarded in $ms ms ($((pk * 1000 / ms)) pkt/s)"
+    echo "LAB INFO: bidir: nic lock waits$w; cpu$load"
+    if [ "$down" -lt 1000 ] || [ "$up" -lt 1000 ]; then
+      fail "bidir: INVALID, a direction did not move (down $down, up $up kbit/s)"
+    fi
+  fi
+  $bb sleep 2
+fi
+
 swarm=$($bb sed -n 's/.*lab_swarm=\([0-9]*\).*/\1/p' /proc/cmdline)
 if [ -n "$swarm" ] && [ "$swarm" != 0 ]; then
   srate=$($bb sed -n 's/.*lab_swarm_kbit=\([0-9]*\).*/\1/p' /proc/cmdline)

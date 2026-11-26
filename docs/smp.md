@@ -113,7 +113,27 @@ does one 64-bit access. TCG answered either way.
     counters are atomics
   - per port `Mutex<Option<Nic>>`: RX by one direction, TX by the other.
     A batch is taken off the NIC under a short lock, then forwarded
-    without it.
+    without it. Each NIC runs one RX and one TX queue (queue 0), although
+    the i211 has 2 + 2 (i210 4 + 4, 82576 16 + 16); virtio-net does not
+    negotiate multiqueue. More RX queues only help with RSS (ruled out
+    above, and RSS can't hash inside PPPoE), and a second TX queue would
+    be a queue next to CAKE that the NIC arbitrates. The lock's cost:
+    `/api/status` `nic_lock_waits` counts the times a direction found it
+    held, and the µs it spun. apu4, 2026-11-26, `networkQuality` (82/19
+    Mbit/s, 248 k packets in ~15 s): 8.3 k RX + 2.0 k TX waits, 8.4 ms of
+    spinning in all (~0.06 % of a core, < 1 µs each). Saturated in QEMU
+    (`LAB_BIDIR=8`, HVF, debug build, 4 cores, both datapath cores 100 %
+    busy): igb 238 + 238 Mbit/s, 60 k pkt/s, 4.8 s of RX-side spinning in
+    20 s (~12 % of the two cores, ~100 µs per wait); virtio-net 122 + 122
+    Mbit/s, 2.2 s. The igb driver then wrote `TDT` per frame (an MMIO exit
+    each, under the lock); it now writes it every 16 frames and at the end
+    of a flush (`Nic::kick_tx`): 366 + 367 Mbit/s, 91 k pkt/s (+51 %), CPU
+    per packet 33 → 21 µs, but the spinning per packet stayed (~3.7 µs:
+    5.7 s RX + 1.1 s TX side, ~17 %), now also behind the RX side's hold.
+    Splitting the igb driver into an RX and a TX half (own locks; possible
+    because ring 0's registers and the MSI-X `EIMS`/`EICR` bits are
+    independent) would remove that; not done yet, since the apu4 is far
+    from saturation.
   - **Lock order:** NIC, then one forwarder shard, then the egress
     neighbor table, then the qdisc; each released before the next is
     taken, except the NIC around a batch.

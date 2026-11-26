@@ -77,7 +77,7 @@
 //! Each connection serves one request (`Connection: close`). A response is
 //! queued whole; the socket is closed once it is sent.
 
-use crate::net::datapath;
+use crate::net::{datapath, stack};
 use crate::net::services::LanServices;
 use crate::net::shared::Shared;
 use crate::net::svc::HostIf;
@@ -1283,7 +1283,7 @@ fn status_json(
     };
     let _ = write!(
         s,
-        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"tx_failed\":{},\"vlan_drops\":{},\"conntrack\":{},\"early_drops\":{},\"conntrack_pass_us\":{{\"last\":{},\"max\":{}}},\"housekeeping_us\":{{\"last\":{},\"max\":{}}},\"revoked\":{},\"rejected\":{},\"icmp_errors\":{},\"unreachable6\":{},\"neigh_probes\":{},\"lan_nd\":{{\"medium\":\"{}\",\"arp_replies\":{},\"na_sent\":{},\"conflicts\":{},\"local_no_route\":{},\"local_queued\":{},\"local_dropped\":{}}},\
+        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"tx_failed\":{},\"nic_lock_waits\":{{\"rx\":{},\"tx\":{},\"rx_us\":{},\"tx_us\":{}}},\"vlan_drops\":{},\"conntrack\":{},\"early_drops\":{},\"conntrack_pass_us\":{{\"last\":{},\"max\":{}}},\"housekeeping_us\":{{\"last\":{},\"max\":{}}},\"revoked\":{},\"rejected\":{},\"icmp_errors\":{},\"unreachable6\":{},\"neigh_probes\":{},\"lan_nd\":{{\"medium\":\"{}\",\"arp_replies\":{},\"na_sent\":{},\"conflicts\":{},\"local_no_route\":{},\"local_queued\":{},\"local_dropped\":{}}},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free},{heap_ops}}},\"cpu\":{cpu},\"temp\":{temp},\"memory\":{memory},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
          \"fragments\":{{\"forwarded\":{},\"parked\":{},\"park_drops\":{},\"split\":{},\"split_drops\":{}}},\"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{},\"origin_check\":{},\"refused\":{{\"host\":{},\"cross_site\":{}}},\"throttle\":{{\"sources\":{},\"throttled\":{},\"hash_busy\":{},\"evicted\":{}}}}},\"interfaces\":[",
@@ -1312,6 +1312,10 @@ fn status_json(
         datapath::FORWARDED.load(Ordering::Relaxed),
         datapath::DROPPED.load(Ordering::Relaxed),
         datapath::TX_FAILED.load(Ordering::Relaxed),
+        stack::NIC_LOCK_WAITS[0].load(Ordering::Relaxed),
+        stack::NIC_LOCK_WAITS[1].load(Ordering::Relaxed),
+        stack::NIC_LOCK_WAIT_NS[0].load(Ordering::Relaxed) / 1000,
+        stack::NIC_LOCK_WAIT_NS[1].load(Ordering::Relaxed) / 1000,
         datapath::VLAN_DROPS.load(Ordering::Relaxed),
         sh.conntrack(),
         datapath::EARLY_DROPS.load(Ordering::Relaxed),

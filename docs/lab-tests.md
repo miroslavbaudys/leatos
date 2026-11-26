@@ -249,6 +249,15 @@ phase is skipped. No check: prints the router's `qdisc wan0` lines (max sojourn,
 backlog, flows) and the client's `/api/status` deltas, to compare with the apu4
 (docs/bufferbloat-cake.md, 2026-11-23: 16 macOS uploads ~500 ms there, Linux ~45 ms here).
 
+### `LAB_BIDIR=N`: both directions at once (info only)
+
+N downloads from the ISP's zero source (port 5002) and N uploads to its sink (5001) at the same
+time for `LAB_BIDIR_SECS` (20), unshaped, so both datapath cores use the same NICs at once (each
+port's NIC lock: RX by one direction, TX by the other, docs/smp.md). The usual shaping phase is
+skipped. No check: the client prints the rates (lan0 / wan0 `tx_bytes`), packets forwarded,
+the `/api/status` `nic_lock_waits` deltas and the datapath tasks' CPU time; INVALID if a
+direction moved under 1 Mbit/s.
+
 ## Feature tests
 
 - `scripts/store-test.sh` (also `LEATOS_ARCH=x86_64`): store read at boot, config save via the web

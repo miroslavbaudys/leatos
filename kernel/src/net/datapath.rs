@@ -1435,6 +1435,13 @@ impl Datapath {
 /// Move packets from a port's qdisc to its NIC while the NIC has room and
 /// the shaper allows (the port's TX task, with the NIC locked).
 pub fn flush_port(port: &PortShared, dev: &mut Nic) -> FlushResult {
+    let r = flush_port_batch(port, dev);
+    dev.kick_tx();
+    r
+}
+
+/// [`flush_port`] without the final doorbell.
+fn flush_port_batch(port: &PortShared, dev: &mut Nic) -> FlushResult {
     let now = now_ns();
     let mut r = FlushResult::default();
     dev.reap_tx();

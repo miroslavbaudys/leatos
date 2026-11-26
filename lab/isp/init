@@ -147,6 +147,8 @@ fi
 $bx httpd -p 80 -h /www
 # Long single-connection upload sink (ECN/AQM check): replies with the byte count.
 $bx tcpsvd -E 0.0.0.0 5001 $bb wc -c &
+# Endless download source (LAB_BIDIR): zeros until the client closes.
+$bx tcpsvd -E 0.0.0.0 5002 $bb cat /dev/zero &
 # dnsd, and with DNS over TLS dnsmasq behind stunnel (lab-dns; the client
 # stops and restarts them through cgi-bin/dns for its serve-stale check).
 if [ -f /etc/dot/server.pem ]; then

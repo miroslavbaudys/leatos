@@ -69,6 +69,24 @@ fn cidr(n: &crate::config::Lan) -> Ipv4Cidr {
     Ipv4Cidr::new(n.addr, n.prefix)
 }
 
+/// Times a direction task found a port's NIC lock held by the other
+/// direction (`[rx side, tx side]`), and the nanoseconds it spun for it.
+pub static NIC_LOCK_WAITS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+pub static NIC_LOCK_WAIT_NS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Lock a port's NIC, counting contention ([`NIC_LOCK_WAITS`]; `side` 0 =
+/// receiving, 1 = transmitting).
+fn lock_nic<T>(m: &Mutex<T>, side: usize) -> spin::MutexGuard<'_, T> {
+    if let Some(g) = m.try_lock() {
+        return g;
+    }
+    let t0 = datapath::now_ns();
+    let g = m.lock();
+    NIC_LOCK_WAITS[side].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    NIC_LOCK_WAIT_NS[side].fetch_add(datapath::now_ns() - t0, core::sync::atomic::Ordering::Relaxed);
+    g
+}
+
 /// Per-port variation for the AQM's random seed.
 fn mac_seed(mac: &[u8; 6]) -> u64 {
     mac.iter().fold(0, |a, &b| a << 8 | b as u64)
@@ -874,7 +892,7 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
             }
             // Step 2: take a batch off the NIC (short lock), then forward it.
             let full = {
-                let mut g = rx.dev.lock();
+                let mut g = lock_nic(&rx.dev, 0);
                 let Some(dev) = g.as_mut() else {
                     drop(g);
                     park().await
@@ -927,6 +945,7 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
                     if let Some(dev) = ports[0].dev.lock().as_mut() {
                         dev.reap_tx();
                         let _ = dev.transmit(pkt);
+                        dev.kick_tx();
                     }
                     timer::sleep(Duration::from_millis(20)).await;
                     println!("  net {}       : PPPoE session ended (PADT)", ports[0].name);
@@ -968,7 +987,7 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
         let mut ring_full_backlog = false;
         for &p in &tx_ports {
             let tx = {
-                let mut g = ports[p].dev.lock();
+                let mut g = lock_nic(&ports[p].dev, 1);
                 let Some(dev) = g.as_mut() else {
                     drop(g);
                     park().await

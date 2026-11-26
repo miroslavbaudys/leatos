@@ -58,6 +58,10 @@ const DESC: usize = 16;
 /// Write the RX tail register at most every this many refills (each MMIO
 /// write is a VM exit under QEMU); always when the ring is drained.
 const RX_TAIL_BATCH: usize = 16;
+/// Likewise for the TX tail: [`Igb::transmit`] writes `TDT` every this many
+/// frames, [`Igb::kick_tx`] the rest at the end of a flush. Fewer MMIO writes
+/// while the port's NIC lock is held (docs/smp.md).
+const TX_TAIL_BATCH: usize = 16;
 pub const DEFAULT_TX_BYTE_LIMIT: usize = 8 * 1514;
 
 // Registers (byte offsets in BAR0).
@@ -210,6 +214,8 @@ pub struct Igb {
     tx_clean: usize,
     tx_inflight_bytes: usize,
     tx_byte_limit: usize,
+    /// Frames put into the ring since the last `TDT` write.
+    tx_unkicked: usize,
     mac: [u8; 6],
     /// Last reported link state (for [`Self::link_changed`]).
     link_reported: Option<(bool, u32, bool)>,
@@ -257,6 +263,7 @@ impl Igb {
             tx_clean: 0,
             tx_inflight_bytes: 0,
             tx_byte_limit: DEFAULT_TX_BYTE_LIMIT,
+            tx_unkicked: 0,
             mac: [0; 6],
             link_reported: None,
             msix: false,
@@ -508,6 +515,8 @@ impl Igb {
         if !self.tx_vector {
             return false;
         }
+        // Frames not handed over would never complete (no interrupt).
+        self.kick_tx();
         self.regs.write32(EICR, EI_TX);
         let _ = self.regs.read32(STATUS);
         self.reap_tx();
@@ -612,8 +621,9 @@ impl Igb {
         self.tx_inflight() < TX_RING - 1 && self.tx_inflight_bytes < self.tx_byte_limit
     }
 
-    /// Transmit an Ethernet frame (without FCS; the NIC appends it and pads
-    /// short frames). Check [`Self::can_transmit`] first.
+    /// Queue an Ethernet frame (without FCS; the NIC appends it and pads
+    /// short frames) for transmission; [`Self::kick_tx`] sends it. Check
+    /// [`Self::can_transmit`] first.
     pub fn transmit(&mut self, pkt: PacketBuf) -> Result<(), PacketBuf> {
         let len = pkt.len();
         if !self.can_transmit() || len == 0 || len > 0xffff {
@@ -634,11 +644,23 @@ impl Igb {
             .write32(i * DESC + 12, (len as u32) << TXD_PAYLEN_SHIFT);
         self.tx_next = (i + 1) % TX_RING;
         self.tx_inflight_bytes += len;
-        arch::cpu::dma_barrier(); // descriptor before the doorbell
-        self.regs.write32(TDT0, self.tx_next as u32);
+        self.tx_unkicked += 1;
+        if self.tx_unkicked >= TX_TAIL_BATCH {
+            self.kick_tx();
+        }
         self.stats.tx_packets += 1;
         self.stats.tx_bytes += len as u64;
         Ok(())
+    }
+
+    /// Hand the frames queued by [`Self::transmit`] to the device (`TDT`).
+    /// Callers end every batch with it; until then the frames wait in the ring.
+    pub fn kick_tx(&mut self) {
+        if self.tx_unkicked > 0 {
+            arch::cpu::dma_barrier(); // descriptors before the doorbell
+            self.regs.write32(TDT0, self.tx_next as u32);
+            self.tx_unkicked = 0;
+        }
     }
 }
 

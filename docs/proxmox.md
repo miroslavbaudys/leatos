@@ -128,7 +128,7 @@ startup: order=1,down=10
 9. **virtio-scsi** (medium, own driver: INQUIRY, READ CAPACITY(16), READ/WRITE(16), SYNCHRONIZE
    CACHE): only if "use VirtIO Block" proves not enough.
 10. **`VIRTIO_F_EVENT_IDX`** on virtio-net (small): fewer kicks and interrupts; measure CPU per
-    Mbit/s under KVM before and after. No multiqueue (each datapath core owns its NIC).
+    Mbit/s under KVM before and after. No multiqueue (one queue pair per NIC, docs/smp.md).
 11. **NIC drivers for passthrough** (large): i350 (igb family: check how far IDs and small
     register differences go), i225/i226 (igc, common in Proxmox mini PCs). Useful on bare
     metal too.
