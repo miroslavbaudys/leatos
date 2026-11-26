@@ -1,11 +1,11 @@
 # LAN neighbors: one table per link (plan)
 
-Status (2026-11-25): step 0 done except the upstream report (lab check `LAB_ND_FLOOD=1` for its
-WAN fix); step 1 done (`fwd::nd`, host tests, `fwd` fuzz target); step 2 done (`fwd::local`,
-`Datapath::send_local` / `set_local_link`); step 3 in QEMU (LAN links IP-only by default,
-`lan_medium=eth` fallback), all §4 lab checks in place (unicast NS, Router flag, readdress, local
-traffic over a `[[route]]`, conflicts, the local queue counters). The apu4 soak ended 2026-11-25;
-next: §5 on the apu4 (457cb97 baseline taken).
+Status (2026-11-26): done. Steps 0–3 as below (step 3 ran a day on the apu4, persisted as
+9bd39ba); step 4 done in QEMU on 2026-11-26 without the planned week on hardware (the user's
+decision: the whole local-stack migration, docs/local-stack.md, goes to the apu4 at once after the
+soak): `lan_medium=eth`, the neighbor hints, `arp_hints=`, `wan_hints6=`, `neigh-cache-256`
+removed, smoltcp built without `medium-ethernet`; the lab's first-contact control is now
+`neigh_pending=0` (docs/lab-tests.md).
 
 ## 1. The problem
 
@@ -130,10 +130,10 @@ Each step is testable on its own; the full matrix (§4) runs before a step is do
   `local_dropped` (what the neighbor table dropped when one was queued: it, or an older pending
   packet, forwarded or local).
 
-### Step 4: remove the LAN workarounds
+### Step 4: remove the LAN workarounds (done 2026-11-26)
 
-After the apu4 has run step 3 without the fallback (at least a week, the clients' usual mix: phones
-sleeping and waking, IPv6 privacy addresses):
+Planned for after a week of step 3 on the apu4 (the clients' usual mix: phones sleeping and waking,
+IPv6 privacy addresses); done earlier, together with the WAN (docs/local-stack.md step 2):
 
 - `NdHints` hints and `ipv6_ns_to_solicited` / `ipv6_na_set_router` only on link 0 (or removed if
   the WAN moved to `Medium::Ip`), `neigh-cache-256` removed, `lan_medium=` removed.

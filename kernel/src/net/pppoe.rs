@@ -30,12 +30,7 @@ fn now_ms() -> u64 {
     timer::uptime().as_millis() as u64
 }
 
-fn mac_text(m: &[u8; 6]) -> String {
-    format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        m[0], m[1], m[2], m[3], m[4], m[5]
-    )
-}
+use crate::net::shared::mac_text;
 
 pub struct Pppoe {
     client: Client,

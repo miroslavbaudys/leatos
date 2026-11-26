@@ -8,11 +8,12 @@
 //!   a network on a VLAN gets its tag first. smoltcp only gets a TX token
 //!   while the qdisc has room.
 //!
-//! On a PPPoE port the device is IP-only (`Medium::Ip`: no ARP, the
-//! session is point to point): RX hands smoltcp the IP packet of the
-//! decapsulated Ethernet frame, TX puts an Ethernet header in front (IPv4
-//! or IPv6 by the packet's version), which the datapath turns into the
-//! session's headers (`datapath::flush_port`).
+//! smoltcp runs on `Medium::Ip` on every link: RX hands it the IP packet
+//! of the frame, TX puts an Ethernet header in front (IPv4 or IPv6 by the
+//! packet's version). On an Ethernet link the datapath does the link
+//! layer (`Datapath::send_local`, its ARP / ND answers); on a PPPoE port
+//! the frame goes into the qdisc and the datapath turns the header into
+//! the session's (`datapath::flush_port`).
 //!
 //! The device is used by the services task (`net::svc`); queue and qdisc
 //! are the port's shared, locked ones (`net::shared::PortShared`). Each
@@ -262,108 +263,44 @@ pub struct PortDevice<'a> {
     pub now_ns: u64,
     /// Frames put into the qdisc (the datapath must be woken to send them).
     pub queued: &'a mut u32,
-    /// The link's IPv6 neighbor hints (`None`: only making the interface).
-    pub nd: Option<&'a mut NdHints>,
+    /// What the services want to see of the link's frames (`None`: only
+    /// making the interface).
+    pub tap: Option<&'a mut RxTap>,
     /// The datapath, for a link without a link layer (`ip_only`; `None`
     /// while only making the interface).
     pub dp: Option<crate::net::stack::SharedDatapath>,
-    /// A link whose stack runs on `Medium::Ip` over Ethernet (the LANs,
-    /// docs/lan-neighbors.md; a static WAN, docs/local-stack.md step 2a):
-    /// RX strips the Ethernet header and passes IP only, TX goes through
-    /// [`crate::net::datapath::Datapath::send_local`], no neighbor hints.
+    /// The link's link layer is the datapath's (every LAN link, a DHCP or
+    /// static WAN; docs/lan-neighbors.md, docs/local-stack.md step 2): RX
+    /// strips the Ethernet header and passes IP only, TX goes through
+    /// [`crate::net::datapath::Datapath::send_local`]. Otherwise PPPoE.
     pub ip_only: bool,
     /// The router's own UDP ports (`net::local`): on an IP-only link,
     /// datagrams to a bound port go there, not to smoltcp.
     pub udp: Option<&'a mut crate::net::local::Udp>,
 }
 
-/// smoltcp (0.14) learns IPv6 neighbors only from neighbor discovery and
-/// drops the packet that makes it resolve one. A client that knows our
-/// MAC from the Router Advertisement never solicits us, so the first
-/// answer to it after a quiet minute (smoltcp's entry lifetime) was lost.
-/// Before such a client's frame, smoltcp gets a neighbor solicitation
-/// from it ([`fwd::wire::ipv6_neighbor_hint`]: to our unicast address,
-/// so recorded, not answered), at most every [`Self::EVERY_NS`] per
-/// neighbor. And unicast solicitations (reachability probes) go to the
-/// solicited-node group instead ([`fwd::wire::ipv6_ns_to_solicited`]):
-/// not needed after all (smoltcp 0.14 answers them, docs/lan-neighbors.md
-/// step 0), harmless; goes with the other LAN workarounds in step 4.
-///
-/// IPv4 the same way: smoltcp learns new neighbors only from ARP aimed at
-/// it (traffic only refreshes entries it still has), and a client that
-/// knows our MAC sends none, so the first answer (DNS, ping, the web
-/// interface) to an address it has not seen, or evicted, or forgot when
-/// the interface was readdressed, was dropped while it asked, and other
-/// clients' answers in that second too (one rate limit for the whole
-/// cache). Before such a client's frame, smoltcp gets an ARP reply from it
-/// ([`fwd::wire::ipv4_neighbor_hint`]: recorded, not answered), at most
-/// every [`Self::EVERY_NS`] per client. Boot argument `arp_hints=0` turns
-/// that off. The cache itself is sized for a home LAN (kernel feature
-/// `neigh-cache-256`; smoltcp's default of 8 evicted entries constantly).
+/// Frames of a link the services look at before smoltcp: the last
+/// Router Advertisement (the WAN's: `net::wan6`, which parses it with
+/// `proto_dhcp::v6::ra::parse_frame`; smoltcp, a host, ignores RAs).
 #[derive(Default)]
-pub struct NdHints {
-    recent: alloc::vec::Vec<(core::net::IpAddr, [u8; 6], u64)>,
-    /// IPv4 hints on (`config::arp_hints`, read once).
-    arp: Option<bool>,
-    /// WAN IPv6 hints from every source (`config::wan_hints6_all`, read
-    /// once).
-    wan6_all: Option<bool>,
-    /// The last Router Advertisement the link received (the WAN's:
-    /// `net::wan6`).
+pub struct RxTap {
     last_ra: Option<alloc::vec::Vec<u8>>,
 }
 
-impl NdHints {
+impl RxTap {
     /// The last RA received, once.
     pub fn take_ra(&mut self) -> Option<alloc::vec::Vec<u8>> {
         self.last_ra.take()
     }
 }
 
-impl NdHints {
-    /// Within smoltcp's 60 s neighbor lifetime.
-    const EVERY_NS: u64 = 20_000_000_000;
-    /// Clients remembered per link, both families (the oldest is forgotten).
-    const MAX: usize = 128;
-
-    /// `ip` at `mac` should be told (again) at `now_ns`.
-    fn due(&mut self, ip: core::net::IpAddr, mac: [u8; 6], now_ns: u64) -> bool {
-        if let Some(e) = self.recent.iter_mut().find(|e| e.0 == ip) {
-            if e.1 == mac && now_ns.saturating_sub(e.2) < Self::EVERY_NS {
-                return false;
-            }
-            (e.1, e.2) = (mac, now_ns);
-            return true;
-        }
-        if self.recent.len() >= Self::MAX
-            && let Some(i) = (0..self.recent.len()).min_by_key(|&i| self.recent[i].2)
-        {
-            self.recent.swap_remove(i);
-        }
-        self.recent.push((ip, mac, now_ns));
-        true
-    }
-}
-
-/// Whether an IPv6 hint from `src` may reach smoltcp on `link`. smoltcp
-/// fills its cache from any NS, with no subnet check (unlike ARP), and
-/// evicts the entry closest to expiry when full. On the WAN, frames from
-/// the internet carry remote sources (ICMPv6 errors to the router pass
-/// from anyone): hints from them would map those to the gateway's MAC
-/// and, past the cache's size within its 60 s lifetime, evict the
-/// gateway itself. The WAN's only on-link neighbors are link-local, so
-/// only those get hints there (docs/security-audit.md §4.2). `all`: the
-/// old behaviour (boot argument `wan_hints6=all`, a negative control).
-fn hint6_on_link(link: &LinkShared, src: core::net::Ipv6Addr, all: bool) -> bool {
-    all || link.port() >= crate::net::shared::FIRST_LAN_PORT || src.is_unicast_link_local()
-}
-
-/// A received frame; `skip` = 14 on an IP-only port (the Ethernet header).
-pub struct RxToken(PacketBuf, usize);
+/// A received frame: smoltcp gets what follows its 14-byte Ethernet
+/// header (every link is IP-only to smoltcp).
+pub struct RxToken(PacketBuf);
 
 impl phy::RxToken for RxToken {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
-        f(self.0.data().get(self.1..).unwrap_or(&[]))
+        f(self.0.data().get(fwd::wire::ETH_HDR..).unwrap_or(&[]))
     }
 }
 
@@ -395,53 +332,34 @@ impl TxToken<'_> {
 
 impl phy::TxToken for TxToken<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        match PacketBuf::alloc() {
-            Some(mut pkt) if self.ip_only => {
-                // IP only: the datapath finds the destination MAC (its
-                // neighbor table) and sends it.
-                let eth = fwd::wire::ETH_HDR;
-                pkt.set_len(eth + len);
-                let d = pkt.data_mut();
-                d[..12].fill(0);
-                let r = f(&mut d[eth..]);
-                let t = if d[eth] >> 4 == 6 { fwd::wire::ETHERTYPE_IPV6 } else { fwd::wire::ETHERTYPE_IPV4 };
-                fwd::wire::put16(d, 12, t);
-                if let Some(dp) = self.dp {
-                    let mut touched = [false; crate::net::shared::MAX_PORTS];
-                    if dp.send_local(self.ifx, pkt, &mut touched) {
-                        *self.queued += 1;
-                    }
+        let Some(mut pkt) = PacketBuf::alloc() else {
+            // No buffer: let smoltcp build the frame into scratch, then drop it.
+            TX_DROPS.fetch_add(1, Ordering::Relaxed);
+            let mut scratch = [0u8; 1514];
+            return f(&mut scratch[..len.min(1514)]);
+        };
+        // An Ethernet header in front of smoltcp's IP packet (EtherType
+        // by the version): the datapath fills in the addresses, or turns
+        // it into the PPPoE session's headers (`datapath::flush_port`).
+        let eth = fwd::wire::ETH_HDR;
+        pkt.set_len(eth + len);
+        let d = pkt.data_mut();
+        d[..12].fill(0);
+        let r = f(&mut d[eth..]);
+        let t = if d[eth] >> 4 == 6 { fwd::wire::ETHERTYPE_IPV6 } else { fwd::wire::ETHERTYPE_IPV4 };
+        fwd::wire::put16(d, 12, t);
+        if self.ip_only {
+            // The datapath finds the destination MAC (its neighbor table).
+            if let Some(dp) = self.dp {
+                let mut touched = [false; crate::net::shared::MAX_PORTS];
+                if dp.send_local(self.ifx, pkt, &mut touched) {
+                    *self.queued += 1;
                 }
-                r
             }
-            Some(mut pkt) if self.port.is_pppoe() => {
-                // IP only: an Ethernet header for the datapath to replace.
-                let eth = fwd::wire::ETH_HDR;
-                pkt.set_len(eth + len);
-                let d = pkt.data_mut();
-                d[..12].fill(0);
-                let r = f(&mut d[eth..]);
-                let t = if d[eth] >> 4 == 6 { fwd::wire::ETHERTYPE_IPV6 } else { fwd::wire::ETHERTYPE_IPV4 };
-                fwd::wire::put16(d, 12, t);
-                self.enqueue(pkt);
-                r
-            }
-            Some(mut pkt) => {
-                pkt.set_len(len);
-                let r = f(pkt.data_mut());
-                // smoltcp is a host: its NAs say "not a router", which
-                // makes clients drop us as their default router.
-                fwd::wire::ipv6_na_set_router(pkt.data_mut());
-                self.enqueue(pkt);
-                r
-            }
-            None => {
-                // No buffer: let smoltcp build the frame into scratch, then drop it.
-                TX_DROPS.fetch_add(1, Ordering::Relaxed);
-                let mut scratch = [0u8; 1514];
-                f(&mut scratch[..len.min(1514)])
-            }
+        } else {
+            self.enqueue(pkt);
         }
+        r
     }
 }
 
@@ -456,80 +374,34 @@ impl Device for PortDevice<'_> {
         Self: 'a;
 
     fn receive(&mut self, _ts: Instant) -> Option<(RxToken, TxToken<'_>)> {
-        let mut pkt = self.link.local_rx.lock().pop_front()?;
-        if self.ip_only {
-            // IP only: the datapath answered ARP / ND itself; anything not
-            // IP is not for a `Medium::Ip` stack. The router's own UDP
-            // ports (`net::local`) take theirs first.
-            loop {
-                let ip = matches!(
-                    fwd::wire::ethertype(pkt.data()),
-                    Some(fwd::wire::ETHERTYPE_IPV4 | fwd::wire::ETHERTYPE_IPV6)
-                );
-                let taken = ip && self.udp.as_deref_mut().is_some_and(|u| u.take(self.ifx, pkt.data()));
-                if ip && !taken {
-                    break;
-                }
-                pkt = self.link.local_rx.lock().pop_front()?;
+        // IP only: the datapath answered ARP / ND itself; anything not IP
+        // is not for a `Medium::Ip` stack. The router's own UDP ports
+        // (`net::local`) take theirs first.
+        let pkt = loop {
+            let pkt = self.link.local_rx.lock().pop_front()?;
+            let ip = matches!(
+                fwd::wire::ethertype(pkt.data()),
+                Some(fwd::wire::ETHERTYPE_IPV4 | fwd::wire::ETHERTYPE_IPV6)
+            );
+            let taken = ip && self.ip_only && self.udp.as_deref_mut().is_some_and(|u| u.take(self.ifx, pkt.data()));
+            if ip && !taken {
+                break pkt;
             }
-        }
-        if let Some(nd) = self.nd.as_deref_mut()
+        };
+        if let Some(tap) = self.tap.as_deref_mut()
             && fwd::wire::ethertype(pkt.data()) == Some(fwd::wire::ETHERTYPE_IPV6)
         {
             let d = pkt.data();
             if d.get(fwd::wire::ETH_HDR + 6) == Some(&fwd::wire::PROTO_ICMPV6) && d.get(fwd::wire::ETH_HDR + 40) == Some(&134) {
-                nd.last_ra = Some(d.to_vec());
-            }
-        }
-        // Neighbor discovery help (Ethernet only: PPP has no link layer,
-        // and an IP-only link's neighbors are the datapath's).
-        if let Some(nd) = self.nd.as_deref_mut()
-            && !self.port.is_pppoe()
-            && !self.ip_only
-            && fwd::wire::ethertype(pkt.data()) == Some(fwd::wire::ETHERTYPE_IPV6)
-        {
-            fwd::wire::ipv6_ns_to_solicited(pkt.data_mut());
-            let mut hint = [0u8; fwd::wire::NEIGHBOR_HINT_LEN];
-            if let Some((ip, mac)) = fwd::wire::ipv6_neighbor_hint(pkt.data(), &mut hint)
-                && hint6_on_link(self.link, ip, *nd.wan6_all.get_or_insert_with(crate::config::wan_hints6_all))
-                && nd.due(ip.into(), mac, self.now_ns)
-                && let Some(mut h) = PacketBuf::alloc()
-            {
-                h.set_len(hint.len());
-                h.data_mut().copy_from_slice(&hint);
-                // The frame itself comes next.
-                self.link.local_rx.lock().push_front(pkt);
-                pkt = h;
-            }
-        }
-        if let Some(nd) = self.nd.as_deref_mut()
-            && !self.port.is_pppoe()
-            && !self.ip_only
-            && fwd::wire::ethertype(pkt.data()) == Some(fwd::wire::ETHERTYPE_IPV4)
-            && *nd.arp.get_or_insert_with(crate::config::arp_hints)
-        {
-            let mut hint = [0u8; fwd::wire::ARP_HINT_LEN];
-            if let Some((ip, mac)) = fwd::wire::ipv4_neighbor_hint(pkt.data(), &mut hint)
-                && nd.due(ip.into(), mac, self.now_ns)
-                && let Some(mut h) = PacketBuf::alloc()
-            {
-                h.set_len(hint.len());
-                h.data_mut().copy_from_slice(&hint);
-                self.link.local_rx.lock().push_front(pkt);
-                pkt = h;
+                tap.last_ra = Some(d.to_vec());
             }
         }
         if is_router_solicitation(pkt.data()) {
             // smoltcp ignores it (a host); the network's advertiser answers.
             self.link.rs_seen.store(true, Ordering::Relaxed);
         }
-        let skip = if self.port.is_pppoe() || self.ip_only {
-            fwd::wire::ETH_HDR
-        } else {
-            0
-        };
         Some((
-            RxToken(pkt, skip),
+            RxToken(pkt),
             TxToken {
                 link: self.link,
                 port: self.port,
@@ -558,16 +430,8 @@ impl Device for PortDevice<'_> {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        if self.port.is_pppoe() {
-            caps.medium = Medium::Ip;
-            caps.max_transmission_unit = self.port.mtu() as usize;
-        } else if self.ip_only {
-            caps.medium = Medium::Ip;
-            caps.max_transmission_unit = 1500;
-        } else {
-            caps.medium = Medium::Ethernet;
-            caps.max_transmission_unit = 1514;
-        }
+        caps.medium = Medium::Ip;
+        caps.max_transmission_unit = if self.port.is_pppoe() { self.port.mtu() as usize } else { 1500 };
         caps.max_burst_size = Some(1);
         caps
     }

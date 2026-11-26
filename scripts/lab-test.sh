@@ -61,21 +61,17 @@
 #                        neigh_secs=10 (LAB_NEIGH_LIFETIME). The client pins
 #                        the router's MAC, pings the router from
 #                        LAB_NEIGH_HOSTS (40) addresses of its own, 3 rounds,
-#                        without loss (round 1 = first contact: smoltcp's ARP
-#                        hints; rounds 2-3: its neighbor cache holds them
-#                        all), then downloads for LAB_NEIGH_SECS (35) with
-#                        no `neighbor` drops and some probes. Negative
-#                        controls (the router's answers use the datapath's
-#                        neighbor table since docs/lan-neighbors.md step 3,
-#                        so the first two need the old path):
-#                        LAB_ROUTER_ARGS="lan_medium=eth arp_hints=0" (round
-#                        1 fails), LAB_NEIGH_CACHE=8 with lan_medium=eth
-#                        (smoltcp's default cache: rounds 2-3 fail),
-#                        LAB_ROUTER_ARGS=neigh_probe=0 (forwarded fails).
-#                        With LAB_GUEST(_LIVE)=1 and LAB_IPV6=1 also a
-#                        readdress: the LAN's ULA prefix moved and back
-#                        live, a fourth round loses nothing (control:
-#                        lan_medium=eth arp_hints=0).
+#                        without loss (round 1 = first contact: the
+#                        answers wait in the datapath's neighbor table while
+#                        it ARPs; rounds 2-3 find them resolved), then
+#                        downloads for LAB_NEIGH_SECS (35) with no `neighbor`
+#                        drops and some probes. Negative controls:
+#                        LAB_ROUTER_ARGS=neigh_pending=0 (nothing waits:
+#                        round 1 fails), LAB_ROUTER_ARGS=neigh_probe=0
+#                        (forwarded fails). With LAB_GUEST(_LIVE)=1 and
+#                        LAB_IPV6=1 also a readdress: the LAN's ULA prefix
+#                        moved and back live, a fourth round loses nothing
+#                        (its control was the old smoltcp path, removed).
 #                        Conflicts: an ARP probe / claim for 192.168.1.1
 #                        counted (lan_nd.conflicts), the router still
 #                        answers; one for another address or from the
@@ -170,14 +166,12 @@
 #                        wan_gw=203.0.113.1 wan_dns=203.0.113.1 (LAB_ROUTER_ARGS
 #                        win). Checks: the router's static line and the ISP
 #                        seeing 203.0.113.60 as the NATed source; all other
-#                        checks run through it. The WAN's router stack is
-#                        IP-only (docs/local-stack.md step 2a): the ISP's ARP
-#                        for 203.0.113.60 must be answered by the datapath
+#                        checks run through it. The ISP's ARP for
+#                        203.0.113.60 must be answered by the datapath
 #                        (client "wan arp": medium ip, wan_nd.arp_replies
-#                        rising). Negative controls: LAB_ROUTER_ARGS=
-#                        wan_mode=dhcp (no address, everything fails),
-#                        LAB_ROUTER_ARGS=wan_medium=eth (smoltcp answers: the
-#                        datapath check fails).
+#                        rising; docs/local-stack.md step 2). Negative
+#                        control: LAB_ROUTER_ARGS=wan_mode=dhcp (no address,
+#                        everything fails).
 #   LAB_GUEST=1          the router boots from a store (tools/leatstore) with a
 #                        second network: VLAN 20 on lan0, 10.20.0.1/24, zone
 #                        "guest" (input: DHCP, DNS, ping; forwards to the
@@ -308,9 +302,10 @@
 #                        (cgi-bin/ndflood) pings it once from each of 1500
 #                        addresses of 2001:db8:eeee::/64 (replies via its
 #                        default router): at most 2 lost. INVALID unless
-#                        100+ were answered. Negative control:
-#                        LAB_ROUTER_ARGS=wan_hints6=all (every source into
-#                        smoltcp's cache, its default router evicted).
+#                        100+ were answered. (Its negative control,
+#                        wan_hints6=all, went with smoltcp's neighbor
+#                        hints: off-link sources never enter the datapath's
+#                        neighbor table.)
 #   LAB_ROUTES=1         (implies LAB_GUEST=1) static routes: [[route]]
 #                        lab-behind = 10.30.0.0/24 via the client
 #                        (192.168.1.100), which puts 10.30.0.5 on its
@@ -432,11 +427,6 @@ if [[ -n "$NEIGH" ]]; then
   [[ -z "${LAB_TIMEOUT:-}" ]] && TIMEOUT=$((TIMEOUT + NEIGH_HOSTS * 4 + NEIGH_SECS + 60))
 fi
 KERNEL_FEATURES=""
-case "${LAB_NEIGH_CACHE:-}" in
-  "") ;;
-  8) KERNEL_FEATURES="--no-default-features" ;;
-  *) echo "LAB_NEIGH_CACHE: only 8 (smoltcp's default) is a control" >&2; exit 2 ;;
-esac
 SHAPE_KBIT="${LAB_SHAPE_KBIT:-${SHAPE_KBIT:-10000}}"
 EXPECT_KBIT="${LAB_EXPECT_KBIT:-$SHAPE_KBIT}"
 ROUTER_ARGS=""
@@ -958,11 +948,10 @@ if [[ -n "$ISP_PPPOE" ]]; then
   fi
 fi
 
-# DHCP WAN (docs/local-stack.md step 2b): IP-only, the datapath answered
-# the ISP's ARP and the router's own DHCP client holds the lease. Negative
-# control LAB_ROUTER_ARGS=wan_medium=eth (smoltcp's socket: medium eth,
-# wan_dhcp null). With LAB_WAN_LEASE also a renewal, lease never lost
-# (negative control LAB_WAN_LEASE_STOP=1).
+# DHCP WAN (docs/local-stack.md step 2b): the datapath answered the ISP's
+# ARP and the router's own DHCP client holds the lease at the end. With
+# LAB_WAN_LEASE also a renewal, lease never lost; negative control for
+# both LAB_WAN_LEASE_STOP=1 (the ISP's server gone: the lease is lost).
 if [[ -z "$ISP_STATIC" && -z "${ISP_PPPOE:-}" ]]; then
   arp=$(tr -d '\r' <"$WORK/client.log" | grep "LAB PASS: wan arp:" | head -1 || true)
   wd=$(tr -d '\r' <"$WORK/client.log" | grep "LAB INFO: wan_dhcp " | head -1 || true)

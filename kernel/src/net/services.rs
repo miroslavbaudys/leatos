@@ -816,7 +816,7 @@ impl LanServices {
                 DhcpEvent::Bound { mac, ip, hostname } => {
                     println!(
                         "  dhcp            : {} -> {ip} ({}.{domain}, {net})",
-                        smoltcp::wire::EthernetAddress(mac),
+                        crate::net::shared::mac_text(&mac),
                         hostname.as_deref().unwrap_or("-")
                     );
                     if let Some(h) = hostname {

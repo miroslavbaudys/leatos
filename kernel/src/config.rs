@@ -1333,6 +1333,13 @@ pub fn neigh_timing() -> (u64, bool) {
     (ms, arg_u64(bootargs(), "neigh_probe") != Some(0))
 }
 
+/// Packets held per neighbor being resolved (`fwd::neigh::MAX_PENDING`;
+/// boot argument `neigh_pending=0`: none, the first packet to an unknown
+/// neighbor is dropped, the lab's negative control for first contact).
+pub fn neigh_pending() -> usize {
+    arg_u64(bootargs(), "neigh_pending").map_or(fwd::neigh::MAX_PENDING, |n| n as usize)
+}
+
 /// igb RX interrupt moderation: the minimum time between two RX interrupts
 /// of a NIC, in µs (`EITR0`; boot argument `igb_itr_us=`, `0` = none, at
 /// most 8191). The NIC still interrupts at once for a packet that arrives
@@ -1345,29 +1352,11 @@ pub fn igb_itr_us() -> u32 {
     arg_u64(bootargs(), "igb_itr_us").map_or(IGB_ITR_US, |us| us.min(8191) as u32)
 }
 
-/// smoltcp's IPv4 neighbors from the frames clients send it (ARP hints,
-/// `net::device::NdHints`); boot argument `arp_hints=0` turns them off
-/// (the lab's negative control).
-pub fn arp_hints() -> bool {
-    arg_u64(bootargs(), "arp_hints") != Some(0)
-}
-
-/// The LAN links' router stack without a link layer (smoltcp on
-/// `Medium::Ip`, the datapath answering ARP / ND and resolving its
-/// packets, docs/lan-neighbors.md); boot argument `lan_medium=eth` keeps
-/// smoltcp on Ethernet with its neighbor hints (the fallback).
-pub fn lan_medium_ip() -> bool {
-    arg(bootargs(), "lan_medium") != Some("eth")
-}
-
-/// The WAN's router stack without a link layer on a DHCP or static WAN
-/// (docs/local-stack.md step 2: smoltcp on `Medium::Ip`, the datapath
-/// answering ARP / ND for the WAN address and resolving the gateway, the
-/// DHCP client `net::wan4` over the router's own UDP); boot argument
-/// `wan_medium=eth` keeps smoltcp on Ethernet with its DHCP socket and
-/// neighbor hints (the fallback). PPPoE has no link layer anyway.
+/// The WAN's link layer is the datapath's (ARP / ND for the WAN address,
+/// the gateway resolved: docs/local-stack.md step 2) on a DHCP or static
+/// WAN; PPPoE has none.
 pub fn wan_ip_only(link: &WanLink) -> bool {
-    !matches!(link, WanLink::Pppoe(_)) && arg(bootargs(), "wan_medium") != Some("eth")
+    !matches!(link, WanLink::Pppoe(_))
 }
 
 /// The datapath's ARP / ND answers on the LANs (`fwd::nd::Config`):
@@ -1378,13 +1367,6 @@ pub fn nd_config() -> fwd::nd::Config {
         unicast_ns: arg_u64(bootargs(), "nd_unicast") != Some(0),
         router: arg_u64(bootargs(), "na_router") != Some(0),
     }
-}
-
-/// IPv6 hints on the WAN from every source, not only link-local ones
-/// (`net::device::hint6_on_link`): boot argument `wan_hints6=all`, the
-/// old behaviour, the lab's negative control (`LAB_ND_FLOOD=1`).
-pub fn wan_hints6_all() -> bool {
-    arg(bootargs(), "wan_hints6") == Some("all")
 }
 
 /// The management interface refuses DNS-rebound `Host`s and cross-site

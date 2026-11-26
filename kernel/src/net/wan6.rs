@@ -3,7 +3,7 @@
 //! prefix by DHCPv6 prefix delegation (`proto_dhcp::v6::pd`).
 //!
 //! - RAs: `net::device` keeps the last one the WAN received
-//!   (`NdHints::take_ra`); `v6::ra::parse_frame` reads it. Its link-local
+//!   (`RxTap::take_ra`); `v6::ra::parse_frame` reads it. Its link-local
 //!   source is the default route while its router lifetime lasts. Until one
 //!   comes, up to three Router Solicitations, 4 s apart.
 //! - DHCPv6: a UDP socket on the WAN's :546, messages to ff02::1:2:547
@@ -147,7 +147,7 @@ impl Wan6 {
     /// the networks must follow (router or prefix).
     pub fn step(&mut self, wan: &mut HostIf, sh: &Shared, now: u64) -> bool {
         // The ISP's RA.
-        if let Some(f) = wan.nd.take_ra()
+        if let Some(f) = wan.tap.take_ra()
             && let Some(r) = ra::parse_frame(&f)
         {
             self.router = (r.lifetime_secs > 0).then(|| (r.router, now + u64::from(r.lifetime_secs) * 1000));

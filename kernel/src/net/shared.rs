@@ -218,6 +218,14 @@ pub struct LinkShared {
     ip_only: AtomicBool,
 }
 
+/// A MAC as `aa:bb:cc:dd:ee:ff` (logs, status pages).
+pub fn mac_text(m: &[u8; 6]) -> alloc::string::String {
+    alloc::format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        m[0], m[1], m[2], m[3], m[4], m[5]
+    )
+}
+
 /// [`LinkShared::neigh6`]'s bound per link.
 pub const NEIGH6_MAX: usize = 128;
 

@@ -1,8 +1,7 @@
-//! The WAN's DHCPv4 client on an IP-only WAN (docs/local-stack.md step
-//! 2b): `proto_dhcp::v4::client` over the router-local UDP path
-//! (`net::local`), port 68 on the WAN link. Replaces smoltcp's
-//! `dhcpv4::Socket`, which panics on `Medium::Ip`; boot argument
-//! `wan_medium=eth` keeps the socket (`svc::handle_dhcp`).
+//! The WAN's DHCPv4 client (docs/local-stack.md step 2b):
+//! `proto_dhcp::v4::client` over the router-local UDP path (`net::local`),
+//! port 68 on the WAN link. It replaced smoltcp's `dhcpv4::Socket`, which
+//! panics on `Medium::Ip`.
 //!
 //! `svc` steps it: replies in, the message due out (from 0.0.0.0 to
 //! broadcast while it has no address, unicast to the server while

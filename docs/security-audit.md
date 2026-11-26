@@ -69,7 +69,7 @@ Columns: **Parser** = where untrusted bytes are first interpreted.
 | DNS answers (plain UDP upstream, ports 65000–65535) | `proto-dns` `wire` (pointer limit 16, name ≤ 255), `resolver`, `cache` | cache `max_entries`, TTL ≤ 86400 | `dns` | poisoning: ID + port randomness (source of entropy at boot), question match, bailiwick of extra records, EDNS size handling |
 | DoT (TCP 853, local ports 61000–64999) | `proto-dot`: rustls 0.23 unbuffered + own RustCrypto provider (`provider.rs` 816 lines) | 30 s idle, backoff | — | **own crypto provider**: verify signature-scheme mapping, curve checks, RSA PKCS#1/PSS selection; certificate date floor before SNTP |
 | SNTP answers | `proto-sntp` | burst + backoff | `sntp` | A2 can move the clock: effects on DoT certificate checks, lease expiry, trial timers (should be monotonic) |
-| ARP / ND on WAN | `fwd::neigh`, smoltcp, `NdHints` | `MAX_PENDING` 3, `NEIGH6_MAX` 128, smoltcp cache 256 | `fwd` partly | neighbor table poisoning by A2 (expected), table exhaustion via ND from A1 for unused /64s (`unreachable6` path) |
+| ARP / ND on WAN | `fwd::neigh`, `fwd::nd` (the datapath answers; smoltcp IP-only since 2026-11-26) | `MAX_PENDING` 3, `NEIGH6_MAX` 128, 64 IPv6 incomplete | `fwd` | neighbor table poisoning by A2 (expected), table exhaustion via ND from A1 for unused /64s (`unreachable6` path) |
 | ICMP errors we generate (TTL, PTB, unreachable, reject RST) | `forwarder` | rate-limited (reject) | `fwd` | amplification and reflection: are TTL-exceeded / PTB rate-limited too? |
 
 ### 4.2 LAN and guest side (A3, A4)
@@ -77,7 +77,7 @@ Columns: **Parser** = where untrusted bytes are first interpreted.
 | Entry point | Parser / state | Limits | Fuzz | Review notes |
 |---|---|---|---|---|
 | Forwarding outward + between networks | `fwd::forwarder` zone `Policy`, rules, `recheck` | as 4.1 | `fwd` | P4 for every path: v6, fragments, hairpin, redirects (`router_serves`), routed subnets (`[[route]]`); anti-spoofing per network (`lan_antispoof`) |
-| ARP / ND on LAN, neighbor hints | `device.rs` `NdHints`, `fwd::wire::ipv4_neighbor_hint`/`ipv6_neighbor_hint` | smoltcp cache 256 per network | — | a client spoofing others' addresses (ARP poisoning of the router: expected on a flat L2, but can it poison across networks?); hint injection rate |
+| ARP / ND on LAN | `fwd::nd`, `fwd::neigh` (the hints were removed 2026-11-26) | `MAX_PENDING` 3, 64 IPv6 incomplete | `fwd` | a client spoofing others' addresses (ARP poisoning of the router: expected on a flat L2, but can it poison across networks?); hint injection rate |
 | DHCPv4 server | `proto-dhcp` v4 server | persist ≤ 4096 leases, pool .100–.199 | `dhcp` | **pool exhaustion by random MACs** (no per-port limit?), host-name option content (shown in UI, DNS names from leases), option 82/overload, client-chosen lease time |
 | Lease host names → DNS | `proto-dns` zone (`add_host_in`) | — | `dns` | a client naming itself `router`, `nas` or a public name: override precedence, label validation |
 | DNS UDP :53 | `proto-dns` resolver/zone | reply ≤ 1472 B, cache bound | `dns` | amplification toward a spoofed LAN source (anti-spoofing helps), query rate per client, views (`handle_query_in`): leaks of hidden names via PTR, cache shared across views? |
@@ -87,7 +87,10 @@ Columns: **Parser** = where untrusted bytes are first interpreted.
 | Web interface :80 | `proto-http` (head ≤ 8 KiB, small body ≤ 64 KiB), `mgmt.rs` (1560 lines) | 4 LAN sockets, 20 s request / 120 s upload timeout, 8 sessions, 12 h idle | `http` | see 4.3 |
 | Other router ports | smoltcp | — | — | what does smoltcp answer on closed ports per zone (RST/ICMP), and is `input` mask applied before smoltcp sees the packet? |
 
-#### Neighbor hints and cache poisoning (reviewed 2026-11-22)
+#### Neighbor hints and cache poisoning (reviewed 2026-11-22; the hints were removed 2026-11-26)
+
+Kept for the record: since docs/local-stack.md step 2 smoltcp runs IP-only on every link and has
+no neighbor cache; the datapath's table (`fwd::neigh`) holds on-link neighbors only.
 
 smoltcp used to learn neighbors from the source of any unicast IP packet and upstream removed that
 on purpose: a router's periodic broadcast poisoned its ARP cache and blackholed the default

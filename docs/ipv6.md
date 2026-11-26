@@ -206,8 +206,9 @@ New or changed (2026-11-20):
   client's frame smoltcp gets a solicitation from that client to our
   unicast address (`ipv6_neighbor_hint`: recorded, not answered), at most
   every 20 s per neighbor (`NdHints`); unicast solicitations are
-  readdressed to the target's group (`ipv6_ns_to_solicited`). Worth
-  taking upstream; until then this stays the only place that knows.
+  readdressed to the target's group (`ipv6_ns_to_solicited`). Gone since
+  2026-11-26: smoltcp is IP-only on every link and the datapath does
+  neighbor discovery (`fwd::nd`, `fwd::neigh`; docs/local-stack.md).
 - **Neighbor table bounded against /64 scans (RFC 6583):** per interface
   a cap on incomplete entries, with the oldest dropped. Counter
   `neigh_incomplete_drops`.
@@ -362,8 +363,9 @@ Two things the lab found that host tests could not:
   Advertisements without the Router flag. A client that sees its default
   router's NA without it removes the router (RFC 4861 §7.2.5), so the
   client's default route vanished seconds after the RA installed it.
-  `net::device` sets the flag on the router stack's NAs
-  (`fwd::wire::ipv6_na_set_router`).
+  `net::device` set the flag on the router stack's NAs
+  (`ipv6_na_set_router`, removed 2026-11-26); now the datapath's NAs carry
+  it (`fwd::nd`, `na_router=0` the lab's control).
 - **ICMPv6 errors about errors.** An ICMPv6 error is never answered with
   one (RFC 4443 §2.4 e), also when its quote is not understood. The first
   version keyed this on "related to a tracked flow".
@@ -418,7 +420,7 @@ fragments too. The `fwd` fuzz target sends later IPv6 fragments through
 ✅ in QEMU (2026-11-20). As built:
 - **`net::wan6`** runs in `svc` while IPv6 and `ipv6.dhcpv6_pd` are on and
   the WAN is Ethernet without the development boot arguments. It:
-  - takes the ISP's RA (the last one the WAN received, `NdHints::take_ra`,
+  - takes the ISP's RA (the last one the WAN received, `RxTap::take_ra`,
     parsed by `proto_dhcp::v6::ra::parse_frame`: its link-local source
     is the default router while the lifetime lasts)
   - sends up to three Router Solicitations

@@ -30,7 +30,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::phy::ChecksumCapabilities;
-use smoltcp::socket::{dhcpv4, icmp};
+use smoltcp::socket::icmp;
 use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address};
 
 /// Set once the WAN has an address: a DHCP lease or a PPPoE link (read by
@@ -47,14 +47,13 @@ const PING_INTERVAL: Duration = Duration::from_millis(200);
 pub struct HostIf {
     pub iface: Interface,
     pub sockets: SocketSet<'static>,
-    /// IPv6 neighbors recently made known to smoltcp (`net::device`).
-    pub nd: crate::net::device::NdHints,
+    /// The link's frames the services look at first (`net::device`).
+    pub tap: crate::net::device::RxTap,
     /// The link's MAC (its port's): smoltcp has none on `Medium::Ip`.
     pub mac: [u8; 6],
-    /// The interface is IP-only over Ethernet (a LAN link with
-    /// `config::lan_medium_ip`, a static WAN with `config::wan_ip_only`;
-    /// set when made, = [`crate::net::shared::LinkShared::ip_only`]):
-    /// smoltcp's `hardware_addr` panics on one.
+    /// The datapath does the link's link layer (every LAN link, a DHCP or
+    /// static WAN: `config::wan_ip_only`; set when made, =
+    /// [`crate::net::shared::LinkShared::ip_only`]); else PPPoE.
     pub ip_only: bool,
 }
 
@@ -163,25 +162,8 @@ impl LeaseChange {
     }
 }
 
-fn handle_dhcp(name: &str, host: &mut HostIf, pinger: &mut Pinger) -> Option<LeaseChange> {
-    let (handle, _) = host
-        .sockets
-        .iter()
-        .find(|(_, s)| matches!(s, smoltcp::socket::Socket::Dhcpv4(_)))?;
-    // Owned first: the event borrows the socket.
-    let event = match host.sockets.get_mut::<dhcpv4::Socket>(handle).poll() {
-        Some(dhcpv4::Event::Configured(cfg)) => Some(Some((cfg.address, cfg.router, cfg.dns_servers.iter().copied().collect::<Vec<_>>()))),
-        Some(dhcpv4::Event::Deconfigured) => Some(None),
-        None => None,
-    };
-    match event? {
-        Some((address, router, dns)) => Some(lease_bound(name, host, pinger, address, router, dns)),
-        None => Some(lease_lost(name, host, pinger)),
-    }
-}
-
-/// The WAN's DHCP client on an IP-only WAN (`net::wan4`): its events
-/// applied in order; the last change (`None`: nothing happened).
+/// The WAN's DHCP client (`net::wan4`): its events applied in order; the
+/// last change (`None`: nothing happened).
 fn handle_wan4(name: &str, host: &mut HostIf, pinger: &mut Pinger, events: Vec<proto_dhcp::v4::client::Event>) -> Option<LeaseChange> {
     use proto_dhcp::v4::client::Event;
     let mut change = None;
@@ -197,7 +179,7 @@ fn handle_wan4(name: &str, host: &mut HostIf, pinger: &mut Pinger, events: Vec<p
     change
 }
 
-/// A DHCP lease (either client): the address and default route on the
+/// A DHCP lease: the address and default route on the
 /// router stack's WAN interface, logged, the gateway pinger aimed.
 fn lease_bound(
     name: &str,
@@ -244,7 +226,7 @@ fn lease_bound(
     }
 }
 
-/// The DHCP lease is gone (either client).
+/// The DHCP lease is gone.
 fn lease_lost(name: &str, host: &mut HostIf, pinger: &mut Pinger) -> LeaseChange {
     if DHCP_OK.load(Ordering::Acquire) {
         println!("  net {}         : dhcp lease lost", name);
@@ -348,13 +330,6 @@ fn lease_text(c: &LeaseChange) -> String {
     )
 }
 
-fn dhcp_socket(host: &HostIf) -> Option<SocketHandle> {
-    host.sockets
-        .iter()
-        .find(|(_, s)| matches!(s, smoltcp::socket::Socket::Dhcpv4(_)))
-        .map(|(h, _)| h)
-}
-
 /// The WAN's clients a mode change starts and stops: PPPoE, the gateway
 /// pinger, the DHCP client on an IP-only WAN and its UDP ports.
 type WanClients<'a> = (&'a mut Option<Pppoe>, &'a mut Pinger, &'a mut Option<crate::net::wan4::Wan4>, &'a mut crate::net::local::Udp);
@@ -381,16 +356,12 @@ fn restart_wan(
     let dhcp = new == WanLink::Dhcp;
     let ip_only = crate::config::wan_ip_only(&new);
     // The lease belongs to the old link: ask again on the new one (the
-    // client's Lost / Deconfigured reports the address gone).
-    if dhcp && !port.is_pppoe() && wan.ip_only == ip_only {
-        if let Some(h) = dhcp_socket(wan) {
-            wan.sockets.get_mut::<dhcpv4::Socket>(h).reset();
-            return None;
-        }
-        if let Some(w) = wan4.as_mut() {
-            w.reset(now_ms());
-            return None;
-        }
+    // client's Lost reports the address gone).
+    if dhcp && !port.is_pppoe()
+        && let Some(w) = wan4.as_mut()
+    {
+        w.reset(now_ms());
+        return None;
     }
     let want_pppoe = matches!(new, WanLink::Pppoe(_));
     if port.is_pppoe() != want_pppoe || wan.ip_only != ip_only {
@@ -406,18 +377,8 @@ fn restart_wan(
         sh.links[0].set_ip_only(ip_only);
         wan.iface = stack::new_iface(port, ip_only);
     }
-    // A DHCP client only in DHCP mode: smoltcp's on Ethernet, ours
-    // (`net::wan4`) on an IP-only WAN.
-    match (dhcp && !ip_only, dhcp_socket(wan)) {
-        (false, Some(h)) => {
-            wan.sockets.remove(h);
-        }
-        (true, None) => {
-            wan.sockets.add(dhcpv4::Socket::new());
-        }
-        _ => {}
-    }
-    match (dhcp && ip_only, wan4.is_some()) {
+    // The DHCP client (`net::wan4`) only in DHCP mode.
+    match (dhcp, wan4.is_some()) {
         (false, true) => {
             if let Some(w) = wan4.take() {
                 w.stop(udp);
@@ -586,7 +547,7 @@ fn poll_stacks(hosts: &mut [HostIf], sh: &Shared, udp: &mut crate::net::local::U
             ifx: ifx as fwd::IfIndex,
             now_ns,
             queued: &mut queued,
-            nd: Some(&mut host.nd),
+            tap: Some(&mut host.tap),
             dp,
             ip_only,
             udp: Some(&mut *udp),
@@ -769,7 +730,7 @@ pub async fn run(
     // The router's own UDP ports (`net::local`) and, on an IP-only DHCP
     // WAN, its DHCP client over them (docs/local-stack.md step 2b).
     let mut udp = crate::net::local::Udp::default();
-    let mut wan4 = (crate::config::wan_link() == crate::config::WanLink::Dhcp && hosts[0].ip_only)
+    let mut wan4 = (crate::config::wan_link() == crate::config::WanLink::Dhcp)
         .then(|| crate::net::wan4::Wan4::new(sh.ports[0].mac, &mut udp, now_ms()));
     // The WAN's IPv6 by prefix delegation (docs/ipv6.md step 3).
     let mut wan6 = crate::net::wan6::Wan6::new(&mut hosts[0], sh, now_ms());
@@ -816,13 +777,8 @@ pub async fn run(
             }
             None => {
                 mgmt.set_wan_pppoe(None);
-                match wan4.as_mut() {
-                    Some(w) => {
-                        let events = w.step(&mut udp, sh, now_ms());
-                        handle_wan4(sh.ports[0].name, &mut hosts[0], &mut pinger, events)
-                    }
-                    None => handle_dhcp(sh.ports[0].name, &mut hosts[0], &mut pinger),
-                }
+                let events = wan4.as_mut().map(|w| w.step(&mut udp, sh, now_ms())).unwrap_or_default();
+                handle_wan4(sh.ports[0].name, &mut hosts[0], &mut pinger, events)
             }
         };
         if let Some(change) = change {

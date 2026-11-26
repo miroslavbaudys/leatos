@@ -31,9 +31,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::socket::dhcpv4;
 use smoltcp::time::Instant as NetInstant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Cidr, Ipv6Cidr};
+use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Cidr, Ipv6Cidr};
 use spin::Mutex;
 
 /// Qdisc hard limits, per port egress and for the WAN ingress stage
@@ -252,13 +251,8 @@ pub fn bring_up(
             let ip_only = crate::config::wan_ip_only(&crate::config::wan_link());
             link.set_ip_only(ip_only);
             let iface = new_iface(&port, ip_only);
-            let mut sockets = SocketSet::new(Vec::new());
-            // smoltcp's DHCP client only on an Ethernet WAN (`wan_medium=eth`);
-            // an IP-only one runs `net::wan4` (it panics on `Medium::Ip`).
-            if crate::config::wan_link() == crate::config::WanLink::Dhcp && !ip_only {
-                sockets.add(dhcpv4::Socket::new());
-            }
-            hosts.push(HostIf { iface, sockets, nd: Default::default(), mac: port.mac, ip_only });
+            let sockets = SocketSet::new(Vec::new());
+            hosts.push(HostIf { iface, sockets, tap: Default::default(), mac: port.mac, ip_only });
             links.push(link);
         } else if i == shared::FIRST_LAN_PORT {
             // Every network slot, with an interface without addresses (on
@@ -266,13 +260,13 @@ pub fn bring_up(
             // config's networks their addresses and port MACs.
             for _ in 1..shared::MAX_LINKS {
                 let link = LinkShared::new(port_ix, false);
-                let ip_only = crate::config::lan_medium_ip();
+                let ip_only = true;
                 link.set_ip_only(ip_only);
                 links.push(link);
                 hosts.push(HostIf {
                     iface: new_iface(&port, ip_only),
                     sockets: SocketSet::new(Vec::new()),
-                    nd: Default::default(),
+                    tap: Default::default(),
                     mac: port.mac,
                     ip_only,
                 });
@@ -313,7 +307,7 @@ pub fn bring_up(
             "  net {name}       : {} {} mac {} {}",
             dev.model(),
             d.df,
-            EthernetAddress(mac),
+            shared::mac_text(&mac),
             match irq {
                 Some((irq, kind)) => {
                     let mut s = alloc::format!("intid {}{kind}", irq.intid);
@@ -393,19 +387,13 @@ fn log_ingress(qos: &crate::config::Qos, rate: Option<qdisc::shaper::Rate>, what
     }
 }
 
-/// The router stack's interface for a link on `port`: Ethernet, or
-/// IP-only on a PPPoE port ([`PortShared::is_pppoe`], set before calling)
-/// and with `ip_only` (the datapath does its link layer: LAN links,
-/// docs/lan-neighbors.md; a static WAN, docs/local-stack.md step 2a).
-/// smoltcp only reads the device's capabilities here.
+/// The router stack's interface for a link on `port`: IP-only, always
+/// (`ip_only`: the datapath does its link layer, docs/lan-neighbors.md,
+/// docs/local-stack.md step 2; else a PPPoE port, [`PortShared::is_pppoe`]
+/// set before calling). smoltcp only reads the device's capabilities here.
 pub fn new_iface(port: &PortShared, ip_only: bool) -> Interface {
     let link = &LinkShared::detached();
-    let hw = if port.is_pppoe() || ip_only {
-        HardwareAddress::Ip
-    } else {
-        HardwareAddress::Ethernet(EthernetAddress(port.mac))
-    };
-    let mut config = Config::new(hw);
+    let mut config = Config::new(HardwareAddress::Ip);
     // TCP initial sequence numbers, DHCP transaction IDs: from the entropy
     // pool, not the tick count (docs/security-audit.md §5 item 7).
     config.random_seed = crate::entropy::u64();
@@ -416,7 +404,7 @@ pub fn new_iface(port: &PortShared, ip_only: bool) -> Interface {
         ifx: 0,
         now_ns: datapath::now_ns(),
         queued: &mut queued,
-        nd: None,
+        tap: None,
         dp: None,
         ip_only,
         udp: None,
@@ -752,11 +740,6 @@ pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: 
         let k = links.iter().position(|&l| l == i);
         if let Some(&mac) = k.and_then(|k| macs.get(nets[k].port)) {
             host.mac = mac;
-            // Only an Ethernet interface has one (smoltcp asserts it).
-            let hw = HardwareAddress::Ethernet(EthernetAddress(mac));
-            if !host.ip_only && host.iface.hardware_addr() != hw {
-                host.iface.set_hardware_addr(hw);
-            }
         }
         let view = &views[i];
         set_host_routes46(&mut host.iface, &view.routes4, &view.routes6);

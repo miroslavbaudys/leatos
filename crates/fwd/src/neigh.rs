@@ -66,6 +66,9 @@ pub struct NeighTable<P, A = Ipv4Addr> {
     pub probes: u64,
     reachable_ms: u64,
     probe: bool,
+    /// Packets held per neighbor being resolved (default [`MAX_PENDING`];
+    /// 0 drops them: the lab's negative control `neigh_pending=0`).
+    max_pending: usize,
 }
 
 impl<P, A> Default for NeighTable<P, A> {
@@ -79,6 +82,7 @@ impl<P, A> Default for NeighTable<P, A> {
             probes: 0,
             reachable_ms: REACHABLE_MS,
             probe: true,
+            max_pending: MAX_PENDING,
         }
     }
 }
@@ -104,6 +108,13 @@ impl<P, A: Copy + Ord> NeighTable<P, A> {
             probe,
             ..self
         }
+    }
+
+    /// At most `n` packets wait per neighbor being resolved (capped at
+    /// [`MAX_PENDING`]; 0: none, the packet that starts a resolution is
+    /// dropped).
+    pub fn with_pending(self, n: usize) -> Self {
+        Self { max_pending: n.min(MAX_PENDING), ..self }
     }
 
     pub fn lookup(&self, ifx: IfIndex, ip: A, now: u64) -> Option<Mac> {
@@ -149,7 +160,11 @@ impl<P, A: Copy + Ord> NeighTable<P, A> {
             }
             Some(Entry::Probe { mac, .. }) => return Resolve::Ready(*mac, pkt),
             Some(Entry::Incomplete { pending, .. }) => {
-                if pending.len() >= MAX_PENDING {
+                if self.max_pending == 0 {
+                    self.dropped += 1;
+                    return Resolve::Queued { send_arp: false };
+                }
+                if pending.len() >= self.max_pending {
                     pending.pop_front();
                     self.dropped += 1;
                 }
@@ -164,8 +179,12 @@ impl<P, A: Copy + Ord> NeighTable<P, A> {
             return Resolve::Queued { send_arp: false };
         }
         self.incomplete += 1;
-        let mut pending = VecDeque::with_capacity(MAX_PENDING);
-        pending.push_back(pkt);
+        let mut pending = VecDeque::with_capacity(self.max_pending);
+        if self.max_pending == 0 {
+            self.dropped += 1;
+        } else {
+            pending.push_back(pkt);
+        }
         self.entries.insert(
             (ifx, ip),
             Entry::Incomplete {
@@ -271,6 +290,27 @@ mod tests {
             n.resolve(0, IP, 9, 3001),
             Resolve::Queued { send_arp: true }
         ));
+    }
+
+    #[test]
+    fn no_pending_queue_drops_while_resolving() {
+        // `neigh_pending=0` (the lab's control): still asks, holds nothing.
+        let mut n: NeighTable<u32> = NeighTable::new().with_pending(0);
+        assert!(matches!(n.resolve(0, IP, 1, 0), Resolve::Queued { send_arp: true }));
+        assert!(matches!(n.resolve(0, IP, 2, 0), Resolve::Queued { send_arp: false }));
+        assert_eq!(n.dropped, 2);
+        assert_eq!(n.learn(0, IP, MAC, 1), [], "nothing was waiting");
+        assert!(matches!(n.resolve(0, IP, 3, 2), Resolve::Ready(MAC, 3)), "resolved: sent");
+        // One held at most with 1; more is capped at MAX_PENDING.
+        let mut n: NeighTable<u32> = NeighTable::new().with_pending(1);
+        n.resolve(0, IP, 1, 0);
+        n.resolve(0, IP, 2, 0);
+        assert_eq!((n.dropped, n.learn(0, IP, MAC, 1)), (1, alloc::vec![2]));
+        let mut n: NeighTable<u32> = NeighTable::new().with_pending(99);
+        for i in 0..5 {
+            n.resolve(0, IP, i, 0);
+        }
+        assert_eq!(n.dropped, 2);
     }
 
     #[test]

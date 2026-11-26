@@ -65,13 +65,14 @@ A client VM, the router and an ISP VM (Alpine; overlays in `lab/client/`, `lab/i
 
 - `LAB_WAN_STATIC=1`: the ISP runs no DHCP server; the router gets
   `wan_mode=static wan_ip=203.0.113.60/24 …`: static line + NATed source 203.0.113.60, all checks
-  through it. The WAN's router stack is IP-only (docs/local-stack.md step 2a): the client's
-  `wan arp` (ISP `cgi-bin/arp` forgets and re-ARPs the WAN address) must be answered by the
-  datapath (`wan_nd` medium `ip`, `arp_replies` rising). Negative controls
-  `LAB_ROUTER_ARGS=wan_mode=dhcp`, `LAB_ROUTER_ARGS=wan_medium=eth` (smoltcp answers).
+  through it. The client's `wan arp` (ISP `cgi-bin/arp` forgets and re-ARPs the WAN address) must
+  be answered by the datapath (`wan_nd` medium `ip`, `arp_replies` rising; docs/local-stack.md
+  step 2). Negative control `LAB_ROUTER_ARGS=wan_mode=dhcp`. (`wan_medium=eth`, smoltcp
+  answering, was the control of the datapath part until the fallback went, 2026-11-26.)
 - Every IPv4 run without PPPoE: `wan arp`, the ISP's ARP for the router's WAN address answered.
   On a DHCP WAN also `dhcp wan ip-only` (docs/local-stack.md step 2b): medium `ip` and the
-  router's own DHCP client bound (`wan_dhcp`); negative control `LAB_ROUTER_ARGS=wan_medium=eth`.
+  router's own DHCP client bound at the end (`wan_dhcp`); negative control
+  `LAB_WAN_LEASE=60 LAB_WAN_LEASE_STOP=1` (the lease lost: not bound).
 - `LAB_WAN_LEASE=N`: the ISP's leases last N s; the router must renew during the run (a third
   reply taken) and never lose the lease. Negative control `LAB_WAN_LEASE_STOP=1` (the ISP's DHCP
   server stopped first: lease lost).
@@ -192,9 +193,9 @@ Modes that imply `LAB_GUEST=1`:
   flood (docs/security-audit.md §4.2). Rule lab-wan-ping6 lets the ISP ping the router's WAN
   address from 2001:db8::/32; the ISP (`cgi-bin/ndflood`) pings it once from each of 1500
   addresses of 2001:db8:eeee::/64, whose replies all go via the router's default router: at most
-  2 lost. INVALID unless 100+ were answered. Negative control `LAB_ROUTER_ARGS=wan_hints6=all`
-  (every source into smoltcp's cache: the default router is evicted once per 256 sources and the
-  reply that finds it missing is lost; 10 of 1500 in the first run).
+  2 lost. INVALID unless 100+ were answered. Its negative control was `wan_hints6=all` (every
+  source into smoltcp's cache: 10 of 1500 lost in the first run), gone with the hints
+  (2026-11-26): the datapath's table holds on-link neighbors only.
 - Neighbor discovery as a client sees it (pd mode, docs/lan-neighbors.md §4): with a 2 s reachable
   time and a 1 s probe delay the client keeps probing the router (its default router) with unicast
   NS while it pings the ISP through it for 15 s: no resolution fails (`res_failed` in
@@ -210,28 +211,28 @@ Modes that imply `LAB_GUEST=1`:
 
 Unshaped unless `LAB_SHAPE_KBIT` is set; router `neigh_secs=10`. The client pins the router's MAC
 (never ARPs) and pings the router from `LAB_NEIGH_HOSTS` (40) addresses of its own, 3 rounds,
-without loss (round 1 = first contact: ARP hints; rounds 2–3: smoltcp's cache holds them all), then
-downloads for `LAB_NEIGH_SECS` (35) across several neighbor lifetimes with no `neighbor` drops and
-some probes. Since docs/lan-neighbors.md step 3 the router's answers use the datapath's neighbor
-table (no hints, no smoltcp cache on the LANs). Negative controls
-`LAB_ROUTER_ARGS="lan_medium=eth arp_hints=0"` (the old path without hints: round 1 fails),
-`LAB_NEIGH_CACHE=8` with `lan_medium=eth` (kernel built `--no-default-features`: rounds 2–3),
-`LAB_ROUTER_ARGS=neigh_probe=0` (forwarded).
+without loss (round 1 = first contact: each answer waits in the datapath's neighbor table while it
+ARPs; rounds 2–3 find them resolved), then downloads for `LAB_NEIGH_SECS` (35) across several
+neighbor lifetimes with no `neighbor` drops and some probes. Negative controls
+`LAB_ROUTER_ARGS=neigh_pending=0` (nothing waits: round 1 fails), `LAB_ROUTER_ARGS=neigh_probe=0`
+(forwarded). The old controls (`lan_medium=eth arp_hints=0`, `LAB_NEIGH_CACHE=8`) went with the
+smoltcp path on 2026-11-26; rounds 2–3 guarded smoltcp's 8-entry cache, the datapath's table has
+no such limit.
 
 Two more parts (docs/lan-neighbors.md §4):
 
 - **Readdress** (with `LAB_GUEST=1` or `LAB_GUEST_LIVE=1` for the store, and `LAB_IPV6=1`): the
   LAN's ULA prefix moved to fd99:1:2::/48 and back by two live `/api/config` saves (as a new
   delegated prefix would), then a fourth IPv4 round loses nothing; INVALID unless the router showed
-  the new ULA. Negative control `LAB_ROUTER_ARGS="lan_medium=eth arp_hints=0"` (smoltcp empties
-  its cache on every address update: 40 of 40 lost).
+  the new ULA. It guarded smoltcp emptying its cache on every address update (40 of 40 lost on
+  the old path, its negative control until 2026-11-26); no control now.
 - **Conflicts** (`lan_nd.conflicts`): an RFC 5227 probe for 192.168.1.1 is answered and counted, a
   gratuitous claim from the client's MAC counted, the router still answers ARP after; a claim
   for another address and one from the router's own MAC (eth0 set to it for a moment) are the
-  controls that must not count. Skipped (INFO) on `lan_medium=eth`.
+  controls that must not count.
 - **Local queue** (`lan_nd.local_queued` / `local_dropped`): in round 1 the router's first answer to
   each new address waits for ARP, so `local_queued` rises by at least one per address and
-  `local_dropped` stays; rounds 2–3 are INFO. Skipped (INFO) on `lan_medium=eth`. Negative control
+  `local_dropped` stays; rounds 2–3 are INFO. Negative control
   (2026-11-25, a one-off build without the `LOCAL_QUEUED` increment): FAIL "not counted".
 
 ### `LAB_ACK=1`: ACK filter

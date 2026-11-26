@@ -403,12 +403,10 @@ else
   fail "wan input: $(echo $wp)"
 fi
 
-# WAN ARP (docs/local-stack.md step 2a): the ISP forgets the router's WAN
-# MAC and asks again (ISP cgi-bin/arp). smoltcp answers on an Ethernet WAN,
-# the datapath on an IP-only static WAN (/api/status wan_nd: medium, and
-# arp_replies rises); scripts/lab-test.sh wants the datapath with
-# LAB_WAN_STATIC=1 (negative control LAB_ROUTER_ARGS=wan_medium=eth). No
-# ARP on PPPoE.
+# WAN ARP (docs/local-stack.md step 2): the ISP forgets the router's WAN
+# MAC and asks again (ISP cgi-bin/arp); the datapath answers (/api/status
+# wan_nd: medium ip, arp_replies rises; nothing else could). No ARP on
+# PPPoE.
 if ! $bb grep -q 'lab_pppoe_kick=' /proc/cmdline; then
   wst() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null; }
   wnd() { echo "$1" | $bb sed -n 's/.*"wan_nd":{"medium":"\([a-z]*\)","arp_replies":\([0-9]*\).*/\1 \2/p'; }
@@ -576,11 +574,10 @@ fi
 # The client pins the router's MAC (a permanent entry: it sends no ARP of
 # its own) and:
 # B) pings the router from lab_neigh_hosts (40) addresses of its own, one
-#    ping each, 3 rounds. Round 1 is first contact: smoltcp has never seen
-#    them, and without the router's ARP hints (negative control
-#    arp_hints=0) it drops each answer while it asks. Rounds 2-3 need
-#    them all in smoltcp's neighbor cache (negative control
-#    LAB_NEIGH_CACHE=8, its default size: evicted, answers dropped);
+#    ping each, 3 rounds. Round 1 is first contact: the router's datapath
+#    has never resolved them, so each answer waits in its neighbor table
+#    while it ARPs (negative control neigh_pending=0: nothing waits, every
+#    first answer is dropped). Rounds 2-3 find them resolved;
 # A) downloads unshaped from the ISP for lab_neigh_secs (35) across several
 #    neighbor lifetimes (the router's neigh_secs=10): entries in use are
 #    probed, so no packet is dropped as `neighbor` (negative control
@@ -600,7 +597,7 @@ if $bb grep -q 'lab_neigh=1' /proc/cmdline; then
   if [ -z "$rmac" ] || [ "$flags" != 0x6 ]; then
     fail "neighbors: INVALID, could not pin the router's MAC '$rmac' (flags '$flags')"
   else
-    # B: router-local answers (smoltcp) to many hosts.
+    # B: router-local answers to many hosts.
     i=0; added=0
     while [ $i -lt "$nhosts" ]; do
       $bb ip addr add "192.168.1.$((200 + i))/24" dev eth0 2>/dev/null && added=$((added + 1))
@@ -625,35 +622,31 @@ if $bb grep -q 'lab_neigh=1' /proc/cmdline; then
     set -- $lost
     what="lost$lost of $nhosts per round (first contact, then twice more) with the router's MAC pinned"
     if [ "$added" != "$nhosts" ]; then fail "neighbors router: INVALID, added $added of $nhosts addresses ($what)"
-    elif [ "$1" != 0 ]; then fail "neighbors router: first contact lost (ARP hints): $what"
-    elif [ "$2" != 0 ] || [ "$3" != 0 ]; then fail "neighbors router: answers lost later (neighbor cache): $what"
+    elif [ "$1" != 0 ]; then fail "neighbors router: first contact lost (answers not held while resolving): $what"
+    elif [ "$2" != 0 ] || [ "$3" != 0 ]; then fail "neighbors router: answers lost later: $what"
     else pass "neighbors router: $what"; fi
     # B2: the router's own packets to unresolved neighbors are counted
     # (local_queued at least one per new address in round 1, none dropped).
     # Rounds 2-3 find them resolved (INFO: an entry idle past neigh_secs in
     # a slow run is resolved anew). Negative control: the counter's
-    # increment removed (docs/lab-tests.md). Skipped on lan_medium=eth.
-    if echo "$s0" | $bb grep -q '"lan_nd":{"medium":"eth"'; then
-      echo "LAB INFO: neighbors local queue: not used on lan_medium=eth (smoltcp resolves)"
-    else
-      q0=$(lq "$s0" queued); q1=$(lq "$s1" queued); q3=$(lq "$s3" queued)
-      d0=$(lq "$s0" dropped); d3=$(lq "$s3" dropped)
-      what="queued ${q0:-?} -> ${q1:-?} (round 1) -> ${q3:-?}, dropped ${d0:-?} -> ${d3:-?}, $added new addresses"
-      if [ -z "$q0" ] || [ -z "$q1" ] || [ -z "$q3" ] || [ -z "$d0" ] || [ -z "$d3" ]; then
-        fail "neighbors local queue: no lan_nd.local_queued / local_dropped in /api/status"
-      elif [ $((q1 - q0)) -lt "$added" ]; then fail "neighbors local queue: router packets to unresolved neighbors not counted ($what)"
-      elif [ "$d3" != "$d0" ]; then fail "neighbors local queue: router packets dropped ($what)"
-      else pass "neighbors local queue: $what"; fi
-    fi
+    # increment removed (docs/lab-tests.md).
+    q0=$(lq "$s0" queued); q1=$(lq "$s1" queued); q3=$(lq "$s3" queued)
+    d0=$(lq "$s0" dropped); d3=$(lq "$s3" dropped)
+    what="queued ${q0:-?} -> ${q1:-?} (round 1) -> ${q3:-?}, dropped ${d0:-?} -> ${d3:-?}, $added new addresses"
+    if [ -z "$q0" ] || [ -z "$q1" ] || [ -z "$q3" ] || [ -z "$d0" ] || [ -z "$d3" ]; then
+      fail "neighbors local queue: no lan_nd.local_queued / local_dropped in /api/status"
+    elif [ $((q1 - q0)) -lt "$added" ]; then fail "neighbors local queue: router packets to unresolved neighbors not counted ($what)"
+    elif [ "$d3" != "$d0" ]; then fail "neighbors local queue: router packets dropped ($what)"
+    else pass "neighbors local queue: $what"; fi
     # C: readdressing keeps neighbors (docs/lan-neighbors.md §4; needs the
     # store and IPv6: LAB_GUEST=1 or LAB_GUEST_LIVE=1, with LAB_IPV6=1):
     # the LAN's ULA prefix moved to fd99:1:2::/48 and back by two live
     # saves (what a new delegated prefix does too), so the LAN interface's
     # addresses change twice; its IPv4 neighbors must stay, a fourth round
     # right after loses nothing. INVALID unless the router showed the new
-    # ULA in between. Negative control LAB_ROUTER_ARGS="lan_medium=eth
-    # arp_hints=0": smoltcp empties its cache on every address update
-    # (update_ip_addrs) and nothing refills it.
+    # ULA in between. (It guarded smoltcp emptying its cache on every
+    # address update; the datapath's table is not touched by one, and the
+    # old path that was the negative control is gone.)
     if $bb grep -q 'lab_guest=' /proc/cmdline && $bb grep -q 'lab_ipv6=' /proc/cmdline; then
       rpost() { $bb wget -q -T 20 -O - --header "Content-Type: application/toml" --post-data="$($bb cat "$1")" \
         "http://admin:lab-pass@192.168.1.1/api/config" 2>&1; }
@@ -690,12 +683,9 @@ if $bb grep -q 'lab_neigh=1' /proc/cmdline; then
     # (sender 192.168.1.1, our MAC) counted; the router still answers ARP
     # afterwards. Not counted: a claim for another address, and one from
     # the router's own MAC (eth0 set to it for a moment; skipped if the
-    # NIC cannot change its MAC live). On lan_medium=eth smoltcp answers
-    # ARP and nothing is counted (INFO).
+    # NIC cannot change its MAC live).
     ncf() { nst | $bb sed -n 's/.*"lan_nd":{[^}]*"conflicts":\([0-9]*\).*/\1/p'; }
-    if nst | $bb grep -q '"lan_nd":{"medium":"eth"'; then
-      echo "LAB INFO: neighbors conflict: not counted on lan_medium=eth (smoltcp answers ARP)"
-    else
+    if true; then
       echo 1 >/proc/sys/net/ipv4/ip_nonlocal_bind
       c0=$(ncf)
       $bb arping -q -U -c 2 -w 3 -I eth0 -s 192.168.1.250 192.168.1.250 >/dev/null 2>&1
@@ -1084,9 +1074,10 @@ if [ -n "$v6on" ]; then
       # WAN neighbor-cache flood (scripts/lab-test.sh LAB_ND_FLOOD=1,
       # docs/security-audit.md §4.2): the ISP pings the router's WAN
       # address once from each of 1500 off-link addresses; every reply goes
-      # via the router's default router, which must stay in smoltcp's cache
-      # (evicted once per 256 new sources, it costs the reply that finds it
-      # missing). Negative control LAB_ROUTER_ARGS=wan_hints6=all.
+      # via the router's default router, which must stay resolved: the
+      # datapath's table holds on-link neighbors only, off-link sources
+      # never enter it (smoltcp's cache did, through the neighbor hints:
+      # the old negative control wan_hints6=all is gone with them).
       if $bb grep -q 'lab_nd_flood=1' /proc/cmdline; then
         nf=$($bb wget -q -T 120 -O - "http://[$ISP6]/cgi-bin/ndflood?2001:db8:100:ff::1" 2>&1)
         nf_ans=$(echo "$nf" | $bb sed -n 's/.*answered=\([0-9]*\).*/\1/p')
@@ -1120,8 +1111,6 @@ if [ -n "$v6on" ]; then
       # Probes: a failed resolution fails; else the router must have
       # answered some (INVALID if nothing was exercised at all).
       if [ "$f1" != "$f0" ]; then fail "ipv6 nd: resolutions of the router failed: unicast probes unanswered? ($ndinfo)"
-      elif v6st | $bb grep -q '"lan_nd":{"medium":"eth"'; then
-        echo "LAB INFO: ipv6 nd: probes not counted on lan_medium=eth (smoltcp answers them) ($ndinfo)"
       elif [ -z "$n1" ] || [ $((n1 - ${n0:-0})) -lt 3 ]; then fail "ipv6 nd: INVALID, no probe was answered or failed ($ndinfo)"
       else pass "ipv6 nd: unicast probes of the router answered ($ndinfo)"
       fi
@@ -1790,7 +1779,7 @@ fi
 
 # --- WAN DHCP client (docs/local-stack.md step 2b) ---------------------------
 # The router's own DHCPv4 client (/api/status wan_dhcp; null with
-# wan_medium=eth or PPPoE / static), reported for scripts/lab-test.sh. With
+# PPPoE / static), reported for scripts/lab-test.sh. With
 # a short lease (LAB_WAN_LEASE=N, lab_wan_lease=N) wait up to 100 s for a
 # renewal (a third reply taken: OFFER, ACK, then the renewal's ACK);
 # lab_wan_lease_stop=1 ends the ISP's DHCP server and waits past the

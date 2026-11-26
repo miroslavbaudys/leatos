@@ -316,24 +316,6 @@ fn udp_check(f: &[u8]) {
     assert_eq!(&out[again.payload.0..again.payload.1], payload);
 }
 
-fn nd_helpers(f: &[u8]) {
-    let mut hint = [0u8; wire::NEIGHBOR_HINT_LEN];
-    if wire::ipv6_neighbor_hint(f, &mut hint).is_some() {
-        let v = wire::Ipv6View::parse(&hint, ETH_HDR).expect("hint parses");
-        assert_eq!(wire::icmpv6_checksum(v.src(&hint), v.dst(&hint), &hint[v.l4..]), 0, "hint checksum");
-    }
-    let mut g = f.to_vec();
-    let valid = |g: &[u8]| {
-        let v = wire::Ipv6View::parse(g, ETH_HDR)?;
-        let end = v.l4 + v.l4_len;
-        (v.l4 == ETH_HDR + 40).then(|| wire::icmpv6_checksum(v.src(g), v.dst(g), &g[v.l4..end]) == 0)
-    };
-    let before = valid(&g);
-    if wire::ipv6_ns_to_solicited(&mut g) && before == Some(true) {
-        assert_eq!(valid(&g), Some(true), "readdressed NS checksum");
-    }
-}
-
 /// The router's IPv4 address and prefix on interface `i` (as `router()`).
 fn addr4(i: usize) -> (Ipv4Addr, u8) {
     [(Ipv4Addr::new(203, 0, 113, 10), 24), (Ipv4Addr::new(192, 168, 1, 1), 24), (Ipv4Addr::new(192, 168, 20, 1), 24)][i]
@@ -676,7 +658,6 @@ fuzz_target!(|ops: Vec<Op>| {
             Op::Raw { ifx, data } => {
                 let mut f = data;
                 f.truncate(1600);
-                nd_helpers(&f);
                 udp_check(&f);
                 nd_answer(usize::from(ifx % 3), &f);
                 let n = f.len();

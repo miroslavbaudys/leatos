@@ -334,12 +334,12 @@ const STATS_MS: u64 = 10_000;
 
 fn neigh_table() -> NeighTable<PacketBuf> {
     let (ms, probe) = crate::config::neigh_timing();
-    NeighTable::new().with_timing(ms, probe)
+    NeighTable::new().with_timing(ms, probe).with_pending(crate::config::neigh_pending())
 }
 
 fn neigh6_table() -> NeighTable<PacketBuf, Ipv6Addr> {
     let (ms, probe) = crate::config::neigh_timing();
-    NeighTable::with_incomplete_cap(NEIGH6_INCOMPLETE).with_timing(ms, probe)
+    NeighTable::with_incomplete_cap(NEIGH6_INCOMPLETE).with_timing(ms, probe).with_pending(crate::config::neigh_pending())
 }
 
 /// Packets a neighbor table dropped (`dropped` went from `before` to

@@ -364,87 +364,8 @@ pub fn solicited_node(a: Ipv6Addr) -> Ipv6Addr {
     Ipv6Addr::from(u128::from(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 0)) | u128::from(u32::from_be_bytes([0, o[13], o[14], o[15]])))
 }
 
-/// Bytes of a neighbor hint ([`ipv6_neighbor_hint`]).
-pub const NEIGHBOR_HINT_LEN: usize = ETH_HDR + 40 + 32;
-
-/// For a host IPv6 stack that learns neighbors only from neighbor
-/// discovery (smoltcp): an IPv6 unicast frame from a neighbor, not itself
-/// ND, as a Neighbor Solicitation from that neighbor (its address and MAC
-/// in the source link-layer option) to the frame's destination, so the
-/// stack can answer without first resolving it (and dropping the answer
-/// while it does). Sent to the unicast address, so the stack records the
-/// neighbor but does not answer it. Returns the neighbor's address and
-/// MAC, written to `out` ([`NEIGHBOR_HINT_LEN`] bytes).
-pub fn ipv6_neighbor_hint(frame: &[u8], out: &mut [u8; NEIGHBOR_HINT_LEN]) -> Option<(Ipv6Addr, Mac)> {
-    if ethertype(frame) != Some(ETHERTYPE_IPV6) || frame.len() < ETH_HDR + 40 || frame[ETH_HDR] >> 4 != 6 {
-        return None;
-    }
-    let (src, dst) = (get_ip6(frame, ETH_HDR + 8), get_ip6(frame, ETH_HDR + 24));
-    let mut smac = [0u8; 6];
-    smac.copy_from_slice(&frame[6..12]);
-    if dst.is_multicast() || src.is_multicast() || src.is_unspecified() || is_multicast_mac(&smac) {
-        return None;
-    }
-    if frame[ETH_HDR + 6] == PROTO_ICMPV6 && frame.get(ETH_HDR + 40).is_some_and(|t| (133..=137).contains(t)) {
-        return None; // ND itself: the stack learns from it already
-    }
-    out.fill(0);
-    out[0..6].copy_from_slice(&frame[0..6]);
-    out[6..12].copy_from_slice(&smac);
-    put16(out, 12, ETHERTYPE_IPV6);
-    let ip = ETH_HDR;
-    out[ip] = 0x60;
-    put16(out, ip + 4, 32);
-    out[ip + 6] = PROTO_ICMPV6;
-    out[ip + 7] = 255;
-    out[ip + 8..ip + 24].copy_from_slice(&src.octets());
-    out[ip + 24..ip + 40].copy_from_slice(&dst.octets());
-    let m = ip + 40;
-    out[m] = 135; // Neighbor Solicitation
-    out[m + 8..m + 24].copy_from_slice(&dst.octets());
-    out[m + 24] = 1; // source link-layer address
-    out[m + 25] = 1;
-    out[m + 26..m + 32].copy_from_slice(&smac);
-    let c = icmpv6_checksum(src, dst, &out[m..m + 32]);
-    put16(out, m + 2, c);
-    Some((src, smac))
-}
-
-/// A unicast Neighbor Solicitation (a reachability probe, RFC 4861 §7.3.3)
-/// readdressed to its target's solicited-node group, for a host stack that
-/// answers only those (thought true of smoltcp 0.14, which answers both):
-/// the destination address and MAC and the checksum change, nothing else.
-/// Returns whether it did.
-pub fn ipv6_ns_to_solicited(frame: &mut [u8]) -> bool {
-    let ip = ETH_HDR;
-    let m = ip + 40;
-    if ethertype(frame) != Some(ETHERTYPE_IPV6)
-        || frame.len() < m + 24
-        || frame[ip] >> 4 != 6
-        || frame[ip + 6] != PROTO_ICMPV6
-        || frame[m] != 135
-    {
-        return false;
-    }
-    let (dst, target) = (get_ip6(frame, ip + 24), get_ip6(frame, m + 8));
-    if dst.is_multicast() || dst != target {
-        return false;
-    }
-    let group = solicited_node(target);
-    let (old, new) = (dst.octets(), group.octets());
-    let mut c = get16(frame, m + 2);
-    for i in (0..16).step_by(2) {
-        c = csum_update16(c, u16::from_be_bytes([old[i], old[i + 1]]), u16::from_be_bytes([new[i], new[i + 1]]));
-    }
-    put16(frame, m + 2, c);
-    frame[ip + 24..ip + 40].copy_from_slice(&new);
-    frame[0..2].copy_from_slice(&[0x33, 0x33]);
-    frame[2..6].copy_from_slice(&new[12..16]);
-    true
-}
-
 /// Bytes of a neighbor solicitation frame ([`build_ns`]).
-pub const NS_LEN: usize = NEIGHBOR_HINT_LEN;
+pub const NS_LEN: usize = ETH_HDR + 40 + 32;
 
 /// A Neighbor Solicitation for `target` from `src_ip` (the router's
 /// link-local address) at `src_mac`, to the target's solicited-node group
@@ -544,31 +465,6 @@ pub fn parse_nd(frame: &[u8]) -> Option<(Ipv6Addr, Mac)> {
         o = &o[len..];
     }
     None
-}
-
-/// A Neighbor Advertisement the router's own (host) stack sends, with the
-/// Router flag set (RFC 4861 §4.4): smoltcp sends it cleared, and a client
-/// that sees its default router's NA without it removes the router from
-/// its default router list (§7.2.5), losing its IPv6 default route.
-/// Returns whether it changed the frame.
-pub fn ipv6_na_set_router(frame: &mut [u8]) -> bool {
-    let ip = ETH_HDR;
-    let m = ip + 40;
-    if ethertype(frame) != Some(ETHERTYPE_IPV6)
-        || frame.len() < m + 24
-        || frame[ip] >> 4 != 6
-        || frame[ip + 6] != PROTO_ICMPV6
-        || frame[m] != 136
-        || frame[m + 4] & 0x80 != 0
-    {
-        return false;
-    }
-    let old = get16(frame, m + 4);
-    frame[m + 4] |= 0x80;
-    let new = get16(frame, m + 4);
-    let c = csum_update16(get16(frame, m + 2), old, new);
-    put16(frame, m + 2, c);
-    true
 }
 
 /// `ff02::1:ffXX:XXXX` (RFC 4291 §2.7.1).
@@ -880,45 +776,6 @@ pub fn is_echo(frame: &[u8]) -> bool {
     }
 }
 
-/// Bytes of an ARP neighbor hint ([`ipv4_neighbor_hint`]).
-pub const ARP_HINT_LEN: usize = ETH_HDR + 28;
-
-/// For a host IPv4 stack that learns neighbors only from ARP aimed at it
-/// and forgets them after a minute (smoltcp 0.14): an IPv4 unicast frame
-/// from a neighbor as an ARP reply from that neighbor (its address and
-/// MAC as the sender) to the frame's destination, so the stack records
-/// the neighbor without answering and can answer the frame without first
-/// resolving it (dropping the answer while it does). Returns the
-/// neighbor's address and MAC, written to `out` ([`ARP_HINT_LEN`] bytes).
-pub fn ipv4_neighbor_hint(frame: &[u8], out: &mut [u8; ARP_HINT_LEN]) -> Option<(Ipv4Addr, Mac)> {
-    if ethertype(frame) != Some(ETHERTYPE_IPV4) || frame.len() < ETH_HDR + 20 || frame[ETH_HDR] >> 4 != 4 {
-        return None;
-    }
-    let (src, dst) = (get_ip(frame, ETH_HDR + 12), get_ip(frame, ETH_HDR + 16));
-    let mut smac = [0u8; 6];
-    smac.copy_from_slice(&frame[6..12]);
-    let mut dmac = [0u8; 6];
-    dmac.copy_from_slice(&frame[0..6]);
-    let unicast = |a: Ipv4Addr| !(a.is_unspecified() || a.is_broadcast() || a.is_multicast());
-    if !unicast(src) || !unicast(dst) || is_multicast_mac(&smac) || is_multicast_mac(&dmac) {
-        return None;
-    }
-    out.fill(0);
-    set_macs(out, dmac, smac);
-    put16(out, 12, ETHERTYPE_ARP);
-    let a = &mut out[ETH_HDR..];
-    put16(a, 0, 1);
-    put16(a, 2, ETHERTYPE_IPV4);
-    a[4] = 6;
-    a[5] = 4;
-    put16(a, 6, 2); // reply: recorded, not answered
-    a[8..14].copy_from_slice(&smac);
-    put_ip(a, 14, src);
-    a[18..24].copy_from_slice(&dmac);
-    put_ip(a, 24, dst);
-    Some((src, smac))
-}
-
 /// IPv4 fragmentation (RFC 791 §2.3): how a packet too large for the
 /// next link is cut. Data goes in pieces of a multiple of 8 bytes; each
 /// piece gets a copy of the header with its own offset and length. A
@@ -1159,26 +1016,6 @@ mod tests {
     const RMAC: Mac = [0x52, 0x54, 0, 0, 0, 2];
     const CMAC: Mac = [0x52, 0x54, 0, 0, 0, 0x10];
 
-    #[test]
-    fn neighbor_hint_is_a_valid_unanswered_solicitation() {
-        let c: Ipv6Addr = "fd00:1:2:1:5054:ff:fe00:10".parse().unwrap();
-        let r: Ipv6Addr = "fd00:1:2:1::1".parse().unwrap();
-        let f = v6_frame(RMAC, CMAC, c, r, PROTO_UDP, &[0u8; 20]);
-        let mut out = [0u8; NEIGHBOR_HINT_LEN];
-        assert_eq!(ipv6_neighbor_hint(&f, &mut out), Some((c, CMAC)));
-        let v = Ipv6View::parse(&out, ETH_HDR).unwrap();
-        assert_eq!((v.proto, v.src(&out), v.dst(&out), v.hop_limit(&out)), (PROTO_ICMPV6, c, r, 255));
-        let msg = &out[v.l4..];
-        assert_eq!((msg[0], get_ip6(msg, 8)), (135, r), "NS for the destination");
-        assert_eq!(&msg[24..32], &[1, 1, 0x52, 0x54, 0, 0, 0, 0x10], "source link-layer option");
-        assert_eq!(icmpv6_checksum(c, r, msg), 0, "checksum");
-        // Not for multicast, ND itself, other EtherTypes, or a short frame.
-        let ns = v6_frame(RMAC, CMAC, c, r, PROTO_ICMPV6, &[135, 0, 0, 0, 0, 0, 0, 0]);
-        let m = v6_frame([0x33, 0x33, 0, 0, 0, 1], CMAC, c, "ff02::1".parse().unwrap(), PROTO_UDP, &[0; 8]);
-        for g in [&ns[..], &m[..], &f[..50]] {
-            assert_eq!(ipv6_neighbor_hint(g, &mut out), None);
-        }
-    }
 
     #[test]
     fn echo_frames_are_recognised() {
@@ -1200,54 +1037,7 @@ mod tests {
         assert!(!is_echo(&v6_frame(RMAC, CMAC, a, b, PROTO_ICMPV6, &[135, 0, 0, 0, 0, 0, 0, 0])));
     }
 
-    #[test]
-    fn arp_hint_is_a_reply_from_the_sender() {
-        let c = Ipv4Addr::new(192, 168, 1, 100);
-        let r = Ipv4Addr::new(192, 168, 1, 1);
-        let mut f = test_util::ipv4_frame(c, r, PROTO_UDP, 64, &[0u8; 8]);
-        set_macs(&mut f, RMAC, CMAC);
-        let mut out = [0u8; ARP_HINT_LEN];
-        assert_eq!(ipv4_neighbor_hint(&f, &mut out), Some((c, CMAC)));
-        assert_eq!((&out[0..6], &out[6..12], ethertype(&out)), (&RMAC[..], &CMAC[..], Some(ETHERTYPE_ARP)));
-        let a = parse_arp(&out).unwrap();
-        assert_eq!(a, Arp { op: 2, sender_mac: CMAC, sender_ip: c, target_ip: r });
-        assert_eq!(&out[ETH_HDR + 18..ETH_HDR + 24], &RMAC, "target MAC = ours");
-        // Not for broadcast or multicast, a source of 0.0.0.0 (DHCP), ARP
-        // itself, or a short frame.
-        let mut b = test_util::ipv4_frame(c, Ipv4Addr::BROADCAST, PROTO_UDP, 64, &[0; 8]);
-        set_macs(&mut b, BROADCAST_MAC, CMAC);
-        let mut z = test_util::ipv4_frame(Ipv4Addr::UNSPECIFIED, r, PROTO_UDP, 64, &[0; 8]);
-        set_macs(&mut z, RMAC, CMAC);
-        let mut m = test_util::ipv4_frame(c, Ipv4Addr::new(224, 0, 0, 251), PROTO_UDP, 255, &[0; 8]);
-        set_macs(&mut m, [1, 0, 0x5e, 0, 0, 0xfb], CMAC);
-        for g in [&b[..], &z[..], &m[..], &out[..], &f[..30]] {
-            assert_eq!(ipv4_neighbor_hint(g, &mut [0u8; ARP_HINT_LEN]), None);
-        }
-    }
 
-    #[test]
-    fn unicast_ns_goes_to_the_solicited_node_group() {
-        let c: Ipv6Addr = "fe80::5054:ff:fe00:10".parse().unwrap();
-        let r: Ipv6Addr = "fd00:1:2:0::1".parse().unwrap();
-        let mut ns = alloc::vec![135u8, 0, 0, 0, 0, 0, 0, 0];
-        ns.extend_from_slice(&r.octets());
-        ns.extend_from_slice(&[1, 1, 0x52, 0x54, 0, 0, 0, 0x10]);
-        let c0 = icmpv6_checksum(c, r, &ns);
-        put16(&mut ns, 2, c0);
-        let mut f = v6_frame(RMAC, CMAC, c, r, PROTO_ICMPV6, &ns);
-        assert!(ipv6_ns_to_solicited(&mut f));
-        let g: Ipv6Addr = "ff02::1:ff00:1".parse().unwrap();
-        assert_eq!(get_ip6(&f, ETH_HDR + 24), g);
-        assert_eq!(&f[0..6], &[0x33, 0x33, 0xff, 0, 0, 1]);
-        assert_eq!(icmpv6_checksum(c, g, &f[ETH_HDR + 40..]), 0, "checksum after the readdressing");
-        assert!(!ipv6_ns_to_solicited(&mut f), "already multicast");
-        // Another target than the destination (not a probe for it): left alone.
-        let mut ns2 = ns.clone();
-        ns2[8..24].copy_from_slice(&c.octets());
-        let mut f2 = v6_frame(RMAC, CMAC, c, r, PROTO_ICMPV6, &ns2);
-        assert!(!ipv6_ns_to_solicited(&mut f2));
-        assert_eq!(solicited_node("2001:db8::abcd:1234:5678".parse().unwrap()), "ff02::1:ff34:5678".parse::<Ipv6Addr>().unwrap());
-    }
 
     #[test]
     fn ns_built_and_nd_parsed() {
@@ -1280,23 +1070,6 @@ mod tests {
         assert_eq!(parse_nd(&v6_frame(RMAC, CMAC, gw, me, PROTO_ICMPV6, &bare)), None);
     }
 
-    #[test]
-    fn na_gets_the_router_flag() {
-        let me: Ipv6Addr = "fe80::5054:ff:fe00:2".parse().unwrap();
-        let c: Ipv6Addr = "fe80::5054:ff:fe00:10".parse().unwrap();
-        let mut na = alloc::vec![136u8, 0, 0, 0, 0x40, 0, 0, 0]; // Solicited
-        na.extend_from_slice(&me.octets());
-        na.extend_from_slice(&[2, 1, 0x52, 0x54, 0, 0, 0, 2]);
-        let k = icmpv6_checksum(me, c, &na);
-        put16(&mut na, 2, k);
-        let mut f = v6_frame(CMAC, RMAC, me, c, PROTO_ICMPV6, &na);
-        assert!(ipv6_na_set_router(&mut f));
-        assert_eq!(f[ETH_HDR + 40 + 4], 0xc0, "Router + Solicited");
-        assert_eq!(icmpv6_checksum(me, c, &f[ETH_HDR + 40..]), 0, "checksum");
-        assert!(!ipv6_na_set_router(&mut f), "already set");
-        let mut ns = v6_frame(CMAC, RMAC, me, c, PROTO_ICMPV6, &[135, 0, 0, 0, 0, 0, 0, 0]);
-        assert!(!ipv6_na_set_router(&mut ns), "not an NA");
-    }
 
     #[test]
     fn rs_is_valid() {

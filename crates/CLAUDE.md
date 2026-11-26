@@ -7,7 +7,7 @@ events out), host-tested with `cargo test`. Fuzz targets in `fuzz/` (fuzz/README
 
 - `wire`: packet views; `Ipv6View` (bounded extension-header walk); `SplitPlan` (RFC 791
   fragmentation of non-DF packets above the egress MTU: `Verdict::Forward` `split`, cut by the
-  datapath); neighbor hints for the kernel's smoltcp.
+  datapath).
 - IPv6: `process6`/`input6` (the zone input policy, ND hop limit 255, rules without addresses);
   `forward6`: untranslated, `ct6`, zones and rules without addresses for new flows, anti-spoofing
   both ways, ICMPv6 Time Exceeded / Packet Too Big, MSS clamp, `Verdict::Forward6`; fragments via

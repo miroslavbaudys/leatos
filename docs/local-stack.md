@@ -1,10 +1,10 @@
 # Router-local stack: smoltcp for TCP only (plan)
 
-Status (2026-11-26): step 1 done (host tests, fuzz target); step 2a in QEMU (static WAN IP-only);
-step 2b in QEMU (DHCP WAN IP-only with `net::wan4` over the router's own UDP, `net::local` +
-`fwd::udp`); `wan_medium=eth` is the fallback for both; the hints' removal is left. Step 0,
-ARP / ND on the LAN links in the datapath, is docs/lan-neighbors.md (step 3 persisted on the apu4
-2026-11-26, step 4 from 2026-12-03). Roadmap M14.
+Status (2026-11-26): steps 1 and 2 done in QEMU (the WAN IP-only on DHCP and static, `net::wan4`
+over the router's own UDP: `net::local` + `fwd::udp`, IPv4 and IPv6); the fallbacks
+(`wan_medium=eth`, `lan_medium=eth`), the neighbor hints and `medium-ethernet` removed on
+2026-11-26 (user decision: the whole migration goes to the apu4 at once after the soak, no
+per-step day there). Step 0 (docs/lan-neighbors.md) done with it. Next: step 3. Roadmap M14.
 
 ## 1. Goal
 
@@ -125,8 +125,8 @@ ARP probe + DECLINE, RELEASE, option overload (52).
 - 2b, DHCP WAN: `svc` drives `v4::client` over the router-local UDP path for ports 68 / 67 (that
   part of step 3 comes first, for broadcast to and from 0.0.0.0).
 - The hints (`NdHints`, `ipv6_ns_to_solicited`, `ipv6_na_set_router`), `arp_hints=`,
-  `neigh-cache-256` and `medium-ethernet` removed; `wan_medium=eth` as the fallback for one
-  deployment cycle, then removed.
+  `neigh-cache-256` and `medium-ethernet` removed, `wan_medium=eth` too (done 2026-11-26, without
+  the planned deployment cycle).
 
 ### Step 3: router-local UDP
 
@@ -176,8 +176,9 @@ card's command line).
 
 - **More code on the wire is ours.** Headers, checksums and demultiplexing are small but exposed:
   builders and parsers in `crates/fwd` with host tests and fuzz targets, like `fwd::nd`.
-- **The DHCP client is the WAN's lifeline.** A bug leaves the home without internet; the fallback
-  (`wan_medium=eth`) stays for a deployment cycle, and the lab covers renew / rebind / NAK.
+- **The DHCP client is the WAN's lifeline.** A bug leaves the home without internet. No fallback
+  any more (removed 2026-11-26); the lab covers bind and renewal (`LAB_WAN_LEASE`), host tests
+  rebind / NAK. The home line is PPPoE, so the apu4 does not exercise it.
 - **smoltcp's TCP on `Medium::Ip` with addresses we manage**: its interface must still know the
   addresses and routes TCP uses (source address for the DoT client). Checked with `LAB_DOT=1` and
   `LAB_IPV6=1` at step 5.
