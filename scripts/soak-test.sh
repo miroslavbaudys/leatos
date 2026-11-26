@@ -6,8 +6,9 @@
 # Every --interval seconds it reads /api/status into lab/cache/soak-LABEL.csv
 # (gitignored): uptime, heap used/free, packet pool free/capacity/failures,
 # connections, early drops, forwarded/dropped packets, the longest conntrack
-# pass (µs) and the CPU temperature. At the end (or on Ctrl-C, or with
-# --report on an existing CSV) it checks:
+# pass (µs), the CPU temperature, neighbor drops and probes, and lan_nd's
+# local_dropped (the router's own packets a neighbor table dropped). At the
+# end (or on Ctrl-C, or with --report on an existing CSV) it checks:
 #   reboot   uptime never went backwards (panic, watchdog or power loss)
 #   heap     the *lowest* heap use in the last window is not above the lowest
 #            in the first window (after warm-up) by more than 5 % + 256 KiB.
@@ -57,7 +58,7 @@ while [[ $# -gt 0 ]]; do
     --window-hours) WINDOW_H="$2"; shift ;;
     --min-forwarded) MIN_FWD="$2"; shift ;;
     --report) REPORT="$2"; shift ;;
-    -h | --help) sed -n '2,34p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,35p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -160,7 +161,7 @@ AUTH=()
 mkdir -p lab/cache
 CSV="lab/cache/soak-$LABEL.csv"
 [[ -e "$CSV" ]] && { echo "$CSV exists: pick another --label" >&2; exit 2; }
-echo "ts,uptime_s,build,heap_used,heap_free,pool_free,pool_cap,pool_fail,conntrack,early_drops,forwarded,dropped,pass_us_max,temp_mc,hk_us_max,heap_live,alloc_n,alloc_avg_ns,alloc_max_ns,dealloc_n,dealloc_avg_ns,dealloc_max_ns,dns_cached" >"$CSV"
+echo "ts,uptime_s,build,heap_used,heap_free,pool_free,pool_cap,pool_fail,conntrack,early_drops,forwarded,dropped,pass_us_max,temp_mc,hk_us_max,heap_live,alloc_n,alloc_avg_ns,alloc_max_ns,dealloc_n,dealloc_avg_ns,dealloc_max_ns,dns_cached,neigh_drops,neigh_probes,local_dropped" >"$CSV"
 
 sample() {
   local now json
@@ -181,9 +182,11 @@ try:
           a.get("count", ""), a.get("avg_ns", ""), a.get("max_ns", ""),
           f.get("count", ""), f.get("avg_ns", ""), f.get("max_ns", ""),
           (d.get("dns") or {}).get("cached", "")]
+    v += [(d.get("drop_reasons") or {}).get("neighbor", ""), d.get("neigh_probes", ""),
+          (d.get("lan_nd") or {}).get("local_dropped", "")]
     print(",".join([now] + ["%s" % x for x in v]))
 except Exception:
-    print(now + "," * 22)
+    print(now + "," * 25)
 ' "$now" >>"$CSV"
 }
 
