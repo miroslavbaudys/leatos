@@ -162,9 +162,14 @@
 #                        wan_gw=203.0.113.1 wan_dns=203.0.113.1 (LAB_ROUTER_ARGS
 #                        win). Checks: the router's static line and the ISP
 #                        seeing 203.0.113.60 as the NATed source; all other
-#                        checks run through it. Negative control:
-#                        LAB_ROUTER_ARGS=wan_mode=dhcp (no address, everything
-#                        fails).
+#                        checks run through it. The WAN's router stack is
+#                        IP-only (docs/local-stack.md step 2a): the ISP's ARP
+#                        for 203.0.113.60 must be answered by the datapath
+#                        (client "wan arp": medium ip, wan_nd.arp_replies
+#                        rising). Negative controls: LAB_ROUTER_ARGS=
+#                        wan_mode=dhcp (no address, everything fails),
+#                        LAB_ROUTER_ARGS=wan_medium=eth (smoltcp answers: the
+#                        datapath check fails).
 #   LAB_GUEST=1          the router boots from a store (tools/leatstore) with a
 #                        second network: VLAN 20 on lan0, 10.20.0.1/24, zone
 #                        "guest" (input: DHCP, DNS, ping; forwards to the
@@ -952,6 +957,16 @@ if [[ -n "$ISP_STATIC" ]]; then
     echo "  LAB PASS: static wan: ${st##*: } (NATed source 203.0.113.60)"
   else
     echo "  LAB FAIL: static wan: ${st:-no 'static' line in the router log}; ${seen:-no NAT pass from the client}"
+    router_fails=$((router_fails + 1))
+  fi
+  # IP-only WAN: the datapath answered the ISP's ARP, not smoltcp.
+  arp=$(tr -d '\r' <"$WORK/client.log" | grep "LAB PASS: wan arp:" | head -1 || true)
+  r0=$(echo "$arp" | sed -n 's/.*datapath replies \([0-9]*\) -> \([0-9]*\).*/\1/p')
+  r1=$(echo "$arp" | sed -n 's/.*datapath replies \([0-9]*\) -> \([0-9]*\).*/\2/p')
+  if echo "$arp" | grep -q "medium ip," && [[ -n "$r0" && -n "$r1" && "$r1" -gt "$r0" ]]; then
+    echo "  LAB PASS: static wan ip-only: the datapath answered the ISP's ARP (replies $r0 -> $r1)"
+  else
+    echo "  LAB FAIL: static wan ip-only: ${arp:-no 'wan arp' pass from the client}"
     router_fails=$((router_fails + 1))
   fi
 fi

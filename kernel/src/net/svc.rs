@@ -51,9 +51,11 @@ pub struct HostIf {
     pub nd: crate::net::device::NdHints,
     /// The link's MAC (its port's): smoltcp has none on `Medium::Ip`.
     pub mac: [u8; 6],
-    /// A LAN link whose interface is IP-only (`config::lan_medium_ip`, set
-    /// when made): smoltcp's `hardware_addr` panics on one.
-    pub lan_ip: bool,
+    /// The interface is IP-only over Ethernet (a LAN link with
+    /// `config::lan_medium_ip`, a static WAN with `config::wan_ip_only`;
+    /// set when made, = [`crate::net::shared::LinkShared::ip_only`]):
+    /// smoltcp's `hardware_addr` panics on one.
+    pub ip_only: bool,
 }
 
 struct Pinger {
@@ -351,15 +353,19 @@ fn restart_wan(
         return None;
     }
     let want_pppoe = matches!(new, WanLink::Pppoe(_));
-    if port.is_pppoe() != want_pppoe {
+    let ip_only = crate::config::wan_ip_only(&new);
+    if port.is_pppoe() != want_pppoe || wan.ip_only != ip_only {
         port.pppoe_mode.store(want_pppoe, Ordering::Relaxed);
         let mtu = match &new {
             WanLink::Pppoe(c) => c.mtu,
             _ => fwd::forwarder::DEFAULT_MTU,
         };
         port.mtu.store(u32::from(mtu), Ordering::Relaxed);
-        // Another medium: a new interface (the sockets stay).
-        wan.iface = stack::new_iface(port, false);
+        // Another medium: a new interface (the sockets stay); with
+        // `ip_only` the datapath does the WAN's ARP / ND from now on.
+        wan.ip_only = ip_only;
+        sh.links[0].set_ip_only(ip_only);
+        wan.iface = stack::new_iface(port, ip_only);
     }
     // The DHCP client runs only in DHCP mode.
     match (dhcp, dhcp_socket(wan)) {
@@ -469,6 +475,7 @@ fn reapply_networks(
         stack::set_host_addrs(hosts, &nets, &links, &stack::port_macs(&sh.ports));
         if let Some(dp) = stack::datapath() {
             stack::set_local_links(dp, sh, &nets, &links);
+            stack::set_wan_local_link(dp, &mut hosts[0]);
         }
         let shape = |v: &[crate::config::Lan]| -> Vec<(String, usize, u16, core::net::Ipv4Addr, u8, u8)> {
             v.iter().map(|n| (n.name.clone(), n.port, n.vid, n.addr, n.prefix, n.zone)).collect()
@@ -491,6 +498,7 @@ fn reapply_networks(
 /// Tell everyone who depends on the WAN address about a change.
 fn publish_wan(
     change: &LeaseChange,
+    wan: &mut HostIf,
     sh: &Shared,
     mgmt: &mut Mgmt,
     cli: &mut Cli,
@@ -501,6 +509,9 @@ fn publish_wan(
         gateway: change.gateway,
         mtu: change.mtu,
     });
+    if let Some(dp) = stack::datapath() {
+        stack::set_wan_local_link(dp, wan);
+    }
     mgmt.set_wan_lease(lease_json(change));
     cli.set_wan(lease_text(change));
     if let Some(svc) = services {
@@ -519,7 +530,7 @@ fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
         let i = link.port();
         let port = &sh.ports[i];
         let mut queued = 0;
-        let lan_ip = host.lan_ip;
+        let ip_only = host.ip_only;
         let mut dev = PortDevice {
             link,
             port,
@@ -528,7 +539,7 @@ fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
             queued: &mut queued,
             nd: Some(&mut host.nd),
             dp,
-            lan_ip,
+            ip_only,
         };
         host.iface.poll(t, &mut dev, &mut host.sockets);
         if queued > 0 {
@@ -711,7 +722,7 @@ pub async fn run(
     let mut ppp6 = crate::net::wan6::ppp_link();
     if let crate::config::WanLink::Static(s) = crate::config::wan_link() {
         let c = configure_static(sh.ports[0].name, &mut hosts[0], &mut pinger, &s);
-        publish_wan(&c, sh, &mut mgmt, &mut cli, services.as_mut());
+        publish_wan(&c, &mut hosts[0], sh, &mut mgmt, &mut cli, services.as_mut());
     }
     // Serial input wakes the task too (the CLI).
     let rx = crate::console::rx_event();
@@ -748,7 +759,7 @@ pub async fn run(
             }
         };
         if let Some(change) = change {
-            publish_wan(&change, sh, &mut mgmt, &mut cli, services.as_mut());
+            publish_wan(&change, &mut hosts[0], sh, &mut mgmt, &mut cli, services.as_mut());
         }
         let now6 = crate::net::wan6::ppp_link();
         if now6 != ppp6 {
@@ -792,7 +803,7 @@ pub async fn run(
                 let svc = services.as_mut();
                 let wan6_before = wan6_key();
                 if let Some(c) = apply_saved((cfg, source.clone()), sh, &mut hosts, (&mut pppoe, &mut pinger), svc, &mut mgmt, &mut slots) {
-                    publish_wan(&c, sh, &mut mgmt, &mut cli, services.as_mut());
+                    publish_wan(&c, &mut hosts[0], sh, &mut mgmt, &mut cli, services.as_mut());
                 }
                 if wan6_follow(&mut wan6, &wan6_before, &mut hosts[0], sh) {
                     reapply_networks(sh, &mut hosts, services.as_mut(), &mut mgmt, &mut slots, None);
@@ -840,7 +851,7 @@ pub async fn run(
                                 let svc = services.as_mut();
                                 let wan6_before = wan6_key();
                                 if let Some(c) = apply_saved((*cfg, source), sh, &mut hosts, (&mut pppoe, &mut pinger), svc, &mut mgmt, &mut slots) {
-                                    publish_wan(&c, sh, &mut mgmt, &mut cli, services.as_mut());
+                                    publish_wan(&c, &mut hosts[0], sh, &mut mgmt, &mut cli, services.as_mut());
                                 }
                                 if wan6_follow(&mut wan6, &wan6_before, &mut hosts[0], sh) {
                                     reapply_networks(sh, &mut hosts, services.as_mut(), &mut mgmt, &mut slots, None);

@@ -1,0 +1,15 @@
+#!/usr/bin/busybox sh
+# WAN ARP check (docs/local-stack.md step 2a): forget the caller's MAC (the
+# router's WAN address after NAT) and ask for it again. Who answers is the
+# router's business: smoltcp on an Ethernet WAN, the datapath on an IP-only
+# static WAN (its /api/status wan_nd.arp_replies, judged by the client).
+bb=/usr/bin/busybox
+addr=${REMOTE_ADDR#\[}; addr=${addr%\]}; addr=${addr#::ffff:}
+echo "Content-Type: text/plain"
+echo
+dev=$($bb ip route get "$addr" 2>/dev/null | $bb sed -n 's/.* dev \([^ ]*\).*/\1/p' | $bb head -1)
+$bb ip neigh flush dev "${dev:-eth0}" >/dev/null 2>&1
+n=$($bb arping -c 2 -w 3 -I "${dev:-eth0}" "$addr" 2>&1 | $bb sed -n 's/^Received \([0-9]*\) .*/\1/p')
+echo "replies=${n:-0}"
+echo "dev=${dev:-?}"
+echo "addr=$addr"

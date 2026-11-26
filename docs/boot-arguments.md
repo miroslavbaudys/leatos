@@ -94,6 +94,7 @@ PVH / Multiboot2 command line on x86_64, QEMU `-append` via `QEMU_APPEND`. They 
 | `wan_hints6=all` | – | smoltcp gets IPv6 neighbor hints on the WAN from every source, not only link-local ones (the old behaviour): the lab's negative control for `LAB_ND_FLOOD=1` |
 | `wan_antispoof=0` | – | WAN packets from our own networks' or loopback sources not dropped as `spoofed`: the lab's negative control |
 | `lan_medium=eth` | – | the LAN links' router stack on Ethernet with smoltcp's own ARP / ND and the neighbor hints (before docs/lan-neighbors.md step 3): the fallback; default IP-only, the datapath answering ARP / ND and resolving the router's packets |
+| `wan_medium=eth` | – | a static WAN's router stack on Ethernet with smoltcp's own ARP / ND and the neighbor hints (before docs/local-stack.md step 2a): the fallback; default IP-only, the datapath answering ARP / ND for the WAN address and resolving the gateway (`/api/status` `wan_nd`). DHCP stays on Ethernet until step 2b, PPPoE has no link layer |
 | `nd_unicast=0` | – | the datapath ignores unicast NS for the router's addresses (as smoltcp did): the lab's negative control |
 | `na_router=0` | – | the datapath's NAs without the Router flag: the lab's negative control |
 | `neigh_secs=N` | – | the forwarder's neighbor lifetime, default 300 (tests) |

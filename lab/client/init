@@ -403,6 +403,26 @@ else
   fail "wan input: $(echo $wp)"
 fi
 
+# WAN ARP (docs/local-stack.md step 2a): the ISP forgets the router's WAN
+# MAC and asks again (ISP cgi-bin/arp). smoltcp answers on an Ethernet WAN,
+# the datapath on an IP-only static WAN (/api/status wan_nd: medium, and
+# arp_replies rises); scripts/lab-test.sh wants the datapath with
+# LAB_WAN_STATIC=1 (negative control LAB_ROUTER_ARGS=wan_medium=eth). No
+# ARP on PPPoE.
+if ! $bb grep -q 'lab_pppoe_kick=' /proc/cmdline; then
+  wst() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null; }
+  wnd() { echo "$1" | $bb sed -n 's/.*"wan_nd":{"medium":"\([a-z]*\)","arp_replies":\([0-9]*\).*/\1 \2/p'; }
+  w0=$(wnd "$(wst)")
+  ar=$($bb wget -q -T 10 -O - "http://$ISP/cgi-bin/arp" 2>&1)
+  w1=$(wnd "$(wst)")
+  what="medium ${w1%% *}, datapath replies ${w0##* } -> ${w1##* }"
+  if echo "$ar" | $bb grep -q "replies=[1-9]"; then
+    pass "wan arp: the ISP's ARP for the WAN address answered ($what)"
+  else
+    fail "wan arp: $(echo $ar) ($what)"
+  fi
+fi
+
 # --- port forward + hairpin (docs/config-v2.md): LAB_GUEST config, lab_forward= -------
 # Forward lab-web: the router's WAN address :8080 -> this client's :8080
 # (httpd above). The ISP fetches it through the router (ISP cgi-bin/fetch:

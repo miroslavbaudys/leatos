@@ -65,7 +65,11 @@ A client VM, the router and an ISP VM (Alpine; overlays in `lab/client/`, `lab/i
 
 - `LAB_WAN_STATIC=1`: the ISP runs no DHCP server; the router gets
   `wan_mode=static wan_ip=203.0.113.60/24 …`: static line + NATed source 203.0.113.60, all checks
-  through it. Negative control `LAB_ROUTER_ARGS=wan_mode=dhcp`.
+  through it. The WAN's router stack is IP-only (docs/local-stack.md step 2a): the client's
+  `wan arp` (ISP `cgi-bin/arp` forgets and re-ARPs the WAN address) must be answered by the
+  datapath (`wan_nd` medium `ip`, `arp_replies` rising). Negative controls
+  `LAB_ROUTER_ARGS=wan_mode=dhcp`, `LAB_ROUTER_ARGS=wan_medium=eth` (smoltcp answers).
+- Every IPv4 run without PPPoE: `wan arp`, the ISP's ARP for the router's WAN address answered.
 - `LAB_PPPOE=pap|chap|none`: the ISP is rp-pppoe `pppoe-server` only (user mode). `none` = no
   authentication and no router user name (negative control `LAB_PPPOE=pap LAB_PPPOE_ANON=1`).
   - All checks run through the session, plus a reconnect after the ISP ends it.

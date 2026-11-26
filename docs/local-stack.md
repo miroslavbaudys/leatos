@@ -1,6 +1,7 @@
 # Router-local stack: smoltcp for TCP only (plan)
 
-Status (2026-11-26): step 1 done (host tests, fuzz target; the kernel does not use it yet). Step 0,
+Status (2026-11-26): step 1 done (host tests, fuzz target; the kernel does not use it yet); step 2a
+in QEMU (static WAN IP-only, `wan_medium=eth` fallback). Step 0,
 ARP / ND on the LAN links in the datapath, is docs/lan-neighbors.md (step 3 persisted on the apu4
 2026-11-26, step 4 from 2026-12-03). Roadmap M14.
 

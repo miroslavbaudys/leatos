@@ -104,6 +104,10 @@ pub static LOCAL_NO_ROUTE: AtomicU64 = AtomicU64::new(0);
 /// claiming or probing for one of the router's addresses.
 pub static ARP_REPLIES: AtomicU64 = AtomicU64::new(0);
 pub static NA_SENT: AtomicU64 = AtomicU64::new(0);
+/// The same on the WAN (an IP-only static WAN, docs/local-stack.md step
+/// 2a; `/api/status` `wan_nd`).
+pub static WAN_ARP_REPLIES: AtomicU64 = AtomicU64::new(0);
+pub static WAN_NA_SENT: AtomicU64 = AtomicU64::new(0);
 pub static ND_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 /// The router stack's unicast packets on those links that waited in the
 /// neighbor table's pending queue (the neighbor was not resolved), and the
@@ -293,9 +297,8 @@ pub struct Datapath {
     /// own packets on a link without a link layer ([`Self::send_local`],
     /// docs/lan-neighbors.md).
     local: Vec<Mutex<fwd::local::LocalLink>>,
-    /// LAN links' router stack is IP-only: the datapath answers their ARP
-    /// / ND (`config::lan_medium_ip`), with these switches.
-    lan_ip: bool,
+    /// ARP / ND answers on links whose router stack is IP-only
+    /// ([`crate::net::shared::LinkShared::ip_only`]), with these switches.
     nd_cfg: fwd::nd::Config,
     /// Which link a frame belongs to and what `shard_of` needs: replaced
     /// whole by [`Self::apply`], read once per batch.
@@ -479,7 +482,6 @@ impl Datapath {
                 .collect(),
             addrs: ifaces.iter().map(|i| Mutex::new(i.addr)).collect(),
             local: ifaces.iter().map(|_| Mutex::new(fwd::local::LocalLink::default())).collect(),
-            lan_ip: crate::config::lan_medium_ip(),
             nd_cfg: crate::config::nd_config(),
             topo: Mutex::new(alloc::sync::Arc::new(Topo::default())),
             hk: Mutex::new(Hk {
@@ -672,8 +674,9 @@ impl Datapath {
         true
     }
 
-    /// ARP and ND on a LAN link whose router stack has no link layer
-    /// (docs/lan-neighbors.md): answered here for the router's addresses
+    /// ARP and ND on a link whose router stack has no link layer
+    /// (docs/lan-neighbors.md; the WAN in static mode, docs/local-stack.md
+    /// step 2a): answered here for the router's addresses
     /// (`fwd::nd`), never passed on (the stack could not read them).
     /// Learning from them happened before ([`Self::snoop_arp`] /
     /// [`Self::snoop_nd`]). Returns true for those frames.
@@ -712,7 +715,13 @@ impl Datapath {
             pkt.data_mut().copy_from_slice(&out[..n]);
             pkt.meta.wire_len = n as u32;
             pkt.meta.enqueue_ts = now_ns();
-            (if arp { &ARP_REPLIES } else { &NA_SENT }).fetch_add(1, Ordering::Relaxed);
+            let n = match (ifx == WAN, arp) {
+                (false, true) => &ARP_REPLIES,
+                (false, false) => &NA_SENT,
+                (true, true) => &WAN_ARP_REPLIES,
+                (true, false) => &WAN_NA_SENT,
+            };
+            n.fetch_add(1, Ordering::Relaxed);
             self.enqueue(ifx, pkt, touched);
         }
         true
@@ -891,7 +900,7 @@ impl Datapath {
                 }
                 _ => {}
             }
-            if self.lan_ip && ifx != WAN && self.link_layer(ifx, pkt.data(), b.touched) {
+            if self.sh.links[ifx as usize].ip_only() && self.link_layer(ifx, pkt.data(), b.touched) {
                 continue;
             }
             let len = pkt.len();

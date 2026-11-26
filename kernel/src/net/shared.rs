@@ -211,6 +211,11 @@ pub struct LinkShared {
     /// neighbor discovery: (address, MAC, last seen ms). Bounded, the
     /// oldest goes; the services task names them (AAAA for DHCP clients).
     pub neigh6: Mutex<Vec<(Ipv6Addr, [u8; 6], u64)>>,
+    /// The link's router stack runs on `Medium::Ip` over Ethernet: the
+    /// datapath answers its ARP / ND and resolves its packets
+    /// (docs/lan-neighbors.md, docs/local-stack.md step 2). Not on a
+    /// PPPoE WAN, which has no link layer at all.
+    ip_only: AtomicBool,
 }
 
 /// [`LinkShared::neigh6`]'s bound per link.
@@ -225,6 +230,7 @@ impl LinkShared {
             local_rx: Mutex::new(VecDeque::with_capacity(LOCAL_RX_MAX)),
             rs_seen: AtomicBool::new(false),
             neigh6: Mutex::new(Vec::with_capacity(NEIGH6_MAX)),
+            ip_only: AtomicBool::new(false),
         }
     }
 
@@ -258,7 +264,18 @@ impl LinkShared {
             local_rx: Mutex::new(VecDeque::new()),
             rs_seen: AtomicBool::new(false),
             neigh6: Mutex::new(Vec::new()),
+            ip_only: AtomicBool::new(false),
         }
+    }
+
+    /// See [`Self::ip_only`]'s field: set when the link's router-stack
+    /// interface is made (the WAN's again on a mode change).
+    pub fn ip_only(&self) -> bool {
+        self.ip_only.load(Ordering::Relaxed)
+    }
+
+    pub fn set_ip_only(&self, on: bool) {
+        self.ip_only.store(on, Ordering::Relaxed);
     }
 
     pub fn port(&self) -> usize {

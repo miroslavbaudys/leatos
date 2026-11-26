@@ -41,14 +41,19 @@ The only coupling between the datapath and the services:
 smoltcp `Device` behind the datapath: RX from `local_rx`, TX into the qdisc.
 
 - **LAN links are IP-only** (docs/lan-neighbors.md step 3; `lan_medium=eth` = the old path below):
-  smoltcp on `Medium::Ip` (`HostIf::lan_ip`; never call `hardware_addr` / `set_hardware_addr` on
-  one, smoltcp panics; the MAC is `HostIf::mac`). RX passes the IP packet only; TX goes through
+  smoltcp on `Medium::Ip` (`HostIf::ip_only` = `LinkShared::ip_only`; never call `hardware_addr` /
+  `set_hardware_addr` on one, smoltcp panics; the MAC is `HostIf::mac`). RX passes the IP packet only; TX goes through
   `Datapath::send_local` (next hop by `fwd::local`, the datapath's neighbor table). The datapath
   answers ARP / NS for the router's LAN addresses (`Datapath::link_layer`, `fwd::nd`; counters
   `/api/status` `lan_nd`, switches `nd_unicast=0`, `na_router=0`) and keeps those frames from
   smoltcp. The per-link addresses and routes come from `stack::local_links`, the one source for
   both smoltcp's interfaces and the datapath (`set_local_links` after every `set_host_addrs`).
-- The WAN (Ethernet on DHCP / static) keeps smoltcp's ND and the hints below.
+- **A static WAN is IP-only too** (docs/local-stack.md step 2a; `wan_medium=eth` = the old path):
+  the same RX / TX path, the datapath answers ARP / NS for the WAN address and resolves the
+  gateway. Its view (`stack::set_wan_local_link`) is read back from smoltcp's WAN interface after
+  every lease or address change (`svc::publish_wan`, `reapply_networks`); `restart_wan` switches
+  the medium live. Counters `/api/status` `wan_nd` (`medium` ip / eth / ppp).
+- The DHCP WAN (Ethernet until step 2b) keeps smoltcp's ND and the hints below.
 - IPv6: notes RS (`LinkShared::rs_seen`) and helps smoltcp 0.14's ND: `NdHints` feed it a
   solicitation from each client (`fwd::wire::ipv6_neighbor_hint`), unicast NS go to the
   solicited-node group (`ipv6_ns_to_solicited`: not needed, smoltcp answers them); docs/ipv6.md §2.

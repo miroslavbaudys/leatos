@@ -249,26 +249,30 @@ pub fn bring_up(
         let port_ix = i;
         if i == 0 {
             let link = LinkShared::new(port_ix, true);
-            let iface = new_iface(&port, false);
+            let ip_only = crate::config::wan_ip_only(&crate::config::wan_link());
+            link.set_ip_only(ip_only);
+            let iface = new_iface(&port, ip_only);
             let mut sockets = SocketSet::new(Vec::new());
             if crate::config::wan_link() == crate::config::WanLink::Dhcp {
                 sockets.add(dhcpv4::Socket::new());
             }
-            hosts.push(HostIf { iface, sockets, nd: Default::default(), mac: port.mac, lan_ip: false });
+            hosts.push(HostIf { iface, sockets, nd: Default::default(), mac: port.mac, ip_only });
             links.push(link);
         } else if i == shared::FIRST_LAN_PORT {
             // Every network slot, with an interface without addresses (on
             // lan0 until a network places it); `set_host_addrs` gives the
             // config's networks their addresses and port MACs.
             for _ in 1..shared::MAX_LINKS {
-                links.push(LinkShared::new(port_ix, false));
-                let lan_ip = crate::config::lan_medium_ip();
+                let link = LinkShared::new(port_ix, false);
+                let ip_only = crate::config::lan_medium_ip();
+                link.set_ip_only(ip_only);
+                links.push(link);
                 hosts.push(HostIf {
-                    iface: new_iface(&port, lan_ip),
+                    iface: new_iface(&port, ip_only),
                     sockets: SocketSet::new(Vec::new()),
                     nd: Default::default(),
                     mac: port.mac,
-                    lan_ip,
+                    ip_only,
                 });
             }
         }
@@ -389,12 +393,12 @@ fn log_ingress(qos: &crate::config::Qos, rate: Option<qdisc::shaper::Rate>, what
 
 /// The router stack's interface for a link on `port`: Ethernet, or
 /// IP-only on a PPPoE port ([`PortShared::is_pppoe`], set before calling)
-/// and on a LAN link with `lan_ip` (the datapath does its link layer,
-/// docs/lan-neighbors.md). smoltcp only reads the device's capabilities
-/// here.
-pub fn new_iface(port: &PortShared, lan_ip: bool) -> Interface {
+/// and with `ip_only` (the datapath does its link layer: LAN links,
+/// docs/lan-neighbors.md; a static WAN, docs/local-stack.md step 2a).
+/// smoltcp only reads the device's capabilities here.
+pub fn new_iface(port: &PortShared, ip_only: bool) -> Interface {
     let link = &LinkShared::detached();
-    let hw = if port.is_pppoe() || lan_ip {
+    let hw = if port.is_pppoe() || ip_only {
         HardwareAddress::Ip
     } else {
         HardwareAddress::Ethernet(EthernetAddress(port.mac))
@@ -412,7 +416,7 @@ pub fn new_iface(port: &PortShared, lan_ip: bool) -> Interface {
         queued: &mut queued,
         nd: None,
         dp: None,
-        lan_ip,
+        ip_only,
     };
     Interface::new(config, &mut device, now())
 }
@@ -593,6 +597,35 @@ pub fn set_local_links(dp: SharedDatapath, sh: &Shared, nets: &[crate::config::L
     }
 }
 
+/// The WAN's addresses and routes for the datapath ([`Datapath::send_local`],
+/// its ARP / ND answers), read back from the router stack's WAN interface,
+/// so both always agree; empty unless the WAN is IP-only
+/// ([`HostIf::ip_only`], a static WAN: docs/local-stack.md step 2a). After
+/// every change of the WAN's addresses or routes (`svc::publish_wan`,
+/// `svc::reapply_networks`).
+pub fn set_wan_local_link(dp: SharedDatapath, wan: &mut HostIf) {
+    use smoltcp::wire::IpAddress;
+    let mut l = fwd::local::LocalLink::default();
+    if wan.ip_only {
+        for c in wan.iface.ip_addrs() {
+            match c {
+                IpCidr::Ipv4(c) => l.v4 = Some((c.address(), c.prefix_len())),
+                IpCidr::Ipv6(c) => l.v6.push((c.address(), c.prefix_len())),
+            }
+        }
+        wan.iface.routes_mut().update(|routes| {
+            for r in routes.iter() {
+                match (r.cidr, r.via_router) {
+                    (IpCidr::Ipv4(c), IpAddress::Ipv4(gw)) => l.routes4.push((c.address(), c.prefix_len(), gw)),
+                    (IpCidr::Ipv6(c), IpAddress::Ipv6(gw)) => l.routes6.push((c.address(), c.prefix_len(), gw)),
+                    _ => {}
+                }
+            }
+        });
+    }
+    dp.set_local_link(datapath::WAN, l);
+}
+
 /// Per link (index = link; the WAN's left empty): the network's IPv4
 /// subnet, its IPv6 addresses (link-local from its port's MAC, ULA,
 /// global; each a /64), its `[[route]]`s and the IPv6 ones through a
@@ -718,7 +751,7 @@ pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: 
             host.mac = mac;
             // Only an Ethernet interface has one (smoltcp asserts it).
             let hw = HardwareAddress::Ethernet(EthernetAddress(mac));
-            if !host.lan_ip && host.iface.hardware_addr() != hw {
+            if !host.ip_only && host.iface.hardware_addr() != hw {
                 host.iface.set_hardware_addr(hw);
             }
         }
