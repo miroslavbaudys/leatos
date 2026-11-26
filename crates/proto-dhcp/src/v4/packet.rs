@@ -26,6 +26,7 @@ const OPT_ROUTER: u8 = 3;
 const OPT_DNS: u8 = 6;
 const OPT_HOSTNAME: u8 = 12;
 const OPT_DOMAIN: u8 = 15;
+const OPT_MTU: u8 = 26;
 const OPT_BROADCAST: u8 = 28;
 const OPT_REQUESTED_IP: u8 = 50;
 const OPT_LEASE_TIME: u8 = 51;
@@ -100,6 +101,8 @@ pub struct Options {
     pub dns: Vec<Ipv4Addr>,
     pub domain: Option<String>,
     pub broadcast: Option<Ipv4Addr>,
+    /// Option 26, interface MTU (RFC 2132 §5.1).
+    pub mtu: Option<u16>,
     pub message: Option<String>,
     /// Option 121 (RFC 3442): (destination, prefix length, router). A
     /// client that takes it ignores option 3, so the default route goes
@@ -244,6 +247,7 @@ impl Message {
                 OPT_SERVER_ID if len == 4 => o.server_id = Some(ip(data)),
                 OPT_SUBNET_MASK if len == 4 => o.subnet_mask = Some(ip(data)),
                 OPT_BROADCAST if len == 4 => o.broadcast = Some(ip(data)),
+                OPT_MTU if len == 2 => o.mtu = Some(u16::from_be_bytes([data[0], data[1]])),
                 OPT_ROUTER => o.routers = ips(data),
                 OPT_DNS => o.dns = ips(data),
                 OPT_HOSTNAME if len > 0 => o.hostname = Some(text(data)),
@@ -311,6 +315,9 @@ impl Message {
         if let Some(a) = o.broadcast {
             opt(OPT_BROADCAST, &a.octets());
         }
+        if let Some(m) = o.mtu {
+            opt(OPT_MTU, &m.to_be_bytes());
+        }
         for (code, list) in [(OPT_ROUTER, &o.routers), (OPT_DNS, &o.dns)] {
             if !list.is_empty() {
                 let bytes: Vec<u8> = list.iter().flat_map(|a| a.octets()).collect();
@@ -371,6 +378,7 @@ mod tests {
                 hostname: Some("laptop".to_string()),
                 param_request: vec![1, 3, 6, 15],
                 client_id: Some(vec![1, 0x52, 0x54, 0, 0, 0, 0x10]),
+                mtu: Some(1492),
                 ..Default::default()
             },
         }

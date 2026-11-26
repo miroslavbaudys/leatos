@@ -32,9 +32,9 @@ Keep them current when you change what they describe; keep this file to the map 
   `cli`, `config` (`config.toml` schema v2, docs/config-v2.md), `config-store` (power-fail-safe
   store), `boot-image`.
 - `fuzz/`: cargo-fuzz targets (own workspace, nightly; fuzz/README.md): `fwd`, `pppoe`, `dns`,
-  `dhcp6`, `sntp`, `http`, `dhcp`, `mdns`, `qdisc`, `ack_filter`, `boot_image`, `cli`, `config`
-  (seeds in `fuzz/seeds/config`), `store`, `dns_tcp`, `auth`, `dot`; shared builders in
-  `fuzz/src/lib.rs`.
+  `dhcp6`, `sntp`, `http`, `dhcp`, `dhcp_client`, `mdns`, `qdisc`, `ack_filter`, `boot_image`,
+  `cli`, `config` (seeds in `fuzz/seeds/config`), `store`, `dns_tcp`, `auth`, `dot`; shared
+  builders in `fuzz/src/lib.rs`.
 - `tools/leatstore`: host tool for store images: `create`, `format`, `show`, `put` (refuses a clear
   `mgmt.password`), `get`, `corrupt`, `hash <password>`.
 - `lab/client/`, `lab/isp/`: overlays for the Alpine lab VMs (`/init`, configs, web/CGI);

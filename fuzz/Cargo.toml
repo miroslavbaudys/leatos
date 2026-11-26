@@ -155,3 +155,10 @@ path = "fuzz_targets/dot.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dhcp_client"
+path = "fuzz_targets/dhcp_client.rs"
+test = false
+doc = false
+bench = false

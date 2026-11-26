@@ -74,6 +74,10 @@ and sparse senders. How the kernel uses it: kernel/src/net/CLAUDE.md.
   - `v6::ra` Router Advertisements: SLAAC prefixes, RDNSS, DNSSL, MTU, router lifetime, RFC 4861
     timers, solicited ≥ 3 s apart, prefixes that leave deprecated for 2 h, `retire`, `parse_frame`
     for upstream RAs; tested against smoltcp's parser.
+  - `v4::client` DHCPv4 client (RFC 2131: DISCOVER/REQUEST, INIT-REBOOT with `Config::last`,
+    renew unicast at T1, rebind at T2, NAK backoff, lease checks, option 26 MTU); returns
+    `Transmit` with source and destination; fuzz target `dhcp_client`. Not used by the kernel yet
+    (docs/local-stack.md step 2).
   - `v6::pd` DHCPv6 prefix delegation client (RFC 8415: Solicit/Advertise/Request/Reply,
     Renew/Rebind, DUID-LL, retransmission with jitter); fuzz target `dhcp6`.
 - `proto-dns`: the forwarder: zone → cache (TTL aging, prefetch, serve-stale) → upstream.

@@ -1,7 +1,8 @@
 # Router-local stack: smoltcp for TCP only (plan)
 
-Status (2026-11-25): planned. The first piece, ARP / ND on the LAN links in the datapath, is
-docs/lan-neighbors.md (step 3 on the apu4 in RAM since 2026-11-25). Roadmap M14.
+Status (2026-11-26): step 1 done (host tests, fuzz target; the kernel does not use it yet). Step 0,
+ARP / ND on the LAN links in the datapath, is docs/lan-neighbors.md (step 3 persisted on the apu4
+2026-11-26, step 4 from 2026-12-03). Roadmap M14.
 
 ## 1. Goal
 
@@ -104,6 +105,15 @@ docs/lan-neighbors.md: the apu4 day (§5), `--persist`, a week, step 4 (LAN work
 - Host tests against the server in the same crate and against recorded ISP packets; a fuzz target
   `dhcp_client` (replies to what it sent).
 - Not used yet: kernel unchanged.
+
+Done (2026-11-26): `proto_dhcp::v4::client` and option 26 in `v4::packet`. 19 host tests: DORA,
+renewal, rebinding to another server, lease end, NAK while renewing, INIT-REBOOT (ACK, NAK,
+unanswered), backoff, NAK spacing, what is ignored, lease checks, infinite and tiny leases, reset,
+broadcast flag, T1 = T2. No ISP capture exists (the home line is PPPoE), so other servers' replies
+are hand-built byte by byte the way busybox udhcpd writes them (the lab ISP), plus T1 / T2 / MTU;
+step 2b checks against the real udhcpd in the lab. Fuzz target `dhcp_client`: 5.6 M runs in 5 min
+clean, after a fix it found (T1 = T2 sent a RENEW and a REBIND at the same instant). Not done:
+ARP probe + DECLINE, RELEASE, option overload (52).
 
 ### Step 2: WAN on `Medium::Ip`
 
