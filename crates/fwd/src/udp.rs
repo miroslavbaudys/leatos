@@ -43,11 +43,12 @@ pub struct Datagram {
     pub payload: (usize, usize),
 }
 
-/// Write `payload` from `e.src:e.sport` to `e.dst:e.dport` into `out`;
+/// Write `payload` from `e.src:e.sport` to `e.dst:e.dport` into `out`,
+/// with time to live `ttl` ([`TTL`]; 255 for mDNS, RFC 6762 §11);
 /// the frame's length, or `None` if `out` is too small or the payload does
 /// not fit in one datagram. No fragmentation (DF clear, never needed:
 /// the router's payloads fit the link MTU, docs/local-stack.md §3.2).
-pub fn build4(out: &mut [u8], e: &Ends, payload: &[u8]) -> Option<usize> {
+pub fn build4(out: &mut [u8], e: &Ends, ttl: u8, payload: &[u8]) -> Option<usize> {
     let total = OVERHEAD + payload.len();
     if out.len() < total || IP_HDR + UDP_HDR + payload.len() > usize::from(u16::MAX) {
         return None;
@@ -61,7 +62,7 @@ pub fn build4(out: &mut [u8], e: &Ends, payload: &[u8]) -> Option<usize> {
     put16(f, ip + 2, (total - ETH_HDR) as u16);
     put16(f, ip + 4, 0); // identification: no fragments
     put16(f, ip + 6, 0);
-    f[ip + 8] = TTL;
+    f[ip + 8] = ttl;
     f[ip + 9] = PROTO_UDP;
     put16(f, ip + 10, 0);
     put_ip(f, ip + 12, e.src);
@@ -212,7 +213,7 @@ mod tests {
             (Ends { src: Ipv4Addr::new(10, 0, 0, 1), dst: Ipv4Addr::new(10, 0, 0, 2), sport: 61000, dport: 53 }, b""),
         ] {
             let mut out = vec![0xaa; 600];
-            let n = build4(&mut out, &e, payload).unwrap();
+            let n = build4(&mut out, &e, TTL, payload).unwrap();
             assert_eq!(n, OVERHEAD + payload.len());
             let f = &out[..n];
             let eth = EthernetFrame::new_checked(f).unwrap();
@@ -232,13 +233,13 @@ mod tests {
     #[test]
     fn too_small_a_buffer() {
         let mut out = [0u8; OVERHEAD + 3];
-        assert_eq!(build4(&mut out, &E, b"four"), None);
-        assert_eq!(build4(&mut out, &E, b"abc"), Some(OVERHEAD + 3));
+        assert_eq!(build4(&mut out, &E, TTL, b"four"), None);
+        assert_eq!(build4(&mut out, &E, TTL, b"abc"), Some(OVERHEAD + 3));
     }
 
     fn frame(payload: &[u8]) -> alloc::vec::Vec<u8> {
         let mut out = vec![0; OVERHEAD + payload.len()];
-        let n = build4(&mut out, &E, payload).unwrap();
+        let n = build4(&mut out, &E, TTL, payload).unwrap();
         out.truncate(n);
         out
     }

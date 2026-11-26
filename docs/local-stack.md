@@ -4,7 +4,8 @@ Status (2026-11-26): steps 1 and 2 done in QEMU (the WAN IP-only on DHCP and sta
 over the router's own UDP: `net::local` + `fwd::udp`, IPv4 and IPv6); the fallbacks
 (`wan_medium=eth`, `lan_medium=eth`), the neighbor hints and `medium-ethernet` removed on
 2026-11-26 (user decision: the whole migration goes to the apu4 at once after the soak, no
-per-step day there). Step 0 (docs/lan-neighbors.md) done with it. Next: step 3. Roadmap M14.
+per-step day there). Step 0 (docs/lan-neighbors.md) done with it. Step 3 done the same day
+(every UDP service on `net::local`, `socket-udp` gone). Next: step 4. Roadmap M14.
 
 ## 1. Goal
 
@@ -139,6 +140,9 @@ end.
 - DNS (2026-11-26, QEMU): :53 per network and the upstream ports on `net::local`, which also got
   its PPPoE send path (into the WAN qdisc) and `source` (the datapath's view of the link:
   `LocalLink::source4` / `source6`). DNS over TCP and DoT stay on smoltcp's TCP.
+- DHCP server :67, DHCPv6 client :546, SNTP and mDNS :5353 (TTL 255: `fwd::udp::build4` takes the
+  TTL now) followed the same day; `socket-udp` removed. Step 3 done in QEMU; the IGMP / MLD reports
+  for mDNS's groups still come from smoltcp (step 4).
 
 ### Step 4: ICMP and group membership
 

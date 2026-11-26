@@ -188,10 +188,11 @@ impl Udp {
 }
 
 /// Send `payload` on link `ifx` from `e`'s source to its destination
-/// (IPv4: the source may be 0.0.0.0, the destination 255.255.255.255;
-/// IPv6 with hop limit `hop6`). False if no buffer, too large, or no next
-/// hop (`send_local` counts that).
-pub fn send(sh: &Shared, ifx: IfIndex, e: &Ends, hop6: u8, payload: &[u8]) -> bool {
+/// (IPv4: the source may be 0.0.0.0, the destination 255.255.255.255),
+/// with time to live / hop limit `ttl` (`fwd::udp::TTL`; 255 for mDNS).
+/// False if no buffer, too large, or no next hop (`send_local` counts
+/// that).
+pub fn send(sh: &Shared, ifx: IfIndex, e: &Ends, ttl: u8, payload: &[u8]) -> bool {
     let Some(dp) = crate::net::stack::datapath() else { return false };
     let overhead = match e {
         Ends::V4(_) => fwd::udp::OVERHEAD,
@@ -204,8 +205,8 @@ pub fn send(sh: &Shared, ifx: IfIndex, e: &Ends, hop6: u8, payload: &[u8]) -> bo
     let Some(mut pkt) = PacketBuf::alloc() else { return false };
     pkt.set_len(overhead + payload.len());
     let n = match e {
-        Ends::V4(e) => fwd::udp::build4(pkt.data_mut(), e, payload),
-        Ends::V6(e) => fwd::udp::build6(pkt.data_mut(), e, hop6, payload),
+        Ends::V4(e) => fwd::udp::build4(pkt.data_mut(), e, ttl, payload),
+        Ends::V6(e) => fwd::udp::build6(pkt.data_mut(), e, ttl, payload),
     };
     let Some(n) = n else { return false };
     pkt.set_len(n);

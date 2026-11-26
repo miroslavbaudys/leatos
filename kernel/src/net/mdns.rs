@@ -1,9 +1,9 @@
-//! mDNS across networks (docs/mdns.md): glue between smoltcp and
-//! `proto_mdns::Reflector`.
+//! mDNS across networks (docs/mdns.md): glue between the router's own UDP
+//! (`net::local`) and `proto_mdns::Reflector`.
 //!
 //! On each network a `[[mdns.reflect]]` entry involves, the router joins
-//! 224.0.0.251 on that link's interface (smoltcp sends the IGMP report)
-//! and listens on UDP 5353. A join waits until the datapath has put the
+//! 224.0.0.251 on that link's interface (smoltcp sends the IGMP report;
+//! docs/local-stack.md step 4 moves that out) and listens on UDP 5353. A join waits until the datapath has put the
 //! network's link into effect (active, with the network's VLAN ID): after
 //! a live change the services task runs ahead of the datapath, and a
 //! report queued earlier would carry the link's old tag (none, for a
@@ -18,29 +18,26 @@
 //! task; the datapath only passes 5353 up when the zone allows `mdns`.
 
 use crate::config;
-use crate::net::shared::LinkShared;
 use crate::net::svc::HostIf;
 use crate::{println, timer};
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{IpAddr, SocketAddr};
 use proto_mdns::{GROUP_V4, GROUP_V6, PORT, Reflector, Stats};
-use smoltcp::iface::SocketHandle;
-use smoltcp::socket::udp;
-use smoltcp::wire::{IpAddress, IpEndpoint};
+use crate::net::local::{self, Ends};
+use crate::net::shared::Shared;
+use smoltcp::wire::IpAddress;
 
-/// Socket buffers per network: a burst of announcements from a device
-/// joining fits, a storm is dropped by smoltcp (counted nowhere, bounded).
-const DATAGRAMS: usize = 16;
-const BUF_BYTES: usize = 24 * 1024;
+/// RFC 6762 §11: TTL / hop limit 255.
 const HOP_LIMIT: u8 = 255;
 
-/// A network's socket: on which host interface, and the handle.
+/// A network's port 5353: on which link (`net::local`, bounded queue: a
+/// storm is dropped and counted in `local_udp.dropped`), and the router's
+/// IPv4 address there (the source of its copies).
 #[derive(Clone, Copy)]
 struct Sock {
     host: usize,
-    handle: SocketHandle,
+    v4: core::net::Ipv4Addr,
 }
 
 /// A group membership on a host interface, for a network with this VID.
@@ -66,7 +63,6 @@ pub struct Mdns {
     socks: Vec<Option<Sock>>,
     /// Network names the counters belong to (index = `NetId`).
     names: Vec<String>,
-    buf: Vec<u8>,
 }
 
 fn now_ms() -> u64 {
@@ -110,7 +106,6 @@ impl Mdns {
             just_joined: false,
             socks: Vec::new(),
             names: Vec::new(),
-            buf: vec![0; proto_mdns::wire::MAX_MESSAGE],
         };
         m.reconfigure(hosts, links);
         m
@@ -144,22 +139,18 @@ impl Mdns {
             }
         }
         self.pending = want.iter().copied().filter(|m| !self.joined.contains(m)).collect();
-        // Sockets: close everything, then open what the rules need (a
-        // change drops at most the datagrams queued at that moment).
+        // Ports: free everything, then bind what the rules need (a change
+        // drops at most the datagrams queued at that moment).
         for s in self.socks.drain(..).flatten() {
-            hosts[s.host].sockets.remove(s.handle);
+            local::unbind(s.host as fwd::IfIndex, PORT);
         }
-        for &link in links.iter().take(nets.len()) {
+        for (k, &link) in links.iter().enumerate().take(nets.len()) {
             if !want.iter().any(|m| m.host == link) {
                 self.socks.push(None);
                 continue;
             }
-            let host = &mut hosts[link];
-            let buf = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; DATAGRAMS], vec![0; BUF_BYTES]);
-            let mut s = udp::Socket::new(buf(), buf());
-            s.bind(PORT).expect("bind :5353");
-            s.set_hop_limit(Some(HOP_LIMIT));
-            self.socks.push(Some(Sock { host: link, handle: host.sockets.add(s) }));
+            local::bind(link as fwd::IfIndex, PORT);
+            self.socks.push(Some(Sock { host: link, v4: nets[k].addr }));
         }
         self.names = names;
         let on: Vec<&str> = (0..self.socks.len())
@@ -173,7 +164,8 @@ impl Mdns {
 
     /// Join where the datapath has caught up, then reflect what arrived
     /// since the last call. `links[i]` belongs to `hosts[i]`.
-    pub fn step(&mut self, hosts: &mut [HostIf], links: &[LinkShared]) {
+    pub fn step(&mut self, hosts: &mut [HostIf], sh: &Shared) {
+        let links = &sh.links;
         self.just_joined = false;
         let mut i = 0;
         while i < self.pending.len() {
@@ -199,21 +191,27 @@ impl Mdns {
         }
         for k in 0..self.socks.len() {
             let Some(s) = self.socks[k] else { continue };
-            loop {
-                let sock = hosts[s.host].sockets.get_mut::<udp::Socket>(s.handle);
-                let Ok((n, meta)) = sock.recv_slice(&mut self.buf) else {
-                    break;
+            while let Some(d) = local::recv(s.host as fwd::IfIndex, PORT) {
+                let src = match d.ends {
+                    Ends::V4(e) => SocketAddr::new(IpAddr::V4(e.src), e.sport),
+                    Ends::V6(e) => SocketAddr::new(IpAddr::V6(e.src), e.sport),
                 };
-                let src = SocketAddr::new(IpAddr::from(meta.endpoint.addr), meta.endpoint.port);
-                for out in self.refl.handle(now_ms(), k, src, &self.buf[..n]) {
+                for out in self.refl.handle(now_ms(), k, src, &d.payload) {
                     let Some(Some(t)) = self.socks.get(out.net).copied() else {
                         continue;
                     };
-                    let group = if out.v6 { IpAddress::Ipv6(GROUP_V6) } else { IpAddress::Ipv4(GROUP_V4) };
-                    let ep = IpEndpoint::new(group, PORT);
-                    // A full TX buffer drops the copy (bounded, like any
-                    // other router-local UDP).
-                    let _ = hosts[t.host].sockets.get_mut::<udp::Socket>(t.handle).send_slice(&out.msg, ep);
+                    let link = t.host as fwd::IfIndex;
+                    // To the group, from the router's address there (IPv6:
+                    // link-local, the source for a link-scoped group).
+                    let e = if out.v6 {
+                        let Some(IpAddr::V6(src)) = local::source(link, IpAddr::V6(GROUP_V6)) else { continue };
+                        Ends::V6(fwd::udp::Ends6 { src, dst: GROUP_V6, sport: PORT, dport: PORT })
+                    } else {
+                        Ends::V4(fwd::udp::Ends { src: t.v4, dst: GROUP_V4, sport: PORT, dport: PORT })
+                    };
+                    // No buffer drops the copy (bounded, like any other
+                    // router-local UDP).
+                    local::send(sh, link, &e, HOP_LIMIT, &out.msg);
                 }
             }
         }

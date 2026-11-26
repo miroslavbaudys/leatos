@@ -41,9 +41,6 @@ use proto_dhcp::v4::server::{self as dhcp, Event as DhcpEvent};
 use proto_dhcp::v6::ra::{Advertiser, RaConfig};
 use proto_dns::resolver::{self, Action, Resolver};
 use proto_dns::zone::{Source, View, Zone};
-use smoltcp::iface::{SocketHandle, SocketSet};
-use smoltcp::socket::udp;
-use smoltcp::wire::IpEndpoint;
 
 const DNS_PORT: u16 = 53;
 /// How often leases are checked for expiry.
@@ -57,7 +54,8 @@ struct Net {
     cfg: config::Lan,
     /// Index into the services' `HostIf`s (the network's link).
     host: usize,
-    dhcp: Option<(dhcp::Server, SocketHandle)>,
+    /// On UDP :67 of the link (`net::local`).
+    dhcp: Option<dhcp::Server>,
     /// TCP :53 (none with `dns_tcp=0`).
     dns_tcp: Option<dns_tcp::Listener>,
     /// Router Advertisements (IPv6 on: `cfg.ula`).
@@ -290,12 +288,6 @@ fn ends(src: IpAddr, sport: u16, to: SocketAddr) -> Option<local::Ends> {
     })
 }
 
-fn udp_socket(datagrams: usize, bytes: usize) -> udp::Socket<'static> {
-    let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; datagrams], vec![0; bytes]);
-    let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; datagrams], vec![0; bytes]);
-    udp::Socket::new(rx, tx)
-}
-
 fn dhcp_config(cfg: &config::Lan) -> dhcp::Config {
     dhcp::Config {
         server_ip: cfg.addr,
@@ -415,7 +407,7 @@ fn now_secs() -> u64 {
 /// A network's services on its link's interface: DHCP (if on) and DNS.
 fn open_net(cfg: config::Lan, host: usize, hosts: &mut [HostIf]) -> Net {
     let sockets = &mut hosts[host].sockets;
-    let dhcp = cfg.dhcp.then(|| open_dhcp(&cfg, sockets));
+    let dhcp = cfg.dhcp.then(|| open_dhcp(&cfg, host));
     local::bind(host as fwd::IfIndex, DNS_PORT);
     let dns_tcp = config::dns_tcp().then(|| dns_tcp::Listener::open(sockets));
     log_net(&cfg);
@@ -432,10 +424,9 @@ fn open_net(cfg: config::Lan, host: usize, hosts: &mut [HostIf]) -> Net {
     }
 }
 
-fn open_dhcp(cfg: &config::Lan, sockets: &mut SocketSet<'static>) -> (dhcp::Server, SocketHandle) {
-    let mut s = udp_socket(8, 8 * 600);
-    s.bind(SERVER_PORT).expect("bind :67");
-    (dhcp::Server::new(dhcp_config(cfg)), sockets.add(s))
+fn open_dhcp(cfg: &config::Lan, host: usize) -> dhcp::Server {
+    local::bind(host as fwd::IfIndex, SERVER_PORT);
+    dhcp::Server::new(dhcp_config(cfg))
 }
 
 fn log_net(cfg: &config::Lan) {
@@ -475,11 +466,10 @@ impl LanServices {
             .zip(links)
             .map(|(cfg, &link)| open_net(cfg, link, hosts))
             .collect();
-        let wan = &mut hosts[0];
         // 61000–65535: router-local (fwd::forwarder::ROUTER_CLIENT_PORTS),
         // apart from SNTP's 60000–60999; never a NAT or forwarded port.
         let upstream = Some(Upstream::new());
-        let ntp = Some(Ntp::new(wan));
+        let ntp = Some(Ntp::new());
         println!("  lan services    : dns cache {}", dns_cfg.cache_entries);
         let mdns = Mdns::new(hosts, links);
         let mut me = Self {
@@ -582,21 +572,20 @@ impl LanServices {
                 continue;
             };
             let mut net = old.remove(pos);
-            let sockets = &mut hosts[net.host].sockets;
             match (net.dhcp.take(), cfg.dhcp) {
-                (Some((mut server, sock)), true) => {
+                (Some(mut server), true) => {
                     dropped += server
                         .reconfigure(now_secs(), dhcp_config(cfg))
                         .iter()
                         .filter(|e| matches!(e, DhcpEvent::Released { .. }))
                         .count();
-                    net.dhcp = Some((server, sock));
+                    net.dhcp = Some(server);
                 }
-                (Some((server, sock)), false) => {
+                (Some(server), false) => {
                     dropped += server.leases().count();
-                    sockets.remove(sock);
+                    local::unbind(net.host as fwd::IfIndex, SERVER_PORT);
                 }
-                (None, true) => net.dhcp = Some(open_dhcp(cfg, sockets)),
+                (None, true) => net.dhcp = Some(open_dhcp(cfg, net.host)),
                 (None, false) => {}
             }
             net.cfg = cfg.clone();
@@ -620,9 +609,12 @@ impl LanServices {
         // Networks that went away (or moved): their sockets go too.
         for net in old {
             let sockets = &mut hosts[net.host].sockets;
-            if let Some((server, sock)) = net.dhcp {
+            if let Some(server) = net.dhcp {
                 dropped += server.leases().count();
-                sockets.remove(sock);
+                // Unless another network with DHCP took the link over.
+                if !self.nets.iter().any(|n| n.host == net.host && n.dhcp.is_some()) {
+                    local::unbind(net.host as fwd::IfIndex, SERVER_PORT);
+                }
             }
             // :53 stays bound if another network took the link over.
             if !self.nets.iter().any(|n| n.host == net.host) {
@@ -680,7 +672,7 @@ impl LanServices {
         self.nets
             .iter()
             .filter_map(|n| {
-                n.dhcp.as_ref().map(|(s, _)| persist::Network {
+                n.dhcp.as_ref().map(|s| persist::Network {
                     name: n.cfg.name.clone(),
                     leases: s.snapshot(),
                 })
@@ -694,7 +686,7 @@ impl LanServices {
     pub fn restore_leases(&mut self, saved: &[persist::Network]) -> (usize, usize) {
         let mut restored = 0;
         for net in &mut self.nets {
-            let (Some((server, _)), Some(s)) = (net.dhcp.as_mut(), saved.iter().find(|s| s.name == net.cfg.name)) else {
+            let (Some(server), Some(s)) = (net.dhcp.as_mut(), saved.iter().find(|s| s.name == net.cfg.name)) else {
                 continue;
             };
             for ev in server.restore(now_secs(), &s.leases) {
@@ -711,7 +703,7 @@ impl LanServices {
     /// The DHCP server's refusals and reclaimed offers on network `name`
     /// (`None`: no DHCP there).
     pub fn dhcp_stats(&self, name: &str) -> Option<dhcp::Stats> {
-        self.nets.iter().find(|n| n.cfg.name == name)?.dhcp.as_ref().map(|(s, _)| s.stats())
+        self.nets.iter().find(|n| n.cfg.name == name)?.dhcp.as_ref().map(|s| s.stats())
     }
 
     /// Current DHCP leases with their network's name.
@@ -719,7 +711,7 @@ impl LanServices {
         self.nets.iter().flat_map(|n| {
             n.dhcp
                 .iter()
-                .flat_map(move |(s, _)| s.leases().map(move |l| (n.cfg.name.as_str(), l)))
+                .flat_map(move |s| s.leases().map(move |l| (n.cfg.name.as_str(), l)))
         })
     }
 
@@ -729,7 +721,7 @@ impl LanServices {
     pub fn leases_with_ipv6(&self, sh: &Shared, now_ms: u64) -> Vec<(&str, &dhcp::Lease, Vec<Ipv6Addr>)> {
         let mut out = Vec::new();
         for n in &self.nets {
-            let Some((s, _)) = &n.dhcp else { continue };
+            let Some(s) = &n.dhcp else { continue };
             let seen = neighbors6(n, sh, now_ms);
             for l in s.leases() {
                 let v6 = seen.iter().filter(|e| e.1 == l.mac).map(|e| e.0).collect();
@@ -749,7 +741,7 @@ impl LanServices {
         if config::dns_aaaa() {
             for net in &self.nets {
                 for (ip, mac) in neighbors6(net, sh, now) {
-                    let lease = net.dhcp.as_ref().and_then(|(s, _)| {
+                    let lease = net.dhcp.as_ref().and_then(|s| {
                         s.leases()
                             .find(|l| l.mac == mac && l.state == dhcp::LeaseState::Bound && l.hostname.is_some())
                             .map(|l| (l.hostname.clone().unwrap_or_default(), l.ip))
@@ -951,21 +943,30 @@ impl LanServices {
         self.retiring.retain(|(_, ra)| !ra.is_done());
 
         // DHCP servers.
-        let mut buf = [0u8; 1500];
         let expire = now_secs() >= self.next_expire;
         if expire {
             self.next_expire = now_secs() + EXPIRE_EVERY_SECS;
         }
         for net in &mut self.nets {
-            let Some((server, sock)) = net.dhcp.as_mut() else {
+            let Some(server) = net.dhcp.as_mut() else {
                 continue;
             };
-            let sockets = &mut hosts[net.host].sockets;
-            while let Ok((n, _meta)) = sockets.get_mut::<udp::Socket>(*sock).recv_slice(&mut buf) {
-                let out = server.handle(now_secs(), &buf[..n]);
+            let link = net.host as fwd::IfIndex;
+            while let Some(d) = local::recv(link, SERVER_PORT) {
+                // From clients only (port 68; IPv4: the server is v4).
+                if d.ends.sport() != CLIENT_PORT || !matches!(d.ends, local::Ends::V4(_)) {
+                    continue;
+                }
+                let out = server.handle(now_secs(), &d.payload);
                 if let Some(reply) = out.reply {
-                    let ep = IpEndpoint::new(IpAddr::V4(Ipv4Addr::BROADCAST).into(), CLIENT_PORT);
-                    let _ = sockets.get_mut::<udp::Socket>(*sock).send_slice(&reply, ep);
+                    // Broadcast (the server sets the flag in every reply).
+                    let e = local::Ends::V4(fwd::udp::Ends {
+                        src: net.cfg.addr,
+                        dst: Ipv4Addr::BROADCAST,
+                        sport: SERVER_PORT,
+                        dport: CLIENT_PORT,
+                    });
+                    local::send(sh, link, &e, fwd::udp::TTL, &reply);
                 }
                 Self::apply_dhcp_events(&mut self.dns, &self.names, &net.cfg.name, &net.cfg.domain, out.events);
             }
@@ -1023,7 +1024,7 @@ impl LanServices {
             self.send_dns(hosts, sh, actions);
         }
         if let Some(n) = self.ntp.as_mut() {
-            n.step(&mut hosts[0].sockets);
+            n.step(sh);
         }
 
         // DNS: retries / timeouts.
@@ -1040,7 +1041,7 @@ impl LanServices {
             }
         }
 
-        self.mdns.step(hosts, links);
+        self.mdns.step(hosts, sh);
     }
 
     /// IPv6 per network: (name, router ULA, RAs sent, solicitations seen).

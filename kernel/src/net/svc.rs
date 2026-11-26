@@ -457,7 +457,7 @@ fn wan6_follow(
     if let Some(old) = w.take() {
         old.stop(wan);
     }
-    *w = crate::net::wan6::Wan6::new(wan, sh, now_ms());
+    *w = crate::net::wan6::Wan6::new(sh, now_ms());
     true
 }
 
@@ -732,7 +732,7 @@ pub async fn run(
     let mut wan4 = (crate::config::wan_link() == crate::config::WanLink::Dhcp)
         .then(|| crate::net::wan4::Wan4::new(sh.ports[0].mac, now_ms()));
     // The WAN's IPv6 by prefix delegation (docs/ipv6.md step 3).
-    let mut wan6 = crate::net::wan6::Wan6::new(&mut hosts[0], sh, now_ms());
+    let mut wan6 = crate::net::wan6::Wan6::new(sh, now_ms());
     // PPPoE: IPv6CP's state the loop last acted on (step 4).
     let mut ppp6 = crate::net::wan6::ppp_link();
     // The datapath's view of an IP-only WAN from the start: its link-local
@@ -791,7 +791,7 @@ pub async fn run(
             if let Some(old) = wan6.take() {
                 old.stop(&mut hosts[0]);
             }
-            wan6 = crate::net::wan6::Wan6::new(&mut hosts[0], sh, now_ms());
+            wan6 = crate::net::wan6::Wan6::new(sh, now_ms());
             reapply_networks(sh, &mut hosts, services.as_mut(), &mut mgmt, &mut slots, None);
         }
         pinger.step(&mut hosts[0].sockets);

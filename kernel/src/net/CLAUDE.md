@@ -77,15 +77,17 @@ services, mgmt. A saved WAN change restarts the WAN live, DHCP ⇄ PPPoE include
 - `pppoe.rs`: svc side of `proto_pppoe::Client`: `ctrl_rx` in, frames into the WAN qdisc, `Session`
   → `PortShared::pppoe_session`, up/down → router-stack address + `LeaseChange`. The WAN interface
   is `Medium::Ip` in PPPoE mode. PADT at reboot/upgrade from the datapath.
-- `services.rs`: per network a DHCP server + DNS, one resolver/zone. DNS over UDP on `net::local`
-  (:53 per network's link, answers from the network's address; step 3): `services::Upstream`, a
-  fresh random upstream port per query on the WAN, bound in `local` and `CLIENT_PORTS`. DHCP still
-  on a smoltcp UDP socket. With IPv6 an RA `Advertiser` per network, frames straight into the port
-  qdisc; retired ones send a last RA.
+- `services.rs`: per network a DHCP server + DNS, one resolver/zone, all UDP on `net::local`
+  (step 3; smoltcp is built without `socket-udp`): DNS :53 per network's link (answers from the
+  network's address), `services::Upstream` a fresh random upstream port per query on the WAN
+  (bound in `local` and `CLIENT_PORTS`), DHCP :67 (replies broadcast from the network's address).
+  With IPv6 an RA `Advertiser` per network, frames straight into the port qdisc; retired ones send
+  a last RA.
 - `dns_tcp.rs`: DNS over TCP from clients (RFC 7766): 4 TCP :53 sockets per network, framing in
   `proto_dns::tcp`, length-prefixed queries → `Resolver::handle_query_tcp`, answers by client
   endpoint, pipelining, bounded buffers, 10 s idle close; `/api/status` `dns.tcp`.
-- `ntp.rs`: SNTP client on the WAN; names resolved through the forwarder as client `127.0.0.1:1`.
+- `ntp.rs`: SNTP client on the WAN (a port in 60000–60999 on `net::local`, from the WAN's source
+  address); names resolved through the forwarder as client `127.0.0.1:1`.
 - `dot.rs`: DNS over TLS (docs/dns-over-tls.md): one `proto_dot::Conn` per `dns.upstreams` server
   over a smoltcp TCP socket on the WAN (local ports 61000–64999), opened on demand, 30 s idle close,
   backoff on failure, reconnect once SNTP sets the clock. Strict: with `dns.tls` no UDP upstream
@@ -96,15 +98,16 @@ services, mgmt. A saved WAN change restarts the WAN live, DHCP ⇄ PPPoE include
     servers after the lease's (`LanServices::set_dns6`).
   - The last prefix asked for again after a restart (lease record v2, `pd_keep=0` off).
   - The ISP's RA (default router; `RxTap::take_ra`), router solicitations,
-    `proto_dhcp::v6::pd::Client` on UDP :546.
+    `proto_dhcp::v6::pd::Client` on UDP :546 (`net::local`, from the link-local address).
   - `wan6::state` feeds `config::wan6`/`gua_router`; changes reapply the networks
     (`svc::reapply_networks`).
   - On PPPoE while IPv6CP is up (`set_ppp_link` from `net::pppoe`): the WAN link-local address,
     `Forwarder::set_ll6`, default router = the RA's or the IPv6CP peer.
   - Not with the `wan6_*`/`lan6_prefix` boot arguments.
-- `mdns.rs`: mDNS reflector glue inside `LanServices`: joins 224.0.0.251 (smoltcp `multicast`) and a
-  5353 socket per network a `[[mdns.reflect]]` entry involves, `proto_mdns::Reflector`, counters in
-  `/api/status` `mdns` and CLI `status`.
+- `mdns.rs`: mDNS reflector glue inside `LanServices`: joins 224.0.0.251 (smoltcp `multicast`, its
+  IGMP / MLD reports until step 4) and port 5353 on `net::local` per network a `[[mdns.reflect]]`
+  entry involves (copies to the group with TTL 255, from the network's address / link-local),
+  `proto_mdns::Reflector`, counters in `/api/status` `mdns` and CLI `status`.
 
 ## Management: `mgmt.rs` + `mgmt.html`
 

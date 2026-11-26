@@ -310,7 +310,7 @@ fn udp_check(f: &[u8]) {
     assert!(d.payload.0 <= d.payload.1 && d.payload.1 <= f.len(), "{d:?}");
     let payload = &f[d.payload.0..d.payload.1];
     let mut out = vec![0u8; fwd::udp::OVERHEAD + payload.len()];
-    let n = fwd::udp::build4(&mut out, &d.ends, payload).expect("fits");
+    let n = fwd::udp::build4(&mut out, &d.ends, 64, payload).expect("fits");
     let again = fwd::udp::parse4(&out[..n]).expect("own datagram parses");
     assert_eq!(again.ends, d.ends);
     assert_eq!(&out[again.payload.0..again.payload.1], payload);

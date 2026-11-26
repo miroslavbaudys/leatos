@@ -23,14 +23,10 @@
 use crate::net::shared::Shared;
 use crate::net::svc::HostIf;
 use crate::println;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::net::Ipv6Addr;
 use proto_dhcp::v6::pd::{self, Client, Event, PdConfig};
 use proto_dhcp::v6::ra;
-use smoltcp::iface::SocketHandle;
-use smoltcp::socket::udp;
-use smoltcp::wire::IpEndpoint;
 
 /// What the WAN has learned (none: not running).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -99,8 +95,8 @@ const RS_TRIES: u8 = 3;
 const RS_INTERVAL_MS: u64 = 4_000;
 
 pub struct Wan6 {
+    /// On UDP :546 of the WAN (`net::local`).
     pd: Client,
-    sock: SocketHandle,
     mac: [u8; 6],
     /// Our link-local address (the RS source).
     ll: Ipv6Addr,
@@ -116,7 +112,7 @@ pub struct Wan6 {
 impl Wan6 {
     /// Prefix delegation on the WAN, if it should run (IPv6 on, PD on, no
     /// development override; on PPPoE while IPv6CP is up).
-    pub fn new(wan: &mut HostIf, sh: &Shared, now: u64) -> Option<Self> {
+    pub fn new(sh: &Shared, now: u64) -> Option<Self> {
         let ll = wan_link_local(sh);
         let Some(ll) = ll.filter(|_| crate::config::pd_wanted()) else {
             *STATE.lock() = None;
@@ -124,22 +120,18 @@ impl Wan6 {
         };
         let lla = !sh.ports[0].is_pppoe();
         let mac = sh.ports[0].mac;
-        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4 * 1024]);
-        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4 * 1024]);
-        let mut s = udp::Socket::new(rx, tx);
-        s.bind(pd::CLIENT_PORT).expect("bind :546");
-        let sock = wan.sockets.add(s);
+        crate::net::local::bind(crate::net::datapath::WAN, pd::CLIENT_PORT);
         let hint = crate::config::get_ipv6().prefix_hint;
         let pd = Client::new(PdConfig { mac, iaid: 1, hint_len: hint, last: last().filter(|_| crate::config::pd_keep()) }, now, crate::timer::ticks());
         println!("  wan6            : DHCPv6 prefix delegation (asking for a /{hint}), router solicitations");
         let shown = State { pd_state: pd.state().name(), ..State::default() };
         *STATE.lock() = Some(shown.clone());
-        Some(Wan6 { pd, sock, mac, ll, lla, rs_sent: 0, next_rs: now, router: None, shown })
+        Some(Wan6 { pd, mac, ll, lla, rs_sent: 0, next_rs: now, router: None, shown })
     }
 
-    /// Stop (the WAN changes mode): its socket goes, nothing is learned.
-    pub fn stop(self, wan: &mut HostIf) {
-        wan.sockets.remove(self.sock);
+    /// Stop (the WAN changes mode): its port goes, nothing is learned.
+    pub fn stop(self, _wan: &mut HostIf) {
+        crate::net::local::unbind(crate::net::datapath::WAN, pd::CLIENT_PORT);
         *STATE.lock() = None;
     }
 
@@ -162,14 +154,16 @@ impl Wan6 {
             self.rs_sent += 1;
             self.next_rs = now + RS_INTERVAL_MS;
         }
-        // DHCPv6.
-        let mut buf = [0u8; 1500];
-        while let Ok((n, _)) = wan.sockets.get_mut::<udp::Socket>(self.sock).recv_slice(&mut buf) {
-            self.pd.handle(now, &buf[..n]);
+        // DHCPv6, from the link-local address to All_DHCP_Relay_Agents_and_Servers.
+        use crate::net::local;
+        while let Some(d) = local::recv(crate::net::datapath::WAN, pd::CLIENT_PORT) {
+            if d.ends.sport() == pd::SERVER_PORT && matches!(d.ends, local::Ends::V6(_)) {
+                self.pd.handle(now, &d.payload);
+            }
         }
         while let Some(m) = self.pd.poll(now) {
-            let ep = IpEndpoint::new(pd::SERVERS.into(), pd::SERVER_PORT);
-            let _ = wan.sockets.get_mut::<udp::Socket>(self.sock).send_slice(&m, ep);
+            let e = local::Ends::V6(fwd::udp::Ends6 { src: self.ll, dst: pd::SERVERS, sport: pd::CLIENT_PORT, dport: pd::SERVER_PORT });
+            local::send(sh, crate::net::datapath::WAN, &e, fwd::udp::TTL, &m);
         }
         while let Some(e) = self.pd.poll_event() {
             match e {

@@ -19,8 +19,10 @@ events out), host-tested with `cargo test`. Fuzz targets in `fuzz/` (fuzz/README
   unicast NS answered) and conflicts (another MAC claiming or probing for our address); RFC 4861
   §7.1.1 checks; `Config` switches for the lab's negative controls (`nd_unicast=0`,
   `na_router=0`). Tests parse every reply with smoltcp.
-- `udp`: the router's own IPv4 UDP datagrams, `build4` / `parse4` (all lengths and both checksums;
-  the kernel's `net::local`, docs/local-stack.md step 2b); tested against smoltcp's parser.
+- `udp`: the router's own UDP datagrams, `build4` (with a TTL) / `parse4`, `build6` / `parse6`
+  (all lengths and the checksums, extension headers skipped, fragments refused; the kernel's
+  `net::local`, docs/local-stack.md steps 2b–3); tested against smoltcp's parser.
+- `local::LocalLink::source4` / `source6`: the router's source address (an RFC 6724 subset).
 - `local`: the next hop of the router's own packets on a link without a link layer
   (docs/lan-neighbors.md step 2): `LocalLink::next_hop` = a fixed MAC (broadcast, directed
   broadcast, IPv4 / IPv6 multicast mapping) or a neighbor (on the link, or a `[[route]]`'s

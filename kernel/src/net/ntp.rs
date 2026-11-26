@@ -12,7 +12,6 @@
 //!   `shared::CLIENT_PORTS`; DNS upstream queries use 61000–65535).
 //! - Starts once the WAN has a lease (DNS upstreams known).
 
-use crate::net::svc::HostIf;
 use crate::{config, println, timer, wallclock};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -20,9 +19,6 @@ use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use proto_dns::wire;
 use proto_sntp::packet::{LEN, PORT};
 use proto_sntp::{Client, Sample};
-use smoltcp::iface::{SocketHandle, SocketSet};
-use smoltcp::socket::udp;
-use smoltcp::wire::IpEndpoint;
 
 /// The "client" address our own DNS lookups carry inside the resolver.
 pub const SELF_CLIENT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
@@ -44,7 +40,8 @@ struct Server {
 pub struct Ntp {
     servers: Vec<Server>,
     client: Client<IpAddr>,
-    sock: SocketHandle,
+    /// The client port on the WAN (`net::local`, `CLIENT_PORTS`).
+    port: u16,
     wan_up: bool,
     next_id: u16,
     synced_once: bool,
@@ -75,13 +72,11 @@ fn servers_from_config() -> Vec<Server> {
 }
 
 impl Ntp {
-    pub fn new(wan: &mut HostIf) -> Self {
-        let rx = udp::PacketBuffer::new(vec_meta(4), alloc::vec![0; 4 * 64]);
-        let tx = udp::PacketBuffer::new(vec_meta(4), alloc::vec![0; 4 * 64]);
-        let mut s = udp::Socket::new(rx, tx);
-        // 60000–60999: router-local, apart from the DNS upstream ports.
+    pub fn new() -> Self {
+        // 60000–60999: router-local, apart from the DNS upstream ports;
+        // on the WAN through the router's own UDP (`net::local`).
         let port = 60_000 + (crate::entropy::u64() % 1_000) as u16;
-        s.bind(port).expect("bind ntp port");
+        crate::net::local::bind(crate::net::datapath::WAN, port);
         crate::net::shared::CLIENT_PORTS.open(port);
         let servers = servers_from_config();
         if servers.is_empty() {
@@ -90,7 +85,7 @@ impl Ntp {
         Ntp {
             servers,
             client: Client::new(crate::entropy::u64()),
-            sock: wan.sockets.add(s),
+            port,
             wan_up: false,
             next_id: (timer::ticks() as u16) | 1,
             synced_once: false,
@@ -172,22 +167,31 @@ impl Ntp {
     }
 
     /// Receive replies, send due requests, apply new estimates.
-    pub fn step(&mut self, wan: &mut SocketSet<'static>) {
+    pub fn step(&mut self, sh: &crate::net::shared::Shared) {
+        use crate::net::datapath::WAN;
+        use crate::net::local::{self, Ends};
         if !self.wan_up {
             return;
         }
         let addrs: Vec<IpAddr> = self.servers.iter().filter_map(|s| s.addr).collect();
         self.client.set_servers(&addrs);
-        let sock = wan.get_mut::<udp::Socket>(self.sock);
-        let mut buf = [0u8; 128];
-        while let Ok((n, meta)) = sock.recv_slice(&mut buf) {
-            if meta.endpoint.port == PORT {
-                self.client.handle(IpAddr::from(meta.endpoint.addr), &buf[..n], now_ns());
+        while let Some(d) = local::recv(WAN, self.port) {
+            let from = match d.ends {
+                Ends::V4(e) => IpAddr::V4(e.src),
+                Ends::V6(e) => IpAddr::V6(e.src),
+            };
+            if d.ends.sport() == PORT {
+                self.client.handle(from, &d.payload, now_ns());
             }
         }
         while let Some(req) = self.client.poll(now_ns()) {
-            let ep = IpEndpoint::new(req.server.into(), PORT);
-            let _ = sock.send_slice(&req.data[..LEN], ep);
+            // From the WAN's address toward the server (none: not yet).
+            let e = match (local::source(WAN, req.server), req.server) {
+                (Some(IpAddr::V4(src)), IpAddr::V4(dst)) => Ends::V4(fwd::udp::Ends { src, dst, sport: self.port, dport: PORT }),
+                (Some(IpAddr::V6(src)), IpAddr::V6(dst)) => Ends::V6(fwd::udp::Ends6 { src, dst, sport: self.port, dport: PORT }),
+                _ => continue,
+            };
+            local::send(sh, WAN, &e, fwd::udp::TTL, &req.data[..LEN]);
         }
         if let Some(s) = self.client.take_update() {
             let step = wallclock::now().map(|t| t.0 - s.offset - now_ns() as i64);
@@ -237,6 +241,3 @@ impl Ntp {
     }
 }
 
-fn vec_meta(n: usize) -> Vec<udp::PacketMetadata> {
-    alloc::vec![udp::PacketMetadata::EMPTY; n]
-}

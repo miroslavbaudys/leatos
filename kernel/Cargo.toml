@@ -50,7 +50,8 @@ safe-mmio = "0.4"
 smoltcp = { version = "0.14", default-features = false, features = [
     # IP only on every link: the datapath does ARP / ND (docs/local-stack.md).
     "alloc", "medium-ip", "proto-ipv4", "proto-ipv6",
-    "socket-icmp", "socket-udp", "socket-tcp",
+    # UDP is the router's own (net::local, docs/local-stack.md step 3).
+    "socket-icmp", "socket-tcp",
     "auto-icmp-echo-reply", # the router answers pings on its own addresses
     "multicast",            # 224.0.0.251 for the mDNS reflector (net::mdns)
     "iface-max-route-count-32", # `[[route]]`s (at most 16) + the default route
