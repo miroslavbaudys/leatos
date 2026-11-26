@@ -1460,7 +1460,8 @@ fn status_json(
                 "{}{{\"network\":{},\"mac\":{},\"ip\":{},\"ipv6\":[{}],\"hostname\":{},\"bound\":{},\"expires_in_s\":{}}}",
                 if n > 0 { "," } else { "" },
                 json_str(net),
-                json_str(&format!("{}", smoltcp::wire::EthernetAddress(l.mac))),
+                // aa:bb:… like the config's reservations (the page compares them).
+                json_str(&format!("{}", config::schema::Mac(l.mac))),
                 json_str(&format!("{}", l.ip)),
                 ipv6.join(","),
                 l.hostname

@@ -597,7 +597,7 @@ fn leases(ctx: &Ctx) {
         println!(
             "{:<15} {}  {:<20} {} {}",
             l.ip,
-            smoltcp::wire::EthernetAddress(l.mac),
+            schema::Mac(l.mac),
             l.hostname.as_deref().unwrap_or("-"),
             if l.state == proto_dhcp::v4::server::LeaseState::Bound { "bound, expires in" } else { "offered, expires in" },
             dur(l.expires.saturating_sub(now))

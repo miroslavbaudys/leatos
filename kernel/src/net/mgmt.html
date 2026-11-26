@@ -1010,7 +1010,9 @@ async function refresh() {
 function showLeases() {
   if (!st) return;
   const q = $("clientq").value.trim().toLowerCase();
-  const reserved = new Set([...readStatics(), ...(readNets() ?? []).flatMap((x) => x.dhcp?.static ?? [])].map((s) => (s.mac ?? "").toLowerCase()));
+  // MACs compared without separators or case (aa:bb:… and AA-BB-… alike).
+  const macKey = (m) => (m ?? "").toLowerCase().replace(/[^0-9a-f]/g, "");
+  const reserved = new Set([...readStatics(), ...(readNets() ?? []).flatMap((x) => x.dhcp?.static ?? [])].map((s) => macKey(s.mac)));
   const ls = st.dhcp_leases.filter((d) => !q || [d.hostname, d.ip, d.mac, ...(d.ipv6 ?? [])].some((v) => (v ?? "").toLowerCase().includes(q)));
   // IPv6: the addresses the device's MAC was seen at in neighbor
   // discovery (global first, then unique local "ULA"; the last 30 min).
@@ -1018,7 +1020,7 @@ function showLeases() {
   $("leases").innerHTML = st.dhcp_leases.length
     ? "<tr><th>Name</th><th>IP address</th><th>Network</th><th>MAC</th><th>State</th><th>Expires in</th><th></th></tr>" + ls.map((d) =>
         `<tr><td>${esc(d.hostname ?? "–")}</td><td>${esc(d.ip)}${v6(d)}</td><td>${esc(d.network ?? "")}</td><td>${esc(d.mac)}</td><td>${d.bound ? "bound" : "offered"}</td><td>${dur(d.expires_in_s)}</td>` +
-        `<td>${reserved.has(d.mac.toLowerCase()) ? '<span class="pill">reserved</span>' : `<button class="plain" data-reserve="${esc(d.mac)}">Reserve</button>`}</td></tr>`).join("")
+        `<td>${reserved.has(macKey(d.mac)) ? '<span class="pill">reserved</span>' : `<button class="plain" data-reserve="${esc(d.mac)}">Reserve</button>`}</td></tr>`).join("")
     : rows([["Leases", "none"]]);
 }
 $("clientq").oninput = showLeases;
