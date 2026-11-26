@@ -1,0 +1,12 @@
+#!/usr/bin/busybox sh
+# DHCP lab helper (scripts/lab-test.sh LAB_WAN_LEASE_STOP=1, the negative
+# control of the renewal check): ?stop ends the ISP's DHCP server, so the
+# router can neither renew nor rebind and loses its lease.
+bb=/usr/bin/busybox
+echo "Content-Type: text/plain"
+echo
+case "$QUERY_STRING" in
+  # An applet of busybox-extras: its name is in the command line only.
+  stop) $bb pkill -f 'busybox-extras udhcpd' >/dev/null 2>&1 && echo "stop=OK" || echo "stop=FAIL" ;;
+  *) echo "unknown" ;;
+esac

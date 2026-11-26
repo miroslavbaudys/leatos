@@ -253,7 +253,9 @@ pub fn bring_up(
             link.set_ip_only(ip_only);
             let iface = new_iface(&port, ip_only);
             let mut sockets = SocketSet::new(Vec::new());
-            if crate::config::wan_link() == crate::config::WanLink::Dhcp {
+            // smoltcp's DHCP client only on an Ethernet WAN (`wan_medium=eth`);
+            // an IP-only one runs `net::wan4` (it panics on `Medium::Ip`).
+            if crate::config::wan_link() == crate::config::WanLink::Dhcp && !ip_only {
                 sockets.add(dhcpv4::Socket::new());
             }
             hosts.push(HostIf { iface, sockets, nd: Default::default(), mac: port.mac, ip_only });
@@ -417,6 +419,7 @@ pub fn new_iface(port: &PortShared, ip_only: bool) -> Interface {
         nd: None,
         dp: None,
         ip_only,
+        udp: None,
     };
     Interface::new(config, &mut device, now())
 }

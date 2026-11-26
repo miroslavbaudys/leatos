@@ -7,6 +7,7 @@
 //! - [`neigh`]: ARP cache with a tiny bounded pending queue
 //! - [`nd`]: ARP / ND answers for the router's own addresses
 //! - [`local`]: the next hop of the router's own packets on a link
+//! - [`udp`]: the router's own UDP datagrams, built and parsed
 //! - [`conntrack`]: connections, NAPT with endpoint-independent mapping
 //! - [`forwarder`]: the per-packet pipeline → [`forwarder::Verdict`]
 //! - [`frag`]: IP fragments forwarded through NAT without reassembly
@@ -27,6 +28,7 @@ pub mod local;
 pub mod nd;
 pub mod neigh;
 pub mod route;
+pub mod udp;
 pub mod wire;
 
 /// Interface index, as assigned by [`forwarder::Forwarder::add_interface`].

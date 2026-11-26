@@ -70,6 +70,11 @@ A client VM, the router and an ISP VM (Alpine; overlays in `lab/client/`, `lab/i
   datapath (`wan_nd` medium `ip`, `arp_replies` rising). Negative controls
   `LAB_ROUTER_ARGS=wan_mode=dhcp`, `LAB_ROUTER_ARGS=wan_medium=eth` (smoltcp answers).
 - Every IPv4 run without PPPoE: `wan arp`, the ISP's ARP for the router's WAN address answered.
+  On a DHCP WAN also `dhcp wan ip-only` (docs/local-stack.md step 2b): medium `ip` and the
+  router's own DHCP client bound (`wan_dhcp`); negative control `LAB_ROUTER_ARGS=wan_medium=eth`.
+- `LAB_WAN_LEASE=N`: the ISP's leases last N s; the router must renew during the run (a third
+  reply taken) and never lose the lease. Negative control `LAB_WAN_LEASE_STOP=1` (the ISP's DHCP
+  server stopped first: lease lost).
 - `LAB_PPPOE=pap|chap|none`: the ISP is rp-pppoe `pppoe-server` only (user mode). `none` = no
   authentication and no router user name (negative control `LAB_PPPOE=pap LAB_PPPOE_ANON=1`).
   - All checks run through the session, plus a reconnect after the ISP ends it.

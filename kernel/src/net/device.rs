@@ -272,6 +272,9 @@ pub struct PortDevice<'a> {
     /// RX strips the Ethernet header and passes IP only, TX goes through
     /// [`crate::net::datapath::Datapath::send_local`], no neighbor hints.
     pub ip_only: bool,
+    /// The router's own UDP ports (`net::local`): on an IP-only link,
+    /// datagrams to a bound port go there, not to smoltcp.
+    pub udp: Option<&'a mut crate::net::local::Udp>,
 }
 
 /// smoltcp (0.14) learns IPv6 neighbors only from neighbor discovery and
@@ -456,11 +459,17 @@ impl Device for PortDevice<'_> {
         let mut pkt = self.link.local_rx.lock().pop_front()?;
         if self.ip_only {
             // IP only: the datapath answered ARP / ND itself; anything not
-            // IP is not for a `Medium::Ip` stack.
-            while !matches!(
-                fwd::wire::ethertype(pkt.data()),
-                Some(fwd::wire::ETHERTYPE_IPV4 | fwd::wire::ETHERTYPE_IPV6)
-            ) {
+            // IP is not for a `Medium::Ip` stack. The router's own UDP
+            // ports (`net::local`) take theirs first.
+            loop {
+                let ip = matches!(
+                    fwd::wire::ethertype(pkt.data()),
+                    Some(fwd::wire::ETHERTYPE_IPV4 | fwd::wire::ETHERTYPE_IPV6)
+                );
+                let taken = ip && self.udp.as_deref_mut().is_some_and(|u| u.take(self.ifx, pkt.data()));
+                if ip && !taken {
+                    break;
+                }
                 pkt = self.link.local_rx.lock().pop_front()?;
             }
         }

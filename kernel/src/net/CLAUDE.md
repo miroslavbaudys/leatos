@@ -42,18 +42,26 @@ smoltcp `Device` behind the datapath: RX from `local_rx`, TX into the qdisc.
 
 - **LAN links are IP-only** (docs/lan-neighbors.md step 3; `lan_medium=eth` = the old path below):
   smoltcp on `Medium::Ip` (`HostIf::ip_only` = `LinkShared::ip_only`; never call `hardware_addr` /
-  `set_hardware_addr` on one, smoltcp panics; the MAC is `HostIf::mac`). RX passes the IP packet only; TX goes through
-  `Datapath::send_local` (next hop by `fwd::local`, the datapath's neighbor table). The datapath
-  answers ARP / NS for the router's LAN addresses (`Datapath::link_layer`, `fwd::nd`; counters
-  `/api/status` `lan_nd`, switches `nd_unicast=0`, `na_router=0`) and keeps those frames from
-  smoltcp. The per-link addresses and routes come from `stack::local_links`, the one source for
-  both smoltcp's interfaces and the datapath (`set_local_links` after every `set_host_addrs`).
-- **A static WAN is IP-only too** (docs/local-stack.md step 2a; `wan_medium=eth` = the old path):
-  the same RX / TX path, the datapath answers ARP / NS for the WAN address and resolves the
-  gateway. Its view (`stack::set_wan_local_link`) is read back from smoltcp's WAN interface after
-  every lease or address change (`svc::publish_wan`, `reapply_networks`); `restart_wan` switches
-  the medium live. Counters `/api/status` `wan_nd` (`medium` ip / eth / ppp).
-- The DHCP WAN (Ethernet until step 2b) keeps smoltcp's ND and the hints below.
+  `set_hardware_addr` on one, smoltcp panics; the MAC is `HostIf::mac`). RX passes the IP packet
+  only; TX goes through `Datapath::send_local` (next hop by `fwd::local`, the datapath's neighbor
+  table). The datapath answers ARP / NS for the router's LAN addresses (`Datapath::link_layer`,
+  `fwd::nd`; counters `/api/status` `lan_nd`, switches `nd_unicast=0`, `na_router=0`) and keeps
+  those frames from smoltcp. The per-link addresses and routes come from `stack::local_links`, the
+  one source for both smoltcp's interfaces and the datapath (`set_local_links` after every
+  `set_host_addrs`).
+- **The WAN is IP-only too** on DHCP and static (docs/local-stack.md step 2; `wan_medium=eth` =
+  the old path): the same RX / TX path, the datapath answers ARP / NS for the WAN address and
+  resolves the gateway. Its view (`stack::set_wan_local_link`) is read back from smoltcp's WAN
+  interface after every lease or address change (`svc::publish_wan`, `reapply_networks`);
+  `restart_wan` switches the medium live. Counters `/api/status` `wan_nd` (`medium` ip / eth /
+  ppp).
+- `local.rs`: the router's own UDP without smoltcp (step 2b, more in step 3): `Udp` port table per
+  link (the device offers it every frame on an IP-only link first; bounded queue per port),
+  `send4` through `Datapath::send_local`; headers by `fwd::udp`.
+- `wan4.rs`: the WAN's DHCPv4 client (`proto_dhcp::v4::client`) on port 68 over `local`, events
+  into `svc::lease_bound` / `lease_lost` (shared with smoltcp's socket on `wan_medium=eth`);
+  `/api/status` `wan_dhcp`.
+- `wan_medium=eth` keeps smoltcp's ND, its DHCP socket and the hints below on the WAN.
 - IPv6: notes RS (`LinkShared::rs_seen`) and helps smoltcp 0.14's ND: `NdHints` feed it a
   solicitation from each client (`fwd::wire::ipv6_neighbor_hint`), unicast NS go to the
   solicited-node group (`ipv6_ns_to_solicited`: not needed, smoltcp answers them); docs/ipv6.md §2.
@@ -66,7 +74,8 @@ smoltcp `Device` behind the datapath: RX from `local_rx`, TX into the qdisc.
 
 ## Services task: `svc.rs`
 
-`svc`, `Priority::Service`: smoltcp, the WAN DHCP client (smoltcp's `dhcpv4` socket) or PPPoE, LAN
+`svc`, `Priority::Service`: smoltcp, the WAN DHCP client (`net::wan4`; smoltcp's `dhcpv4` socket
+with `wan_medium=eth`) or PPPoE, LAN
 services, mgmt. A saved WAN change restarts the WAN live, DHCP ⇄ PPPoE included; static WAN via
 `configure_static`. `LeaseStore`: see kernel/CLAUDE.md (store).
 

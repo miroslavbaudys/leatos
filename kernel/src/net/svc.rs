@@ -168,61 +168,92 @@ fn handle_dhcp(name: &str, host: &mut HostIf, pinger: &mut Pinger) -> Option<Lea
         .sockets
         .iter()
         .find(|(_, s)| matches!(s, smoltcp::socket::Socket::Dhcpv4(_)))?;
-    let event = host.sockets.get_mut::<dhcpv4::Socket>(handle).poll();
-    match event {
-        Some(dhcpv4::Event::Configured(cfg)) => {
-            host.iface.update_ip_addrs(|a| {
-                a.retain(|c| !matches!(c, IpCidr::Ipv4(_))); // IPv6 stays
-                a.push(IpCidr::Ipv4(cfg.address)).expect("wan addr");
-            });
-            match cfg.router {
-                Some(gw) => {
-                    host.iface
-                        .routes_mut()
-                        .add_default_ipv4_route(gw)
-                        .expect("route");
-                }
-                None => {
-                    host.iface.routes_mut().remove_default_ipv4_route();
-                }
-            }
-            let dns: Vec<_> = cfg
-                .dns_servers
-                .iter()
-                .map(|d| alloc::format!("{d}"))
-                .collect();
-            println!(
-                "  net {}         : dhcp lease {} gw {} dns [{}]",
-                name,
-                cfg.address,
-                cfg.router
-                    .map(|r| alloc::format!("{r}"))
-                    .unwrap_or_else(|| "-".into()),
-                dns.join(", ")
-            );
-            warn_overlap(cfg.address);
-            DHCP_OK.store(true, Ordering::Release);
-            pinger.retarget(cfg.router);
-            Some(LeaseChange {
-                addr: Some((cfg.address.address(), cfg.address.prefix_len())),
-                gateway: cfg.router,
-                dns: cfg.dns_servers.iter().copied().collect(),
-                mtu: fwd::forwarder::DEFAULT_MTU,
-                via: None,
-            })
-        }
-        Some(dhcpv4::Event::Deconfigured) => {
-            if DHCP_OK.load(Ordering::Acquire) {
-                println!("  net {}         : dhcp lease lost", name);
-            }
-            host.iface.update_ip_addrs(|a| a.retain(|c| !matches!(c, IpCidr::Ipv4(_))));
-            host.iface.routes_mut().remove_default_ipv4_route();
-            DHCP_OK.store(false, Ordering::Release);
-            pinger.retarget(None);
-            Some(LeaseChange::lost())
-        }
+    // Owned first: the event borrows the socket.
+    let event = match host.sockets.get_mut::<dhcpv4::Socket>(handle).poll() {
+        Some(dhcpv4::Event::Configured(cfg)) => Some(Some((cfg.address, cfg.router, cfg.dns_servers.iter().copied().collect::<Vec<_>>()))),
+        Some(dhcpv4::Event::Deconfigured) => Some(None),
         None => None,
+    };
+    match event? {
+        Some((address, router, dns)) => Some(lease_bound(name, host, pinger, address, router, dns)),
+        None => Some(lease_lost(name, host, pinger)),
     }
+}
+
+/// The WAN's DHCP client on an IP-only WAN (`net::wan4`): its events
+/// applied in order; the last change (`None`: nothing happened).
+fn handle_wan4(name: &str, host: &mut HostIf, pinger: &mut Pinger, events: Vec<proto_dhcp::v4::client::Event>) -> Option<LeaseChange> {
+    use proto_dhcp::v4::client::Event;
+    let mut change = None;
+    for e in events {
+        change = Some(match e {
+            Event::Bound(l) => {
+                let cidr = smoltcp::wire::Ipv4Cidr::new(l.address, l.prefix_len);
+                lease_bound(name, host, pinger, cidr, l.router, l.dns)
+            }
+            Event::Lost => lease_lost(name, host, pinger),
+        });
+    }
+    change
+}
+
+/// A DHCP lease (either client): the address and default route on the
+/// router stack's WAN interface, logged, the gateway pinger aimed.
+fn lease_bound(
+    name: &str,
+    host: &mut HostIf,
+    pinger: &mut Pinger,
+    address: smoltcp::wire::Ipv4Cidr,
+    router: Option<Ipv4Address>,
+    dns_servers: Vec<Ipv4Address>,
+) -> LeaseChange {
+    host.iface.update_ip_addrs(|a| {
+        a.retain(|c| !matches!(c, IpCidr::Ipv4(_))); // IPv6 stays
+        a.push(IpCidr::Ipv4(address)).expect("wan addr");
+    });
+    match router {
+        Some(gw) => {
+            host.iface
+                .routes_mut()
+                .add_default_ipv4_route(gw)
+                .expect("route");
+        }
+        None => {
+            host.iface.routes_mut().remove_default_ipv4_route();
+        }
+    }
+    let dns: Vec<_> = dns_servers.iter().map(|d| alloc::format!("{d}")).collect();
+    println!(
+        "  net {}         : dhcp lease {} gw {} dns [{}]",
+        name,
+        address,
+        router
+            .map(|r| alloc::format!("{r}"))
+            .unwrap_or_else(|| "-".into()),
+        dns.join(", ")
+    );
+    warn_overlap(address);
+    DHCP_OK.store(true, Ordering::Release);
+    pinger.retarget(router);
+    LeaseChange {
+        addr: Some((address.address(), address.prefix_len())),
+        gateway: router,
+        dns: dns_servers,
+        mtu: fwd::forwarder::DEFAULT_MTU,
+        via: None,
+    }
+}
+
+/// The DHCP lease is gone (either client).
+fn lease_lost(name: &str, host: &mut HostIf, pinger: &mut Pinger) -> LeaseChange {
+    if DHCP_OK.load(Ordering::Acquire) {
+        println!("  net {}         : dhcp lease lost", name);
+    }
+    host.iface.update_ip_addrs(|a| a.retain(|c| !matches!(c, IpCidr::Ipv4(_))));
+    host.iface.routes_mut().remove_default_ipv4_route();
+    DHCP_OK.store(false, Ordering::Release);
+    pinger.retarget(None);
+    LeaseChange::lost()
 }
 
 /// A WAN address inside one of the networks breaks forwarding between them.
@@ -324,6 +355,10 @@ fn dhcp_socket(host: &HostIf) -> Option<SocketHandle> {
         .map(|(h, _)| h)
 }
 
+/// The WAN's clients a mode change starts and stops: PPPoE, the gateway
+/// pinger, the DHCP client on an IP-only WAN and its UDP ports.
+type WanClients<'a> = (&'a mut Option<Pppoe>, &'a mut Pinger, &'a mut Option<crate::net::wan4::Wan4>, &'a mut crate::net::local::Udp);
+
 /// Restart the WAN on new link settings: end a PPPoE session, switch the
 /// port and its router-stack interface between Ethernet (DHCP, static)
 /// and PPPoE (IP only), and start what `new` needs: the DHCP client, the
@@ -333,8 +368,7 @@ fn dhcp_socket(host: &HostIf) -> Option<SocketHandle> {
 fn restart_wan(
     sh: &Shared,
     wan: &mut HostIf,
-    pppoe: &mut Option<Pppoe>,
-    pinger: &mut Pinger,
+    (pppoe, pinger, wan4, udp): WanClients<'_>,
     new: crate::config::WanLink,
 ) -> Option<LeaseChange> {
     use crate::config::WanLink;
@@ -345,15 +379,20 @@ fn restart_wan(
         sh.tx_kick[0].signal();
     }
     let dhcp = new == WanLink::Dhcp;
-    if dhcp && !port.is_pppoe()
-        && let Some(h) = dhcp_socket(wan)
-    {
-        // The lease belongs to the old link: ask again on the new one.
-        wan.sockets.get_mut::<dhcpv4::Socket>(h).reset();
-        return None;
+    let ip_only = crate::config::wan_ip_only(&new);
+    // The lease belongs to the old link: ask again on the new one (the
+    // client's Lost / Deconfigured reports the address gone).
+    if dhcp && !port.is_pppoe() && wan.ip_only == ip_only {
+        if let Some(h) = dhcp_socket(wan) {
+            wan.sockets.get_mut::<dhcpv4::Socket>(h).reset();
+            return None;
+        }
+        if let Some(w) = wan4.as_mut() {
+            w.reset(now_ms());
+            return None;
+        }
     }
     let want_pppoe = matches!(new, WanLink::Pppoe(_));
-    let ip_only = crate::config::wan_ip_only(&new);
     if port.is_pppoe() != want_pppoe || wan.ip_only != ip_only {
         port.pppoe_mode.store(want_pppoe, Ordering::Relaxed);
         let mtu = match &new {
@@ -367,14 +406,24 @@ fn restart_wan(
         sh.links[0].set_ip_only(ip_only);
         wan.iface = stack::new_iface(port, ip_only);
     }
-    // The DHCP client runs only in DHCP mode.
-    match (dhcp, dhcp_socket(wan)) {
+    // A DHCP client only in DHCP mode: smoltcp's on Ethernet, ours
+    // (`net::wan4`) on an IP-only WAN.
+    match (dhcp && !ip_only, dhcp_socket(wan)) {
         (false, Some(h)) => {
             wan.sockets.remove(h);
         }
         (true, None) => {
             wan.sockets.add(dhcpv4::Socket::new());
         }
+        _ => {}
+    }
+    match (dhcp && ip_only, wan4.is_some()) {
+        (false, true) => {
+            if let Some(w) = wan4.take() {
+                w.stop(udp);
+            }
+        }
+        (true, false) => *wan4 = Some(crate::net::wan4::Wan4::new(port.mac, udp, now_ms())),
         _ => {}
     }
     wan.iface.update_ip_addrs(|a| a.retain(|c| !matches!(c, IpCidr::Ipv4(_))));
@@ -396,7 +445,7 @@ fn apply_saved(
     (cfg, source): (crate::config::schema::Config, String),
     sh: &Shared,
     hosts: &mut [HostIf],
-    (pppoe, pinger): (&mut Option<Pppoe>, &mut Pinger),
+    clients: WanClients<'_>,
     services: Option<&mut LanServices>,
     mgmt: &mut Mgmt,
     slots: &mut Vec<Option<String>>,
@@ -419,7 +468,7 @@ fn apply_saved(
             tag.map_or(String::from("untagged"), stack::vlan_text),
             new_link.name()
         );
-        change = restart_wan(sh, &mut hosts[0], pppoe, pinger, new_link);
+        change = restart_wan(sh, &mut hosts[0], clients, new_link);
     }
     // Also picks up the WAN tag's 4 bytes and PPPoE's 8 of shaper overhead.
     stack::apply_qos(sh, &old, &crate::config::qos());
@@ -522,7 +571,7 @@ fn publish_wan(
 
 /// Poll every router-stack interface (one per link); wake the TX task of
 /// each port that got frames in its qdisc.
-fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
+fn poll_stacks(hosts: &mut [HostIf], sh: &Shared, udp: &mut crate::net::local::Udp) {
     let t = stack::now();
     let now_ns = datapath::now_ns();
     let dp = stack::datapath();
@@ -540,6 +589,7 @@ fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
             nd: Some(&mut host.nd),
             dp,
             ip_only,
+            udp: Some(&mut *udp),
         };
         host.iface.poll(t, &mut dev, &mut host.sockets);
         if queued > 0 {
@@ -716,10 +766,21 @@ pub async fn run(
     let mut mgmt = Mgmt::new(&mut hosts, &links, store.is_some());
     let mut cli = Cli::new(store.is_some());
     let mut pppoe = crate::config::pppoe().map(|c| Pppoe::new(c, &sh.ports[0]));
+    // The router's own UDP ports (`net::local`) and, on an IP-only DHCP
+    // WAN, its DHCP client over them (docs/local-stack.md step 2b).
+    let mut udp = crate::net::local::Udp::default();
+    let mut wan4 = (crate::config::wan_link() == crate::config::WanLink::Dhcp && hosts[0].ip_only)
+        .then(|| crate::net::wan4::Wan4::new(sh.ports[0].mac, &mut udp, now_ms()));
     // The WAN's IPv6 by prefix delegation (docs/ipv6.md step 3).
     let mut wan6 = crate::net::wan6::Wan6::new(&mut hosts[0], sh, now_ms());
     // PPPoE: IPv6CP's state the loop last acted on (step 4).
     let mut ppp6 = crate::net::wan6::ppp_link();
+    // The datapath's view of an IP-only WAN from the start: its link-local
+    // address is answered before any lease (prefix delegation runs from
+    // it at once).
+    if let Some(dp) = stack::datapath() {
+        stack::set_wan_local_link(dp, &mut hosts[0]);
+    }
     if let crate::config::WanLink::Static(s) = crate::config::wan_link() {
         let c = configure_static(sh.ports[0].name, &mut hosts[0], &mut pinger, &s);
         publish_wan(&c, &mut hosts[0], sh, &mut mgmt, &mut cli, services.as_mut());
@@ -734,7 +795,7 @@ pub async fn run(
         if let Some(rx) = rx {
             rx.take();
         }
-        poll_stacks(&mut hosts, sh);
+        poll_stacks(&mut hosts, sh, &mut udp);
         let change = match pppoe.as_mut() {
             Some(p) => {
                 let (change, queued) = p.step(&sh.ports[0], &mut hosts[0]);
@@ -755,7 +816,13 @@ pub async fn run(
             }
             None => {
                 mgmt.set_wan_pppoe(None);
-                handle_dhcp(sh.ports[0].name, &mut hosts[0], &mut pinger)
+                match wan4.as_mut() {
+                    Some(w) => {
+                        let events = w.step(&mut udp, sh, now_ms());
+                        handle_wan4(sh.ports[0].name, &mut hosts[0], &mut pinger, events)
+                    }
+                    None => handle_dhcp(sh.ports[0].name, &mut hosts[0], &mut pinger),
+                }
             }
         };
         if let Some(change) = change {
@@ -802,7 +869,7 @@ pub async fn run(
                 let cfg = (**cfg).clone();
                 let svc = services.as_mut();
                 let wan6_before = wan6_key();
-                if let Some(c) = apply_saved((cfg, source.clone()), sh, &mut hosts, (&mut pppoe, &mut pinger), svc, &mut mgmt, &mut slots) {
+                if let Some(c) = apply_saved((cfg, source.clone()), sh, &mut hosts, (&mut pppoe, &mut pinger, &mut wan4, &mut udp), svc, &mut mgmt, &mut slots) {
                     publish_wan(&c, &mut hosts[0], sh, &mut mgmt, &mut cli, services.as_mut());
                 }
                 if wan6_follow(&mut wan6, &wan6_before, &mut hosts[0], sh) {
@@ -850,7 +917,7 @@ pub async fn run(
                             } else if let Some(source) = source {
                                 let svc = services.as_mut();
                                 let wan6_before = wan6_key();
-                                if let Some(c) = apply_saved((*cfg, source), sh, &mut hosts, (&mut pppoe, &mut pinger), svc, &mut mgmt, &mut slots) {
+                                if let Some(c) = apply_saved((*cfg, source), sh, &mut hosts, (&mut pppoe, &mut pinger, &mut wan4, &mut udp), svc, &mut mgmt, &mut slots) {
                                     publish_wan(&c, &mut hosts[0], sh, &mut mgmt, &mut cli, services.as_mut());
                                 }
                                 if wan6_follow(&mut wan6, &wan6_before, &mut hosts[0], sh) {
@@ -876,11 +943,11 @@ pub async fn run(
                 timer::sleep(Duration::from_secs(3600)).await;
             }
         }
-        poll_stacks(&mut hosts, sh);
+        poll_stacks(&mut hosts, sh, &mut udp);
 
         // More frames arrived while we worked: go round again, after
         // letting the datapath run.
-        if cli.more() || sh.links.iter().any(|l| !l.local_rx.lock().is_empty()) {
+        if cli.more() || udp.pending() || sh.links.iter().any(|l| !l.local_rx.lock().is_empty()) {
             crate::executor::yield_now().await;
             continue;
         }
@@ -904,6 +971,9 @@ pub async fn run(
             delay = delay.min(at.saturating_duration_since(timer::Instant::now()));
         }
         if let Some(w) = &wan6 {
+            delay = delay.min(Duration::from_millis(w.next_deadline().saturating_sub(now_ms())));
+        }
+        if let Some(w) = &wan4 {
             delay = delay.min(Duration::from_millis(w.next_deadline().saturating_sub(now_ms())));
         }
         if let Some(at) = pppoe.as_ref().and_then(Pppoe::wake_at) {

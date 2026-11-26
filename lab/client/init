@@ -1110,7 +1110,7 @@ if [ -n "$v6on" ]; then
       ndp=/proc/sys/net/ipv6/neigh/eth0
       rt0=$($bb cat $ndp/base_reachable_time_ms); dp0=$($bb cat $ndp/delay_first_probe_time)
       resf() { $bb awk 'NR > 1 { s += ("0x" $7) + 0 } END { print s + 0 }' /proc/net/stat/ndisc_cache; }
-      nas() { v6st | $bb grep -o '"na_sent":[0-9]*' | $bb cut -d: -f2; }
+      nas() { v6st | $bb grep -o '"lan_nd":{[^}]*}' | $bb grep -o '"na_sent":[0-9]*' | $bb cut -d: -f2; }
       echo 2000 >$ndp/base_reachable_time_ms; echo 1 >$ndp/delay_first_probe_time
       f0=$(resf); n0=$(nas)
       $bb ping6 -c 75 -i 0.2 -W 1 "$ISP6" >/tmp/ndp 2>&1
@@ -1786,6 +1786,33 @@ if [ "$v6mode" = pd ] && $bb grep -q 'lab_pd_keep=1' /proc/cmdline; then
   else
     fail "ipv6 pd: prefix after the reboot '${after:-none}', before '$before' ($fr)"
   fi
+fi
+
+# --- WAN DHCP client (docs/local-stack.md step 2b) ---------------------------
+# The router's own DHCPv4 client (/api/status wan_dhcp; null with
+# wan_medium=eth or PPPoE / static), reported for scripts/lab-test.sh. With
+# a short lease (LAB_WAN_LEASE=N, lab_wan_lease=N) wait up to 100 s for a
+# renewal (a third reply taken: OFFER, ACK, then the renewal's ACK);
+# lab_wan_lease_stop=1 ends the ISP's DHCP server and waits past the
+# lease's end (negative control: the router loses the lease).
+if ! $bb grep -q 'lab_pppoe_kick=' /proc/cmdline; then
+  # The object (nothing when it is null: musl's sed has no \| in BREs).
+  wdh() { $bb wget -q -T 5 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb grep -o '"wan_dhcp":{[^}]*}'; }
+  wl=$($bb sed -n 's/.*lab_wan_lease=\([0-9]*\).*/\1/p' /proc/cmdline)
+  if [ -n "$wl" ] && $bb grep -q 'lab_wan_lease_stop=1' /proc/cmdline; then
+    echo "LAB INFO: wan dhcp: $($bb wget -q -T 5 -O - "http://$ISP/cgi-bin/dhcp?stop" 2>&1), waiting $((wl + 15)) s"
+    $bb sleep $((wl + 15))
+  fi
+  wd=$(wdh)
+  if [ -n "$wl" ]; then
+    for i in $($bb seq 1 100); do
+      n=$(echo "$wd" | $bb sed -n 's/.*"received":\([0-9]*\).*/\1/p')
+      [ "${n:-0}" -ge 3 ] && break
+      $bb sleep 1
+      wd=$(wdh)
+    done
+  fi
+  echo "LAB INFO: wan_dhcp ${wd:-none}"
 fi
 
 echo "LAB DONE fails=$fails"

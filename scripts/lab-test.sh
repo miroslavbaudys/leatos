@@ -157,6 +157,14 @@
 #                        (docs/ipv6.md step 4). Negative control
 #                        LAB_PPPOE_IPV6=0 (no offer: the offer check, or
 #                        with LAB_IPV6=1 the IPv6CP and IPv6 checks, fail).
+#   LAB_WAN_LEASE=N      the ISP's DHCP leases last N s (e.g. 60): the router's
+#                        own DHCP client (docs/local-stack.md step 2b) must
+#                        renew during the run (client "wan_dhcp": a third
+#                        reply taken) and never lose the lease. Negative
+#                        control LAB_WAN_LEASE_STOP=1 (the ISP's DHCP server
+#                        is stopped first: no renewal, the lease is lost).
+#   LAB_WAN_LEASE_STOP=1 with LAB_WAN_LEASE: stop the ISP's DHCP server
+#                        before the renewal (the negative control above).
 #   LAB_WAN_STATIC=1     the ISP runs no DHCP server; the router gets
 #                        wan_mode=static wan_ip=203.0.113.60/24
 #                        wan_gw=203.0.113.1 wan_dns=203.0.113.1 (LAB_ROUTER_ARGS
@@ -476,6 +484,8 @@ if [[ -n "$ISP_PPPOE" ]]; then
   BIG_PING="${LAB_BIG_PING:-1464}"
 fi
 ISP_STATIC="${LAB_WAN_STATIC:-}"
+ISP_LEASE="${LAB_WAN_LEASE:-}"
+WAN_LEASE_STOP="${LAB_WAN_LEASE_STOP:-}"
 [[ -n "$ISP_STATIC" ]] && ROUTER_ARGS="$ROUTER_ARGS wan_mode=static wan_ip=203.0.113.60/24 wan_gw=203.0.113.1 wan_dns=203.0.113.1"
 # 1 (or pd): the ISP delegates a prefix (DHCPv6-PD, docs/ipv6.md step
 # 3); static: the development boot arguments of step 2b.
@@ -811,7 +821,7 @@ PIDS+=($!)
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
   VM_NIC2="${PORTS:+52:54:00:00:00:11 $((LAN1_PORT + 1)) $LAN1_PORT}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${NEIGH:+ lab_neigh=1 lab_neigh_hosts=$NEIGH_HOSTS lab_neigh_secs=$NEIGH_SECS}${ACK:+ lab_ack=1}${SWARM:+ lab_swarm=$SWARM lab_swarm_kbit=$SWARM_KBIT lab_swarm_secs=${LAB_SWARM_SECS:-15} lab_swarm_mtu=${LAB_SWARM_MTU:-680} lab_swarm_ovf=${LAB_SWARM_OVF:-10}}${UPLOAD:+ lab_upload=$UPLOAD lab_upload_secs=${LAB_UPLOAD_SECS:-30}}${BIDIR:+ lab_bidir=$BIDIR lab_bidir_secs=${LAB_BIDIR_SECS:-20}} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN lab_guest_v6=$GUEST_IPV6}${GUEST_LIVE:+ lab_guest_live=1}${LAB_MGMT_SAME_SOURCE:+ lab_mgmt_same=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}${ND_FLOOD:+ lab_nd_flood=1}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${NEIGH:+ lab_neigh=1 lab_neigh_hosts=$NEIGH_HOSTS lab_neigh_secs=$NEIGH_SECS}${ACK:+ lab_ack=1}${SWARM:+ lab_swarm=$SWARM lab_swarm_kbit=$SWARM_KBIT lab_swarm_secs=${LAB_SWARM_SECS:-15} lab_swarm_mtu=${LAB_SWARM_MTU:-680} lab_swarm_ovf=${LAB_SWARM_OVF:-10}}${UPLOAD:+ lab_upload=$UPLOAD lab_upload_secs=${LAB_UPLOAD_SECS:-30}}${BIDIR:+ lab_bidir=$BIDIR lab_bidir_secs=${LAB_BIDIR_SECS:-20}} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${ISP_LEASE:+ lab_wan_lease=$ISP_LEASE}${WAN_LEASE_STOP:+ lab_wan_lease_stop=1}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN lab_guest_v6=$GUEST_IPV6}${GUEST_LIVE:+ lab_guest_live=1}${LAB_MGMT_SAME_SOURCE:+ lab_mgmt_same=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}${ND_FLOOD:+ lab_nd_flood=1}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so
@@ -943,6 +953,32 @@ if [[ -n "$ISP_PPPOE" ]]; then
       echo "  LAB PASS: pppoe ipv6 offer: ${v6##*: }"
     else
       echo "  LAB FAIL: pppoe ipv6 offer: no IPv6CP offer in the router log"
+      router_fails=$((router_fails + 1))
+    fi
+  fi
+fi
+
+# DHCP WAN (docs/local-stack.md step 2b): IP-only, the datapath answered
+# the ISP's ARP and the router's own DHCP client holds the lease. Negative
+# control LAB_ROUTER_ARGS=wan_medium=eth (smoltcp's socket: medium eth,
+# wan_dhcp null). With LAB_WAN_LEASE also a renewal, lease never lost
+# (negative control LAB_WAN_LEASE_STOP=1).
+if [[ -z "$ISP_STATIC" && -z "${ISP_PPPOE:-}" ]]; then
+  arp=$(tr -d '\r' <"$WORK/client.log" | grep "LAB PASS: wan arp:" | head -1 || true)
+  wd=$(tr -d '\r' <"$WORK/client.log" | grep "LAB INFO: wan_dhcp " | head -1 || true)
+  if echo "$arp" | grep -q "medium ip," && echo "$wd" | grep -q '"state":"bound"'; then
+    echo "  LAB PASS: dhcp wan ip-only: our DHCP client bound, the datapath answered ARP (${wd##*wan_dhcp })"
+  else
+    echo "  LAB FAIL: dhcp wan ip-only: ${arp:-no 'wan arp' pass}; ${wd:-no wan_dhcp from the client}"
+    router_fails=$((router_fails + 1))
+  fi
+  if [[ -n "$ISP_LEASE" ]]; then
+    rcv=$(echo "$wd" | sed -n 's/.*"received":\([0-9]*\).*/\1/p')
+    lost=$(grep -c "dhcp lease lost" "$RLOG" || true)
+    if [[ "${rcv:-0}" -ge 3 && "$lost" -eq 0 ]]; then
+      echo "  LAB PASS: dhcp wan renewal: $rcv replies taken, lease never lost (lease ${ISP_LEASE} s)"
+    else
+      echo "  LAB FAIL: dhcp wan renewal: ${rcv:-?} replies taken, lease lost $lost time(s) (${wd:-no wan_dhcp})"
       router_fails=$((router_fails + 1))
     fi
   fi

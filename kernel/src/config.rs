@@ -1360,14 +1360,14 @@ pub fn lan_medium_ip() -> bool {
     arg(bootargs(), "lan_medium") != Some("eth")
 }
 
-/// The WAN's router stack without a link layer on a static WAN
-/// (docs/local-stack.md step 2a: smoltcp on `Medium::Ip`, the datapath
-/// answering ARP / ND for the WAN address and resolving the gateway);
-/// boot argument `wan_medium=eth` keeps smoltcp on Ethernet with its
-/// neighbor hints (the fallback). DHCP stays on Ethernet until the
-/// router's own DHCP client (step 2b); PPPoE is IP-only anyway.
+/// The WAN's router stack without a link layer on a DHCP or static WAN
+/// (docs/local-stack.md step 2: smoltcp on `Medium::Ip`, the datapath
+/// answering ARP / ND for the WAN address and resolving the gateway, the
+/// DHCP client `net::wan4` over the router's own UDP); boot argument
+/// `wan_medium=eth` keeps smoltcp on Ethernet with its DHCP socket and
+/// neighbor hints (the fallback). PPPoE has no link layer anyway.
 pub fn wan_ip_only(link: &WanLink) -> bool {
-    matches!(link, WanLink::Static(_)) && arg(bootargs(), "wan_medium") != Some("eth")
+    !matches!(link, WanLink::Pppoe(_)) && arg(bootargs(), "wan_medium") != Some("eth")
 }
 
 /// The datapath's ARP / ND answers on the LANs (`fwd::nd::Config`):

@@ -294,6 +294,19 @@ fn ipv6_frame(ifx: u8, src: u8, dst: u8, hop: u8, ext: &[(u8, u8)], proto: u8, p
 /// The router stack's ND help (`kernel/src/net/device.rs`): a hint is a
 /// valid NS with a correct checksum; readdressing a probe keeps a valid
 /// checksum valid.
+/// `fwd::udp` (the router's own datagrams): a parsed payload lies inside
+/// the frame, and building the same datagram again parses back to it.
+fn udp_check(f: &[u8]) {
+    let Some(d) = fwd::udp::parse4(f) else { return };
+    assert!(d.payload.0 <= d.payload.1 && d.payload.1 <= f.len(), "{d:?}");
+    let payload = &f[d.payload.0..d.payload.1];
+    let mut out = vec![0u8; fwd::udp::OVERHEAD + payload.len()];
+    let n = fwd::udp::build4(&mut out, &d.ends, payload).expect("fits");
+    let again = fwd::udp::parse4(&out[..n]).expect("own datagram parses");
+    assert_eq!(again.ends, d.ends);
+    assert_eq!(&out[again.payload.0..again.payload.1], payload);
+}
+
 fn nd_helpers(f: &[u8]) {
     let mut hint = [0u8; wire::NEIGHBOR_HINT_LEN];
     if wire::ipv6_neighbor_hint(f, &mut hint).is_some() {
@@ -487,6 +500,7 @@ fuzz_target!(|ops: Vec<Op>| {
                 if let Some(noise) = &noise {
                     damage(&mut f[..n], noise);
                 }
+                udp_check(&f[..n]);
                 let clean = noise.is_none() && !pkt.is_fragment();
                 // A later fragment goes the way of its first one.
                 if pkt.frag_offset() != 0 {
@@ -653,6 +667,7 @@ fuzz_target!(|ops: Vec<Op>| {
                 let mut f = data;
                 f.truncate(1600);
                 nd_helpers(&f);
+                udp_check(&f);
                 nd_answer(usize::from(ifx % 3), &f);
                 let n = f.len();
                 f.resize(n + TAIL, 0);
