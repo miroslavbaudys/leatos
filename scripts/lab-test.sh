@@ -869,7 +869,7 @@ if [[ "$SHAPE_KBIT" != 0 && -z "$SWARM$UPLOAD$BIDIR" ]]; then
     marks=$(echo "$line" | sed -n 's/.*ecn marks \([0-9]*\).*/\1/p')
     what="$2 ($1): aqm drops ${drops:-?}, ecn marks ${marks:-?}"
     if [[ -z "$drops" || -z "$marks" ]]; then
-      echo "  LAB FAIL: ecn $what (no router counters)"; router_fails=$((router_fails + 1))
+      echo "  LAB FAIL: ecn $what (no router counters; last line: '${line:0:200}', $(grep -c "qdisc $1 " "$RLOG") lines)"; router_fails=$((router_fails + 1))
     elif [[ "$3" == 1 && "$marks" -gt 0 ]]; then
       echo "  LAB PASS: ecn $2 on: $what"
     elif [[ "$3" == 0 && "$marks" == 0 && "$drops" -gt 0 ]]; then

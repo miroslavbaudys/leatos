@@ -136,6 +136,10 @@ highest volume, and the random-port slots go away), DHCP server :67, DHCPv6 clie
 mDNS :5353 (multicast send and receive without smoltcp groups). `socket-udp` removed at the
 end.
 
+- DNS (2026-11-26, QEMU): :53 per network and the upstream ports on `net::local`, which also got
+  its PPPoE send path (into the WAN qdisc) and `source` (the datapath's view of the link:
+  `LocalLink::source4` / `source6`). DNS over TCP and DoT stay on smoltcp's TCP.
+
 ### Step 4: ICMP and group membership
 
 - Echo replies for the router's addresses, ICMP errors to the router's own senders, the gateway

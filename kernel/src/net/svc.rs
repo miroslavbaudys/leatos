@@ -331,8 +331,8 @@ fn lease_text(c: &LeaseChange) -> String {
 }
 
 /// The WAN's clients a mode change starts and stops: PPPoE, the gateway
-/// pinger, the DHCP client on an IP-only WAN and its UDP ports.
-type WanClients<'a> = (&'a mut Option<Pppoe>, &'a mut Pinger, &'a mut Option<crate::net::wan4::Wan4>, &'a mut crate::net::local::Udp);
+/// pinger, the DHCP client.
+type WanClients<'a> = (&'a mut Option<Pppoe>, &'a mut Pinger, &'a mut Option<crate::net::wan4::Wan4>);
 
 /// Restart the WAN on new link settings: end a PPPoE session, switch the
 /// port and its router-stack interface between Ethernet (DHCP, static)
@@ -343,7 +343,7 @@ type WanClients<'a> = (&'a mut Option<Pppoe>, &'a mut Pinger, &'a mut Option<cra
 fn restart_wan(
     sh: &Shared,
     wan: &mut HostIf,
-    (pppoe, pinger, wan4, udp): WanClients<'_>,
+    (pppoe, pinger, wan4): WanClients<'_>,
     new: crate::config::WanLink,
 ) -> Option<LeaseChange> {
     use crate::config::WanLink;
@@ -381,10 +381,10 @@ fn restart_wan(
     match (dhcp, wan4.is_some()) {
         (false, true) => {
             if let Some(w) = wan4.take() {
-                w.stop(udp);
+                w.stop();
             }
         }
-        (true, false) => *wan4 = Some(crate::net::wan4::Wan4::new(port.mac, udp, now_ms())),
+        (true, false) => *wan4 = Some(crate::net::wan4::Wan4::new(port.mac, now_ms())),
         _ => {}
     }
     wan.iface.update_ip_addrs(|a| a.retain(|c| !matches!(c, IpCidr::Ipv4(_))));
@@ -532,7 +532,7 @@ fn publish_wan(
 
 /// Poll every router-stack interface (one per link); wake the TX task of
 /// each port that got frames in its qdisc.
-fn poll_stacks(hosts: &mut [HostIf], sh: &Shared, udp: &mut crate::net::local::Udp) {
+fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
     let t = stack::now();
     let now_ns = datapath::now_ns();
     let dp = stack::datapath();
@@ -550,7 +550,7 @@ fn poll_stacks(hosts: &mut [HostIf], sh: &Shared, udp: &mut crate::net::local::U
             tap: Some(&mut host.tap),
             dp,
             ip_only,
-            udp: Some(&mut *udp),
+            local_udp: true,
         };
         host.iface.poll(t, &mut dev, &mut host.sockets);
         if queued > 0 {
@@ -727,11 +727,10 @@ pub async fn run(
     let mut mgmt = Mgmt::new(&mut hosts, &links, store.is_some());
     let mut cli = Cli::new(store.is_some());
     let mut pppoe = crate::config::pppoe().map(|c| Pppoe::new(c, &sh.ports[0]));
-    // The router's own UDP ports (`net::local`) and, on an IP-only DHCP
-    // WAN, its DHCP client over them (docs/local-stack.md step 2b).
-    let mut udp = crate::net::local::Udp::default();
+    // The WAN's DHCP client over the router's own UDP (`net::local`,
+    // docs/local-stack.md step 2b).
     let mut wan4 = (crate::config::wan_link() == crate::config::WanLink::Dhcp)
-        .then(|| crate::net::wan4::Wan4::new(sh.ports[0].mac, &mut udp, now_ms()));
+        .then(|| crate::net::wan4::Wan4::new(sh.ports[0].mac, now_ms()));
     // The WAN's IPv6 by prefix delegation (docs/ipv6.md step 3).
     let mut wan6 = crate::net::wan6::Wan6::new(&mut hosts[0], sh, now_ms());
     // PPPoE: IPv6CP's state the loop last acted on (step 4).
@@ -756,7 +755,7 @@ pub async fn run(
         if let Some(rx) = rx {
             rx.take();
         }
-        poll_stacks(&mut hosts, sh, &mut udp);
+        poll_stacks(&mut hosts, sh);
         let change = match pppoe.as_mut() {
             Some(p) => {
                 let (change, queued) = p.step(&sh.ports[0], &mut hosts[0]);
@@ -777,7 +776,7 @@ pub async fn run(
             }
             None => {
                 mgmt.set_wan_pppoe(None);
-                let events = wan4.as_mut().map(|w| w.step(&mut udp, sh, now_ms())).unwrap_or_default();
+                let events = wan4.as_mut().map(|w| w.step(sh, now_ms())).unwrap_or_default();
                 handle_wan4(sh.ports[0].name, &mut hosts[0], &mut pinger, events)
             }
         };
@@ -825,7 +824,7 @@ pub async fn run(
                 let cfg = (**cfg).clone();
                 let svc = services.as_mut();
                 let wan6_before = wan6_key();
-                if let Some(c) = apply_saved((cfg, source.clone()), sh, &mut hosts, (&mut pppoe, &mut pinger, &mut wan4, &mut udp), svc, &mut mgmt, &mut slots) {
+                if let Some(c) = apply_saved((cfg, source.clone()), sh, &mut hosts, (&mut pppoe, &mut pinger, &mut wan4), svc, &mut mgmt, &mut slots) {
                     publish_wan(&c, &mut hosts[0], sh, &mut mgmt, &mut cli, services.as_mut());
                 }
                 if wan6_follow(&mut wan6, &wan6_before, &mut hosts[0], sh) {
@@ -873,7 +872,7 @@ pub async fn run(
                             } else if let Some(source) = source {
                                 let svc = services.as_mut();
                                 let wan6_before = wan6_key();
-                                if let Some(c) = apply_saved((*cfg, source), sh, &mut hosts, (&mut pppoe, &mut pinger, &mut wan4, &mut udp), svc, &mut mgmt, &mut slots) {
+                                if let Some(c) = apply_saved((*cfg, source), sh, &mut hosts, (&mut pppoe, &mut pinger, &mut wan4), svc, &mut mgmt, &mut slots) {
                                     publish_wan(&c, &mut hosts[0], sh, &mut mgmt, &mut cli, services.as_mut());
                                 }
                                 if wan6_follow(&mut wan6, &wan6_before, &mut hosts[0], sh) {
@@ -899,11 +898,11 @@ pub async fn run(
                 timer::sleep(Duration::from_secs(3600)).await;
             }
         }
-        poll_stacks(&mut hosts, sh, &mut udp);
+        poll_stacks(&mut hosts, sh);
 
         // More frames arrived while we worked: go round again, after
         // letting the datapath run.
-        if cli.more() || udp.pending() || sh.links.iter().any(|l| !l.local_rx.lock().is_empty()) {
+        if cli.more() || crate::net::local::pending() || sh.links.iter().any(|l| !l.local_rx.lock().is_empty()) {
             crate::executor::yield_now().await;
             continue;
         }

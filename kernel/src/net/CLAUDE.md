@@ -55,9 +55,11 @@ smoltcp `Device` behind the datapath: RX from `local_rx`, TX into the qdisc.
   PPPoE the frame goes into the qdisc for the session's headers.
 - Neighbor table limits: `neigh_secs=`, `neigh_probe=0`, `neigh_pending=0` (nothing held while
   resolving: the lab's first-contact control).
-- `local.rs`: the router's own UDP without smoltcp (step 2b, more in step 3): `Udp` port table per
-  link (the device offers it every frame on an IP-only link first; bounded queue per port),
-  IPv4 and IPv6 (`Ends`), `send` through `Datapath::send_local`; headers by `fwd::udp`.
+- `local.rs`: the router's own UDP without smoltcp (docs/local-stack.md steps 2b, 3): one port
+  table per link owned by the module (`bind` / `recv`; the device offers every frame to `take`
+  before smoltcp; bounded queue per port, `/api/status` `local_udp.dropped`), IPv4 and IPv6
+  (`Ends`), `send` through `Datapath::send_local` or, on PPPoE, into the WAN qdisc; `source` =
+  the datapath's view of the link (`Datapath::local_source`); headers by `fwd::udp`.
 - `wan4.rs`: the WAN's DHCPv4 client (`proto_dhcp::v4::client`) on port 68 over `local`, events
   into `svc::lease_bound` / `lease_lost`; `/api/status` `wan_dhcp`.
 - `RxTap` (`HostIf::tap`): the last RA a link received (the WAN's for `net::wan6`) and RS seen
@@ -75,9 +77,11 @@ services, mgmt. A saved WAN change restarts the WAN live, DHCP ⇄ PPPoE include
 - `pppoe.rs`: svc side of `proto_pppoe::Client`: `ctrl_rx` in, frames into the WAN qdisc, `Session`
   → `PortShared::pppoe_session`, up/down → router-stack address + `LeaseChange`. The WAN interface
   is `Medium::Ip` in PPPoE mode. PADT at reboot/upgrade from the datapath.
-- `services.rs`: per network a DHCP server + DNS socket, one resolver/zone: smoltcp UDP sockets ↔
-  sans-IO crates. With IPv6 an RA `Advertiser` per network, frames straight into the port qdisc;
-  retired ones send a last RA. `services::Upstream`: a fresh random upstream DNS port per query.
+- `services.rs`: per network a DHCP server + DNS, one resolver/zone. DNS over UDP on `net::local`
+  (:53 per network's link, answers from the network's address; step 3): `services::Upstream`, a
+  fresh random upstream port per query on the WAN, bound in `local` and `CLIENT_PORTS`. DHCP still
+  on a smoltcp UDP socket. With IPv6 an RA `Advertiser` per network, frames straight into the port
+  qdisc; retired ones send a last RA.
 - `dns_tcp.rs`: DNS over TCP from clients (RFC 7766): 4 TCP :53 sockets per network, framing in
   `proto_dns::tcp`, length-prefixed queries → `Resolver::handle_query_tcp`, answers by client
   endpoint, pipelining, bounded buffers, 10 s idle close; `/api/status` `dns.tcp`.

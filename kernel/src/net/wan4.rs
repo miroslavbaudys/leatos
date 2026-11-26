@@ -10,7 +10,7 @@
 //! `svc::lease_lost`). Counters in `/api/status` `wan_dhcp`.
 
 use crate::net::datapath::WAN;
-use crate::net::local::{self, Udp};
+use crate::net::local;
 use crate::net::shared::Shared;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use proto_dhcp::v4::client::{CLIENT_PORT, Client, Config, Event, SERVER_PORT, State};
@@ -64,8 +64,8 @@ pub struct Wan4 {
 
 impl Wan4 {
     /// Start on the WAN (port 68 bound) with the port's MAC.
-    pub fn new(mac: [u8; 6], udp: &mut Udp, now_ms: u64) -> Self {
-        udp.bind(WAN, CLIENT_PORT);
+    pub fn new(mac: [u8; 6], now_ms: u64) -> Self {
+        local::bind(WAN, CLIENT_PORT);
         let cfg = Config { mac, hostname: None, last: None, broadcast: false };
         let w = Wan4 { client: Client::new(cfg, now_ms, crate::entropy::u64()), send_failed: 0 };
         w.publish();
@@ -73,8 +73,8 @@ impl Wan4 {
     }
 
     /// Another WAN mode: port 68 freed, status cleared.
-    pub fn stop(self, udp: &mut Udp) {
-        udp.unbind(WAN, CLIENT_PORT);
+    pub fn stop(self) {
+        local::unbind(WAN, CLIENT_PORT);
         STATE.store(0, Ordering::Relaxed);
     }
 
@@ -84,8 +84,8 @@ impl Wan4 {
     }
 
     /// Replies in, the due message out; the lease's events in order.
-    pub fn step(&mut self, udp: &mut Udp, sh: &Shared, now_ms: u64) -> alloc::vec::Vec<Event> {
-        while let Some(d) = udp.recv(WAN, CLIENT_PORT) {
+    pub fn step(&mut self, sh: &Shared, now_ms: u64) -> alloc::vec::Vec<Event> {
+        while let Some(d) = local::recv(WAN, CLIENT_PORT) {
             if d.ends.sport() == SERVER_PORT && matches!(d.ends, local::Ends::V4(_)) {
                 self.client.handle(now_ms, &d.payload);
             }

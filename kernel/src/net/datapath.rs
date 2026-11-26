@@ -636,6 +636,16 @@ impl Datapath {
         }
     }
 
+    /// The router's source address toward `dst` on link `ifx`
+    /// (`fwd::local::LocalLink::source4` / `source6`; `net::local`).
+    pub fn local_source(&self, ifx: IfIndex, dst: core::net::IpAddr) -> Option<core::net::IpAddr> {
+        let l = self.local.get(ifx as usize)?.lock();
+        match dst {
+            core::net::IpAddr::V4(_) => l.source4().map(Into::into),
+            core::net::IpAddr::V6(d) => l.source6(d).map(Into::into),
+        }
+    }
+
     /// A packet from the router's own stack on link `ifx`, whose stack has
     /// no link layer (smoltcp on `Medium::Ip`, docs/lan-neighbors.md):
     /// `pkt` is 14 bytes of Ethernet header (EtherType set) and the IP

@@ -407,7 +407,7 @@ pub fn new_iface(port: &PortShared, ip_only: bool) -> Interface {
         tap: None,
         dp: None,
         ip_only,
-        udp: None,
+        local_udp: false,
     };
     Interface::new(config, &mut device, now())
 }
@@ -590,14 +590,15 @@ pub fn set_local_links(dp: SharedDatapath, sh: &Shared, nets: &[crate::config::L
 
 /// The WAN's addresses and routes for the datapath ([`Datapath::send_local`],
 /// its ARP / ND answers), read back from the router stack's WAN interface,
-/// so both always agree; empty unless the WAN is IP-only
-/// ([`HostIf::ip_only`], a static WAN: docs/local-stack.md step 2a). After
+/// so both always agree (docs/local-stack.md step 2). After
 /// every change of the WAN's addresses or routes (`svc::publish_wan`,
 /// `svc::reapply_networks`).
 pub fn set_wan_local_link(dp: SharedDatapath, wan: &mut HostIf) {
     use smoltcp::wire::IpAddress;
     let mut l = fwd::local::LocalLink::default();
-    if wan.ip_only {
+    // On PPPoE too: its addresses pick the router's source addresses
+    // (`net::local::source`); the datapath answers no ARP there.
+    {
         for c in wan.iface.ip_addrs() {
             match c {
                 IpCidr::Ipv4(c) => l.v4 = Some((c.address(), c.prefix_len())),

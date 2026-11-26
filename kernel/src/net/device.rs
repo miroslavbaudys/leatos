@@ -274,9 +274,9 @@ pub struct PortDevice<'a> {
     /// strips the Ethernet header and passes IP only, TX goes through
     /// [`crate::net::datapath::Datapath::send_local`]. Otherwise PPPoE.
     pub ip_only: bool,
-    /// The router's own UDP ports (`net::local`): on an IP-only link,
-    /// datagrams to a bound port go there, not to smoltcp.
-    pub udp: Option<&'a mut crate::net::local::Udp>,
+    /// Offer frames to the router's own UDP ports first (`net::local`;
+    /// false while only making the interface).
+    pub local_udp: bool,
 }
 
 /// Frames of a link the services look at before smoltcp: the last
@@ -383,7 +383,7 @@ impl Device for PortDevice<'_> {
                 fwd::wire::ethertype(pkt.data()),
                 Some(fwd::wire::ETHERTYPE_IPV4 | fwd::wire::ETHERTYPE_IPV6)
             );
-            let taken = ip && self.ip_only && self.udp.as_deref_mut().is_some_and(|u| u.take(self.ifx, pkt.data()));
+            let taken = ip && self.local_udp && crate::net::local::take(self.ifx, pkt.data());
             if ip && !taken {
                 break pkt;
             }

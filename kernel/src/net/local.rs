@@ -2,9 +2,9 @@
 //! started in step 2b for the WAN's DHCPv4 client; the other services
 //! follow in step 3).
 //!
-//! - Receive: [`Udp`], a port table per link. On an IP-only link
-//!   (`LinkShared::ip_only`) the router-stack device
-//!   (`net::device::PortDevice`) offers every frame to [`Udp::take`]
+//! - Receive: one port table per link ([`bind`], [`recv`]), owned here
+//!   (only the services task uses it). The router-stack device
+//!   (`net::device::PortDevice`) offers every frame of a link to [`take`]
 //!   before smoltcp; UDP (IPv4 or IPv6) to a bound port is parsed
 //!   (`fwd::udp::parse4` / `parse6`: lengths and checksums) and queued for
 //!   its service, bounded (the oldest is kept, a new one dropped and
@@ -13,8 +13,9 @@
 //! - Send: [`send`] builds the headers (`fwd::udp::build4` / `build6`)
 //!   into a pool buffer and hands it to `Datapath::send_local` (next hop
 //!   by `fwd::local`: broadcast, multicast, or a neighbor through the
-//!   datapath's table). The source address is the caller's
-//!   (`fwd::local::LocalLink::source6` for IPv6).
+//!   datapath's table); on a PPPoE WAN straight into the port's qdisc,
+//!   where the datapath puts the session's headers on. The source address
+//!   is the caller's, [`source`] picks one (`fwd::local::LocalLink`).
 //!
 //! Payloads are copied out of the packet buffer (one allocation per
 //! datagram): fine for DHCP's few; the DNS path (step 3) will want slices.
@@ -22,6 +23,9 @@
 use crate::net::datapath::Touched;
 use crate::net::packet::PacketBuf;
 use crate::net::shared::{MAX_PORTS, Shared};
+use core::net::IpAddr;
+use qdisc::Qdisc;
+use spin::Mutex;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use fwd::IfIndex;
@@ -58,12 +62,51 @@ struct Bound {
     q: VecDeque<Datagram>,
 }
 
-/// The router's bound UDP ports (IPv4), per link.
-#[derive(Default)]
-pub struct Udp {
+/// The router's bound UDP ports, per link.
+struct Udp {
     bound: Vec<Bound>,
     /// Datagrams dropped because their port's queue was full.
-    pub dropped: u64,
+    dropped: u64,
+}
+
+static UDP: Mutex<Udp> = Mutex::new(Udp { bound: Vec::new(), dropped: 0 });
+
+/// Bind `port` on link `ifx` (again: nothing changes).
+pub fn bind(ifx: IfIndex, port: u16) {
+    UDP.lock().bind(ifx, port);
+}
+
+/// Free `port` on link `ifx`; its waiting datagrams go.
+pub fn unbind(ifx: IfIndex, port: u16) {
+    UDP.lock().unbind(ifx, port);
+}
+
+/// The next datagram for `port` on `ifx`.
+pub fn recv(ifx: IfIndex, port: u16) -> Option<Datagram> {
+    UDP.lock().recv(ifx, port)
+}
+
+/// Datagrams are waiting for a service.
+pub fn pending() -> bool {
+    UDP.lock().pending()
+}
+
+/// Datagrams dropped for a full queue (status).
+pub fn dropped() -> u64 {
+    UDP.lock().dropped
+}
+
+/// A frame of link `ifx` for the router (Ethernet header, then IP):
+/// `true` if it was UDP to a bound port (queued, or dropped when the
+/// queue is full or it is malformed), else smoltcp's.
+pub fn take(ifx: IfIndex, frame: &[u8]) -> bool {
+    UDP.lock().take(ifx, frame)
+}
+
+/// The router's source address toward `dst` on link `ifx`, as the
+/// datapath knows the link (`fwd::local::LocalLink::source4` / `source6`).
+pub fn source(ifx: IfIndex, dst: IpAddr) -> Option<IpAddr> {
+    crate::net::stack::datapath()?.local_source(ifx, dst)
 }
 
 impl Udp {
@@ -166,6 +209,21 @@ pub fn send(sh: &Shared, ifx: IfIndex, e: &Ends, hop6: u8, payload: &[u8]) -> bo
     };
     let Some(n) = n else { return false };
     pkt.set_len(n);
+    let Some(link) = sh.links.get(ifx as usize) else { return false };
+    let port = link.port();
+    if sh.ports[port].is_pppoe() {
+        // No link layer: into the qdisc as the router stack's own
+        // frames go (`net::device`); the datapath adds the session.
+        if let Some(tci) = link.tci() {
+            pkt.push_vlan(tci);
+        }
+        let now = crate::net::datapath::now_ns();
+        pkt.meta.wire_len = pkt.len() as u32;
+        pkt.meta.enqueue_ts = now;
+        let ok = sh.ports[port].qdisc.lock().enqueue(pkt, now).is_ok();
+        sh.tx_kick[port].signal();
+        return ok;
+    }
     let mut touched: Touched = [false; MAX_PORTS];
     let sent = dp.send_local(ifx, pkt, &mut touched);
     for (i, t) in touched.iter().enumerate() {
