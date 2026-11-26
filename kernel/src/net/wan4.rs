@@ -87,13 +87,13 @@ impl Wan4 {
     /// Replies in, the due message out; the lease's events in order.
     pub fn step(&mut self, udp: &mut Udp, sh: &Shared, now_ms: u64) -> alloc::vec::Vec<Event> {
         while let Some(d) = udp.recv(WAN, CLIENT_PORT) {
-            if d.ends.sport == SERVER_PORT {
+            if d.ends.sport() == SERVER_PORT && matches!(d.ends, local::Ends::V4(_)) {
                 self.client.handle(now_ms, &d.payload);
             }
         }
         while let Some(t) = self.client.poll(now_ms) {
-            let e = fwd::udp::Ends { src: t.src, dst: t.dst, sport: CLIENT_PORT, dport: SERVER_PORT };
-            if !local::send4(sh, WAN, &e, &t.payload) {
+            let e = local::Ends::V4(fwd::udp::Ends { src: t.src, dst: t.dst, sport: CLIENT_PORT, dport: SERVER_PORT });
+            if !local::send(sh, WAN, &e, fwd::udp::TTL, &t.payload) {
                 self.send_failed += 1;
             }
         }

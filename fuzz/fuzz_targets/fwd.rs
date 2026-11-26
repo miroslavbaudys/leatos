@@ -297,6 +297,15 @@ fn ipv6_frame(ifx: u8, src: u8, dst: u8, hop: u8, ext: &[(u8, u8)], proto: u8, p
 /// `fwd::udp` (the router's own datagrams): a parsed payload lies inside
 /// the frame, and building the same datagram again parses back to it.
 fn udp_check(f: &[u8]) {
+    if let Some(d) = fwd::udp::parse6(f) {
+        assert!(d.payload.0 <= d.payload.1 && d.payload.1 <= f.len(), "{d:?}");
+        let payload = &f[d.payload.0..d.payload.1];
+        let mut out = vec![0u8; fwd::udp::OVERHEAD6 + payload.len()];
+        let n = fwd::udp::build6(&mut out, &d.ends, 64, payload).expect("fits");
+        let again = fwd::udp::parse6(&out[..n]).expect("own datagram parses");
+        assert_eq!(again.ends, d.ends);
+        assert_eq!(&out[again.payload.0..again.payload.1], payload);
+    }
     let Some(d) = fwd::udp::parse4(f) else { return };
     assert!(d.payload.0 <= d.payload.1 && d.payload.1 <= f.len(), "{d:?}");
     let payload = &f[d.payload.0..d.payload.1];
@@ -601,6 +610,7 @@ fuzz_target!(|ops: Vec<Op>| {
                     damage(&mut f, noise);
                 }
                 let n = f.len();
+                udp_check(&f);
                 let inp = f.clone();
                 f.resize(n + TAIL + 1300, 0);
                 // A later fragment goes the way of its first one (as the

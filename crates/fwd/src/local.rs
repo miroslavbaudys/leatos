@@ -132,6 +132,36 @@ impl LocalLink {
     pub fn addrs6(&self) -> impl Iterator<Item = Ipv6Addr> + '_ {
         self.v6.iter().map(|&(a, _)| a)
     }
+
+    /// The source address for the router's own IPv6 packet to `dst` on
+    /// this link (docs/local-stack.md §3.2, an RFC 6724 subset): link-local
+    /// for link-local and link-scoped multicast destinations (ff02::/16);
+    /// otherwise an address of the same kind (unique local for a unique
+    /// local destination, global for the rest) with the longest prefix in
+    /// common, else any non-link-local one, else link-local. `None`
+    /// without an address that fits.
+    pub fn source6(&self, dst: Ipv6Addr) -> Option<Ipv6Addr> {
+        let ll = || self.addrs6().find(|a| a.is_unicast_link_local());
+        let link_scope = dst.is_unicast_link_local() || (dst.is_multicast() && dst.segments()[0] & 0x000f <= 2);
+        if link_scope {
+            return ll();
+        }
+        let ula = |a: &Ipv6Addr| a.segments()[0] & 0xfe00 == 0xfc00;
+        let common = |a: &Ipv6Addr| (u128::from(*a) ^ u128::from(dst)).leading_zeros();
+        let routable = || self.addrs6().filter(|a| !a.is_unicast_link_local());
+        routable()
+            .filter(|a| ula(a) == ula(&dst))
+            .max_by_key(common)
+            .or_else(|| routable().max_by_key(common))
+            .or_else(ll)
+    }
+
+    /// The source address for the router's own IPv4 packet on this link:
+    /// the link's address (`None` without one: then only 0.0.0.0, which a
+    /// caller like the DHCP client chooses itself).
+    pub fn source4(&self) -> Option<Ipv4Addr> {
+        self.v4.map(|(a, _)| a)
+    }
 }
 
 #[cfg(test)]
@@ -222,5 +252,38 @@ mod tests {
             let _ = l.next_hop(&f[..n]);
         }
         assert_eq!(l.next_hop(&f[..ETH_HDR + 39]), NextHop::NoRoute);
+    }
+
+    #[test]
+    fn source_addresses() {
+        let l = LocalLink {
+            v4: Some((Ipv4Addr::new(192, 168, 1, 1), 24)),
+            v6: vec![(LL, 64), (ULA, 64), (GUA, 64)],
+            ..Default::default()
+        };
+        assert_eq!(l.source4(), Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(LocalLink::default().source4(), None);
+        let s = |d: Ipv6Addr| l.source6(d);
+        // Link scope: link-local.
+        assert_eq!(s(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 9)), Some(LL));
+        assert_eq!(s(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)), Some(LL), "mDNS group");
+        assert_eq!(s(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 9)), Some(LL), "solicited-node");
+        // Unique local to unique local, global to global (also off-link).
+        assert_eq!(s(Ipv6Addr::new(0xfd00, 0, 0, 1, 0, 0, 0, 0x10)), Some(ULA));
+        assert_eq!(s(Ipv6Addr::new(0xfd99, 1, 2, 3, 0, 0, 0, 1)), Some(ULA), "another ULA prefix");
+        assert_eq!(s(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 0x10)), Some(GUA));
+        assert_eq!(s(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111)), Some(GUA), "the internet");
+        assert_eq!(s(Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 2)), Some(GUA), "site-scoped multicast");
+        // Longest common prefix among several of a kind.
+        let gua2 = Ipv6Addr::new(0x2a03, 0xab00, 0x1000, 0x910, 0, 0, 0, 1);
+        let two = LocalLink { v6: vec![(LL, 64), (GUA, 64), (gua2, 64)], ..Default::default() };
+        assert_eq!(two.source6(Ipv6Addr::new(0x2a03, 0xab00, 0x10, 0, 0, 0, 0, 0x131)), Some(gua2));
+        assert_eq!(two.source6(Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 1)), Some(GUA));
+        // Missing a kind: the other routable one, then link-local.
+        let ula_only = LocalLink { v6: vec![(LL, 64), (ULA, 64)], ..Default::default() };
+        assert_eq!(ula_only.source6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), Some(ULA));
+        let ll_only = LocalLink { v6: vec![(LL, 64)], ..Default::default() };
+        assert_eq!(ll_only.source6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)), Some(LL));
+        assert_eq!(LocalLink::default().source6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), None);
     }
 }
