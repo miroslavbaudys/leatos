@@ -24,14 +24,11 @@ use crate::net::shared::{Shared, WanChange};
 use crate::net::stack::{self, WaitAny};
 use crate::{println, timer};
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
-use smoltcp::iface::{Interface, SocketHandle, SocketSet};
-use smoltcp::phy::ChecksumCapabilities;
-use smoltcp::socket::icmp;
-use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::iface::{Interface, SocketSet};
+use smoltcp::wire::{IpCidr, Ipv4Address};
 
 /// Set once the WAN has an address: a DHCP lease or a PPPoE link (read by
 /// the boot self-test).
@@ -57,8 +54,9 @@ pub struct HostIf {
     pub ip_only: bool,
 }
 
+/// The WAN gateway check: three echo requests (`net::local`) after each
+/// new gateway; `PING_OK` once one is answered.
 struct Pinger {
-    socket: SocketHandle,
     target: Option<Ipv4Address>,
     seq: u16,
     sent_at: [Option<timer::Instant>; PING_COUNT as usize],
@@ -67,14 +65,9 @@ struct Pinger {
 }
 
 impl Pinger {
-    fn new(sockets: &mut SocketSet<'static>) -> Self {
-        let rx = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 512]);
-        let tx = icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 4], vec![0; 512]);
-        let mut sock = icmp::Socket::new(rx, tx);
-        sock.bind(icmp::Endpoint::Ident(PING_IDENT))
-            .expect("icmp bind");
+    fn new() -> Self {
+        crate::net::local::ping_bind(PING_IDENT);
         Self {
-            socket: sockets.add(sock),
             target: None,
             seq: 0,
             sent_at: [None; PING_COUNT as usize],
@@ -94,36 +87,24 @@ impl Pinger {
         }
     }
 
-    fn step(&mut self, sockets: &mut SocketSet<'static>) {
+    fn step(&mut self, sh: &Shared) {
+        use crate::net::{datapath::WAN, local};
         let Some(target) = self.target else { return };
-        let sock = sockets.get_mut::<icmp::Socket>(self.socket);
-        let caps = ChecksumCapabilities::default();
-
-        if self.seq < PING_COUNT && sock.can_send() && timer::Instant::now() >= self.next_send {
-            let repr = Icmpv4Repr::EchoRequest {
-                ident: PING_IDENT,
-                seq_no: self.seq,
-                data: b"leatos",
-            };
-            if let Ok(buf) = sock.send(repr.buffer_len(), IpAddress::Ipv4(target)) {
-                repr.emit(&mut Icmpv4Packet::new_unchecked(buf), &caps);
-                self.sent_at[self.seq as usize] = Some(timer::Instant::now());
-                self.seq += 1;
-                self.next_send = timer::Instant::now().checked_add(PING_INTERVAL).unwrap();
-            }
+        let dst = core::net::IpAddr::V4(target);
+        if self.seq < PING_COUNT
+            && timer::Instant::now() >= self.next_send
+            && let Some(src) = local::source(WAN, dst)
+            && local::send_echo(sh, WAN, src, dst, PING_IDENT, self.seq, b"leatos")
+        {
+            self.sent_at[self.seq as usize] = Some(timer::Instant::now());
+            self.seq += 1;
+            self.next_send = timer::Instant::now().checked_add(PING_INTERVAL).unwrap();
         }
-
-        while let Ok((payload, from)) = sock.recv() {
-            let Ok(pkt) = Icmpv4Packet::new_checked(payload) else {
+        while let Some((from, seq_no)) = local::ping_recv(PING_IDENT) {
+            if from != dst {
                 continue;
-            };
-            if let Ok(Icmpv4Repr::EchoReply {
-                ident: PING_IDENT,
-                seq_no,
-                ..
-            }) = Icmpv4Repr::parse(&pkt, &caps)
-                && let Some(Some(t0)) = self.sent_at.get(seq_no as usize)
-            {
+            }
+            if let Some(Some(t0)) = self.sent_at.get(seq_no as usize) {
                 println!(
                     "  net ping        : {from} seq={seq_no} rtt={} us",
                     t0.elapsed().as_micros()
@@ -718,7 +699,7 @@ pub async fn run(
     sh: &'static Shared,
     mut store: Option<crate::store::Store>,
 ) {
-    let mut pinger = Pinger::new(&mut hosts[0].sockets);
+    let mut pinger = Pinger::new();
     // Network slots as bring_up placed them (`stack::place_networks`).
     let (mut slots, links, _) = stack::place_networks(&[]);
     let links = if sh.links.len() > 1 { links } else { Vec::new() };
@@ -727,6 +708,11 @@ pub async fn run(
     let mut mgmt = Mgmt::new(&mut hosts, &links, store.is_some());
     let mut cli = Cli::new(store.is_some());
     let mut pppoe = crate::config::pppoe().map(|c| Pppoe::new(c, &sh.ports[0]));
+    // The router's multicast memberships per link (IGMP / MLD reports,
+    // docs/local-stack.md step 4): recomputed when the links' addresses
+    // or mDNS's memberships change.
+    let mut groups = crate::net::groups::Groups::new();
+    let mut groups_seen = (u64::MAX, u64::MAX);
     // The WAN's DHCP client over the router's own UDP (`net::local`,
     // docs/local-stack.md step 2b).
     let mut wan4 = (crate::config::wan_link() == crate::config::WanLink::Dhcp)
@@ -794,7 +780,7 @@ pub async fn run(
             wan6 = crate::net::wan6::Wan6::new(sh, now_ms());
             reapply_networks(sh, &mut hosts, services.as_mut(), &mut mgmt, &mut slots, None);
         }
-        pinger.step(&mut hosts[0].sockets);
+        pinger.step(sh);
         if let Some(w) = wan6.as_mut()
             && w.step(&mut hosts[0], sh, now_ms())
         {
@@ -804,6 +790,20 @@ pub async fn run(
         if let Some(svc) = services.as_mut() {
             svc.step(&mut hosts, sh);
         }
+        if let Some(dp) = stack::datapath() {
+            let key = (dp.local_gen(), services.as_ref().map_or(0, LanServices::mdns_generation));
+            if key != groups_seen {
+                groups_seen = key;
+                let mdns = services.as_ref().map(LanServices::mdns_members).unwrap_or_default();
+                for ifx in 0..sh.links.len() {
+                    groups.set(sh, ifx, crate::net::groups::wanted(sh, ifx, &mdns), now_ms());
+                }
+            }
+        }
+        while let Some((ifx, q)) = crate::net::local::take_query() {
+            groups.query(ifx as usize, q, now_ms());
+        }
+        groups.step(sh, now_ms());
         let action = mgmt.step(&mut hosts, sh, services.as_ref());
         if let Some((conn, op)) = mgmt.take_op()
             && let Some(st) = store.as_mut()
@@ -931,6 +931,7 @@ pub async fn run(
         if let Some(w) = &wan4 {
             delay = delay.min(Duration::from_millis(w.next_deadline().saturating_sub(now_ms())));
         }
+        delay = delay.min(Duration::from_millis(groups.next_deadline().saturating_sub(now_ms())));
         if let Some(at) = pppoe.as_ref().and_then(Pppoe::wake_at) {
             delay = delay.min(at.saturating_duration_since(timer::Instant::now()));
         }

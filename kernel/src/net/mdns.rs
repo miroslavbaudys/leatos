@@ -2,8 +2,8 @@
 //! (`net::local`) and `proto_mdns::Reflector`.
 //!
 //! On each network a `[[mdns.reflect]]` entry involves, the router joins
-//! 224.0.0.251 on that link's interface (smoltcp sends the IGMP report;
-//! docs/local-stack.md step 4 moves that out) and listens on UDP 5353. A join waits until the datapath has put the
+//! 224.0.0.251 on that link (`net::groups` sends the IGMP / MLD reports,
+//! docs/local-stack.md step 4) and listens on UDP 5353. A join waits until the datapath has put the
 //! network's link into effect (active, with the network's VLAN ID): after
 //! a live change the services task runs ahead of the datapath, and a
 //! report queued earlier would carry the link's old tag (none, for a
@@ -26,13 +26,12 @@ use core::net::{IpAddr, SocketAddr};
 use proto_mdns::{GROUP_V4, GROUP_V6, PORT, Reflector, Stats};
 use crate::net::local::{self, Ends};
 use crate::net::shared::Shared;
-use smoltcp::wire::IpAddress;
 
 /// RFC 6762 §11: TTL / hop limit 255.
 const HOP_LIMIT: u8 = 255;
 
 /// A network's port 5353: on which link (`net::local`, bounded queue: a
-/// storm is dropped and counted in `local_udp.dropped`), and the router's
+/// storm is dropped and counted in `local.udp_dropped`), and the router's
 /// IPv4 address there (the source of its copies).
 #[derive(Clone, Copy)]
 struct Sock {
@@ -55,9 +54,10 @@ pub struct Mdns {
     joined: Vec<Member>,
     /// To join once the datapath shows the link with this VID.
     pending: Vec<Member>,
-    /// A join happened in the last step: its report goes out on the next
-    /// interface poll.
+    /// A join happened in the last step.
     just_joined: bool,
+    /// Bumped when `joined` changes (`net::groups` follows).
+    generation: u64,
     /// Per network (`config::networks` index): its socket, while it takes
     /// part.
     socks: Vec<Option<Sock>>,
@@ -89,13 +89,6 @@ fn reflector_config(nets: &[config::Lan], hosts: &[HostIf], links: &[usize]) -> 
     }
 }
 
-fn leave(host: &mut HostIf, m: Member) {
-    let _ = host.iface.leave_multicast_group(IpAddress::Ipv4(GROUP_V4));
-    if m.v6 {
-        let _ = host.iface.leave_multicast_group(IpAddress::Ipv6(GROUP_V6));
-    }
-}
-
 impl Mdns {
     /// Network `k` of `config::networks` is on `hosts[links[k]]`.
     pub fn new(hosts: &mut [HostIf], links: &[usize]) -> Self {
@@ -104,6 +97,7 @@ impl Mdns {
             joined: Vec::new(),
             pending: Vec::new(),
             just_joined: false,
+            generation: 0,
             socks: Vec::new(),
             names: Vec::new(),
         };
@@ -135,7 +129,7 @@ impl Mdns {
             if want.contains(&m) {
                 self.joined.push(m);
             } else {
-                leave(&mut hosts[m.host], m);
+                self.generation += 1; // left: `net::groups` sends the leave
             }
         }
         self.pending = want.iter().copied().filter(|m| !self.joined.contains(m)).collect();
@@ -164,7 +158,7 @@ impl Mdns {
 
     /// Join where the datapath has caught up, then reflect what arrived
     /// since the last call. `links[i]` belongs to `hosts[i]`.
-    pub fn step(&mut self, hosts: &mut [HostIf], sh: &Shared) {
+    pub fn step(&mut self, sh: &Shared) {
         let links = &sh.links;
         self.just_joined = false;
         let mut i = 0;
@@ -176,18 +170,9 @@ impl Mdns {
                 continue;
             }
             self.pending.swap_remove(i);
-            match hosts[m.host].iface.join_multicast_group(IpAddress::Ipv4(GROUP_V4)) {
-                Ok(()) => {
-                    self.joined.push(m);
-                    self.just_joined = true;
-                }
-                Err(e) => println!("  mdns            : cannot join {GROUP_V4} on link {}: {e}", m.host),
-            }
-            if m.v6
-                && let Err(e) = hosts[m.host].iface.join_multicast_group(IpAddress::Ipv6(GROUP_V6))
-            {
-                println!("  mdns            : cannot join {GROUP_V6} on link {}: {e}", m.host);
-            }
+            self.joined.push(m);
+            self.just_joined = true;
+            self.generation += 1;
         }
         for k in 0..self.socks.len() {
             let Some(s) = self.socks[k] else { continue };
@@ -221,6 +206,16 @@ impl Mdns {
     /// datapath (which does not wake it), or a report waits for the poll.
     pub fn wants_soon(&self) -> bool {
         !self.pending.is_empty() || self.just_joined
+    }
+
+    /// Bumped whenever [`Self::members`] changes.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The memberships in effect: (link, IPv6 too).
+    pub fn members(&self) -> Vec<(usize, bool)> {
+        self.joined.iter().map(|m| (m.host, m.v6)).collect()
     }
 
     /// Counters of the networks taking part (status page, CLI).

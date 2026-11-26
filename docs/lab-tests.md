@@ -149,8 +149,10 @@ Modes that imply `LAB_GUEST=1`:
   `LAB_DNS_HOSTS=0`, `LAB_GUEST_RULES=0`.
 - `LAB_MDNS=1` (docs/mdns.md): rule guest-printers reflects `_ipp._tcp` guest → lan. The client
   announces on VLAN 20 (crafted, `nc -u`), checked by the router's counters and on the LAN capture
-  (copy from 192.168.1.1, TTL 255, `_ipp` only; IGMP joins on both networks). Negative control
-  `LAB_MDNS_RULES=0`.
+  (copy from 192.168.1.1, TTL 255, `_ipp` only; IGMP joins on both networks, with `LAB_IPV6=1`
+  also the MLDv2 report with ff02::fb from the router's link-local address: `net::groups`).
+  Negative controls `LAB_MDNS_RULES=0`, `LAB_ROUTER_ARGS=groups=0` (no reports: both join checks
+  fail).
 - `LAB_ROUTES=1`: `[[route]]` lab-behind 10.30.0.0/24 via the client, 10.30.0.5 on its loopback:
   option 121 (route + default), NAT to the ISP and ping to the router from 10.30.0.5, `/api/status`
   `routes`, the ISP forging 10.30.0.5 dropped as `spoofed` (`cgi-bin/spoof?8080&src=`); the

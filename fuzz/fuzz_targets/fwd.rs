@@ -297,6 +297,18 @@ fn ipv6_frame(ifx: u8, src: u8, dst: u8, hop: u8, ext: &[(u8, u8)], proto: u8, p
 /// `fwd::udp` (the router's own datagrams): a parsed payload lies inside
 /// the frame, and building the same datagram again parses back to it.
 fn udp_check(f: &[u8]) {
+    // ICMP echo (the router's answers, docs/local-stack.md step 4): a
+    // reply is a reply, back to the sender, with the request's data.
+    if let Some(e) = fwd::echo::parse(f) {
+        assert!(e.data.0 <= e.data.1 && e.data.1 <= f.len(), "{e:?}");
+        let mut out = vec![0u8; 1600];
+        if let Some(n) = fwd::echo::reply(f, &mut out) {
+            let r = fwd::echo::parse(&out[..n]).expect("own reply parses");
+            assert!(e.request && !r.request && r.src == e.dst && r.dst == e.src && (r.ident, r.seq) == (e.ident, e.seq));
+            assert_eq!(&out[r.data.0..r.data.1], &f[e.data.0..e.data.1]);
+        }
+    }
+    let _ = fwd::mcast::parse_query(f);
     if let Some(d) = fwd::udp::parse6(f) {
         assert!(d.payload.0 <= d.payload.1 && d.payload.1 <= f.len(), "{d:?}");
         let payload = &f[d.payload.0..d.payload.1];

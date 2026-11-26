@@ -25,12 +25,12 @@ watchdog backed by a hardware timer resets a stuck one (M8,
 ```
 ┌───────────────────────────────────────────────────────────────┐
 │ Services (`svc` task, no_std + alloc)                          │
-│  pppoe client · dhcpv4 server (+ smoltcp's client on the WAN)  │
-│  dns forwarder + DoT · sntp · mdns reflector · web UI (own     │
-│  HTTP, proto-http) · config + store · serial CLI               │
-│  (planned: dhcpv6-pd · RA, M7)                                 │
+│  pppoe · dhcpv4 client + server · dhcpv6-pd · RA · dns + DoT   │
+│  sntp · mdns · web UI (own HTTP, proto-http) · config + store  │
+│  serial CLI · echo replies · IGMP / MLD (net::groups)          │
 ├───────────────────────────────────────────────────────────────┤
-│ Local stack: smoltcp  ← packets addressed TO the router        │
+│ Local stack ← packets addressed TO the router: own UDP / ICMP  │
+│  (net::local) · smoltcp for TCP only (docs/local-stack.md)     │
 ├───────────────────────────────────────────────────────────────┤
 │ Forwarding plane (crates/fwd) ← packets going THROUGH          │
 │  L2: eth / VLAN / PPPoE encap (kernel datapath)                │
@@ -65,9 +65,11 @@ watchdog backed by a hardware timer resets a stuck one (M8,
    unshaped and traffic between networks is not held to the download
    rate (docs/bufferbloat-cake.md §3.4).
    Packets *for* the router go into a small bounded per-link queue
-   (`local_rx`, 64 packets) and from there into smoltcp, which runs in the
-   services task. The router's own transmissions go straight into the port's qdisc,
-   so the qdisc sees all egress traffic.
+   (`local_rx`, 64 packets) and from there, in the services task, to the
+   router's own UDP / ICMP / IGMP / MLD handling (`net::local`) or, for
+   TCP, to smoltcp. The router's own transmissions go through the
+   datapath's neighbor table (`send_local`) into the port's qdisc, so the
+   qdisc sees all egress traffic.
 4. Egress: enqueue into the egress port's qdisc (CAKE by default on both
    ports, wrapped in the shaper). The transmitting task **pulls** from the qdisc when the driver has ring space and the
    shaper allows it, then encapsulates and transmits. The qdisc is the only

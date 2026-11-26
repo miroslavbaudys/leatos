@@ -572,6 +572,9 @@ impl Default for ClientPorts {
 }
 
 /// ICMP errors: token bucket, 50/s with a burst of 20.
+/// IGMP (RFC 2236) and its membership query type.
+const PROTO_IGMP: u8 = 2;
+const IGMP_QUERY: u8 = 0x11;
 const ICMP_RATE_PER_SEC: u64 = 50;
 const ICMP_BURST: u64 = 20;
 
@@ -1786,6 +1789,17 @@ impl Forwarder {
             _ => false,
         };
         if reply {
+            return self.local();
+        }
+        // An IGMP membership query on a network: the router answers with
+        // reports for its own groups (mDNS; docs/local-stack.md step 4), as
+        // the IPv6 path passes MLD queries. Not from the WAN.
+        if v.proto == PROTO_IGMP
+            && self.ifs[ingress as usize].role != Role::Wan
+            && !v.is_fragment
+            && v.l4_len >= 8
+            && f[v.l4] == IGMP_QUERY
+        {
             return self.local();
         }
         let ports = matches!(v.proto, PROTO_TCP | PROTO_UDP).then_some(dport).flatten();
@@ -4186,6 +4200,25 @@ mod tests {
     fn udp_frame(mac: Mac, src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16) -> Vec<u8> {
         let d = udp_datagram(src, dst, sport, dport, b"ntp");
         to(mac, ipv4_frame(src, dst, PROTO_UDP, 64, &d))
+    }
+
+    #[test]
+    fn igmp_queries_reach_the_router_from_networks_only() {
+        let mut fw = router();
+        // No service allowed to the router, from the WAN or the LAN.
+        fw.set_policy(Some(Policy { input: vec![Some(0), Some(0)], ..Policy::default() }));
+        let mut q = alloc::vec![0x11, 100, 0, 0, 0, 0, 0, 0];
+        let c = crate::wire::checksum(&q);
+        crate::wire::put16(&mut q, 2, c);
+        let all = Ipv4Addr::new(224, 0, 0, 1);
+        let mut f = to(crate::local::multicast_mac4(all), ipv4_frame(HOST, all, PROTO_IGMP, 1, &q));
+        assert_eq!(run(&mut fw, 0, LAN, &mut f), Verdict::Local, "a query on the LAN");
+        let mut f = to(crate::local::multicast_mac4(all), ipv4_frame(SERVER, all, PROTO_IGMP, 1, &q));
+        assert_ne!(run(&mut fw, 0, WAN, &mut f), Verdict::Local, "not from the WAN");
+        // A report from a host is no query: refused as before.
+        q[0] = 0x16;
+        let mut f = to(crate::local::multicast_mac4(all), ipv4_frame(HOST, all, PROTO_IGMP, 1, &q));
+        assert_ne!(run(&mut fw, 0, LAN, &mut f), Verdict::Local);
     }
 
     #[test]

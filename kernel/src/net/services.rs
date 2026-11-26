@@ -814,6 +814,16 @@ impl LanServices {
     }
 
     /// mDNS reflector counters per network taking part.
+    /// mDNS's group memberships (`net::groups`): (link, v6), and a
+    /// generation bumped when they change.
+    pub fn mdns_members(&self) -> Vec<(usize, bool)> {
+        self.mdns.members()
+    }
+
+    pub fn mdns_generation(&self) -> u64 {
+        self.mdns.generation()
+    }
+
     pub fn mdns_status(&self) -> Vec<(&str, proto_mdns::Stats)> {
         self.mdns.status()
     }
@@ -1041,7 +1051,7 @@ impl LanServices {
             }
         }
 
-        self.mdns.step(hosts, sh);
+        self.mdns.step(sh);
     }
 
     /// IPv6 per network: (name, router ULA, RAs sent, solicitations seen).

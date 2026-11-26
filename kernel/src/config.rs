@@ -1333,6 +1333,13 @@ pub fn neigh_timing() -> (u64, bool) {
     (ms, arg_u64(bootargs(), "neigh_probe") != Some(0))
 }
 
+/// The router's IGMP / MLD reports for its groups (`net::groups`); boot
+/// argument `groups=0` sends none: the lab's negative control for the
+/// mDNS join checks.
+pub fn groups_on() -> bool {
+    arg_u64(bootargs(), "groups") != Some(0)
+}
+
 /// Packets held per neighbor being resolved (`fwd::neigh::MAX_PENDING`;
 /// boot argument `neigh_pending=0`: none, the first packet to an unknown
 /// neighbor is dropped, the lab's negative control for first contact).

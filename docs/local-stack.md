@@ -5,7 +5,8 @@ over the router's own UDP: `net::local` + `fwd::udp`, IPv4 and IPv6); the fallba
 (`wan_medium=eth`, `lan_medium=eth`), the neighbor hints and `medium-ethernet` removed on
 2026-11-26 (user decision: the whole migration goes to the apu4 at once after the soak, no
 per-step day there). Step 0 (docs/lan-neighbors.md) done with it. Step 3 done the same day
-(every UDP service on `net::local`, `socket-udp` gone). Next: step 4. Roadmap M14.
+(every UDP service on `net::local`, `socket-udp` gone), steps 4 and 5 too (ICMP echo, the
+pinger, IGMP / MLD ours; smoltcp for TCP only). Left: the apu4 (§6). Roadmap M14.
 
 ## 1. Goal
 
@@ -144,14 +145,27 @@ end.
   TTL now) followed the same day; `socket-udp` removed. Step 3 done in QEMU; the IGMP / MLD reports
   for mDNS's groups still come from smoltcp (step 4).
 
-### Step 4: ICMP and group membership
+### Step 4: ICMP and group membership (done in QEMU 2026-11-26)
+
+Done: `fwd::echo` (echo parse / reply / request) and `fwd::mcast` (IGMPv2 report / leave, MLDv2
+report, IGMP v1–v3 / MLD v1–v2 query parse); `net::local` answers echo requests to the router's
+unicast addresses (`/api/status` `local.echo_replies`) and queues pinger replies and membership
+queries; `net::groups` keeps the memberships per link (solicited-node, ff02::2, mDNS) with
+reports on change (twice) and to queries; the forwarder passes IGMP queries from networks up (MLD
+queries it did already). `groups=0`: the lab's control for the mDNS IGMP / MLD checks. ICMP
+errors about the router's own packets are not delivered to its senders (smoltcp did not either).
 
 - Echo replies for the router's addresses, ICMP errors to the router's own senders, the gateway
   pinger without an ICMP socket; `auto-icmp-echo-reply` and `socket-icmp` removed.
 - IGMPv2 / MLDv2 reports and query answers for the groups the router listens to (switches with
   snooping); `multicast` removed if smoltcp no longer needs it for TCP.
 
-### Step 5: smoltcp trimmed
+### Step 5: smoltcp trimmed (done 2026-11-26)
+
+Reached with step 4: smoltcp is built with `alloc`, `medium-ip`, `proto-ipv4`, `proto-ipv6`,
+`socket-tcp` and its route / address limits; `socket-udp`, `socket-icmp`, `socket-dhcpv4`,
+`socket-dns`, `medium-ethernet`, `auto-icmp-echo-reply`, `multicast` and the neighbor cache size
+are gone.
 
 Features down to `medium-ip`, `proto-ipv4`, `proto-ipv6`, `socket-tcp` (+ limits); its interfaces
 hold the addresses and routes TCP needs. Docs: kernel/src/net/CLAUDE.md, docs/architecture.md,

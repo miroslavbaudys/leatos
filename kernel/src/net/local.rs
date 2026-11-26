@@ -17,8 +17,14 @@
 //!   where the datapath puts the session's headers on. The source address
 //!   is the caller's, [`source`] picks one (`fwd::local::LocalLink`).
 //!
+//! - ICMP echo (docs/local-stack.md step 4): a request to one of the
+//!   router's unicast addresses on the link is answered here
+//!   (`fwd::echo::reply`, from the address it was sent to); a reply whose
+//!   identifier a pinger registered ([`ping_bind`]) is queued for it
+//!   ([`ping_recv`]); [`send_echo`] sends its requests.
+//!
 //! Payloads are copied out of the packet buffer (one allocation per
-//! datagram): fine for DHCP's few; the DNS path (step 3) will want slices.
+//! datagram).
 
 use crate::net::datapath::Touched;
 use crate::net::packet::PacketBuf;
@@ -71,6 +77,81 @@ struct Udp {
 
 static UDP: Mutex<Udp> = Mutex::new(Udp { bound: Vec::new(), dropped: 0 });
 
+/// Echo replies for one pinger: its identifier, (from, sequence) each.
+type PingQueue = (u16, VecDeque<(IpAddr, u16)>);
+/// Echo replies waiting for their pinger.
+static PINGS: Mutex<Vec<PingQueue>> = Mutex::new(Vec::new());
+/// Replies kept per identifier.
+const PING_QUEUE: usize = 8;
+
+/// Echo replies with this identifier are queued for [`ping_recv`].
+pub fn ping_bind(ident: u16) {
+    let mut p = PINGS.lock();
+    if !p.iter().any(|(i, _)| *i == ident) {
+        p.push((ident, VecDeque::with_capacity(PING_QUEUE)));
+    }
+}
+
+/// The next echo reply for `ident`: (from, sequence number).
+pub fn ping_recv(ident: u16) -> Option<(IpAddr, u16)> {
+    PINGS.lock().iter_mut().find(|(i, _)| *i == ident)?.1.pop_front()
+}
+
+/// Echo requests answered (status).
+static ECHO_REPLIES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn echo_replies() -> u64 {
+    ECHO_REPLIES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// ICMP echo in a frame for the router: a request to one of its
+/// addresses is answered, a reply for a pinger queued (both `true`);
+/// anything else `false`.
+fn echo(ifx: IfIndex, frame: &[u8]) -> bool {
+    let is_echo = match fwd::wire::ethertype(frame) {
+        Some(ETHERTYPE_IPV4) => frame.get(ETH_HDR + 9) == Some(&fwd::wire::PROTO_ICMP),
+        Some(ETHERTYPE_IPV6) => frame.get(ETH_HDR + 6) == Some(&fwd::wire::PROTO_ICMPV6)
+            && frame.get(ETH_HDR + 40).is_some_and(|&t| t == fwd::wire::ICMPV6_ECHO_REQUEST || t == fwd::wire::ICMPV6_ECHO_REPLY),
+        _ => false,
+    };
+    if !is_echo {
+        return false;
+    }
+    let Some(e) = fwd::echo::parse(frame) else { return false };
+    let Some(dp) = crate::net::stack::datapath() else { return true };
+    if !e.request {
+        let mut p = PINGS.lock();
+        let Some((_, q)) = p.iter_mut().find(|(i, _)| *i == e.ident) else { return false };
+        if q.len() < PING_QUEUE {
+            q.push_back((e.src, e.seq));
+        }
+        return true;
+    }
+    // Only to a unicast address of ours on the link (not a broadcast or
+    // multicast ping: those stay unanswered, as most hosts do).
+    if !dp.is_local_addr(ifx, e.dst) {
+        return true;
+    }
+    let Some(mut pkt) = PacketBuf::alloc() else { return true };
+    pkt.set_len(crate::net::packet::RX_AREA);
+    let Some(n) = fwd::echo::reply(frame, pkt.data_mut()) else { return true };
+    pkt.set_len(n);
+    if send_frame(dp.shared(), ifx, pkt) {
+        ECHO_REPLIES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    true
+}
+
+/// An echo request of the router's own (the gateway pinger) from `src`
+/// to `dst` on link `ifx`.
+pub fn send_echo(sh: &Shared, ifx: IfIndex, src: IpAddr, dst: IpAddr, ident: u16, seq: u16, data: &[u8]) -> bool {
+    let Some(mut pkt) = PacketBuf::alloc() else { return false };
+    pkt.set_len(crate::net::packet::RX_AREA);
+    let Some(n) = fwd::echo::build(pkt.data_mut(), src, dst, true, ident, seq, data) else { return false };
+    pkt.set_len(n);
+    send_frame(sh, ifx, pkt)
+}
+
 /// Bind `port` on link `ifx` (again: nothing changes).
 pub fn bind(ifx: IfIndex, port: u16) {
     UDP.lock().bind(ifx, port);
@@ -100,7 +181,53 @@ pub fn dropped() -> u64 {
 /// `true` if it was UDP to a bound port (queued, or dropped when the
 /// queue is full or it is malformed), else smoltcp's.
 pub fn take(ifx: IfIndex, frame: &[u8]) -> bool {
-    UDP.lock().take(ifx, frame)
+    membership(ifx, frame) || echo(ifx, frame) || UDP.lock().take(ifx, frame)
+}
+
+/// IGMP / MLD queries heard (link, query), for `net::groups`; bounded.
+static QUERIES: Mutex<VecDeque<(IfIndex, fwd::mcast::Query)>> = Mutex::new(VecDeque::new());
+const MAX_QUERIES: usize = 16;
+
+/// The next membership query heard.
+pub fn take_query() -> Option<(IfIndex, fwd::mcast::Query)> {
+    QUERIES.lock().pop_front()
+}
+
+/// IGMP, or ICMPv6 behind a Hop-by-Hop header (MLD carries Router
+/// Alert): a query is queued for `net::groups`; other IGMP (others'
+/// reports) dropped. Both `true`.
+fn membership(ifx: IfIndex, frame: &[u8]) -> bool {
+    let igmp = fwd::wire::ethertype(frame) == Some(ETHERTYPE_IPV4) && frame.get(ETH_HDR + 9) == Some(&2);
+    let hbh = fwd::wire::ethertype(frame) == Some(ETHERTYPE_IPV6) && frame.get(ETH_HDR + 6) == Some(&0);
+    let mld_query = fwd::wire::ethertype(frame) == Some(ETHERTYPE_IPV6)
+        && frame.get(ETH_HDR + 6) == Some(&fwd::wire::PROTO_ICMPV6)
+        && frame.get(ETH_HDR + 40) == Some(&fwd::wire::ICMPV6_MLD_QUERY);
+    if !(igmp || hbh || mld_query) {
+        return false;
+    }
+    match fwd::mcast::parse_query(frame) {
+        Some(q) => {
+            let mut qs = QUERIES.lock();
+            if qs.len() < MAX_QUERIES {
+                qs.push_back((ifx, q));
+            }
+            true
+        }
+        // A Hop-by-Hop packet that is no query: smoltcp's, as before.
+        None => igmp,
+    }
+}
+
+/// A ready frame of the router's own (Ethernet header, then IP: IGMP /
+/// MLD from `net::groups`) out on link `ifx`.
+pub fn send_raw(sh: &Shared, ifx: IfIndex, frame: &[u8]) -> bool {
+    if frame.len() > crate::net::packet::RX_AREA {
+        return false;
+    }
+    let Some(mut pkt) = PacketBuf::alloc() else { return false };
+    pkt.set_len(frame.len());
+    pkt.data_mut().copy_from_slice(frame);
+    send_frame(sh, ifx, pkt)
 }
 
 /// The router's source address toward `dst` on link `ifx`, as the
@@ -193,7 +320,6 @@ impl Udp {
 /// False if no buffer, too large, or no next hop (`send_local` counts
 /// that).
 pub fn send(sh: &Shared, ifx: IfIndex, e: &Ends, ttl: u8, payload: &[u8]) -> bool {
-    let Some(dp) = crate::net::stack::datapath() else { return false };
     let overhead = match e {
         Ends::V4(_) => fwd::udp::OVERHEAD,
         Ends::V6(_) => fwd::udp::OVERHEAD6,
@@ -210,6 +336,14 @@ pub fn send(sh: &Shared, ifx: IfIndex, e: &Ends, ttl: u8, payload: &[u8]) -> boo
     };
     let Some(n) = n else { return false };
     pkt.set_len(n);
+    send_frame(sh, ifx, pkt)
+}
+
+/// A frame of the router's own (Ethernet header with zero addresses,
+/// then IP) out on link `ifx`: into the port's qdisc on PPPoE (the
+/// datapath adds the session), else through `Datapath::send_local`.
+fn send_frame(sh: &Shared, ifx: IfIndex, mut pkt: PacketBuf) -> bool {
+    let Some(dp) = crate::net::stack::datapath() else { return false };
     let Some(link) = sh.links.get(ifx as usize) else { return false };
     let port = link.port();
     if sh.ports[port].is_pppoe() {

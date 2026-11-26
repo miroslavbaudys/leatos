@@ -297,6 +297,8 @@ pub struct Datapath {
     /// own packets on a link without a link layer ([`Self::send_local`],
     /// docs/lan-neighbors.md).
     local: Vec<Mutex<fwd::local::LocalLink>>,
+    /// Changes of `local` ([`Self::local_gen`]).
+    local_gen: AtomicU64,
     /// ARP / ND answers on links whose router stack is IP-only
     /// ([`crate::net::shared::LinkShared::ip_only`]), with these switches.
     nd_cfg: fwd::nd::Config,
@@ -482,6 +484,7 @@ impl Datapath {
                 .collect(),
             addrs: ifaces.iter().map(|i| Mutex::new(i.addr)).collect(),
             local: ifaces.iter().map(|_| Mutex::new(fwd::local::LocalLink::default())).collect(),
+            local_gen: AtomicU64::new(0),
             nd_cfg: crate::config::nd_config(),
             topo: Mutex::new(alloc::sync::Arc::new(Topo::default())),
             hk: Mutex::new(Hk {
@@ -632,7 +635,41 @@ impl Datapath {
     /// ([`Self::send_local`]).
     pub fn set_local_link(&self, ifx: IfIndex, l: fwd::local::LocalLink) {
         if let Some(m) = self.local.get(ifx as usize) {
-            *m.lock() = l;
+            let mut cur = m.lock();
+            if *cur != l {
+                *cur = l;
+                self.local_gen.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The router's addresses on link `ifx` (IPv4, IPv6): `net::groups`.
+    pub fn local_addrs(&self, ifx: IfIndex) -> (Option<Ipv4Addr>, Vec<Ipv6Addr>) {
+        let Some(l) = self.local.get(ifx as usize) else { return (None, Vec::new()) };
+        let l = l.lock();
+        (l.v4.map(|(a, _)| a), l.addrs6().collect())
+    }
+
+    /// Bumped by every [`Self::set_local_link`]: the services recompute
+    /// what depends on the links' addresses (`net::groups`) only then.
+    pub fn local_gen(&self) -> u64 {
+        self.local_gen.load(Ordering::Relaxed)
+    }
+
+    /// What the datapath shares with the services (`net::local` sends
+    /// through it from the device, which has no `Shared` at hand).
+    pub fn shared(&self) -> &'static Shared {
+        self.sh
+    }
+
+    /// `ip` is one of the router's own unicast addresses on link `ifx`
+    /// (an echo request to it is answered: `net::local`).
+    pub fn is_local_addr(&self, ifx: IfIndex, ip: core::net::IpAddr) -> bool {
+        let Some(l) = self.local.get(ifx as usize) else { return false };
+        let l = l.lock();
+        match ip {
+            core::net::IpAddr::V4(a) => l.v4.is_some_and(|(me, _)| me == a),
+            core::net::IpAddr::V6(a) => l.addrs6().any(|me| me == a),
         }
     }
 

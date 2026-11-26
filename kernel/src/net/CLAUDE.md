@@ -57,9 +57,16 @@ smoltcp `Device` behind the datapath: RX from `local_rx`, TX into the qdisc.
   resolving: the lab's first-contact control).
 - `local.rs`: the router's own UDP without smoltcp (docs/local-stack.md steps 2b, 3): one port
   table per link owned by the module (`bind` / `recv`; the device offers every frame to `take`
-  before smoltcp; bounded queue per port, `/api/status` `local_udp.dropped`), IPv4 and IPv6
+  before smoltcp; bounded queue per port, `/api/status` `local.udp_dropped`), IPv4 and IPv6
   (`Ends`), `send` through `Datapath::send_local` or, on PPPoE, into the WAN qdisc; `source` =
-  the datapath's view of the link (`Datapath::local_source`); headers by `fwd::udp`.
+  the datapath's view of the link (`Datapath::local_source`); headers by `fwd::udp`. Also ICMP
+  echo (step 4: requests to the router's addresses answered by `fwd::echo::reply`, the gateway
+  pinger's replies queued: `ping_bind` / `ping_recv`, `send_echo`) and IGMP / MLD queries
+  (`take_query`, for `groups.rs`).
+- `groups.rs`: the router's multicast memberships per link (solicited-node groups, ff02::2,
+  mDNS's 224.0.0.251 / ff02::fb from `mdns.rs`), IGMPv2 / MLDv2 reports on change and to queries
+  (`fwd::mcast`), recomputed when `Datapath::local_gen` or the mDNS generation moves; `groups=0`
+  sends none (lab control).
 - `wan4.rs`: the WAN's DHCPv4 client (`proto_dhcp::v4::client`) on port 68 over `local`, events
   into `svc::lease_bound` / `lease_lost`; `/api/status` `wan_dhcp`.
 - `RxTap` (`HostIf::tap`): the last RA a link received (the WAN's for `net::wan6`) and RS seen

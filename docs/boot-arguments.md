@@ -96,6 +96,7 @@ PVH / Multiboot2 command line on x86_64, QEMU `-append` via `QEMU_APPEND`. They 
 | `na_router=0` | – | the datapath's NAs without the Router flag: the lab's negative control |
 | `neigh_secs=N` | – | the forwarder's neighbor lifetime, default 300 (tests) |
 | `neigh_probe=0` | – | entries in use dropped at the end of their lifetime instead of probed: the lab's negative control |
+| `groups=0` | – | no IGMP / MLD reports for the router's groups (`net::groups`: mDNS, solicited-node, all-routers): the lab's negative control for the mDNS join checks (`LAB_MDNS=1`) |
 | `neigh_pending=0` | – | the neighbor table holds no packet while it resolves a neighbor (default `fwd::neigh::MAX_PENDING` = 3): the first packet to an unknown neighbor is dropped; the lab's negative control for first contact (`LAB_NEIGH=1`) |
 
 ## Management and configuration

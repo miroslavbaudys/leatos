@@ -23,6 +23,10 @@ events out), host-tested with `cargo test`. Fuzz targets in `fuzz/` (fuzz/README
   (all lengths and the checksums, extension headers skipped, fragments refused; the kernel's
   `net::local`, docs/local-stack.md steps 2b–3); tested against smoltcp's parser.
 - `local::LocalLink::source4` / `source6`: the router's source address (an RFC 6724 subset).
+- `echo`: ICMP / ICMPv6 echo for the router (parse, `reply`, `build`); `mcast`: IGMPv2 report /
+  leave, MLDv2 report, IGMP / MLD query parse (docs/local-stack.md step 4). Both against
+  smoltcp's parsers where it has them; the `fwd` fuzz target runs them on every frame.
+- The forwarder passes IGMP membership queries from networks (not the WAN) to the router.
 - `local`: the next hop of the router's own packets on a link without a link layer
   (docs/lan-neighbors.md step 2): `LocalLink::next_hop` = a fixed MAC (broadcast, directed
   broadcast, IPv4 / IPv6 multicast mapping) or a neighbor (on the link, or a `[[route]]`'s

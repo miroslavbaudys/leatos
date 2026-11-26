@@ -1136,6 +1136,19 @@ if [[ -n "$MDNS" ]]; then
       fi
     fi
   fi
+  # The router's MLDv2 report (net::groups, docs/local-stack.md step 4):
+  # from its link-local address to ff02::16, listing ff02::fb. Negative
+  # control (with the IGMP one below): LAB_ROUTER_ARGS=groups=0.
+  if [[ -n "$IPV6" ]]; then
+    mld=$(tcpdump -nn -v -r "$PCAP_DIR/lan.pcap" 'ip6 dst ff02::16' 2>/dev/null \
+      | awk '/^[^ \t]/ { if (l != "") print l; l = $0; next } { l = l " " $0 } END { if (l != "") print l }' \
+      | grep -v "vlan 20" | grep "fe80::5054:ff:fe00:2 > ff02::16" | grep "ff02::fb" | head -1 || true)
+    if [[ -n "$mld" ]]; then
+      echo "  LAB PASS: mdns mld: router reported ff02::fb from fe80::5054:ff:fe00:2 (MLDv2)"
+    else
+      echo "  LAB FAIL: mdns mld: no MLDv2 report with ff02::fb from the router"; router_fails=$((router_fails + 1))
+    fi
+  fi
   igmp_lan=$(grep -v "vlan 20" "$WORK/mdns.txt" | grep -c "192.168.1.1 > 224.0.0.251: igmp v2 report 224.0.0.251" || true)
   igmp_guest=$(grep "vlan 20" "$WORK/mdns.txt" | grep -c "10.20.0.1 > 224.0.0.251: igmp v2 report 224.0.0.251" || true)
   if [[ "$igmp_lan" -ge 1 && "$igmp_guest" -ge 1 ]]; then
