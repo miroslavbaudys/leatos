@@ -400,9 +400,22 @@ pub fn new_iface(port: &PortShared, lan_ip: bool) -> Interface {
 }
 
 /// Wait until any of `events` fires or the sleep ends.
+///
+/// Always returns to the executor at least once, even when an event has
+/// already fired: a task looping on events that never stop (both
+/// directions under load kick each other) would otherwise never end its
+/// poll, and the other tasks on its core (the `watchdog`) would starve
+/// (the watchdog rebooted the router after 5 s, `LAB_BIDIR`).
 pub struct WaitAny<'a> {
-    pub events: &'a [&'static IrqEvent],
-    pub sleep: timer::Sleep,
+    events: &'a [&'static IrqEvent],
+    sleep: timer::Sleep,
+    yielded: bool,
+}
+
+impl<'a> WaitAny<'a> {
+    pub fn new(events: &'a [&'static IrqEvent], sleep: timer::Sleep) -> Self {
+        Self { events, sleep, yielded: false }
+    }
 }
 
 impl Future for WaitAny<'_> {
@@ -414,11 +427,17 @@ impl Future for WaitAny<'_> {
             // and the main loop still sees (and handles) the fired flags.
             ready |= ev.poll_fired(cx).is_ready();
         }
-        if ready || Pin::new(&mut self.sleep).poll(cx).is_ready() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
+        if !(ready || Pin::new(&mut self.sleep).poll(cx).is_ready()) {
+            self.yielded = true;
+            return Poll::Pending;
         }
+        if !self.yielded {
+            // Ready at once: let the core's other ready tasks run first.
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        Poll::Ready(())
     }
 }
 
@@ -1000,10 +1019,6 @@ pub async fn run_dir(d: Dir, ports: &'static [Port], sh: &'static Shared, dp: Sh
         if ring_full_backlog || ports.iter().any(|n| n.irq.is_none()) {
             delay = delay.min(Duration::from_millis(1));
         }
-        WaitAny {
-            events: &events,
-            sleep: timer::sleep(delay),
-        }
-        .await;
+        WaitAny::new(&events, timer::sleep(delay)).await;
     }
 }

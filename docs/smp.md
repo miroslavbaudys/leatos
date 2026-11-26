@@ -118,6 +118,11 @@ does one 64-bit access. TCG answered either way.
     neighbor table, then the qdisc; each released before the next is
     taken, except the NIC around a batch.
 - **Wakeups:**
+  - `net::stack::WaitAny` (the direction tasks' and `svc`'s wait) always
+    returns to the executor once, even when an event already fired. Under
+    load in both directions the tasks kick each other without pause, and
+    `dp_down` never ended its poll: core 0's `watchdog` task starved and
+    rebooted the router after 5 s (found with `LAB_BIDIR=8`, 2026-11-26).
   - Per port `tx_kick` wakes whoever transmits on that port: the other
     direction (ARP-released packets), `svc` (router-local frames), or the
     RX task after its NIC's interrupt (TX completions share the NIC's

@@ -905,10 +905,6 @@ pub async fn run(
         if mgmt.busy() {
             delay = delay.min(Duration::from_millis(10));
         }
-        WaitAny {
-            events: &events,
-            sleep: timer::sleep(delay),
-        }
-        .await;
+        WaitAny::new(&events, timer::sleep(delay)).await;
     }
 }
