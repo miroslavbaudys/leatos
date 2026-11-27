@@ -1399,6 +1399,14 @@ pub fn fw_client_ports() -> bool {
     arg_u64(bootargs(), "fw_client_ports") != Some(0)
 }
 
+/// UDP to a router port nobody bound is dropped silently (`net::local`);
+/// boot argument `udp_unbound_drop=0` hands it to smoltcp, which answers
+/// with ICMP protocol unreachable / parameter problem (the lab's negative
+/// control for its unbound-port checks).
+pub fn udp_unbound_drop() -> bool {
+    arg_u64(bootargs(), "udp_unbound_drop") != Some(0)
+}
+
 /// Upstream DNS queries over UDP leave from a fresh random port each
 /// (`net::services`, RFC 5452); boot argument `dns_port_random=0` keeps one
 /// port for the whole boot, as before (the lab's negative control).

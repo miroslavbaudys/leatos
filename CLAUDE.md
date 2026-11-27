@@ -87,8 +87,10 @@ Keep them current when you change what they describe; keep this file to the map 
   future ones) must bind ≥ 60000 (`fwd::forwarder::ROUTER_CLIENT_PORTS`; TCP replies pass only from
   `Policy::router_tcp_peers`) so replies are never mistaken for NAT or port-forward traffic. UDP
   from outside reaches only bound client ports (`net::shared::CLIENT_PORTS` →
-  `fwd::forwarder::ClientPorts`; 68 only from 67, 546 only from 547), the rest is dropped silently,
-  so the stack answers no scan with port unreachable. Port forwards may use anything below 60000
+  `fwd::forwarder::ClientPorts`; 68 only from 67, 546 only from 547), the rest is dropped
+  silently; UDP to any router port nobody bound is dropped silently by `net::local` too (smoltcp
+  has no UDP and would answer protocol unreachable), so the router answers no UDP scan. Port
+  forwards may use anything below 60000
   (validated).
 - **Packet buffers** come only from `net::packet` (bounded pool, no allocation per packet). On
   pool exhaustion, drop; never grow.

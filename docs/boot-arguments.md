@@ -88,6 +88,7 @@ PVH / Multiboot2 command line on x86_64, QEMU `-append` via `QEMU_APPEND`. They 
 |---|---|---|
 | `conn_per_host=N` | – | connections one initiating host may hold, default a quarter of the 16384-entry table, `0` = no limit |
 | `fw_client_ports=0` | – | UDP to the whole router client range from anyone (the old behaviour): the lab's negative control for its client-port check |
+| `udp_unbound_drop=0` | – | UDP to a router port nobody bound goes to smoltcp, which answers with ICMP protocol unreachable (IPv6: parameter problem), instead of being dropped silently: the lab's negative control for its unbound-UDP checks |
 | `fw_recheck=0` | – | a new firewall policy leaves tracked connections alone: the lab's negative control |
 | `fw_frag=0` | – | IP fragments dropped instead of forwarded: the lab's negative control |
 | `fw_split=0` | – | non-DF packets above the egress MTU dropped as `too-big` instead of split: the lab's negative control |

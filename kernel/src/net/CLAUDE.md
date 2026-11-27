@@ -57,7 +57,9 @@ smoltcp `Device` behind the datapath: RX from `local_rx`, TX into the qdisc.
   resolving: the lab's first-contact control).
 - `local.rs`: the router's own UDP without smoltcp (docs/local-stack.md steps 2b, 3): one port
   table per link owned by the module (`bind` / `recv`; the device offers every frame to `take`
-  before smoltcp; bounded queue per port, `/api/status` `local.udp_dropped`), IPv4 and IPv6
+  before smoltcp; bounded queue per port, `/api/status` `local.udp_dropped`; UDP to an unbound
+  port dropped silently, `local.udp_unbound`, as smoltcp without `socket-udp` would answer it
+  with protocol unreachable; `udp_unbound_drop=0` is the lab's control), IPv4 and IPv6
   (`Ends`), `send` through `Datapath::send_local` or, on PPPoE, into the WAN qdisc; `source` =
   the datapath's view of the link (`Datapath::local_source`); headers by `fwd::udp`. Also ICMP
   echo (step 4: requests to the router's addresses answered by `fwd::echo::reply`, the gateway

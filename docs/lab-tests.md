@@ -51,8 +51,13 @@ A client VM, the router and an ISP VM (Alpine; overlays in `lab/client/`, `lab/i
   `LAB_ROUTER_ARGS=mgmt_evict=0`.
 - Firewall end to end.
 - Client ports, from the router's WAN capture: the ISP's UDP probes to unbound client ports and 68
-  draw no port unreachable; upstream DNS queries use many ports. Negative controls
-  `LAB_ROUTER_ARGS=fw_client_ports=0`, `dns_port_random=0`.
+  draw no ICMP unreachable (any code), and they never reach the router's own UDP (the client's
+  `local.udp_unbound` before and after); upstream DNS queries use many ports. Negative controls
+  `LAB_ROUTER_ARGS=fw_client_ports=0` (the client's check), `"fw_client_ports=0
+  udp_unbound_drop=0"` (the capture check), `dns_port_random=0`.
+- Unbound UDP from the LAN: the client's UDP to router ports nobody bound is dropped by the
+  router's own UDP (`local.udp_unbound` rises) and draws no ICMP unreachable (LAN capture).
+  Negative control `LAB_ROUTER_ARGS=udp_unbound_drop=0`.
 - WAN input silent to the ISP's probes (TCP 22, 80, 61000, ping). Negative controls
   `LAB_ROUTER_ARGS=mgmt=wan`, `LAB_WAN_OPEN=1` (a rule accepting wan → router).
 - Router-side ECN per direction, from the router's counters (`LAB_EXPECT_ECN=U:D` for the negative

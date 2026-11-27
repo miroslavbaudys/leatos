@@ -9,7 +9,12 @@
 //!   (`fwd::udp::parse4` / `parse6`: lengths and checksums) and queued for
 //!   its service, bounded (the oldest is kept, a new one dropped and
 //!   counted). Cheap for the rest: the destination port is looked at
-//!   before any checksum.
+//!   before any checksum. UDP to a port nobody bound is dropped silently
+//!   and counted ([`unbound`]): smoltcp, built without `socket-udp`,
+//!   would answer it with ICMP protocol unreachable (IPv6: parameter
+//!   problem), and the router answers no UDP scan (CLAUDE.md, ports).
+//!   Boot argument `udp_unbound_drop=0` hands it to smoltcp again (the
+//!   lab's negative control).
 //! - Send: [`send`] builds the headers (`fwd::udp::build4` / `build6`)
 //!   into a pool buffer and hands it to `Datapath::send_local` (next hop
 //!   by `fwd::local`: broadcast, multicast, or a neighbor through the
@@ -73,9 +78,18 @@ struct Udp {
     bound: Vec<Bound>,
     /// Datagrams dropped because their port's queue was full.
     dropped: u64,
+    /// UDP to a port nobody bound, dropped silently.
+    unbound: u64,
 }
 
-static UDP: Mutex<Udp> = Mutex::new(Udp { bound: Vec::new(), dropped: 0 });
+static UDP: Mutex<Udp> = Mutex::new(Udp { bound: Vec::new(), dropped: 0, unbound: 0 });
+
+/// Unbound UDP is dropped here (`udp_unbound_drop=0`: smoltcp's, which
+/// answers it with protocol unreachable). Read once.
+fn unbound_drop() -> bool {
+    static DROP: spin::Once<bool> = spin::Once::new();
+    *DROP.call_once(crate::config::udp_unbound_drop)
+}
 
 /// Echo replies for one pinger: its identifier, (from, sequence) each.
 type PingQueue = (u16, VecDeque<(IpAddr, u16)>);
@@ -177,9 +191,15 @@ pub fn dropped() -> u64 {
     UDP.lock().dropped
 }
 
+/// UDP datagrams to unbound ports dropped (status).
+pub fn unbound() -> u64 {
+    UDP.lock().unbound
+}
+
 /// A frame of link `ifx` for the router (Ethernet header, then IP):
-/// `true` if it was UDP to a bound port (queued, or dropped when the
-/// queue is full or it is malformed), else smoltcp's.
+/// `true` if it was UDP (to a bound port: queued, or dropped when the
+/// queue is full or it is malformed; else dropped), ICMP echo or an
+/// IGMP / MLD query, else smoltcp's (TCP).
 pub fn take(ifx: IfIndex, frame: &[u8]) -> bool {
     membership(ifx, frame) || echo(ifx, frame) || UDP.lock().take(ifx, frame)
 }
@@ -247,13 +267,11 @@ impl Udp {
         self.bound.retain(|b| !(b.ifx == ifx && b.port == port));
     }
 
-    /// The frame (Ethernet header, then IP) if it is UDP to a port bound
-    /// on `ifx`: queued (or dropped when the queue is full) and `true`;
-    /// anything else `false` (smoltcp's).
+    /// The frame (Ethernet header, then IP) if it is UDP: to a port
+    /// bound on `ifx` queued (or dropped when the queue is full), to any
+    /// other port dropped, both `true`; anything else `false` (smoltcp's).
+    /// With `udp_unbound_drop=0` unbound UDP is `false` too.
     pub fn take(&mut self, ifx: IfIndex, frame: &[u8]) -> bool {
-        if self.bound.is_empty() {
-            return false;
-        }
         // The port before any checksum: most frames are not for us.
         let dport = match fwd::wire::ethertype(frame) {
             Some(ETHERTYPE_IPV4) => {
@@ -267,19 +285,28 @@ impl Udp {
             // for the router's own traffic) only after the full parse.
             Some(ETHERTYPE_IPV6) => match frame.get(ETH_HDR + 6) {
                 Some(&PROTO_UDP) => frame.get(ETH_HDR + 40 + 2..ETH_HDR + 40 + 4),
-                Some(&(0 | 43 | 44 | 60)) => match fwd::udp::parse6(frame) {
-                    Some(d) => return self.queue(ifx, d.ends.dport, Some((Ends::V6(d.ends), d.payload)), frame),
-                    None => return false,
+                Some(&(0 | 43 | 44 | 60)) => match fwd::wire::Ipv6View::parse(frame, ETH_HDR) {
+                    Some(v) if v.proto == PROTO_UDP => match fwd::udp::parse6(frame) {
+                        Some(d) => {
+                            let ends = Ends::V6(d.ends);
+                            return self.queue(ifx, d.ends.dport, Some((ends, d.payload)), frame)
+                                || self.unbound();
+                        }
+                        // Malformed or a fragment: nobody's datagram.
+                        None => return self.unbound(),
+                    },
+                    _ => return false,
                 },
                 _ => return false,
             },
             _ => return false,
         };
+        // Too short for a port: malformed (or an IPv4 fragment's tail).
         let Some(dport) = dport.map(|p| u16::from_be_bytes([p[0], p[1]])) else {
-            return false;
+            return self.unbound();
         };
         if !self.bound.iter().any(|b| b.ifx == ifx && b.port == dport) {
-            return false;
+            return self.unbound();
         }
         // Bound: ours even if malformed (smoltcp has no socket there).
         let parsed = match fwd::wire::ethertype(frame) {
@@ -300,6 +327,16 @@ impl Udp {
         } else {
             b.q.push_back(Datagram { ends, payload: frame[from..to].to_vec() });
         }
+        true
+    }
+
+    /// UDP nobody bound: dropped and counted (`true`), or with
+    /// `udp_unbound_drop=0` left to smoltcp (`false`).
+    fn unbound(&mut self) -> bool {
+        if !unbound_drop() {
+            return false;
+        }
+        self.unbound += 1;
         true
     }
 

@@ -6,7 +6,8 @@ over the router's own UDP: `net::local` + `fwd::udp`, IPv4 and IPv6); the fallba
 2026-11-26 (user decision: the whole migration goes to the apu4 at once after the soak, no
 per-step day there). Step 0 (docs/lan-neighbors.md) done with it. Step 3 done the same day
 (every UDP service on `net::local`, `socket-udp` gone), steps 4 and 5 too (ICMP echo, the
-pinger, IGMP / MLD ours; smoltcp for TCP only). Left: the apu4 (§6). Roadmap M14.
+pinger, IGMP / MLD ours; smoltcp for TCP only). Unbound UDP dropped silently (2026-11-27, step 3
+below). Left: the apu4 (§6). Roadmap M14.
 
 ## 1. Goal
 
@@ -144,6 +145,11 @@ end.
 - DHCP server :67, DHCPv6 client :546, SNTP and mDNS :5353 (TTL 255: `fwd::udp::build4` takes the
   TTL now) followed the same day; `socket-udp` removed. Step 3 done in QEMU; the IGMP / MLD reports
   for mDNS's groups still come from smoltcp (step 4).
+- Unbound ports (2026-11-27): without `socket-udp`, smoltcp answered UDP to a router port nobody
+  bound with ICMP protocol unreachable (IPv6: parameter problem), from zones without an input
+  policy. `net::local` now takes all UDP and drops unbound datagrams silently
+  (`local.udp_unbound`); the lab's client-port check counts every ICMP unreachable, and a LAN
+  probe checks the drop (negative control `udp_unbound_drop=0`).
 
 ### Step 4: ICMP and group membership (done in QEMU 2026-11-26)
 

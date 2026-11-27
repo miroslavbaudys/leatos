@@ -95,10 +95,16 @@
 #                        (no free slot: the request is refused)
 #                        Client ports (§5 item 7), from the WAN capture
 #                        (always taken but in swarm mode): the ISP's UDP
-#                        probes to unbound client ports and 68 get no port
-#                        unreachable, upstream DNS queries use many ports.
-#                        Negative controls LAB_ROUTER_ARGS=fw_client_ports=0
-#                        and LAB_ROUTER_ARGS=dns_port_random=0
+#                        probes to unbound client ports and 68 get no ICMP
+#                        unreachable (any code), upstream DNS queries use
+#                        many ports. Negative controls LAB_ROUTER_ARGS=
+#                        "fw_client_ports=0 udp_unbound_drop=0" and
+#                        LAB_ROUTER_ARGS=dns_port_random=0
+#                        (fw_client_ports=0 alone: the client's "wan client
+#                        ports" check fails). Unbound UDP from the LAN, from
+#                        the LAN capture: the client's probes to unbound
+#                        router ports get no ICMP unreachable. Negative
+#                        control LAB_ROUTER_ARGS=udp_unbound_drop=0
 #   LAB_ROUTER_ARGS="…"  extra router boot arguments, e.g. qdisc=codel (single
 #                        CoDel queue: the negative control for the flow-
 #                        isolation latency check), or dns_prefetch=0 (the
@@ -1160,10 +1166,13 @@ fi
 
 # Router client ports (docs/security-audit.md §5 item 7), judged on the
 # router's WAN capture: the ISP's UDP probes (cgi-bin/wanprobe, source ports
-# 40120-40127) to unbound client ports and to 68 draw no ICMP port
-# unreachable, and the router's upstream DNS queries leave from many ports.
-# Negative controls: LAB_ROUTER_ARGS=fw_client_ports=0 (port unreachable
-# again), LAB_ROUTER_ARGS=dns_port_random=0 (one port).
+# 40120-40127) to unbound client ports and to 68 draw no ICMP unreachable
+# of any code (smoltcp, without UDP sockets, would send protocol
+# unreachable), and the router's upstream DNS queries leave from many
+# ports. Negative controls: LAB_ROUTER_ARGS="fw_client_ports=0
+# udp_unbound_drop=0" (unreachable again; fw_client_ports=0 alone is caught
+# by the client's "wan client ports" check, the router's UDP drops them),
+# LAB_ROUTER_ARGS=dns_port_random=0 (one port).
 if [[ -z "$SWARM$UPLOAD$BIDIR" ]]; then
   if ! command -v tcpdump >/dev/null || [[ ! -f "$PCAP_DIR/wan.pcap" ]]; then
     echo "  LAB FAIL: client ports: INVALID, no WAN capture or no tcpdump to read it"; router_fails=$((router_fails + 1))
@@ -1173,13 +1182,32 @@ if [[ -z "$SWARM$UPLOAD$BIDIR" ]]; then
     [[ -n "$ISP_PPPOE" ]] && pre="${pre}pppoes and "
     td() { tcpdump -nr "$PCAP_DIR/wan.pcap" "$1" 2>/dev/null || true; }
     probes=$(td "${pre}udp src portrange 40120-40127" | grep -c . || true)
-    unreach=$(td "${pre}icmp[icmptype] == 3 and icmp[icmpcode] == 3 and (icmp[30:2] >= 60000 or icmp[30:2] == 68)" | grep -c . || true)
+    unreach=$(td "${pre}icmp[icmptype] == 3 and (icmp[30:2] >= 60000 or icmp[30:2] == 68)" | grep -c . || true)
     if [[ "$probes" -lt 8 ]]; then
       echo "  LAB FAIL: client ports: INVALID, $probes of 8 UDP probes in the WAN capture"; router_fails=$((router_fails + 1))
     elif [[ "$unreach" == 0 ]]; then
-      echo "  LAB PASS: client ports: $probes UDP probes to unbound client ports and 68, no port unreachable back"
+      echo "  LAB PASS: client ports: $probes UDP probes to unbound client ports and 68, no ICMP unreachable back"
     else
-      echo "  LAB FAIL: client ports: $unreach port unreachable answers to $probes UDP probes"; router_fails=$((router_fails + 1))
+      echo "  LAB FAIL: client ports: $unreach ICMP unreachable answers to $probes UDP probes"; router_fails=$((router_fails + 1))
+    fi
+    # Unbound UDP from the LAN (docs/local-stack.md): the client's probes
+    # (source ports 40130-40133) to router ports nobody bound draw no ICMP
+    # unreachable (IPv4: type 3, the inner UDP source port at icmp[28]).
+    # Negative control LAB_ROUTER_ARGS=udp_unbound_drop=0 (protocol
+    # unreachable from smoltcp).
+    if [[ -f "$PCAP_DIR/lan.pcap" ]]; then
+      tl() { tcpdump -nr "$PCAP_DIR/lan.pcap" "$1" 2>/dev/null || true; }
+      lprobes=$(tl "udp and src portrange 40130-40133" | grep -c . || true)
+      lunreach=$(tl "icmp[icmptype] == 3 and icmp[28:2] >= 40130 and icmp[28:2] <= 40133" | grep -c . || true)
+      if [[ "$lprobes" -lt 4 ]]; then
+        echo "  LAB FAIL: unbound udp: INVALID, $lprobes of 4 LAN UDP probes in the LAN capture"; router_fails=$((router_fails + 1))
+      elif [[ "$lunreach" == 0 ]]; then
+        echo "  LAB PASS: unbound udp: $lprobes LAN UDP probes to unbound router ports, no ICMP unreachable back"
+      else
+        echo "  LAB FAIL: unbound udp: $lunreach ICMP unreachable answers to $lprobes LAN UDP probes"; router_fails=$((router_fails + 1))
+      fi
+    else
+      echo "  LAB FAIL: unbound udp: INVALID, no LAN capture"; router_fails=$((router_fails + 1))
     fi
     if [[ -n "$DOT" ]]; then
       echo "  LAB INFO: dns upstream ports: not checked (DNS over TLS)"

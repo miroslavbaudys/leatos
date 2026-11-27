@@ -394,13 +394,53 @@ fi
 # must refuse). Negative controls (scripts/lab-test.sh): LAB_ROUTER_ARGS=
 # mgmt=wan (tcp80 open), LAB_WAN_OPEN=1 (a rule accepting wan -> router:
 # RST and ping reply again).
+unb() { $bb wget -q -T 5 -O - "http://admin:lab-pass@$router/api/status" 2>/dev/null | $bb sed -n 's/.*"udp_unbound":\([0-9]*\).*/\1/p'; }
+ub0=$(unb)
 wp=$($bb wget -q -T 40 -O - "http://$ISP/cgi-bin/wanprobe" 2>&1)
+ub1=$(unb)
 if echo "$wp" | $bb grep -q "control=REFUSED" && echo "$wp" | $bb grep -q "tcp22=SILENT" \
    && echo "$wp" | $bb grep -q "tcp80=SILENT" && echo "$wp" | $bb grep -q "tcp61000=SILENT" \
    && echo "$wp" | $bb grep -q "ping=SILENT"; then
   pass "wan input: router silent to unsolicited traffic (tcp 22, 80, 61000, ping; control refused)"
 else
   fail "wan input: $(echo $wp)"
+fi
+# The ISP's UDP probes (wanprobe, 8 to unbound client ports and 68; their
+# answers are judged on the WAN capture by scripts/lab-test.sh) stop at
+# the forwarder's client-port filter: none reaches the router's own UDP
+# (/api/status local.udp_unbound unchanged; the client is the only LAN
+# host and idle meanwhile). Negative control
+# LAB_ROUTER_ARGS=fw_client_ports=0.
+wn=$(echo "$wp" | $bb sed -n 's/.*udp_probes=\([0-9]*\).*/\1/p')
+if [ -z "$ub0" ] || [ -z "$ub1" ] || [ -z "$wn" ]; then
+  fail "wan client ports: INVALID, no udp_unbound in status ($ub0 -> $ub1) or no probe count ($wn)"
+elif [ "$ub1" = "$ub0" ]; then
+  pass "wan client ports: $wn ISP UDP probes stopped by the forwarder (udp_unbound $ub0 -> $ub1)"
+else
+  fail "wan client ports: $((ub1 - ub0)) of the ISP's $wn UDP probes reached the router's UDP (udp_unbound $ub0 -> $ub1)"
+fi
+
+# Unbound UDP on the router (docs/local-stack.md): the main LAN's zone has
+# no input policy, so UDP to a router port nobody bound reaches the
+# router's own UDP, which drops it silently (/api/status local.udp_unbound
+# counts it: the probes arrived). scripts/lab-test.sh judges the LAN
+# capture: no ICMP unreachable back to source ports 40130-40133. Negative
+# control LAB_ROUTER_ARGS=udp_unbound_drop=0 (smoltcp answers protocol
+# unreachable; nothing counted).
+ul0=$(unb)
+n=0
+for p in 9 1900 4000 40000; do
+  (echo probe | $bb nc -u -w 1 -p $((40130 + n)) "$router" $p >/dev/null 2>&1) &
+  n=$((n + 1))
+done
+wait
+ul1=$(unb)
+if [ -z "$ul0" ] || [ -z "$ul1" ]; then
+  fail "unbound udp: INVALID, no udp_unbound in status"
+elif [ $((ul1 - ul0)) -ge "$n" ]; then
+  pass "unbound udp: $n probes to unbound router ports dropped by the router (udp_unbound $ul0 -> $ul1)"
+else
+  fail "unbound udp: $n probes, udp_unbound $ul0 -> $ul1 (not dropped by the router's UDP)"
 fi
 
 # WAN ARP (docs/local-stack.md step 2): the ISP forgets the router's WAN
