@@ -13,8 +13,9 @@ author's home router (PC Engines apu4, PPPoE over VLAN). Expect breaking changes
 ## Features
 
 - **WAN:** DHCP, PPPoE (PAP/CHAP, RFC 4638 MTU), static; 802.1Q VLAN tag
-- **LAN:** several networks (VLANs or their own ports), DHCPv4 server with
-  leases kept across reboots, static routes (option 121)
+- **LAN:** several networks (VLANs or their own routed ports, no bridge),
+  DHCPv4 server with leases kept across reboots and pool-exhaustion defences,
+  static routes (option 121)
 - **Forwarding:** NAT (NAPT), zone firewall with rules, port forwards, redirects,
   hairpin, IP fragments, MSS clamping, WAN anti-spoofing
 - **IPv6** (off by default: `[ipv6] enabled`; on or off per network):
@@ -27,12 +28,25 @@ author's home router (PC Engines apu4, PPPoE over VLAN). Expect breaking changes
 - **Queueing:** CAKE (default), FQ-CoDel or CoDel; shaped upload and a shaped
   download stage, ECN
 - **DNS:** caching forwarder with prefetch and serve-stale, DNS over TCP,
-  DNS over TLS upstream, local names with split-horizon views; mDNS reflector
-- **SNTP**, hardware and cross-core watchdogs, multicore datapath
-- **Management:** web interface, serial CLI, config in TOML with trial
-  changes that revert unless confirmed, kernel upgrades over HTTP with rollback
+  DNS over TLS upstream, a fresh random upstream port per query, local names
+  under `home.arpa` with split-horizon views; mDNS reflector
+- **Own network stack:** ARP / ND, UDP, ICMP echo, IGMP / MLD and the DHCP
+  client are leatos's own sans-IO code; [smoltcp](https://github.com/smoltcp-rs/smoltcp)
+  carries only TCP (web interface, DNS over TCP, DNS over TLS)
+- **SNTP**, hardware and cross-core watchdogs, multicore datapath (download,
+  upload and services on their own cores)
+- **Management:** web interface (with a live WAN throughput chart), serial
+  CLI, config in TOML with trial changes that revert unless confirmed, kernel
+  upgrades over HTTP with rollback
+- **Hardening:** silent to scans from the WAN (no RST, no port unreachable),
+  DNS-rebinding and cross-site request refusals and per-source login backoff
+  on the web interface, a security audit
+  ([docs/security-audit.md](docs/security-audit.md)), 18 fuzz targets
 
-IPv6 (M7) runs on the author's apu4 with its ISP (PPPoE, a delegated /60); a long soak test is next, then IPv6 on by default. A WireGuard server (M12) is planned: see [docs/roadmap.md](docs/roadmap.md).
+IPv6 (M7) runs on the author's apu4 with its ISP (PPPoE, a delegated /60); it
+goes on by default after a long soak test. Planned
+([docs/roadmap.md](docs/roadmap.md)): a WireGuard server (M12) and leatos as a
+KVM / Proxmox VE guest (M13).
 
 ## Platforms
 
