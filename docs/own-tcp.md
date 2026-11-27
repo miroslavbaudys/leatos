@@ -2,7 +2,7 @@
 
 Status (2026-11-27): steps 1–5 done in QEMU (the kernel has no smoltcp; `crates/proto-tcp`,
 `fwd::tcp`, `HostIf` = `LocalLink` + `proto_tcp::Tcp`). On the apu4 since 2026-11-27 (§6):
-persisted (slot B seq 24, uploaded over the new TCP), 72 h soak running until 11-30. Roadmap
+aaa0f7c persisted (slot A seq 25, with the TIME-WAIT fix), 72 h soak running until 11-30. Roadmap
 M15. This reverses docs/local-stack.md §1 ("Not a goal: our own TCP"), by decision of the user on
 2026-11-27. What the implementation does differently from the plan is marked "Done:" below.
 
@@ -223,7 +223,10 @@ over `proto_tcp` (slot B seq 24, confirmed), and a new soak (`apu4-owntcp-dcf83e
   the owed ACK goes out, a repeated FIN (or data) is acknowledged and restarts the 10 s, RSTs are
   ignored (RFC 1337), bare ACKs need nothing, a new SYN above `rcv_nxt` takes the pair;
   `local.tcp.time_wait` counts segments answered from it. Host tests with a control (the
-  hand-off switched off: three of the four fail). Not on the apu4 yet (soak until 11-30).
+  hand-off switched off: three of the four fail). On the apu4 (aaa0f7c): 20 requests add 3 to
+  `no_socket` (20 before) and 40 to `time_wait`. Left: ~2.5/s `no_socket` from elsewhere (all
+  of them RSTs for segments to no socket, none from aborts), likely LAN devices trying closed
+  router ports (443, 853?); a per-port counter would tell.
 - **The upgrade path runs on this TCP.** A bug that stalls large uploads cuts off remote
   upgrades; the RAM day includes uploading over the new TCP before anything is persisted.
 - **Internet-facing protocol code.** The DoT client always, mgmt with `mgmt-wan`: fuzzing and
