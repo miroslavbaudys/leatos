@@ -22,8 +22,9 @@
 //! fattest-flow overflow drop and the slab storage are those of
 //! [`crate::fq_codel`]. The CoDel part is RFC 8289 ([`crate::codel`]);
 //! CAKE's COBALT variant differs in details (count decay, no MTU rule).
-//! DiffServ tins, the ACK filter, rate-aware targets and ingress mode
-//! come later.
+//! The ACK filter is [`crate::ack_filter`], ingress mode
+//! [`crate::shaper::Shaper::ingress`]; DiffServ tins and rate-aware
+//! targets come later.
 
 use crate::codel::{MAX_PACKET, Params, Sojourn, Vars};
 use crate::fq_codel::{FlowQueue, FlowSource, NIL, Slab};

@@ -23,8 +23,9 @@ Keep them current when you change what they describe; keep this file to the map 
   CCP TRNG, CPU temperature); `src/config.rs` (boot-time `Config`), `store.rs`, `upgrade.rs`,
   `cli.rs`, `console.rs`, `fatal.rs`, `watchdog.rs`, `entropy.rs`, `wallclock.rs`.
 - `kernel/src/net/`: the datapath tasks `dp_down`/`dp_up` (`stack.rs`, `datapath.rs`), the services
-  task `svc` (`svc.rs`: smoltcp, WAN, LAN services, mgmt), `shared.rs` = the only coupling between
-  them, `mgmt.rs` + `mgmt.html` = web interface and API on :80.
+  task `svc` (`svc.rs`: WAN, LAN services, mgmt; the router's own UDP / ICMP in `local.rs`,
+  smoltcp for TCP only), `shared.rs` = the only coupling between them, `mgmt.rs` + `mgmt.html` = web
+  interface and API on :80.
 - Ports: `wan0` + routed LAN ports `lan0`–`lan2` (NICs in PCI order), no bridge; networks (VLANs)
   are link slots on a port.
 - `crates/`: sans-IO protocol and policy crates: `fwd` (forwarder, conntrack/NAT, firewall, routes,
@@ -45,8 +46,9 @@ Keep them current when you change what they describe; keep this file to the map 
 - `docs/`: design and reference. Start with architecture.md and roadmap.md;
   **boot-arguments.md** (every kernel option), **lab-tests.md** (every test and its negative
   controls), safety-and-portability, smp, config-and-storage, config-v2, upgrades, ipv6,
-  security-audit, lan-neighbors (plan: LAN links on `Medium::Ip`, one neighbor table), local-stack
-  (plan: smoltcp for TCP only), proxmox (plan: leatos as a KVM / Proxmox guest), …
+  security-audit, lan-neighbors (done: one neighbor table, the datapath does ARP / ND),
+  local-stack (done in QEMU: smoltcp for TCP only), proxmox (plan: leatos as a KVM / Proxmox
+  guest), …
 
 ## Rules
 

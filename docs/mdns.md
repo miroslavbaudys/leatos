@@ -6,6 +6,9 @@ config (`[[mdns.reflect]]`, zone service `mdns`, validation) and the
 kernel (`net/mdns.rs`, counters on `/api/status` and the CLI), with a
 first lab check (`LAB_MDNS=1`, §7), and the web page section (§5).
 Open: a browse test with real mDNS software, the apu4 (§8).
+Since 2026-11-26 (docs/local-stack.md steps 3–4) the transport is the
+router's own: port 5353 on `net::local`, the IGMP / MLD reports from
+`net::groups`; smoltcp has no part in mDNS any more (§4).
 
 mDNS (RFC 6762) and DNS-SD (RFC 6763) are link-local: queries and
 announcements go to `224.0.0.251:5353` (IPv6 `ff02::fb`) with TTL 255, and
@@ -94,12 +97,15 @@ behind it without changing the kernel side.
 - Host tests for each point above, plus a fuzz target (M9).
 
 ## 4. Kernel (`kernel/src/net/mdns.rs`)
-- `kernel/Cargo.toml`: smoltcp feature `multicast` (the default group
-  count, 4 per interface, is enough: one group).
+- Transport (since 2026-11-26, docs/local-stack.md steps 3–4; before, a
+  smoltcp UDP socket and its `multicast` feature): port 5353 bound on the
+  link in `net::local` (8 datagrams queued, the rest dropped and counted
+  in `local.udp_dropped`), copies sent with `local::send` and TTL 255;
+  the memberships (`Mdns::members`, `generation`) go to `net::groups`,
+  which sends the IGMPv2 / MLDv2 reports and answers queries.
 - `Mdns`, owned by `LanServices` like `Ntp`: for each network a rule
-  involves (`Reflector::takes_part`), `join_multicast_group(224.0.0.251)`
-  on that link's interface and a UDP socket on 5353 (16 datagrams, 24 KiB
-  each way, `set_hop_limit(Some(255))`); never on the WAN. Network `k` of
+  involves (`Reflector::takes_part`), a membership of 224.0.0.251 (and
+  ff02::fb with IPv6) on that link and port 5353; never on the WAN. Network `k` of
   `config::networks` is reflector network `k`; `config::mdns_rules()`
   maps the enabled entries to those indices.
 - `reconfigure` (boot and every live config apply): memberships that
@@ -111,20 +117,20 @@ behind it without changing the kernel side.
   queued before `Datapath::apply` would carry the link's old tag (none,
   for a network just added) and never reach the network. This was caught
   by `LAB_MDNS=1 LAB_GUEST_LIVE=1` (no IGMP join on the live-added guest
-  VLAN). Sockets are closed and reopened. Counters stay while the network
+  VLAN). Ports are unbound and bound again. Counters stay while the network
   names stay the same.
 - `step` (end of `LanServices::step`): each received datagram goes to
   `Reflector::handle`; its copies are sent to `224.0.0.251:5353` on the
-  target networks' sockets (smoltcp picks the source address and the
-  multicast MAC). A full socket buffer drops (bounded). `Priority::Service`;
+  target networks' links, from the router's address there (IPv6: its
+  link-local address); `fwd::local` maps the group to its multicast MAC.
+  A full port queue drops (bounded). `Priority::Service`;
   the datapath is untouched (the forwarder passes 5353 up when the zone
   allows `mdns`); reflected packets reach the LAN qdisc like any local
   traffic.
-- smoltcp sends the IGMP v2 report when the group is joined on an
-  interface that has its address; it answers IGMP queries. The guest
-  zone's input policy drops IGMP queries (no service bit for IGMP); this
-  matters only for snooping switches that do not flood 224.0.0.0/24
-  (RFC 4541 says they must).
+- `net::groups` sends the report when a group is joined (once the link has
+  its address) and answers IGMP / MLD queries; the forwarder passes
+  queries from every network, the guest zone's included (not from the
+  WAN), for snooping switches (`groups=0`: none sent, the lab's control).
 - Status: `GET /api/status` `"mdns":[{network, received, sent, filtered,
   duplicate, rate_limited, malformed, foreign, oversize}]` (networks taking
   part), the CLI `status` an `mdns :` line per network.
@@ -171,8 +177,9 @@ services = ["_airplay._tcp", "_raop._tcp", "_googlecast._tcp", "_ipp._tcp"]
    no matching forward path.
 2. **Privacy**: reflecting guest → main exposes main's host names. Off by
    default; only what a rule names.
-3. **Size**: mDNS allows up to 9000 B; without IPv4 reassembly in smoltcp
-   fragmented messages are lost. Accepted (≤ MTU), counted as malformed.
+3. **Size**: mDNS allows up to 9000 B; the router does not reassemble
+   (`net::local` drops fragments), so fragmented messages are lost.
+   Accepted (≤ MTU), counted as malformed.
 4. **Link-local addresses** in answers are useless on another link; the
    rebuild removes them (IPv6 transport: `ff02::fb`, docs/ipv6.md step 5b).
 5. **Name conflicts**: probes reflected across networks make names unique

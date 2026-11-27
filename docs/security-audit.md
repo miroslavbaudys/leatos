@@ -5,6 +5,13 @@ Phase 2 (code review by exposure), phase 3 (tools: long fuzz runs, coverage,
 `cargo deny`/`cargo vet`, external scans) and phase 4 (findings, fixes,
 regression tests) build on this document.
 
+Update 2026-11-27: since M14 (docs/local-stack.md, 2026-11-26) smoltcp carries only the router's
+TCP; ARP / ND, UDP, ICMP echo, IGMP / MLD and the WAN's DHCPv4 client are leatos's own. Where
+this document names smoltcp for those, it describes the code at the time. Found with it: UDP to
+an unbound router port from a zone without an input policy drew ICMP protocol unreachable from
+smoltcp (no UDP sockets any more); `net::local` now drops it silently (`local.udp_unbound`, lab
+checks `unbound udp` and `client ports`, negative control `udp_unbound_drop=0`).
+
 ## 1. What we protect (assets)
 
 | Asset | Why it matters |
@@ -85,7 +92,7 @@ Columns: **Parser** = where untrusted bytes are first interpreted.
 | mDNS 5353 (reflector) | `proto-mdns` parse/rebuild, `Reflector` | 128 hosts, 128 services, 64 recent, output ≤ 1472 B | `mdns` | compression loops in parse, rule bypass (service type spoofing), amplification between networks, rate limits |
 | RS → RA | `proto_dhcp::v6::ra` | solicited ≥ 3 s apart | — (RS side) | RS flood |
 | Web interface :80 | `proto-http` (head ≤ 8 KiB, small body ≤ 64 KiB), `mgmt.rs` (1560 lines) | 4 LAN sockets, 20 s request / 120 s upload timeout, 8 sessions, 12 h idle | `http` | see 4.3 |
-| Other router ports | smoltcp | — | — | what does smoltcp answer on closed ports per zone (RST/ICMP), and is `input` mask applied before smoltcp sees the packet? |
+| Other router ports | smoltcp | — | — | what does smoltcp answer on closed ports per zone (RST/ICMP), and is `input` mask applied before smoltcp sees the packet? (2026-11-27: the zone input applies first; then UDP is dropped silently by `net::local`, TCP gets a RST from smoltcp, other protocols protocol unreachable) |
 
 #### Neighbor hints and cache poisoning (reviewed 2026-11-22; the hints were removed 2026-11-26)
 
@@ -252,7 +259,8 @@ the LAN side), the rest are open.
    would make a missed overflow a reboot instead of a value a later bounds
    check drops. The fuzzers keep running with them on.
    Not covered: smoltcp's own DHCPv4 client (WAN), the DoT crypto glue
-   (item 9).
+   (item 9). (2026-11-26: the WAN client is now `proto_dhcp::v4::client`,
+   fuzz target `dhcp_client`.)
 5. **FIXED a–c, f; d–e accepted (2026-11-22): DHCP pool exhaustion** (A3/A4: any
    client on a network the server answers, guest networks included).
    Measured on `proto_dhcp::v4::server` with the default pool (.100–.199,

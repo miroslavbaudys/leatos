@@ -37,8 +37,8 @@ watchdog backed by a hardware timer resets a stuck one (M8,
 │  L3: LPM route table · ARP neighbor cache · TTL · ICMP errors  │
 │  conntrack · NAPT · DNAT · zone firewall + rules · MSS clamp   │
 │ Queue management (crates/qdisc): CAKE egress on both ports     │
-│  shaper · FQ · COBALT · host isolation (later: tins, ACK       │
-│  filter, ingress mode)                                         │
+│  shaper · FQ · COBALT · host isolation · ACK filter · ingress  │
+│  stage (later: DiffServ tins)                                  │
 ├───────────────────────────────────────────────────────────────┤
 │ Drivers: virtio-net · igb (i211/82576) · virtio-blk · SDHCI ·  │
 │ i6300esb / AMD FCH watchdog · PL011 / 16550                    │
@@ -54,7 +54,8 @@ watchdog backed by a hardware timer resets a stuck one (M8,
    for the WAN, `dp_up` for the LAN), which drains the RX queue in batches.
 2. Classification: if the packet is addressed to the router (one of its IPs,
    ARP/NDP for its IPs, PPPoE discovery or control frames), hand it to the local
-   path (smoltcp or a protocol state machine). Otherwise it goes to the forwarding plane.
+   path (the datapath's ARP / ND, the PPPoE client, `net::local`, or smoltcp for
+   TCP). Otherwise it goes to the forwarding plane.
 3. Forwarding: decapsulate (VLAN or PPPoE), conntrack lookup or create,
    firewall verdict, NAT rewrite, **classify** (fill `PacketMeta`: pre-NAT
    flow and host hashes, wire length), route lookup (LPM), neighbor
@@ -71,8 +72,9 @@ watchdog backed by a hardware timer resets a stuck one (M8,
    datapath's neighbor table (`send_local`) into the port's qdisc, so the
    qdisc sees all egress traffic.
 4. Egress: enqueue into the egress port's qdisc (CAKE by default on both
-   ports, wrapped in the shaper). The transmitting task **pulls** from the qdisc when the driver has ring space and the
-   shaper allows it, then encapsulates and transmits. The qdisc is the only
+   ports, wrapped in the shaper). The transmitting task **pulls** from the
+   qdisc when the driver has ring space and the shaper allows it, then
+   encapsulates and transmits. The qdisc is the only
    place packets wait (no hidden queues).
 
 **VLAN tags (802.1Q, implemented for the WAN):** a port's tag
@@ -136,8 +138,9 @@ all or none, `split_drops`), and they enter the qdisc back to back in one
 CAKE flow. Not split: packets with IP options (`too-big`). Counters in
 `/api/status` `fragments` (`split`, `split_drops`); boot argument
 `fw_split=0` drops them as `too-big` again (negative control).
-Fragments to the router itself still go to smoltcp, which does not
-reassemble. Boot argument `fw_frag=0` drops all fragments (negative
+Fragments to the router itself are not reassembled: UDP ones are
+dropped by the router's own UDP (`net::local`), TCP ones by smoltcp. Boot
+argument `fw_frag=0` drops all fragments (negative
 control).
 
 ```text
@@ -162,7 +165,7 @@ the project (it effectively replaces netfilter), and it must be fuzzed.
 | Task | Priority | Core (≥ 3 online) | Owns | Does |
 |---|---|---|---|---|
 | `dp_down` / `dp_up` (`net::stack::run_dir`) | Datapath | 0 / 1 | one direction each: RX on one port, TX on the other; share the locked NICs and `Datapath` (16 forwarder shards, neighbor tables) | RX → forward → qdisc → TX, NAPI; `dp_down` also housekeeping and control |
-| `svc` (`net::svc::run`) | Service | 2 | smoltcp interfaces and sockets (`HostIf`, one per link), WAN DHCP client or PPPoE, LAN DHCP servers, DNS + DoT, SNTP, mDNS, mgmt, CLI, store writes | the router's own traffic |
+| `svc` (`net::svc::run`) | Service | 2 | the router's own UDP / ICMP (`net::local`), smoltcp interfaces and TCP sockets (`HostIf`, one per link), WAN DHCP client or PPPoE, LAN DHCP servers, DNS + DoT, SNTP, mDNS, mgmt, CLI, store writes | the router's own traffic |
 | `watchdog` (one per core) | Datapath | each | `LAST_SEEN` stamps | cross-core check, hardware watchdog (docs/watchdog-and-time.md) |
 
 With one core everything runs on core 0 (a single `dp` task); with two the
@@ -186,7 +189,7 @@ pppoe: PADI→PADO→PADR→PADS → LCP → PAP/CHAP → IPCP
         └─► Session + LeaseChange{ip, peer, dns[]}
               ├─ fwd:     WAN address + default route (Control), masquerade, MSS clamp
               ├─ dns:     upstreams = dns[] (unless dns.upstreams is set)
-              └─ (M7) dhcp6pd: solicit over PPPoE → PrefixDelegated{/56}
+              └─ dhcp6pd: solicit over PPPoE → PrefixDelegated{/56, /60}
                                 └─ LAN /64 + RA with RDNSS
 DHCP Bound/Released{mac, ip, hostname} ─► dns local zone (`host.<domain>`)
 WAN down (PADT / LCP echo timeout / lease lost) ─► address withdrawn, reconnect with backoff
@@ -201,14 +204,15 @@ state machines that take bytes and the current time as input, and return
 bytes to send plus events.
 
 ```
-crates/proto-pppoe   PPPoE discovery, LCP, PAP/CHAP, IPCP (IPv6CP: M7)
-crates/proto-dhcp    DHCPv4 server + lease snapshots (DHCPv6-PD, RA: M7)
+crates/proto-pppoe   PPPoE discovery, LCP, PAP/CHAP, IPCP, IPv6CP
+crates/proto-dhcp    DHCPv4 server + lease snapshots, DHCPv4 client, DHCPv6-PD, RA
 crates/proto-dns     forwarder, cache, local zones
 crates/proto-dot     DNS over TLS client (rustls, unbuffered)
 crates/proto-sntp    SNTP client
 crates/proto-mdns    mDNS reflector across networks
 crates/proto-http    incremental HTTP/1.1 parser
-crates/fwd           LPM, neighbor cache, conntrack, NAT, zone firewall
+crates/fwd           LPM, neighbor cache, conntrack, NAT, zone firewall;
+                     the router's own ARP / ND, UDP, ICMP echo, IGMP / MLD
 crates/qdisc         CoDel, FQ-CoDel, CAKE, shaper (simulation-tested with fake time)
 crates/config        config.toml schema, validation, migration
 crates/config-store  power-fail-safe store partition format
@@ -236,14 +240,14 @@ and dhcproto are out).
 | Need | Choice |
 |---|---|
 | DTB parsing | `fdt` |
-| Heap | `linked_list_allocator` (bring-up); packet buffers come from dedicated pools |
+| Heap | `talc` (`heap=list`: `linked_list_allocator`, the old one); packet buffers come from dedicated pools |
 | Locks | `spin` |
 | virtio drivers + PCI config access | `virtio-drivers` (rcore-os), we implement its `Hal` trait |
 | MMIO | `safe-mmio` (via `mmio::Region`) |
 | aarch64 system registers | `aarch64-cpu` (arch backend only) |
-| TCP/IP for the router's own services | `smoltcp` |
+| TCP for the router's own services | `smoltcp` (TCP only: UDP, ICMP, ARP / ND, IGMP / MLD are our own, docs/local-stack.md) |
 | DNS wire format | our own (`crates/proto-dns`, `crates/proto-mdns`) |
-| HTTP server | our own (`crates/proto-http`) over smoltcp TCP |
+| HTTP server | our own (`crates/proto-http`) over smoltcp's TCP |
 | TLS (DoT) | `rustls` 0.23 (no std, unbuffered API) + RustCrypto provider |
 | Config | `toml` + `serde`, `serde_json` |
 | SSH (later) | `sunset` |

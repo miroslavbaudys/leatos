@@ -14,8 +14,9 @@ events out), host-tested with `cargo test`. Fuzz targets in `fuzz/` (fuzz/README
   `frag` like IPv4 (`Decision6`, no rewrite); `ipv6` off = dropped.
 - `route`: connected, default and static routes (`Forwarder::set_static_routes`), active while a
   connected subnet holds the router; routed subnets count as inside.
-- `nd`: the router's link layer for its own addresses (docs/lan-neighbors.md, step 1; not used by
-  the kernel yet): `nd::answer` gives the ARP reply / NA (R, S, O flags; DAD defended to all nodes;
+- `nd`: the router's link layer for its own addresses (docs/lan-neighbors.md; the datapath's
+  `Datapath::link_layer` on every link but PPPoE): `nd::answer` gives the ARP reply / NA (R, S, O
+  flags; DAD defended to all nodes;
   unicast NS answered) and conflicts (another MAC claiming or probing for our address); RFC 4861
   §7.1.1 checks; `Config` switches for the lab's negative controls (`nd_unicast=0`,
   `na_router=0`). Tests parse every reply with smoltcp.
@@ -84,8 +85,8 @@ and sparse senders. How the kernel uses it: kernel/src/net/CLAUDE.md.
     for upstream RAs; tested against smoltcp's parser.
   - `v4::client` DHCPv4 client (RFC 2131: DISCOVER/REQUEST, INIT-REBOOT with `Config::last`,
     renew unicast at T1, rebind at T2, NAK backoff, lease checks, option 26 MTU); returns
-    `Transmit` with source and destination; fuzz target `dhcp_client`. Not used by the kernel yet
-    (docs/local-stack.md step 2).
+    `Transmit` with source and destination; fuzz target `dhcp_client`. The WAN's client
+    (`net::wan4`, docs/local-stack.md step 2b).
   - `v6::pd` DHCPv6 prefix delegation client (RFC 8415: Solicit/Advertise/Request/Reply,
     Renew/Rebind, DUID-LL, retransmission with jitter); fuzz target `dhcp6`.
 - `proto-dns`: the forwarder: zone → cache (TTL aging, prefetch, serve-stale) → upstream.

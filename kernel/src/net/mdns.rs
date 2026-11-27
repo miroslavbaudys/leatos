@@ -12,8 +12,8 @@
 //! network's index (`config::networks` order); its copies are sent to
 //! `224.0.0.251:5353` on their networks, from the router's address there,
 //! with TTL 255 (RFC 6762 §11). With IPv6 on, the same over ff02::fb
-//! (docs/ipv6.md step 5b): joined beside 224.0.0.251 (smoltcp sends the
-//! MLD report), each copy sent in the family its message came in on, from
+//! (docs/ipv6.md step 5b): joined beside 224.0.0.251 (`net::groups` sends
+//! the MLD report), each copy sent in the family its message came in on, from
 //! the router's link-local address. Everything happens in the services
 //! task; the datapath only passes 5353 up when the zone allows `mdns`.
 

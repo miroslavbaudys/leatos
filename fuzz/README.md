@@ -30,7 +30,7 @@ reveals a bug gets a host regression test in its crate before the fix.
 | `sntp` | `crates/proto-sntp` | WAN replies | requests only to configured servers |
 | `http` | `crates/proto-http` parser | LAN, before authentication | body ≤ limits and Content-Length; whole and split feeds agree |
 | `dhcp` | `crates/proto-dhcp` server, packet, persist | LAN | no shared addresses; pool bounds; persist round trip; emit/parse |
-| `dhcp_client` | `crates/proto-dhcp` `v4::client` (not used by the kernel yet) | WAN (the ISP's server, anyone on the segment) | requests from our MAC, from 0.0.0.0 to broadcast unless renewing; a held lease is a host address with a contiguous mask; `Lost` only after `Bound`; deadline never past |
+| `dhcp_client` | `crates/proto-dhcp` `v4::client` (the WAN's client, `net::wan4`) | WAN (the ISP's server, anyone on the segment) | requests from our MAC, from 0.0.0.0 to broadcast unless renewing; a held lease is a host address with a contiguous mask; `Lost` only after `Bound`; deadline never past |
 | `mdns` | `crates/proto-mdns` wire + reflector | LAN multicast | rebuild = parse; reflects only along rules, never back |
 | `qdisc` | `crates/qdisc` CAKE / FQ-CoDel / CoDel + shaper, ACK filter on and off | every forwarded packet | backlog limits; packet conservation; no duplicates; drains |
 | `ack_filter` | `crates/qdisc` ACK filter decision on arbitrary bytes | pure TCP ACKs from the LAN | no panic; never supersedes itself; never mutual |

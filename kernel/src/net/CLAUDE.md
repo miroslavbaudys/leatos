@@ -6,11 +6,11 @@ Docs: architecture, bufferbloat-cake, ipv6, dns-over-tls, dns-views, mdns, secur
 ## Datapath
 
 - `packet.rs`: bounded pool, headroom, `PacketMeta`, `pop_vlan`/`push_vlan`.
-- `datapath.rs`: NIC RX → VLAN check/untag → PPPoE decap → `fwd::Forwarder` → (from the WAN: the
-  ingress qdisc, `drain_ingress`) → neighbor (PPPoE: the AC) → qdisc → PPPoE encap → VLAN tag → NIC
-  TX. PPPoE control frames → `ctrl_rx`.
-- `Datapath::send_local` / `set_local_link` (docs/lan-neighbors.md step 2, not called yet): the
-  router stack's own packets on a link without a link layer, next hop by `fwd::local`, then the
+- `datapath.rs`: NIC RX → VLAN check/untag → PPPoE decap → `fwd::Forwarder` → (from the WAN:
+  the ingress qdisc, `drain_ingress`) → neighbor (PPPoE: the AC) → qdisc → PPPoE encap → VLAN
+  tag → NIC TX. PPPoE control frames → `ctrl_rx`.
+- `Datapath::send_local` / `set_local_link` (docs/lan-neighbors.md step 2): every packet the
+  router sends on a link without a link layer (all but PPPoE), next hop by `fwd::local`, then the
   same neighbor table and qdisc as forwarded packets; `LOCAL_NO_ROUTE` counts the rest.
 - `stack.rs`: port bring-up + the **datapath direction tasks** `dp_down`/`dp_up` (`run_dir`):
   NAPI-style IRQ loop. Lock order NIC → forwarder shard → neighbor table → qdisc.
@@ -79,7 +79,7 @@ smoltcp `Device` behind the datapath: RX from `local_rx`, TX into the qdisc.
 
 ## Services task: `svc.rs`
 
-`svc`, `Priority::Service`: smoltcp, the WAN DHCP client (`net::wan4`) or PPPoE, LAN
+`svc`, `Priority::Service`: smoltcp (TCP), the WAN DHCP client (`net::wan4`) or PPPoE, LAN
 services, mgmt. A saved WAN change restarts the WAN live, DHCP ⇄ PPPoE included; static WAN via
 `configure_static`. `LeaseStore`: see kernel/CLAUDE.md (store).
 
@@ -98,8 +98,9 @@ services, mgmt. A saved WAN change restarts the WAN live, DHCP ⇄ PPPoE include
 - `ntp.rs`: SNTP client on the WAN (a port in 60000–60999 on `net::local`, from the WAN's source
   address); names resolved through the forwarder as client `127.0.0.1:1`.
 - `dot.rs`: DNS over TLS (docs/dns-over-tls.md): one `proto_dot::Conn` per `dns.upstreams` server
-  over a smoltcp TCP socket on the WAN (local ports 61000–64999), opened on demand, 30 s idle close,
-  backoff on failure, reconnect once SNTP sets the clock. Strict: with `dns.tls` no UDP upstream
+  over a smoltcp TCP socket on the WAN (local ports 61000–64999), opened on demand, 30 s idle
+  close, backoff on failure, reconnect once SNTP sets the clock. Strict: with `dns.tls` no UDP
+  upstream
   query and UDP answers ignored. Entropy from `entropy`, clock `wallclock`, build time floor
   `LEATOS_BUILD_TIME`.
 - `wan6.rs`: the WAN's IPv6 (docs/ipv6.md steps 3–5a).
@@ -113,9 +114,9 @@ services, mgmt. A saved WAN change restarts the WAN live, DHCP ⇄ PPPoE include
   - On PPPoE while IPv6CP is up (`set_ppp_link` from `net::pppoe`): the WAN link-local address,
     `Forwarder::set_ll6`, default router = the RA's or the IPv6CP peer.
   - Not with the `wan6_*`/`lan6_prefix` boot arguments.
-- `mdns.rs`: mDNS reflector glue inside `LanServices`: joins 224.0.0.251 (smoltcp `multicast`, its
-  IGMP / MLD reports until step 4) and port 5353 on `net::local` per network a `[[mdns.reflect]]`
-  entry involves (copies to the group with TTL 255, from the network's address / link-local),
+- `mdns.rs`: mDNS reflector glue inside `LanServices`: joins 224.0.0.251 / ff02::fb (the reports
+  from `groups.rs`) and port 5353 on `net::local` per network a `[[mdns.reflect]]` entry involves
+  (copies to the group with TTL 255, from the network's address / link-local),
   `proto_mdns::Reflector`, counters in `/api/status` `mdns` and CLI `status`.
 
 ## Management: `mgmt.rs` + `mgmt.html`
