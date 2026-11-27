@@ -22,8 +22,9 @@ client), on `Medium::Ip` on every link, with features `medium-ip`, `proto-ipv4`,
 `socket-tcp`. Everything else the router sends or answers is leatos's own code: link layer in the
 datapath, UDP and ICMP in a small router-local path in `svc`, packet building in `crates/fwd`.
 
-Not a goal: our own TCP. Retransmission, windows and the state machine are where a stack is hard
-to get right; the router's TCP is low-volume, and smoltcp's TCP needs no workarounds.
+Not a goal (then; reversed 2026-11-27, docs/own-tcp.md, roadmap M15): our own TCP.
+Retransmission, windows and the state machine are where a stack is hard to get right; the
+router's TCP is low-volume, and smoltcp's TCP needs no workarounds.
 
 ## 2. What smoltcp does today, and what replaces it
 
