@@ -2,7 +2,7 @@
 
 Status (2026-11-27): steps 1–5 done in QEMU (the kernel has no smoltcp; `crates/proto-tcp`,
 `fwd::tcp`, `HostIf` = `LocalLink` + `proto_tcp::Tcp`). On the apu4 since 2026-11-27 (§6):
-aaa0f7c persisted (slot A seq 25, with the TIME-WAIT fix), 72 h soak running until 11-30. Roadmap
+7896fbb persisted (slot B seq 26, with the TIME-WAIT fix), 72 h soak running until 11-30. Roadmap
 M15. This reverses docs/local-stack.md §1 ("Not a goal: our own TCP"), by decision of the user on
 2026-11-27. What the implementation does differently from the plan is marked "Done:" below.
 
