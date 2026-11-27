@@ -9,7 +9,7 @@
 //! it.
 //!
 //! Bounded: [`CONNS`] connections per network (more are refused with a
-//! RST by smoltcp: no socket listens); the framing and its limits (query
+//! RST by `proto_tcp`: no socket listens); the framing and its limits (query
 //! size, unanswered queries, answers waiting) are `proto_dns::tcp`, which
 //! the `dns_tcp` fuzz target covers. A connection with nothing to answer is
 //! closed after [`IDLE_MS`] without traffic; one still waiting after
@@ -17,13 +17,11 @@
 //!
 //! The boot argument `dns_tcp=0` opens no listeners (`config::dns_tcp`).
 
-use alloc::vec;
 use alloc::vec::Vec;
 use core::net::SocketAddr;
 use core::sync::atomic::{AtomicU64, Ordering};
-use smoltcp::iface::{SocketHandle, SocketSet};
 use proto_dns::tcp::Framing;
-use smoltcp::socket::tcp;
+use proto_tcp::{Handle as SocketHandle, Socket, State, Tcp as SocketSet};
 
 const PORT: u16 = 53;
 /// Connections per network.
@@ -52,7 +50,7 @@ struct Conn {
     framing: Framing,
     /// Last traffic (ms since boot).
     last_ms: u64,
-    /// We sent our FIN: smoltcp finishes the connection.
+    /// We sent our FIN: `proto_tcp` finishes the connection.
     closing: bool,
 }
 
@@ -64,7 +62,7 @@ impl Conn {
     }
 
     /// Move queued answers into the socket.
-    fn flush(&mut self, s: &mut tcp::Socket) {
+    fn flush(&mut self, s: &mut Socket) {
         let out = self.framing.pending_out();
         if out.is_empty() || !s.may_send() {
             return;
@@ -80,15 +78,15 @@ pub struct Listener {
     conns: Vec<Conn>,
 }
 
-fn socket() -> tcp::Socket<'static> {
-    let mut s = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; RX_BUF]), tcp::SocketBuffer::new(vec![0; TX_BUF]));
-    s.set_timeout(Some(smoltcp::time::Duration::from_secs(10))); // unacknowledged data
+fn socket() -> Socket {
+    let mut s = Socket::new(RX_BUF, TX_BUF);
+    s.set_timeout(Some(10_000)); // unacknowledged data, ms
     s.listen(PORT).expect("dns: listen :53/tcp");
     s
 }
 
 impl Listener {
-    pub fn open(sockets: &mut SocketSet<'static>) -> Self {
+    pub fn open(sockets: &mut SocketSet) -> Self {
         let conns = (0..CONNS)
             .map(|_| Conn {
                 sock: sockets.add(socket()),
@@ -103,7 +101,7 @@ impl Listener {
 
     /// The network went away: its sockets too (open connections end
     /// without a FIN; the interface is gone or readdressed anyway).
-    pub fn close(self, sockets: &mut SocketSet<'static>) {
+    pub fn close(self, sockets: &mut SocketSet) {
         for c in self.conns {
             sockets.remove(c.sock);
         }
@@ -111,18 +109,18 @@ impl Listener {
 
     /// Whole queries received since the last call: (client, message
     /// without its length).
-    pub fn recv(&mut self, sockets: &mut SocketSet<'static>, now_ms: u64) -> Vec<(SocketAddr, Vec<u8>)> {
+    pub fn recv(&mut self, sockets: &mut SocketSet, now_ms: u64) -> Vec<(SocketAddr, Vec<u8>)> {
         let mut queries = Vec::new();
         let mut buf = [0u8; 512];
         for c in &mut self.conns {
-            let s = sockets.get_mut::<tcp::Socket>(c.sock);
+            let s = sockets.get_mut(c.sock);
             let connected = matches!(
                 s.state(),
-                tcp::State::Established | tcp::State::FinWait1 | tcp::State::FinWait2 | tcp::State::CloseWait
+                State::Established | State::FinWait1 | State::FinWait2 | State::CloseWait
             );
             if c.remote.is_none() && connected {
                 let Some(ep) = s.remote_endpoint() else { continue };
-                c.remote = Some(SocketAddr::new(ep.addr.into(), ep.port));
+                c.remote = Some(ep);
                 c.last_ms = now_ms;
                 ACCEPTED.fetch_add(1, Ordering::Relaxed);
             }
@@ -155,11 +153,11 @@ impl Listener {
 
     /// An answer for `to`: framed and sent on its connection. False if no
     /// connection of this network has that client (it went away).
-    pub fn send(&mut self, sockets: &mut SocketSet<'static>, to: SocketAddr, data: &[u8], now_ms: u64) -> bool {
+    pub fn send(&mut self, sockets: &mut SocketSet, to: SocketAddr, data: &[u8], now_ms: u64) -> bool {
         let Some(c) = self.conns.iter_mut().find(|c| c.remote == Some(to)) else {
             return false;
         };
-        let s = sockets.get_mut::<tcp::Socket>(c.sock);
+        let s = sockets.get_mut(c.sock);
         c.last_ms = now_ms;
         // Queries that waited behind the outstanding limit come out on the
         // next `recv`.
@@ -174,9 +172,9 @@ impl Listener {
     /// Queued answers out, finished connections closed, closed sockets
     /// listening again. Pending queries of a remaining message are read on
     /// the next [`Self::recv`].
-    pub fn step(&mut self, sockets: &mut SocketSet<'static>, now_ms: u64) {
+    pub fn step(&mut self, sockets: &mut SocketSet, now_ms: u64) {
         for c in &mut self.conns {
-            let s = sockets.get_mut::<tcp::Socket>(c.sock);
+            let s = sockets.get_mut(c.sock);
             if !s.is_open() {
                 c.reset();
                 let _ = s.listen(PORT);
@@ -188,7 +186,7 @@ impl Listener {
             c.flush(s);
             let idle = now_ms.saturating_sub(c.last_ms);
             let done = c.framing.idle() && s.send_queue() == 0;
-            let peer_closed = s.state() == tcp::State::CloseWait;
+            let peer_closed = s.state() == State::CloseWait;
             if idle > HARD_MS {
                 s.abort();
             } else if !c.closing && done && (peer_closed || idle > IDLE_MS) {

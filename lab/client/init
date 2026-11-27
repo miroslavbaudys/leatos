@@ -310,6 +310,100 @@ else
 fi
 [ "$att" = "$ip" ] || $bb ip addr del "$att/24" dev eth0
 
+# The router's own TCP (docs/own-tcp.md). The web page byte-exact (its
+# SHA-256 against kernel/src/net/mgmt.html, from scripts/lab-test.sh); with
+# LAB_TCP_LOSS the relay drops TCP frames on the way, and the router's
+# retransmissions are printed for the host's validity check.
+psha=$($bb sed -n 's/.*lab_page_sha=\([0-9a-f]*\).*/\1/p' /proc/cmdline)
+tloss=$($bb sed -n 's/.*lab_tcp_loss=\([0-9]*\).*/\1/p' /proc/cmdline)
+# Retransmissions, timer and fast ones together.
+tcpst() {
+  ts=$($bb wget -q -T 20 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null)
+  tr=$(echo "$ts" | $bb grep -o '"retransmits":[0-9]*,"fast_retransmits":[0-9]*' | $bb tr -c '0-9\n' ' ')
+  if [ -n "$tr" ]; then
+    echo "$tr" | { read -r a b && echo $((a + b)); }
+  else
+    echo "LAB INFO: tcp: no retransmit counters in /api/status (${#ts} bytes)" >&2
+  fi
+}
+if [ -n "$psha" ]; then
+  r0=$(tcpst)
+  t0=$($bb date +%s)
+  got=$($bb wget -q -T 120 -O - "http://192.168.1.1/" 2>/dev/null | $bb sha256sum | $bb cut -d' ' -f1)
+  t1=$($bb date +%s)
+  r1=$(tcpst)
+  if [ "$got" = "$psha" ]; then
+    pass "tcp: the web page arrived byte-exact in $((t1 - t0)) s${tloss:+ with $tloss % of the TCP frames dropped}"
+  else
+    fail "tcp: the web page arrived damaged or incomplete (sha256 $got, expected $psha)${tloss:+ with $tloss % loss}"
+  fi
+  [ -n "$tloss" ] && echo "LAB INFO: tcp: router retransmits $(( ${r1:-0} - ${r0:-0} )) during the page ($r0 -> $r1)"
+fi
+# A closed router port on the LAN (no input policy there): refused at once
+# with a RST. Negative control LAB_ROUTER_ARGS=tcp_rst=0 (silent: nc
+# times out).
+# busybox nc prints nothing when refused: a non-zero exit within 2 s is
+# the RST, the -w 3 timeout is silence, exit 0 an open port.
+t0=$($bb date +%s)
+$bb nc -w 3 192.168.1.1 22 </dev/null >/dev/null 2>&1
+rc=$?
+t1=$($bb date +%s)
+if [ "$rc" != 0 ] && [ $((t1 - t0)) -lt 2 ]; then
+  pass "tcp closed port: the router refused :22 at once (RST, nc exit $rc)"
+elif [ "$rc" = 0 ]; then
+  fail "tcp closed port: :22 accepted a connection"
+else
+  fail "tcp closed port: no RST for :22 (nc exit $rc after $((t1 - t0)) s)"
+fi
+# Other IP protocols to the router are dropped silently (docs/own-tcp.md
+# §3.4): the host injects 4 frames now; the router counts them
+# (local.other_dropped), and scripts/lab-test.sh checks the LAN capture
+# for answers.
+odr() { $bb wget -q -T 20 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null | $bb sed -n 's/.*"other_dropped":\([0-9]*\).*/\1/p'; }
+od0=$(odr)
+echo "LAB other-proto: inject"
+$bb sleep 3
+od1=$(odr)
+if [ -z "$od0" ] || [ -z "$od1" ]; then
+  fail "other protocol: INVALID, no other_dropped in status"
+elif [ $((od1 - od0)) -ge 4 ]; then
+  pass "other protocol: the router dropped the 4 injected frames (other_dropped $od0 -> $od1)"
+else
+  fail "other protocol: other_dropped $od0 -> $od1 for 4 injected frames"
+fi
+# Blind RST (RFC 5961, LAB_TCP_RST, docs/own-tcp.md §5): a request to the
+# web interface stays half-sent for 4 s while the relay injects RSTs into the
+# connection with our addresses and ports, at sequence numbers in the window
+# but not the exact one (and one far outside it): the connection must
+# survive (the answer comes) and the router count challenge ACKs. Negative
+# control LAB_TCP_RST=exact (one RST at the exact number: the answer never
+# comes).
+trst=$($bb sed -n 's/.*lab_tcp_rst=\([a-z]*\).*/\1/p' /proc/cmdline)
+if [ -n "$trst" ]; then
+  chal() {
+    $bb wget -q -T 20 -O - "http://admin:lab-pass@192.168.1.1/api/status" 2>/dev/null \
+      | $bb grep -o '"challenge_acks":[0-9]*' | $bb cut -d: -f2
+  }
+  c0=$(chal)
+  ( { $bb printf 'GET / HTTP/1.1\r\nHost: 192.168.1.1\r\nConnection: close\r\n'; $bb sleep 4
+      $bb printf '\r\n'; $bb sleep 3; } | $bb nc -w 8 192.168.1.1 80 2>/dev/null | $bb head -1 >/tmp/rst.out ) &
+  rp=$!
+  $bb sleep 1.5
+  echo "LAB tcp-rst: inject"
+  wait $rp
+  c1=$(chal)
+  ans=$($bb tr -d '\r' </tmp/rst.out)
+  if [ -z "$c0" ] || [ -z "$c1" ]; then
+    fail "tcp blind rst: INVALID, no challenge_acks in /api/status"
+  elif [ "${ans%% *}" = "HTTP/1.1" ] && [ $((c1 - c0)) -ge 1 ]; then
+    pass "tcp blind rst ($trst): the connection survived the injected RSTs ('$ans'), challenge ACKs $c0 -> $c1"
+  elif [ "${ans%% *}" = "HTTP/1.1" ]; then
+    fail "tcp blind rst ($trst): INVALID, no challenge ACK ($c0 -> $c1): the RSTs missed the window"
+  else
+    fail "tcp blind rst ($trst): the injected RSTs ended the connection (no answer; challenge ACKs $c0 -> $c1)"
+  fi
+fi
+
 # --- forwarding, NAT, firewall (M4) -------------------------------------------
 $bx httpd -p 8080 -h /www   # target for the firewall probe from the ISP side
 

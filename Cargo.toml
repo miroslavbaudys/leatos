@@ -27,6 +27,7 @@ cli = { path = "crates/cli" }
 auth = { path = "crates/auth" }
 proto-mdns = { path = "crates/proto-mdns" }
 proto-dot = { path = "crates/proto-dot" }
+proto-tcp = { path = "crates/proto-tcp" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -1,4 +1,4 @@
-//! Management web interface: HTTP on port 80 (smoltcp TCP ↔ `proto_http`).
+//! Management web interface: HTTP on port 80 (`proto_tcp` ↔ `proto_http`).
 //!
 //! - `GET /`: the page (`mgmt.html`, compiled in): a login screen first
 //!   when a password exists, then the interface, which polls
@@ -85,7 +85,6 @@ use crate::upgrade::{self, Prepared};
 use crate::{config, println, timer};
 use alloc::format;
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -93,8 +92,7 @@ use core::time::Duration;
 use config_store::{RecordHeader, Slot};
 use proto_http::{Error as HttpError, Head, Method, Parser, json_str, response};
 use qdisc::Qdisc;
-use smoltcp::iface::SocketHandle;
-use smoltcp::socket::tcp;
+use proto_tcp::{Handle as SocketHandle, Socket, State as TcpState};
 
 const PORT: u16 = 80;
 /// Login sessions at once, and how long one lasts unused.
@@ -140,7 +138,7 @@ fn add_lan_sockets(conns: &mut Vec<Conn>, ifs: &mut [HostIf], links: &[usize]) -
             continue;
         }
         for _ in 0..LAN_SOCKETS {
-            conns.push(Conn::new(link, ifs[link].sockets.add(tcp_socket())));
+            conns.push(Conn::new(link, ifs[link].tcp.add(tcp_socket())));
         }
         on.push(net.name.clone());
     }
@@ -389,11 +387,9 @@ fn check_origin(head: &Head) -> Result<(), (u16, &'static str)> {
     }
 }
 
-fn tcp_socket() -> tcp::Socket<'static> {
-    let rx = tcp::SocketBuffer::new(vec![0; RX_BUF]);
-    let tx = tcp::SocketBuffer::new(vec![0; TX_BUF]);
-    let mut s = tcp::Socket::new(rx, tx);
-    s.set_timeout(Some(smoltcp::time::Duration::from_secs(10))); // unacknowledged data
+fn tcp_socket() -> Socket {
+    let mut s = Socket::new(RX_BUF, TX_BUF);
+    s.set_timeout(Some(10_000)); // unacknowledged data, ms
     s.listen(PORT).expect("mgmt: listen");
     s
 }
@@ -407,7 +403,7 @@ impl Mgmt {
         // The WAN only with mgmt=wan.
         if cfg.on_wan {
             for _ in 0..WAN_SOCKETS {
-                conns.push(Conn::new(0, ifs[0].sockets.add(tcp_socket())));
+                conns.push(Conn::new(0, ifs[0].tcp.add(tcp_socket())));
             }
         }
         let on = add_lan_sockets(&mut conns, ifs, links);
@@ -1058,12 +1054,12 @@ impl Mgmt {
         }
         for i in 0..self.conns.len() {
             let (ifx, handle) = (self.conns[i].ifx, self.conns[i].handle);
-            let sock = ifs[ifx].sockets.get_mut::<tcp::Socket>(handle);
+            let sock = ifs[ifx].tcp.get_mut(handle);
             if sock.is_active() && self.conns[i].since.is_none() {
                 self.conns[i].since = Some(timer::Instant::now());
                 self.conns[i].peer = sock
                     .remote_endpoint()
-                    .map(|e| auth::source_key(core::net::IpAddr::from(e.addr)));
+                    .map(|e| auth::source_key(e.ip()));
             }
             while sock.can_recv() {
                 if sock.recv(|buf| (buf.len(), self.on_bytes(i, buf))).is_err() {
@@ -1077,7 +1073,7 @@ impl Mgmt {
                 self.on_done(i, &mut || json.take().unwrap_or_default());
             }
             // Send, close, recycle.
-            let sock = ifs[ifx].sockets.get_mut::<tcp::Socket>(handle);
+            let sock = ifs[ifx].tcp.get_mut(handle);
             let c = &mut self.conns[i];
             if c.sent < c.out.len() && sock.can_send() {
                 if let Ok(n) = sock.send_slice(&c.out[c.sent..]) {
@@ -1148,7 +1144,7 @@ impl Mgmt {
         let (mut used, mut listening) = ([false; MAX_LINKS], [false; MAX_LINKS]);
         for c in &self.conns {
             used[c.ifx] = true;
-            listening[c.ifx] |= ifs[c.ifx].sockets.get::<tcp::Socket>(c.handle).state() == tcp::State::Listen;
+            listening[c.ifx] |= ifs[c.ifx].tcp.get(c.handle).state() == TcpState::Listen;
         }
         for ifx in (0..MAX_LINKS).filter(|&x| used[x] && !listening[x]) {
             let conns = &self.conns;
@@ -1158,7 +1154,7 @@ impl Mgmt {
                 // Most slots first; among those the oldest (earliest `since`).
                 .max_by_key(|&i| (held(conns[i].peer), core::cmp::Reverse(conns[i].since)));
             if let Some(i) = victim {
-                let sock = ifs[ifx].sockets.get_mut::<tcp::Socket>(self.conns[i].handle);
+                let sock = ifs[ifx].tcp.get_mut(self.conns[i].handle);
                 sock.abort();
                 self.conns[i].reset();
                 let _ = sock.listen(PORT);
@@ -1176,6 +1172,48 @@ impl Mgmt {
 /// "config" or "kernel", for logs.
 fn what_trial(area: &str) -> &'static str {
     if area == upgrade::AREA { "kernel" } else { "config" }
+}
+
+/// The router's TCP, all links summed (`/api/status` `local.tcp`).
+fn tcp_json(ifs: &[HostIf]) -> String {
+    let mut t = proto_tcp::Stats::default();
+    for h in ifs {
+        let s = h.tcp.stats();
+        t.segments_in += s.segments_in;
+        t.segments_out += s.segments_out;
+        t.bad_checksum += s.bad_checksum;
+        t.malformed += s.malformed;
+        t.no_socket += s.no_socket;
+        t.resets_sent += s.resets_sent;
+        t.resets_dropped += s.resets_dropped;
+        t.resets_received += s.resets_received;
+        t.refused += s.refused;
+        t.challenge_acks += s.challenge_acks;
+        t.retransmits += s.retransmits;
+        t.fast_retransmits += s.fast_retransmits;
+        t.window_probes += s.window_probes;
+        t.timeouts += s.timeouts;
+        t.time_wait += s.time_wait;
+    }
+    format!(
+        "{{\"segments_in\":{},\"segments_out\":{},\"bad_checksum\":{},\"malformed\":{},\"no_socket\":{},\"resets_sent\":{},\"resets_dropped\":{},\"resets_received\":{},\"refused\":{},\"challenge_acks\":{},\"retransmits\":{},\"fast_retransmits\":{},\"window_probes\":{},\"timeouts\":{},\"time_wait\":{},\"tx_drops\":{}}}",
+        t.segments_in,
+        t.segments_out,
+        t.bad_checksum,
+        t.malformed,
+        t.no_socket,
+        t.resets_sent,
+        t.resets_dropped,
+        t.resets_received,
+        t.refused,
+        t.challenge_acks,
+        t.retransmits,
+        t.fast_retransmits,
+        t.window_probes,
+        t.timeouts,
+        t.time_wait,
+        crate::net::device::tx_drops()
+    )
 }
 
 fn status_json(
@@ -1283,7 +1321,7 @@ fn status_json(
     };
     let _ = write!(
         s,
-        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"tx_failed\":{},\"nic_lock_waits\":{{\"rx\":{},\"tx\":{},\"rx_us\":{},\"tx_us\":{}}},\"vlan_drops\":{},\"conntrack\":{},\"early_drops\":{},\"conntrack_pass_us\":{{\"last\":{},\"max\":{}}},\"housekeeping_us\":{{\"last\":{},\"max\":{}}},\"revoked\":{},\"rejected\":{},\"icmp_errors\":{},\"unreachable6\":{},\"neigh_probes\":{},\"lan_nd\":{{\"arp_replies\":{},\"na_sent\":{},\"conflicts\":{},\"local_no_route\":{},\"local_queued\":{},\"local_dropped\":{}}},\"wan_nd\":{{\"medium\":\"{}\",\"arp_replies\":{},\"na_sent\":{}}},\"wan_dhcp\":{},\"local\":{{\"udp_dropped\":{},\"udp_unbound\":{},\"echo_replies\":{}}},\
+        "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"tx_failed\":{},\"nic_lock_waits\":{{\"rx\":{},\"tx\":{},\"rx_us\":{},\"tx_us\":{}}},\"vlan_drops\":{},\"conntrack\":{},\"early_drops\":{},\"conntrack_pass_us\":{{\"last\":{},\"max\":{}}},\"housekeeping_us\":{{\"last\":{},\"max\":{}}},\"revoked\":{},\"rejected\":{},\"icmp_errors\":{},\"unreachable6\":{},\"neigh_probes\":{},\"lan_nd\":{{\"arp_replies\":{},\"na_sent\":{},\"conflicts\":{},\"local_no_route\":{},\"local_queued\":{},\"local_dropped\":{}}},\"wan_nd\":{{\"medium\":\"{}\",\"arp_replies\":{},\"na_sent\":{}}},\"wan_dhcp\":{},\"local\":{{\"udp_dropped\":{},\"udp_unbound\":{},\"echo_replies\":{},\"other_dropped\":{},\"tcp\":{}}},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
          \"heap\":{{\"used\":{heap_used},\"free\":{heap_free},{heap_ops}}},\"cpu\":{cpu},\"temp\":{temp},\"memory\":{memory},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
          \"fragments\":{{\"forwarded\":{},\"parked\":{},\"park_drops\":{},\"split\":{},\"split_drops\":{}}},\"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{},\"origin_check\":{},\"refused\":{{\"host\":{},\"cross_site\":{}}},\"throttle\":{{\"sources\":{},\"throttled\":{},\"hash_busy\":{},\"evicted\":{}}}}},\"interfaces\":[",
@@ -1345,6 +1383,8 @@ fn status_json(
         crate::net::local::dropped(),
         crate::net::local::unbound(),
         crate::net::local::echo_replies(),
+        crate::net::local::other_dropped(),
+        tcp_json(ifs),
         mgmt.wan_pppoe.as_deref().unwrap_or("null"),
         datapath::PPPOE_DROPS.load(Ordering::Relaxed),
         datapath::FRAGS_FORWARDED.load(Ordering::Relaxed),
@@ -1396,7 +1436,7 @@ fn status_json(
             .iter()
             .zip(&sh.links)
             .filter(|(_, l)| l.port() == n)
-            .flat_map(|(h, _)| h.iface.ip_addrs().iter().map(|a| json_str(&format!("{a}"))).collect::<Vec<_>>())
+            .flat_map(|(h, _)| h.addrs_text().into_iter().map(|a| json_str(&a)).collect::<Vec<_>>())
             .collect();
         let vlan = nif
             .vlan()

@@ -16,6 +16,8 @@
 #                        networking; lab = WAN and LAN on UDP socket links to
 #                        the ISP and client VMs (scripts/lab-test.sh)
 #   LAB_LAN_PORT=10003   lab mode: router's LAN link port (client uses +1)
+#   LAB_LAN_PEER=port    lab mode: where the router's LAN frames go (default
+#                        LAB_LAN_PORT + 1; LAB_TCP_LOSS: the relay)
 #   LAB_LAN1_PORT=10007  lab mode: a third NIC, the LAN port lan1 (client's
 #                        second NIC uses +1); unset = no lan1
 #   LAB_WAN_PORT=10005   lab mode: router's WAN link port (ISP uses +1)
@@ -119,7 +121,7 @@ if [[ "${QEMU_NET:-none}" == "lab" ]]; then
   NET=(
     -netdev "dgram,id=wan,local.type=inet,local.host=127.0.0.1,local.port=$wp,remote.type=inet,remote.host=127.0.0.1,remote.port=$((wp + 1))"
     -device "$NIC,netdev=wan,mac=52:54:00:00:00:01$WAN_ADDR"
-    -netdev "dgram,id=lan,local.type=inet,local.host=127.0.0.1,local.port=$lp,remote.type=inet,remote.host=127.0.0.1,remote.port=$((lp + 1))"
+    -netdev "dgram,id=lan,local.type=inet,local.host=127.0.0.1,local.port=$lp,remote.type=inet,remote.host=127.0.0.1,remote.port=${LAB_LAN_PEER:-$((lp + 1))}"
     -device "$NIC,netdev=lan,mac=52:54:00:00:00:02$LAN_ADDR"
   )
   if [[ -n "${LAB_LAN1_PORT:-}" ]]; then

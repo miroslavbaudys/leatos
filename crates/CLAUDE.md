@@ -23,6 +23,10 @@ events out), host-tested with `cargo test`. Fuzz targets in `fuzz/` (fuzz/README
 - `udp`: the router's own UDP datagrams, `build4` (with a TTL) / `parse4`, `build6` / `parse6`
   (all lengths and the checksums, extension headers skipped, fragments refused; the kernel's
   `net::local`, docs/local-stack.md steps 2b–3); tested against smoltcp's parser.
+  `port_unreachable` only for the lab control `udp_unbound_drop=0`.
+- `tcp`: the IP layer of the router's own TCP (docs/own-tcp.md): `frame` puts the IPv4 / IPv6
+  header around a `proto_tcp` segment, `parse` checks a frame for the router down to its segment
+  (header checksum, no fragments, unicast ends); tested against smoltcp's parsers.
 - `local::LocalLink::source4` / `source6`: the router's source address (an RFC 6724 subset).
 - `echo`: ICMP / ICMPv6 echo for the router (parse, `reply`, `build`); `mcast`: IGMPv2 report /
   leave, MLDv2 report, IGMP / MLD query parse (docs/local-stack.md step 4). Both against
@@ -117,6 +121,13 @@ and sparse senders. How the kernel uses it: kernel/src/net/CLAUDE.md.
 - `proto-mdns`: mDNS across networks: whole-message parse/rebuild with raw labels and compression,
   filtered `Reflector` with rules from → to per service type, hosts learned from SRV, link-local
   addresses removed, QU cleared, echo/rate/source checks; docs/mdns.md.
+- `proto-tcp`: the router's own TCP (docs/own-tcp.md; the kernel has no host stack): `Socket`
+  with smoltcp's API shape (listen / connect, one socket per connection, no backlog), `Tcp` = the
+  sockets of one link (demultiplexing, RST for segments nobody takes, `next_deadline`), `wire`
+  (header, MSS option, checksum). RFC 9293 states, RFC 6298 RTO, fast retransmit, user timeout,
+  bounded out-of-order ranges, zero-window probes, RFC 5961 (exact-sequence RST / SYN, challenge
+  ACKs ≤ 10/s), RFC 6528 ISNs (SipHash). No window scaling, SACK, Nagle, congestion control.
+  Tests on a lossy simulated link and against smoltcp's TCP (dev-dependency); fuzz target `tcp`.
 - `proto-http`: incremental HTTP/1.1 parser with streaming bodies, Basic auth, JSON escaping,
   `check_browser_origin`.
 

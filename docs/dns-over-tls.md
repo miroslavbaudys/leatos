@@ -55,7 +55,7 @@ LAN client ──UDP 53──> Resolver (zone → cache → upstream)
                           │ yes
                           ▼
             net::dot: one proto_dot::Conn per server
-              TCP (smoltcp, WAN, local port 61000–64999) ⇄ rustls (unbuffered)
+              TCP (proto_tcp, WAN, local port 61000–64999) ⇄ rustls (unbuffered)
               ⇄ 2-byte-length framing, pipelined queries
 ```
 

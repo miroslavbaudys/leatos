@@ -61,7 +61,7 @@ while iot uses 192.168.1.238 (1,725 hits).
 
 ## 3. Which network asks
 The **socket the query arrived on**, not the source address: each network
-has its own DNS socket on its own link (smoltcp interface on its VLAN), so
+has its own DNS socket on its own link (`net::local`'s port table per link), so
 a guest client cannot claim to be on the LAN by forging a LAN source. A
 client asking another network's router address is still answered as its
 own network. The router's own lookups (`ntp::SELF_CLIENT`) use a `ROUTER`

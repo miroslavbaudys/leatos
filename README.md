@@ -30,9 +30,9 @@ author's home router (PC Engines apu4, PPPoE over VLAN). Expect breaking changes
 - **DNS:** caching forwarder with prefetch and serve-stale, DNS over TCP,
   DNS over TLS upstream, a fresh random upstream port per query, local names
   under `home.arpa` with split-horizon views; mDNS reflector
-- **Own network stack:** ARP / ND, UDP, ICMP echo, IGMP / MLD and the DHCP
-  client are leatos's own sans-IO code; [smoltcp](https://github.com/smoltcp-rs/smoltcp)
-  carries only TCP (web interface, DNS over TCP, DNS over TLS)
+- **Own network stack:** ARP / ND, UDP, TCP (web interface, DNS over TCP,
+  DNS over TLS), ICMP echo, IGMP / MLD and the DHCP client are leatos's own
+  sans-IO code; no host stack
 - **SNTP**, hardware and cross-core watchdogs, multicore datapath (download,
   upload and services on their own cores)
 - **Management:** web interface (with a live WAN throughput chart), serial

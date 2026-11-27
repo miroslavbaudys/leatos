@@ -353,8 +353,9 @@ At most 16. The route leaves through the network whose subnet holds `via`
   the router never sends a packet back out the link it came in on
   (drop reason `hairpin`), so devices with a fixed address need the route
   themselves.
-- **The router's own stack** (smoltcp, per link): each link's interface
-  holds the routes through its routers, so the router answers hosts
+- **The router's own stack** (per link `HostIf::link`, a
+  `fwd::local::LocalLink`; smoltcp's interfaces until 2026-11-27): each
+  link's view holds the routes through its routers, so the router answers hosts
   behind them (DNS, web interface, ping); the WAN's holds WAN routes.
 - **DNS views:** a routed subnet belongs to `via`'s network.
 - **Status:** `/api/status` `routes` (the table in use, then configured
@@ -459,11 +460,11 @@ with step 3.
   (`net::shared::LinkShared`) is a router interface on a port: link 0 is
   the WAN on `wan0`, links 1.. the networks, each on its LAN port
   (`LinkShared::port`, set live with the VID: routed ports, 2026-11-19).
-  Forwarder interfaces (with the port's MAC), ARP tables, smoltcp
-  interfaces (likewise) and `local_rx` queues are per link. On RX the
+  Forwarder interfaces (with the port's MAC), ARP tables, the router
+  stack's `HostIf`s and `local_rx` queues are per link. On RX the
   datapath maps the frame's (port, VID) to a link (none:
   dropped, `vlan_drops`); a frame for a network on a VLAN gets its tag
-  when it is queued (forwarded, ARP, smoltcp), so the qdisc holds tagged
+  when it is queued (forwarded, ARP, the router's own), so the qdisc holds tagged
   frames and shapes the 4 bytes too. `fwd::Interface` gained `zone: u8`;
   `Role` stays and now only means "masquerade towards it" (`Wan`), so
   traffic between networks is not NATed. `shard_of` hashes a flow
@@ -514,13 +515,14 @@ with step 3.
   - Input policy: packets for the router from a zone with `input = drop`
     are dropped in the forwarder (`drop_reasons.input`) unless they are
     an `allow`ed service (DHCP UDP 67, DNS 53, NTP UDP 123, ping, web TCP
-    80). smoltcp never sees them. With `input = reject` they are answered
+    80). The router stack never sees them. With `input = reject` they are answered
     (above). Replies to the router's own clients always pass,
     before rules and zones: TCP/UDP to ports ≥ 60000 (router-local
     sockets), UDP 68 (the DHCP client), ICMP other than echo requests. So
     a rule "from any to router: drop" cannot break its DHCP, DNS
-    upstream or SNTP. The WAN zone's input stays open otherwise (smoltcp
-    answers only on ports it listens on); rules can close it.
+    upstream or SNTP. The WAN zone's input stays open otherwise (the
+    router answers only on ports it listens on, TCP elsewhere with a RST);
+    rules can close it.
 - **DNAT** ✅. `Policy::forwards` (`fwd::forwarder::PortForward`). On a
   conntrack miss for a TCP/UDP packet to the WAN address, a matching
   forward (from the WAN if `src` allows; from inside only with hairpin)
@@ -559,7 +561,7 @@ with step 3.
   mDNS rules, the WAN mode and VLAN.
 - **Networks live** ✅ (2026-11-15): the kernel has a link slot per
   possible network from boot (`net::shared::MAX_LINKS`: a forwarder
-  interface, ARP table and smoltcp interface each, inactive until used).
+  interface, ARP table and router-stack `HostIf` each, inactive until used).
   A save places the networks in slots (`shared::assign_slots`: a network
   keeps its slot while its name stays), gives the router stack its
   addresses (`stack::set_host_addrs`), sends the datapath the slots with

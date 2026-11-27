@@ -262,20 +262,6 @@ impl LinkShared {
         t.push((ip, mac, now_ms));
     }
 
-    /// A placeholder (smoltcp reads only a device's capabilities when an
-    /// interface is made).
-    pub fn detached() -> Self {
-        LinkShared {
-            port: AtomicUsize::new(0),
-            vid: AtomicU16::new(0),
-            active: AtomicBool::new(false),
-            local_rx: Mutex::new(VecDeque::new()),
-            rs_seen: AtomicBool::new(false),
-            neigh6: Mutex::new(Vec::new()),
-            ip_only: AtomicBool::new(false),
-        }
-    }
-
     /// See [`Self::ip_only`]'s field: set when the link's router-stack
     /// interface is made (the WAN's again on a mode change).
     pub fn ip_only(&self) -> bool {

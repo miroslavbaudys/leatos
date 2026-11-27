@@ -192,6 +192,70 @@ pub fn parse6(frame: &[u8]) -> Option<Datagram6> {
     })
 }
 
+/// ICMP port unreachable (IPv6: destination unreachable, port
+/// unreachable) for a UDP `frame` sent to the router, from the address it
+/// went to back to its source, into `out`: the frame's length. The
+/// router answers no UDP to an unbound port (`net::local`); this is only
+/// for the boot argument `udp_unbound_drop=0`, the lab's negative control
+/// that shows its checks see an answer when one comes. Quotes the IPv4
+/// header and 8 bytes (RFC 792), for IPv6 as much as fits in 1280 bytes
+/// (RFC 4443 §3.1).
+pub fn port_unreachable(frame: &[u8], out: &mut [u8]) -> Option<usize> {
+    match ethertype(frame)? {
+        ETHERTYPE_IPV4 => {
+            let d = parse4(frame)?;
+            let ip = ETH_HDR;
+            let ihl = usize::from(frame[ip] & 0x0f) * 4;
+            let quote = &frame[ip..(ip + ihl + 8).min(frame.len())];
+            let total = ETH_HDR + IP_HDR + 8 + quote.len();
+            let f = out.get_mut(..total)?;
+            f[..12].fill(0);
+            put16(f, 12, ETHERTYPE_IPV4);
+            f[ip] = 0x45;
+            f[ip + 1] = 0;
+            put16(f, ip + 2, (total - ETH_HDR) as u16);
+            put16(f, ip + 4, 0);
+            put16(f, ip + 6, 0);
+            f[ip + 8] = TTL;
+            f[ip + 9] = crate::wire::PROTO_ICMP;
+            put16(f, ip + 10, 0);
+            put_ip(f, ip + 12, d.ends.dst);
+            put_ip(f, ip + 16, d.ends.src);
+            let c = checksum(&f[ip..ip + IP_HDR]);
+            put16(f, ip + 10, c);
+            let m = ip + IP_HDR;
+            f[m..m + 8].copy_from_slice(&[3, 3, 0, 0, 0, 0, 0, 0]);
+            f[m + 8..].copy_from_slice(quote);
+            let c = checksum(&f[m..]);
+            put16(f, m + 2, c);
+            Some(total)
+        }
+        ETHERTYPE_IPV6 => {
+            let d = parse6(frame)?;
+            let ip = ETH_HDR;
+            let end = (ip + IP6_HDR + usize::from(get16(frame, ip + 4))).min(frame.len());
+            let quote = &frame[ip..end.min(ip + 1280 - IP6_HDR - 8)];
+            let total = ETH_HDR + IP6_HDR + 8 + quote.len();
+            let f = out.get_mut(..total)?;
+            f[..12].fill(0);
+            put16(f, 12, ETHERTYPE_IPV6);
+            f[ip..ip + 4].copy_from_slice(&[0x60, 0, 0, 0]);
+            put16(f, ip + 4, (8 + quote.len()) as u16);
+            f[ip + 6] = crate::wire::PROTO_ICMPV6;
+            f[ip + 7] = TTL;
+            f[ip + 8..ip + 24].copy_from_slice(&d.ends.dst.octets());
+            f[ip + 24..ip + 40].copy_from_slice(&d.ends.src.octets());
+            let m = ip + IP6_HDR;
+            f[m..m + 8].copy_from_slice(&[1, 4, 0, 0, 0, 0, 0, 0]);
+            f[m + 8..].copy_from_slice(quote);
+            let c = crate::wire::icmpv6_checksum(d.ends.dst, d.ends.src, &f[m..]);
+            put16(f, m + 2, c);
+            Some(total)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +497,38 @@ mod tests {
                 assert!(d.payload.0 <= d.payload.1 && d.payload.1 <= f.len());
             }
         }
+    }
+
+    #[test]
+    fn port_unreachable_parses_with_smoltcp() {
+        use smoltcp::wire::{Icmpv4Message, Icmpv4Packet, Icmpv6Message, Icmpv6Packet};
+        let e = Ends { src: Ipv4Addr::new(10, 0, 0, 2), dst: Ipv4Addr::new(10, 0, 0, 1), sport: 5555, dport: 9 };
+        let f = frame_of(&e, b"probe");
+        let mut out = vec![0u8; 1500];
+        let n = port_unreachable(&f, &mut out).unwrap();
+        let eth = EthernetFrame::new_checked(&out[..n]).unwrap();
+        let ip = Ipv4Packet::new_checked(eth.payload()).unwrap();
+        assert!(ip.verify_checksum());
+        assert_eq!((ip.src_addr(), ip.dst_addr()), (e.dst, e.src));
+        let icmp = Icmpv4Packet::new_checked(ip.payload()).unwrap();
+        assert!(icmp.verify_checksum());
+        assert_eq!((icmp.msg_type(), icmp.msg_code()), (Icmpv4Message::DstUnreachable, 3));
+        let e6 = Ends6 { src: Ipv6Addr::new(0xfd00, 0, 0, 1, 0, 0, 0, 2), dst: Ipv6Addr::new(0xfd00, 0, 0, 1, 0, 0, 0, 1), sport: 5555, dport: 9 };
+        let mut f = vec![0u8; OVERHEAD6 + 5];
+        let k = build6(&mut f, &e6, TTL, b"probe").unwrap();
+        let n = port_unreachable(&f[..k], &mut out).unwrap();
+        let eth = EthernetFrame::new_checked(&out[..n]).unwrap();
+        let ip = Ipv6Packet::new_checked(eth.payload()).unwrap();
+        assert_eq!((ip.src_addr(), ip.dst_addr()), (e6.dst, e6.src));
+        let icmp = Icmpv6Packet::new_checked(ip.payload()).unwrap();
+        assert!(icmp.verify_checksum(&e6.dst, &e6.src));
+        assert_eq!((icmp.msg_type(), icmp.msg_code()), (Icmpv6Message::DstUnreachable, 4));
+    }
+
+    fn frame_of(e: &Ends, payload: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut out = vec![0; OVERHEAD + payload.len()];
+        let n = build4(&mut out, e, TTL, payload).unwrap();
+        out.truncate(n);
+        out
     }
 }

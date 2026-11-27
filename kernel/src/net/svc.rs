@@ -1,21 +1,21 @@
 //! The services task (`Priority::Service`): the router's own IP stack
-//! (smoltcp, one interface per port) and everything on top of it:
+//! (per link: its addresses and routes, `net::local` for UDP and ICMP, a
+//! `proto_tcp::Tcp` for TCP; docs/own-tcp.md) and everything on top of it:
 //!
-//! - WAN: DHCPv4 client (smoltcp socket), or the PPPoE client
+//! - WAN: DHCPv4 client (`net::wan4`), or the PPPoE client
 //!   (`net::pppoe`, `wan.mode = "pppoe"`); once up, ICMP echo to the
 //!   gateway (boot self-test).
 //! - LAN: DHCP server and DNS forwarder (`net::services`).
 //! - Management web interface (`net::mgmt`).
 //!
-//! Frames reach smoltcp from the datapath through each port's `local_rx`
-//! (`net::shared`, `svc_kick` wakes this task); smoltcp's frames go
-//! straight into the port's qdisc, then `dp_kick` wakes the datapath. WAN
+//! Frames reach the router stack from the datapath through each link's
+//! `local_rx` (`net::shared`, `svc_kick` wakes this task); its frames go
+//! through `Datapath::send_local` or, on PPPoE, into the port's qdisc,
+//! then `dp_kick` wakes the datapath. WAN
 //! lease changes and reboot/upgrade requests go to the datapath as
 //! `net::shared::Control` messages.
 
 use crate::cli::{Cli, CliAction, Ctx};
-use crate::net::datapath;
-use crate::net::device::PortDevice;
 use crate::net::mgmt::{Mgmt, StoreOp};
 use crate::net::pppoe::Pppoe;
 use crate::net::services::LanServices;
@@ -27,8 +27,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
-use smoltcp::iface::{Interface, SocketSet};
-use smoltcp::wire::{IpCidr, Ipv4Address};
+use core::net::{IpAddr, Ipv4Addr as Ipv4Address, Ipv6Addr};
 
 /// Set once the WAN has an address: a DHCP lease or a PPPoE link (read by
 /// the boot self-test).
@@ -40,18 +39,71 @@ const PING_IDENT: u16 = 0x22b;
 const PING_COUNT: u16 = 3;
 const PING_INTERVAL: Duration = Duration::from_millis(200);
 
-/// The services' half of a port: the router stack's interface and sockets.
+/// The services' half of a link: the router stack's addresses and routes
+/// there, and its TCP.
 pub struct HostIf {
-    pub iface: Interface,
-    pub sockets: SocketSet<'static>,
+    /// The link's addresses and routes (the WAN's from its lease, PPPoE
+    /// or static config; a network's from `stack::local_links`): the
+    /// datapath gets the same view (`stack::set_wan_local_link`,
+    /// `set_local_links`).
+    pub link: fwd::local::LocalLink,
+    /// The router's TCP on this link (docs/own-tcp.md).
+    pub tcp: proto_tcp::Tcp,
     /// The link's frames the services look at first (`net::device`).
     pub tap: crate::net::device::RxTap,
-    /// The link's MAC (its port's): smoltcp has none on `Medium::Ip`.
+    /// The link's MAC (its port's).
     pub mac: [u8; 6],
     /// The datapath does the link's link layer (every LAN link, a DHCP or
     /// static WAN: `config::wan_ip_only`; set when made, =
     /// [`crate::net::shared::LinkShared::ip_only`]); else PPPoE.
     pub ip_only: bool,
+}
+
+impl HostIf {
+    pub fn new(mac: [u8; 6], ip_only: bool, mtu: u16) -> Self {
+        let mut secret = [0u8; 16];
+        secret[..8].copy_from_slice(&crate::entropy::u64().to_le_bytes());
+        secret[8..].copy_from_slice(&crate::entropy::u64().to_le_bytes());
+        let mut tcp = proto_tcp::Tcp::new(secret);
+        tcp.set_mtu(mtu);
+        tcp.set_rst_closed(crate::config::tcp_rst());
+        Self { link: Default::default(), tcp, tap: Default::default(), mac, ip_only }
+    }
+
+    /// The link's IPv4 address (IPv6 stays).
+    pub fn set_addr4(&mut self, a: Option<(Ipv4Address, u8)>) {
+        self.link.v4 = a;
+    }
+
+    /// The IPv4 default route (`None`: none).
+    pub fn set_default4(&mut self, gw: Option<Ipv4Address>) {
+        self.link.routes4.retain(|r| r.1 != 0);
+        if let Some(gw) = gw {
+            self.link.routes4.push((Ipv4Address::UNSPECIFIED, 0, gw));
+        }
+    }
+
+    /// The IPv6 default route.
+    pub fn set_default6(&mut self, gw: Option<Ipv6Addr>) {
+        self.link.routes6.retain(|r| r.1 != 0);
+        if let Some(gw) = gw {
+            self.link.routes6.push((Ipv6Addr::UNSPECIFIED, 0, gw));
+        }
+    }
+
+    /// The link's addresses, for status output (`10.0.0.1/24`, ...).
+    pub fn addrs_text(&self) -> Vec<String> {
+        let v4 = self.link.v4.map(|(a, l)| alloc::format!("{a}/{l}"));
+        v4.into_iter().chain(self.link.v6.iter().map(|(a, l)| alloc::format!("{a}/{l}"))).collect()
+    }
+
+    /// One of the router's unicast addresses on this link.
+    fn is_ours(&self, a: IpAddr) -> bool {
+        match a {
+            IpAddr::V4(a) => self.link.v4.is_some_and(|(x, _)| x == a),
+            IpAddr::V6(a) => self.link.v6.iter().any(|&(x, _)| x == a),
+        }
+    }
 }
 
 /// The WAN gateway check: three echo requests (`net::local`) after each
@@ -150,10 +202,7 @@ fn handle_wan4(name: &str, host: &mut HostIf, pinger: &mut Pinger, events: Vec<p
     let mut change = None;
     for e in events {
         change = Some(match e {
-            Event::Bound(l) => {
-                let cidr = smoltcp::wire::Ipv4Cidr::new(l.address, l.prefix_len);
-                lease_bound(name, host, pinger, cidr, l.router, l.dns)
-            }
+            Event::Bound(l) => lease_bound(name, host, pinger, (l.address, l.prefix_len), l.router, l.dns),
             Event::Lost => lease_lost(name, host, pinger),
         });
     }
@@ -166,30 +215,18 @@ fn lease_bound(
     name: &str,
     host: &mut HostIf,
     pinger: &mut Pinger,
-    address: smoltcp::wire::Ipv4Cidr,
+    address: (Ipv4Address, u8),
     router: Option<Ipv4Address>,
     dns_servers: Vec<Ipv4Address>,
 ) -> LeaseChange {
-    host.iface.update_ip_addrs(|a| {
-        a.retain(|c| !matches!(c, IpCidr::Ipv4(_))); // IPv6 stays
-        a.push(IpCidr::Ipv4(address)).expect("wan addr");
-    });
-    match router {
-        Some(gw) => {
-            host.iface
-                .routes_mut()
-                .add_default_ipv4_route(gw)
-                .expect("route");
-        }
-        None => {
-            host.iface.routes_mut().remove_default_ipv4_route();
-        }
-    }
+    host.set_addr4(Some(address));
+    host.set_default4(router);
     let dns: Vec<_> = dns_servers.iter().map(|d| alloc::format!("{d}")).collect();
     println!(
-        "  net {}         : dhcp lease {} gw {} dns [{}]",
+        "  net {}         : dhcp lease {}/{} gw {} dns [{}]",
         name,
-        address,
+        address.0,
+        address.1,
         router
             .map(|r| alloc::format!("{r}"))
             .unwrap_or_else(|| "-".into()),
@@ -199,7 +236,7 @@ fn lease_bound(
     DHCP_OK.store(true, Ordering::Release);
     pinger.retarget(router);
     LeaseChange {
-        addr: Some((address.address(), address.prefix_len())),
+        addr: Some(address),
         gateway: router,
         dns: dns_servers,
         mtu: fwd::forwarder::DEFAULT_MTU,
@@ -212,25 +249,24 @@ fn lease_lost(name: &str, host: &mut HostIf, pinger: &mut Pinger) -> LeaseChange
     if DHCP_OK.load(Ordering::Acquire) {
         println!("  net {}         : dhcp lease lost", name);
     }
-    host.iface.update_ip_addrs(|a| a.retain(|c| !matches!(c, IpCidr::Ipv4(_))));
-    host.iface.routes_mut().remove_default_ipv4_route();
+    host.set_addr4(None);
+    host.set_default4(None);
     DHCP_OK.store(false, Ordering::Release);
     pinger.retarget(None);
     LeaseChange::lost()
 }
 
 /// A WAN address inside one of the networks breaks forwarding between them.
-fn warn_overlap(wan: smoltcp::wire::Ipv4Cidr) {
+fn warn_overlap(wan: (Ipv4Address, u8)) {
     for n in crate::config::networks() {
-        let lan = smoltcp::wire::Ipv4Cidr::new(n.addr, n.prefix);
-        let shorter = wan.prefix_len().min(lan.prefix_len());
+        let shorter = wan.1.min(n.prefix);
         let net = |a: Ipv4Address| {
             u32::from(a) & (u32::MAX.checked_shl(32 - shorter as u32).unwrap_or(0))
         };
-        if net(wan.address()) == net(lan.address()) {
+        if net(wan.0) == net(n.addr) {
             println!(
-                "  net WARNING     : WAN {} overlaps network {} {lan}: forwarding between them breaks; boot with e.g. lan=10.10.0.1/24",
-                wan, n.name
+                "  net WARNING     : WAN {}/{} overlaps network {} {}/{}: forwarding between them breaks; boot with e.g. lan=10.10.0.1/24",
+                wan.0, wan.1, n.name, n.addr, n.prefix
             );
         }
     }
@@ -244,20 +280,15 @@ fn configure_static(
     pinger: &mut Pinger,
     s: &crate::config::WanStatic,
 ) -> LeaseChange {
-    let cidr = smoltcp::wire::Ipv4Cidr::new(s.addr, s.prefix);
-    host.iface.update_ip_addrs(|a| {
-        a.retain(|c| !matches!(c, IpCidr::Ipv4(_))); // IPv6 stays
-        a.push(IpCidr::Ipv4(cidr)).expect("wan addr");
-    });
-    host.iface
-        .routes_mut()
-        .add_default_ipv4_route(s.gateway)
-        .expect("route");
+    let cidr = (s.addr, s.prefix);
+    host.set_addr4(Some(cidr));
+    host.set_default4(Some(s.gateway));
     let dns: Vec<_> = s.dns.iter().map(|d| alloc::format!("{d}")).collect();
     println!(
-        "  net {}         : static {} gw {} dns [{}]",
+        "  net {}         : static {}/{} gw {} dns [{}]",
         name,
-        cidr,
+        cidr.0,
+        cidr.1,
         s.gateway,
         dns.join(", ")
     );
@@ -352,11 +383,12 @@ fn restart_wan(
             _ => fwd::forwarder::DEFAULT_MTU,
         };
         port.mtu.store(u32::from(mtu), Ordering::Relaxed);
-        // Another medium: a new interface (the sockets stay); with
-        // `ip_only` the datapath does the WAN's ARP / ND from now on.
+        // Another medium (the sockets stay; new connections take the
+        // MTU's MSS); with `ip_only` the datapath does the WAN's ARP / ND
+        // from now on.
         wan.ip_only = ip_only;
         sh.links[0].set_ip_only(ip_only);
-        wan.iface = stack::new_iface(port, ip_only);
+        wan.tcp.set_mtu(mtu);
     }
     // The DHCP client (`net::wan4`) only in DHCP mode.
     match (dhcp, wan4.is_some()) {
@@ -368,8 +400,8 @@ fn restart_wan(
         (true, false) => *wan4 = Some(crate::net::wan4::Wan4::new(port.mac, now_ms())),
         _ => {}
     }
-    wan.iface.update_ip_addrs(|a| a.retain(|c| !matches!(c, IpCidr::Ipv4(_))));
-    wan.iface.routes_mut().remove_default_ipv4_route();
+    wan.set_addr4(None);
+    wan.set_default4(None);
     DHCP_OK.store(false, Ordering::Release);
     pinger.retarget(None);
     match new {
@@ -511,32 +543,55 @@ fn publish_wan(
     }
 }
 
-/// Poll every router-stack interface (one per link); wake the TX task of
-/// each port that got frames in its qdisc.
+/// The router stack's receive and send for every link: frames from the
+/// datapath (`local_rx`) to `net::local` (UDP, ICMP echo, IGMP / MLD
+/// queries) or the link's TCP; anything else for the router is dropped
+/// and counted (`local.other_dropped`). Then the TCP segments due, out
+/// through `net::local::send_frame`; the TX task of each port that got
+/// frames in its qdisc is woken.
 fn poll_stacks(hosts: &mut [HostIf], sh: &Shared) {
-    let t = stack::now();
-    let now_ns = datapath::now_ns();
-    let dp = stack::datapath();
+    use crate::net::{device, local};
+    let now = now_ms();
     for (ifx, (host, link)) in hosts.iter_mut().zip(&sh.links).enumerate() {
-        let i = link.port();
-        let port = &sh.ports[i];
-        let mut queued = 0;
-        let ip_only = host.ip_only;
-        let mut dev = PortDevice {
-            link,
-            port,
-            ifx: ifx as fwd::IfIndex,
-            now_ns,
-            queued: &mut queued,
-            tap: Some(&mut host.tap),
-            dp,
-            ip_only,
-            local_udp: true,
-        };
-        host.iface.poll(t, &mut dev, &mut host.sockets);
-        if queued > 0 {
-            sh.tx_kick[i].signal();
+        let ifx = ifx as fwd::IfIndex;
+        loop {
+            let Some(pkt) = link.local_rx.lock().pop_front() else { break };
+            let f = pkt.data();
+            let ip = matches!(fwd::wire::ethertype(f), Some(fwd::wire::ETHERTYPE_IPV4 | fwd::wire::ETHERTYPE_IPV6));
+            if !ip {
+                continue; // ARP / ND were the datapath's
+            }
+            device::tap(&mut host.tap, link, f);
+            if local::take(ifx, f) {
+                continue;
+            }
+            match fwd::tcp::parse(f) {
+                Some(seg) if host.is_ours(seg.dst) => host.tcp.receive(now, seg.src, seg.dst, &f[seg.l4.0..seg.l4.1]),
+                _ => local::other(sh, ifx, f),
+            }
         }
+        host.tcp.poll(now, |e| {
+            let off = fwd::tcp::offset(e.src.is_ipv6());
+            let Some(mut pkt) = crate::net::packet::PacketBuf::alloc() else {
+                device::count_tx_drop();
+                return true; // lost: the retransmission timer covers it
+            };
+            if off + e.len() > crate::net::packet::RX_AREA {
+                device::count_tx_drop();
+                return true;
+            }
+            pkt.set_len(off + e.len());
+            let d = pkt.data_mut();
+            let Some(n) = e.write(&mut d[off..]).and_then(|n| fwd::tcp::frame(d, e.src.ip(), e.dst.ip(), fwd::tcp::TTL, n)) else {
+                device::count_tx_drop();
+                return true;
+            };
+            pkt.set_len(n);
+            if !local::send_frame(sh, ifx, pkt) {
+                device::count_tx_drop();
+            }
+            true
+        });
     }
 }
 
@@ -906,11 +961,11 @@ pub async fn run(
             crate::executor::yield_now().await;
             continue;
         }
-        let t = stack::now();
+        let t = now_ms();
         let mut delay = hosts
-            .iter_mut()
-            .filter_map(|h| h.iface.poll_delay(t, &h.sockets))
-            .map(|d| Duration::from_micros(d.total_micros()))
+            .iter()
+            .filter_map(|h| h.tcp.next_deadline(t))
+            .map(|d| Duration::from_millis(d.saturating_sub(t)))
             .min()
             .unwrap_or(Duration::from_secs(1));
         if let Some(svc) = &services {

@@ -23,15 +23,12 @@ use crate::net::svc::HostIf;
 use crate::{println, timer, wallclock};
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::net::IpAddr;
 use core::time::Duration;
 use proto_dot::rustls::crypto::{GetRandomFailed, SecureRandom};
 use proto_dot::{Clock, Conn, ServerName, State, UnixTime};
-use smoltcp::iface::SocketHandle;
-use smoltcp::socket::tcp;
-use smoltcp::wire::IpEndpoint;
+use proto_tcp::{Handle as SocketHandle, Socket, State as TcpState};
 
 /// Close a connection that carried no query for this long.
 const IDLE: Duration = Duration::from_secs(30);
@@ -228,8 +225,8 @@ impl Dot {
             self.close(i, wan);
         }
         for (h, _) in self.closing.drain(..) {
-            wan.sockets.get_mut::<tcp::Socket>(h).abort();
-            wan.sockets.remove(h);
+            wan.tcp.get_mut(h).abort();
+            wan.tcp.remove(h);
         }
     }
 
@@ -282,14 +279,21 @@ impl Dot {
             Ok(c) => c,
             Err(e) => return self.fail(i, alloc::format!("{e}")),
         };
-        let mut s = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; TCP_BUF]), tcp::SocketBuffer::new(vec![0; TCP_BUF]));
+        let mut s = Socket::new(TCP_BUF, TCP_BUF);
         // Unacknowledged data for this long ends the connection.
-        s.set_timeout(Some(smoltcp::time::Duration::from_secs(10)));
-        let remote = IpEndpoint::new(l.up.ip.into(), l.port);
-        if let Err(e) = s.connect(wan.iface.context(), remote, port) {
-            return self.fail(i, alloc::format!("connect: {e:?} (no WAN address?)"));
+        s.set_timeout(Some(10_000));
+        let remote = core::net::SocketAddr::new(l.up.ip, l.port);
+        let source = match l.up.ip {
+            IpAddr::V4(_) => wan.link.source4().map(IpAddr::V4),
+            IpAddr::V6(d) => wan.link.source6(d).map(IpAddr::V6),
+        };
+        let Some(source) = source else {
+            return self.fail(i, String::from("connect: no WAN address"));
+        };
+        if let Err(e) = s.connect(core::net::SocketAddr::new(source, port), remote) {
+            return self.fail(i, alloc::format!("connect: {e:?}"));
         }
-        l.sock = Some(wan.sockets.add(s));
+        l.sock = Some(wan.tcp.add(s));
         l.conn = Some(conn);
     }
 
@@ -298,7 +302,7 @@ impl Dot {
         let l = &mut self.links[i];
         if let (Some(c), Some(h)) = (l.conn.as_mut(), l.sock) {
             c.close();
-            let s = wan.sockets.get_mut::<tcp::Socket>(h);
+            let s = wan.tcp.get_mut(h);
             let _ = s.send_slice(c.outgoing());
             s.close();
         }
@@ -313,7 +317,7 @@ impl Dot {
         let l = &mut self.links[i];
         l.conn = None;
         if let Some(h) = l.sock.take() {
-            wan.sockets.get_mut::<tcp::Socket>(h).abort();
+            wan.tcp.get_mut(h).abort();
             self.closing.push((h, later(LINGER)));
         }
     }
@@ -339,7 +343,7 @@ impl Dot {
             let (Some(h), true) = (self.links[i].sock, self.links[i].conn.is_some()) else {
                 continue;
             };
-            let s = wan.sockets.get_mut::<tcp::Socket>(h);
+            let s = wan.tcp.get_mut(h);
             let l = &mut self.links[i];
             let c = l.conn.as_mut().expect("checked");
             while s.can_recv() {
@@ -358,7 +362,7 @@ impl Dot {
             }
             let peer_gone = matches!(
                 s.state(),
-                tcp::State::Closed | tcp::State::CloseWait | tcp::State::TimeWait | tcp::State::Closing | tcp::State::LastAck
+                TcpState::Closed | TcpState::CloseWait | TcpState::TimeWait | TcpState::Closing | TcpState::LastAck
             );
             match c.state().clone() {
                 State::Failed(e) => {
@@ -403,11 +407,11 @@ impl Dot {
         self.flush(wan);
         // Sockets on their way out.
         self.closing.retain(|&(h, until)| {
-            let s = wan.sockets.get_mut::<tcp::Socket>(h);
-            let done = s.state() == tcp::State::Closed || now >= until;
+            let s = wan.tcp.get_mut(h);
+            let done = s.state() == TcpState::Closed || now >= until;
             if done {
                 s.abort();
-                wan.sockets.remove(h);
+                wan.tcp.remove(h);
             }
             !done
         });
@@ -418,7 +422,7 @@ impl Dot {
     pub fn flush(&mut self, wan: &mut HostIf) {
         for l in &mut self.links {
             let (Some(h), Some(c)) = (l.sock, l.conn.as_mut()) else { continue };
-            let s = wan.sockets.get_mut::<tcp::Socket>(h);
+            let s = wan.tcp.get_mut(h);
             while !c.outgoing().is_empty() && s.can_send() {
                 match s.send_slice(c.outgoing()) {
                     Ok(0) | Err(_) => break,

@@ -30,7 +30,7 @@ watchdog backed by a hardware timer resets a stuck one (M8,
 │  serial CLI · echo replies · IGMP / MLD (net::groups)          │
 ├───────────────────────────────────────────────────────────────┤
 │ Local stack ← packets addressed TO the router: own UDP / ICMP  │
-│  (net::local) · smoltcp for TCP only (docs/local-stack.md)     │
+│  (net::local) · own TCP, proto-tcp (docs/own-tcp.md)           │
 ├───────────────────────────────────────────────────────────────┤
 │ Forwarding plane (crates/fwd) ← packets going THROUGH          │
 │  L2: eth / VLAN / PPPoE encap (kernel datapath)                │
@@ -54,8 +54,8 @@ watchdog backed by a hardware timer resets a stuck one (M8,
    for the WAN, `dp_up` for the LAN), which drains the RX queue in batches.
 2. Classification: if the packet is addressed to the router (one of its IPs,
    ARP/NDP for its IPs, PPPoE discovery or control frames), hand it to the local
-   path (the datapath's ARP / ND, the PPPoE client, `net::local`, or smoltcp for
-   TCP). Otherwise it goes to the forwarding plane.
+   path (the datapath's ARP / ND, the PPPoE client, `net::local`, or the
+   router's own TCP, `proto_tcp`). Otherwise it goes to the forwarding plane.
 3. Forwarding: decapsulate (VLAN or PPPoE), conntrack lookup or create,
    firewall verdict, NAT rewrite, **classify** (fill `PacketMeta`: pre-NAT
    flow and host hashes, wire length), route lookup (LPM), neighbor
@@ -68,9 +68,10 @@ watchdog backed by a hardware timer resets a stuck one (M8,
    Packets *for* the router go into a small bounded per-link queue
    (`local_rx`, 64 packets) and from there, in the services task, to the
    router's own UDP / ICMP / IGMP / MLD handling (`net::local`) or, for
-   TCP, to smoltcp. The router's own transmissions go through the
-   datapath's neighbor table (`send_local`) into the port's qdisc, so the
-   qdisc sees all egress traffic.
+   TCP, to the link's `proto_tcp`; any other protocol is dropped
+   silently. The router's own transmissions go through the datapath's
+   neighbor table (`send_local`) into the port's qdisc, so the qdisc sees
+   all egress traffic.
 4. Egress: enqueue into the egress port's qdisc (CAKE by default on both
    ports, wrapped in the shaper). The transmitting task **pulls** from the
    qdisc when the driver has ring space and the shaper allows it, then
@@ -85,8 +86,8 @@ priority-tagged frames; stacked tags never) and removes it (a 12-byte move
 of the MAC addresses into the headroom gap); everything else is dropped and
 counted (`VLAN_DROPS`, `vlan_drops` in `/api/status`). `flush_port` adds it
 again after the qdisc, right before the NIC, so this one place covers
-forwarded frames, ARP requests and smoltcp's frames. The forwarder, ARP
-snooping, neighbor tables, smoltcp and the qdiscs therefore only see
+forwarded frames, ARP requests and the router's own frames. The forwarder,
+ARP snooping, neighbor tables, the router stack and the qdiscs only see
 untagged frames, and `crates/fwd` stays tag-free. Because the qdisc counts
 untagged lengths, the WAN shaper adds the tag's 4 bytes to its overhead
 (`config::Qos::port_rate`). LAN VLANs use the RX hook the same way (the
@@ -139,7 +140,8 @@ CAKE flow. Not split: packets with IP options (`too-big`). Counters in
 `/api/status` `fragments` (`split`, `split_drops`); boot argument
 `fw_split=0` drops them as `too-big` again (negative control).
 Fragments to the router itself are not reassembled: UDP ones are
-dropped by the router's own UDP (`net::local`), TCP ones by smoltcp. Boot
+dropped by the router's own UDP (`net::local`), TCP ones by
+`fwd::tcp::parse` (`local.other_dropped`). Boot
 argument `fw_frag=0` drops all fragments (negative
 control).
 
@@ -151,9 +153,10 @@ control).
 ```
 
 ### Forwarding plane
-smoltcp is a *host* stack: it has no forwarding, NAT, conntrack, bridging or
-PPPoE. The `fwd` crate provides these. It is the largest and riskiest part of
-the project (it effectively replaces netfilter), and it must be fuzzed.
+There is no host stack (smoltcp was one, and had no forwarding, NAT,
+conntrack, bridging or PPPoE). The `fwd` crate provides these. It is the
+largest and riskiest part of the project (it effectively replaces
+netfilter), and it must be fuzzed.
 
 ## Latency rules (from the CAKE requirements)
 - Timers are **tickless** and high-resolution: program the next deadline in
@@ -165,7 +168,7 @@ the project (it effectively replaces netfilter), and it must be fuzzed.
 | Task | Priority | Core (≥ 3 online) | Owns | Does |
 |---|---|---|---|---|
 | `dp_down` / `dp_up` (`net::stack::run_dir`) | Datapath | 0 / 1 | one direction each: RX on one port, TX on the other; share the locked NICs and `Datapath` (16 forwarder shards, neighbor tables) | RX → forward → qdisc → TX, NAPI; `dp_down` also housekeeping and control |
-| `svc` (`net::svc::run`) | Service | 2 | the router's own UDP / ICMP (`net::local`), smoltcp interfaces and TCP sockets (`HostIf`, one per link), WAN DHCP client or PPPoE, LAN DHCP servers, DNS + DoT, SNTP, mDNS, mgmt, CLI, store writes | the router's own traffic |
+| `svc` (`net::svc::run`) | Service | 2 | the router's own UDP / ICMP (`net::local`), per link its addresses and TCP (`HostIf`: `LocalLink`, `proto_tcp::Tcp`), WAN DHCP client or PPPoE, LAN DHCP servers, DNS + DoT, SNTP, mDNS, mgmt, CLI, store writes | the router's own traffic |
 | `watchdog` (one per core) | Datapath | each | `LAST_SEEN` stamps | cross-core check, hardware watchdog (docs/watchdog-and-time.md) |
 
 With one core everything runs on core 0 (a single `dp` task); with two the
@@ -245,9 +248,9 @@ and dhcproto are out).
 | virtio drivers + PCI config access | `virtio-drivers` (rcore-os), we implement its `Hal` trait |
 | MMIO | `safe-mmio` (via `mmio::Region`) |
 | aarch64 system registers | `aarch64-cpu` (arch backend only) |
-| TCP for the router's own services | `smoltcp` (TCP only: UDP, ICMP, ARP / ND, IGMP / MLD are our own, docs/local-stack.md) |
+| TCP for the router's own services | our own (`crates/proto-tcp`, docs/own-tcp.md; smoltcp until 2026-11-27) |
 | DNS wire format | our own (`crates/proto-dns`, `crates/proto-mdns`) |
-| HTTP server | our own (`crates/proto-http`) over smoltcp's TCP |
+| HTTP server | our own (`crates/proto-http`) over `proto_tcp` |
 | TLS (DoT) | `rustls` 0.23 (no std, unbuffered API) + RustCrypto provider |
 | Config | `toml` + `serde`, `serde_json` |
 | SSH (later) | `sunset` |

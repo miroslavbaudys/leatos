@@ -1,7 +1,7 @@
 //! LAN services: DHCPv4 server and DNS forwarder, plus the SNTP client
 //! (`net::ntp`), which resolves its server names through the forwarder.
 //!
-//! Thin glue between smoltcp UDP sockets and the sans-IO crates
+//! Thin glue between the router's own UDP (`net::local`) and the sans-IO crates
 //! (`proto_dhcp::v4::server`, `proto_dns::resolver`): receive datagrams, feed
 //! them in with the current time, and send what comes out. DHCP lease events
 //! update the DNS zone (`host.home.arpa`). The DNS upstreams are `dns.upstreams`
@@ -406,7 +406,7 @@ fn now_secs() -> u64 {
 
 /// A network's services on its link's interface: DHCP (if on) and DNS.
 fn open_net(cfg: config::Lan, host: usize, hosts: &mut [HostIf]) -> Net {
-    let sockets = &mut hosts[host].sockets;
+    let sockets = &mut hosts[host].tcp;
     let dhcp = cfg.dhcp.then(|| open_dhcp(&cfg, host));
     local::bind(host as fwd::IfIndex, DNS_PORT);
     let dns_tcp = config::dns_tcp().then(|| dns_tcp::Listener::open(sockets));
@@ -608,7 +608,7 @@ impl LanServices {
         }
         // Networks that went away (or moved): their sockets go too.
         for net in old {
-            let sockets = &mut hosts[net.host].sockets;
+            let sockets = &mut hosts[net.host].tcp;
             if let Some(server) = net.dhcp {
                 dropped += server.leases().count();
                 // Unless another network with DHCP took the link over.
@@ -868,7 +868,7 @@ impl LanServices {
                 Action::Reply { to, data, tcp: true } => {
                     // The connection's network (the one its query came in on).
                     for net in &mut self.nets {
-                        let sockets = &mut hosts[net.host].sockets;
+                        let sockets = &mut hosts[net.host].tcp;
                         if net.dns_tcp.as_mut().is_some_and(|l| l.send(sockets, to, &data, now_ms())) {
                             break;
                         }
@@ -997,7 +997,7 @@ impl LanServices {
             }
             let host = &mut hosts[host];
             let queries = match self.nets[i].dns_tcp.as_mut() {
-                Some(l) => l.recv(&mut host.sockets, now_ms()),
+                Some(l) => l.recv(&mut host.tcp, now_ms()),
                 None => Vec::new(),
             };
             for (client, q) in queries {
@@ -1047,7 +1047,7 @@ impl LanServices {
 
         for net in &mut self.nets {
             if let Some(l) = net.dns_tcp.as_mut() {
-                l.step(&mut hosts[net.host].sockets, now_ms());
+                l.step(&mut hosts[net.host].tcp, now_ms());
             }
         }
 

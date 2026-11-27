@@ -58,6 +58,13 @@ A client VM, the router and an ISP VM (Alpine; overlays in `lab/client/`, `lab/i
 - Unbound UDP from the LAN: the client's UDP to router ports nobody bound is dropped by the
   router's own UDP (`local.udp_unbound` rises) and draws no ICMP unreachable (LAN capture).
   Negative control `LAB_ROUTER_ARGS=udp_unbound_drop=0`.
+- The router's own TCP (docs/own-tcp.md): the web page byte-exact (SHA-256 against
+  `kernel/src/net/mgmt.html`); a closed router port refused at once with a RST (negative control
+  `LAB_ROUTER_ARGS=tcp_rst=0`: silent, the client's `nc` times out).
+- Other protocols: the host injects 4 frames with IP protocol 253 (`LAB_OTHER_PROTO`) from the
+  client to the router (`scripts/lab/inject.py`); the router drops them (`local.other_dropped`
+  rises) and the LAN capture shows no ICMP unreachable back. Negative control `LAB_OTHER_PROTO=17
+  LAB_ROUTER_ARGS=udp_unbound_drop=0` (UDP to port 9: a port unreachable comes back).
 - WAN input silent to the ISP's probes (TCP 22, 80, 61000, ping). Negative controls
   `LAB_ROUTER_ARGS=mgmt=wan`, `LAB_WAN_OPEN=1` (a rule accepting wan → router).
 - Router-side ECN per direction, from the router's counters (`LAB_EXPECT_ECN=U:D` for the negative
@@ -96,6 +103,24 @@ A client VM, the router and an ISP VM (Alpine; overlays in `lab/client/`, `lab/i
   - Combines with `LAB_VLAN=848`.
 - `LAB_VLAN=N`: the ISP VM on VLAN N only (8021q from `modloop-virt`, `fetch-alpine.sh modloop`),
   the router on `wan_vlan=N`. Negative controls `LAB_ROUTER_ARGS=wan_vlan=0` / another VID.
+
+### `LAB_TCP_LOSS=N`: loss on the path to the router's TCP
+
+A relay (`scripts/lab/relay.py`) between the router's LAN NIC and the client drops N % of the TCP
+frames in both directions (nothing else). The default checks run through it; the web page must
+still arrive byte-exact. Valid only if the relay dropped frames and the router retransmitted
+(`local.tcp.retransmits` over the page), else INVALID. Negative control `LAB_TCP_LOSS=100`
+(nothing gets through: the page and the other TCP checks fail).
+
+### `LAB_TCP_RST=blind`: blind RSTs into the router's TCP (RFC 5961)
+
+The same relay (0 % loss unless `LAB_TCP_LOSS` is set) knows the router's next expected sequence
+number from the client's last segment. The client leaves a request to the web interface
+half-sent for 4 s; meanwhile the relay injects RSTs with the client's addresses and ports, four
+in the window but off the exact number and one far outside it. The request must still be
+answered and `local.tcp.challenge_acks` rise (else INVALID: the RSTs missed the window); INVALID
+too if the relay injected nothing. Negative control `LAB_TCP_RST=exact` (one RST at the exact
+number: the connection ends, the check fails). No shaping phase, ECN or queue checks.
 
 ### `LAB_DOT=1`: DNS over TLS (docs/dns-over-tls.md)
 

@@ -16,7 +16,6 @@
 
 use crate::net::packet::PacketBuf;
 use crate::net::shared::PortShared;
-use crate::net::stack;
 use crate::net::svc::{HostIf, LeaseChange};
 use crate::{println, timer};
 use alloc::format;
@@ -24,7 +23,6 @@ use alloc::string::String;
 use core::sync::atomic::Ordering;
 use proto_pppoe::{Client, Event, Link};
 use qdisc::Qdisc;
-use smoltcp::wire::{IpCidr, Ipv4Cidr};
 
 fn now_ms() -> u64 {
     timer::uptime().as_millis() as u64
@@ -106,16 +104,12 @@ impl Pppoe {
                             t.echo.map_or(String::from("none"), |(g, s)| format!("{g} B back for {s} B"))
                         );
                     }
-                    if u32::from(link.mtu) != port.mtu.load(Ordering::Relaxed) {
-                        // smoltcp reads the MTU when the interface is made.
-                        port.mtu.store(u32::from(link.mtu), Ordering::Relaxed);
-                        host.iface = stack::new_iface(port, false);
-                    }
-                    host.iface.update_ip_addrs(|a| {
-                        a.clear();
-                        let _ = a.push(IpCidr::Ipv4(Ipv4Cidr::new(link.local, 32)));
-                    });
-                    let _ = host.iface.routes_mut().add_default_ipv4_route(link.remote);
+                    // The session's MTU: the MSS of new TCP connections.
+                    port.mtu.store(u32::from(link.mtu), Ordering::Relaxed);
+                    host.tcp.set_mtu(link.mtu);
+                    host.link.v6.clear();
+                    host.set_addr4(Some((link.local, 32)));
+                    host.set_default4(Some(link.remote));
                     let dns: alloc::vec::Vec<String> =
                         link.dns.iter().map(|d| format!("{d}")).collect();
                     println!(
@@ -142,8 +136,9 @@ impl Pppoe {
                 Event::Down { reason, was_up } => {
                     port.set_pppoe_session(None);
                     if was_up {
-                        host.iface.update_ip_addrs(|a| a.clear());
-                        host.iface.routes_mut().remove_default_ipv4_route();
+                        host.link.v6.clear();
+                        host.set_addr4(None);
+                        host.set_default4(None);
                         change = Some(LeaseChange::lost());
                         println!("  pppoe {}     : down: {reason}", port.name);
                     } else {

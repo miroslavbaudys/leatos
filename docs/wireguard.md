@@ -81,8 +81,9 @@ implementations queue a few, which would be a second queue outside the
 qdisc and is not done here).
 
 **Traffic from and to the router itself** (DNS, the web page over the
-tunnel): `Verdict::Local` on `wg0` to `svc`'s smoltcp interface for that
-link, like the network slots; its replies route back to `wg0`.
+tunnel): `Verdict::Local` on `wg0` to `svc`'s router stack for that link
+(`HostIf`: `net::local`, `proto_tcp`), like the network slots; its replies
+route back to `wg0`.
 
 **NAT.** Tunnel subnets count as inside: a peer reaching the internet is
 masqueraded on the WAN like a LAN host. The router's own outer packets

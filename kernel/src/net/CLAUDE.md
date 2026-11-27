@@ -32,37 +32,43 @@ The only coupling between the datapath and the services:
   `interfaces[0].rate_history_kbit`, the overview chart).
 - Per **link** `local_rx` (`LinkShared`): link 0 = WAN on port 0, links 1..`MAX_LINKS` = network
   slots on `lan0`, created at boot, switched on/retagged/readdressed live (`assign_slots`,
-  `Networks` → `Datapath::apply`). Forwarder interfaces, ARP tables and smoltcp interfaces are per
-  link; a VLAN network's tag is pushed when a frame is queued on the port.
+  `Networks` → `Datapath::apply`). Forwarder interfaces, ARP tables and the router stack's
+  `HostIf`s are per link; a VLAN network's tag is pushed when a frame is queued on the port.
 - `Control` messages (WAN lease, zone `Policy`, reboot/exec), `dp_kick`/`svc_kick` events.
 
-## smoltcp side: `device.rs`
+## The router's own stack (no host stack; docs/own-tcp.md, docs/local-stack.md)
 
-smoltcp `Device` behind the datapath: RX from `local_rx`, TX into the qdisc.
+Per link a `svc::HostIf`: its addresses and routes (`fwd::local::LocalLink`), its TCP
+(`proto_tcp::Tcp`), the RX tap and MAC. `svc::poll_stacks` takes the link's `local_rx` frames:
+`device::tap` (the WAN's RA, RS seen), then `local::take` (UDP, ICMP echo, IGMP / MLD queries),
+then TCP to one of the link's own addresses (`fwd::tcp::parse`, `HostIf::is_ours`) into
+`proto_tcp`; anything else `local::other` (dropped, `/api/status` `local.other_dropped`). TCP
+segments out: `fwd::tcp::frame` around `proto_tcp`'s segment, `local::send_frame`; a segment that
+cannot be queued counts `local.tcp.tx_drops` and the retransmission timer covers it. TCP
+counters `/api/status` `local.tcp`. `svc` sleeps until the earliest `Tcp::next_deadline`.
 
-- **smoltcp is IP-only on every link** (`Medium::Ip`, built without `medium-ethernet`;
-  docs/lan-neighbors.md, docs/local-stack.md step 2). On a LAN link and a DHCP / static WAN
-  (`HostIf::ip_only` = `LinkShared::ip_only`; the MAC is `HostIf::mac`) RX passes the IP packet
-  only; TX goes through `Datapath::send_local` (next hop by `fwd::local`, the datapath's neighbor
-  table). The datapath answers ARP / NS for the router's addresses (`Datapath::link_layer`,
-  `fwd::nd`; counters `/api/status` `lan_nd`, switches `nd_unicast=0`, `na_router=0`) and keeps
-  those frames from smoltcp. The per-link addresses and routes come from `stack::local_links`, the
-  one source for both smoltcp's interfaces and the datapath (`set_local_links` after every
+- **The datapath does the link layer on every link but PPPoE** (`HostIf::ip_only` =
+  `LinkShared::ip_only`; the MAC is `HostIf::mac`): `Datapath::send_local` (next hop by
+  `fwd::local`, the datapath's neighbor table). It answers ARP / NS for the router's addresses
+  (`Datapath::link_layer`, `fwd::nd`; counters `/api/status` `lan_nd`, switches `nd_unicast=0`,
+  `na_router=0`). The networks' addresses and routes come from `stack::local_links`, the one
+  source for both `HostIf::link` and the datapath (`set_local_links` after every
   `set_host_addrs`).
-- The WAN's view (`stack::set_wan_local_link`) is read back from smoltcp's WAN interface at start
-  and after every lease or address change (`svc::publish_wan`, `reapply_networks`); `restart_wan`
-  switches DHCP / static ⇄ PPPoE live. Counters `/api/status` `wan_nd` (`medium` ip / ppp). On
-  PPPoE the frame goes into the qdisc for the session's headers.
+- The WAN's `HostIf::link` is set from its lease, PPPoE or static config (`svc::lease_bound`,
+  `configure_static`, `net::pppoe`) and `set_host_addrs` (IPv6), and copied to the datapath
+  (`stack::set_wan_local_link`) after every change (`svc::publish_wan`, `reapply_networks`);
+  `restart_wan` switches DHCP / static ⇄ PPPoE live. Counters `/api/status` `wan_nd` (`medium` ip
+  / ppp). On PPPoE the frame goes into the qdisc for the session's headers; the session's MTU
+  sets the MSS of new TCP connections (`Tcp::set_mtu`).
 - Neighbor table limits: `neigh_secs=`, `neigh_probe=0`, `neigh_pending=0` (nothing held while
   resolving: the lab's first-contact control).
-- `local.rs`: the router's own UDP without smoltcp (docs/local-stack.md steps 2b, 3): one port
-  table per link owned by the module (`bind` / `recv`; the device offers every frame to `take`
-  before smoltcp; bounded queue per port, `/api/status` `local.udp_dropped`; UDP to an unbound
-  port dropped silently, `local.udp_unbound`, as smoltcp without `socket-udp` would answer it
-  with protocol unreachable; `udp_unbound_drop=0` is the lab's control), IPv4 and IPv6
-  (`Ends`), `send` through `Datapath::send_local` or, on PPPoE, into the WAN qdisc; `source` =
-  the datapath's view of the link (`Datapath::local_source`); headers by `fwd::udp`. Also ICMP
-  echo (step 4: requests to the router's addresses answered by `fwd::echo::reply`, the gateway
+- `local.rs`: the router's own UDP (docs/local-stack.md steps 2b, 3): one port table per link owned
+  by the module (`bind` / `recv`; `svc` offers every frame to `take` first; bounded queue per port,
+  `/api/status` `local.udp_dropped`; UDP to an unbound port dropped silently, `local.udp_unbound`;
+  `udp_unbound_drop=0`, the lab's control, answers it with a port unreachable via `local::other`),
+  IPv4 and IPv6 (`Ends`), `send` through `Datapath::send_local` or, on PPPoE, into the WAN qdisc;
+  `source` = the datapath's view of the link (`Datapath::local_source`); headers by `fwd::udp`. Also
+  ICMP echo (step 4: requests to the router's addresses answered by `fwd::echo::reply`, the gateway
   pinger's replies queued: `ping_bind` / `ping_recv`, `send_echo`) and IGMP / MLD queries
   (`take_query`, for `groups.rs`).
 - `groups.rs`: the router's multicast memberships per link (solicited-node groups, ff02::2,
@@ -71,38 +77,35 @@ smoltcp `Device` behind the datapath: RX from `local_rx`, TX into the qdisc.
   sends none (lab control).
 - `wan4.rs`: the WAN's DHCPv4 client (`proto_dhcp::v4::client`) on port 68 over `local`, events
   into `svc::lease_bound` / `lease_lost`; `/api/status` `wan_dhcp`.
-- `RxTap` (`HostIf::tap`): the last RA a link received (the WAN's for `net::wan6`) and RS seen
-  (`LinkShared::rs_seen`, the network's advertiser answers). No neighbor hints any more (removed
-  with the fallbacks, 2026-11-26).
+- `RxTap` (`HostIf::tap`, `device::tap`): the last RA a link received (the WAN's for
+  `net::wan6`) and RS seen (`LinkShared::rs_seen`, the network's advertiser answers).
 - Per-queue `Delay`: time waited summed, pings apart (`/api/status` per queue `delay`, the lab's
   latency-under-load check).
 
 ## Services task: `svc.rs`
 
-`svc`, `Priority::Service`: smoltcp (TCP), the WAN DHCP client (`net::wan4`) or PPPoE, LAN
-services, mgmt. A saved WAN change restarts the WAN live, DHCP ⇄ PPPoE included; static WAN via
-`configure_static`. `LeaseStore`: see kernel/CLAUDE.md (store).
+`svc`, `Priority::Service`: the router stack (`poll_stacks`), the WAN DHCP client (`net::wan4`) or
+PPPoE, LAN services, mgmt. A saved WAN change restarts the WAN live, DHCP ⇄ PPPoE included; static
+WAN via `configure_static`. `LeaseStore`: see kernel/CLAUDE.md (store).
 
 - `pppoe.rs`: svc side of `proto_pppoe::Client`: `ctrl_rx` in, frames into the WAN qdisc, `Session`
-  → `PortShared::pppoe_session`, up/down → router-stack address + `LeaseChange`. The WAN interface
-  is `Medium::Ip` in PPPoE mode. PADT at reboot/upgrade from the datapath.
-- `services.rs`: per network a DHCP server + DNS, one resolver/zone, all UDP on `net::local`
-  (step 3; smoltcp is built without `socket-udp`): DNS :53 per network's link (answers from the
-  network's address), `services::Upstream` a fresh random upstream port per query on the WAN
-  (bound in `local` and `CLIENT_PORTS`), DHCP :67 (replies broadcast from the network's address).
-  With IPv6 an RA `Advertiser` per network, frames straight into the port qdisc; retired ones send
-  a last RA.
+  → `PortShared::pppoe_session`, up/down → router-stack address + `LeaseChange`. PADT at
+  reboot/upgrade from the datapath.
+- `services.rs`: per network a DHCP server + DNS, one resolver/zone, all UDP on `net::local` (step
+  3): DNS :53 per network's link (answers from the network's address), `services::Upstream` a fresh
+  random upstream port per query on the WAN (bound in `local` and `CLIENT_PORTS`), DHCP :67 (replies
+  broadcast from the network's address). With IPv6 an RA `Advertiser` per network, frames straight
+  into the port qdisc; retired ones send a last RA.
 - `dns_tcp.rs`: DNS over TCP from clients (RFC 7766): 4 TCP :53 sockets per network, framing in
   `proto_dns::tcp`, length-prefixed queries → `Resolver::handle_query_tcp`, answers by client
   endpoint, pipelining, bounded buffers, 10 s idle close; `/api/status` `dns.tcp`.
 - `ntp.rs`: SNTP client on the WAN (a port in 60000–60999 on `net::local`, from the WAN's source
   address); names resolved through the forwarder as client `127.0.0.1:1`.
 - `dot.rs`: DNS over TLS (docs/dns-over-tls.md): one `proto_dot::Conn` per `dns.upstreams` server
-  over a smoltcp TCP socket on the WAN (local ports 61000–64999), opened on demand, 30 s idle
-  close, backoff on failure, reconnect once SNTP sets the clock. Strict: with `dns.tls` no UDP
-  upstream
-  query and UDP answers ignored. Entropy from `entropy`, clock `wallclock`, build time floor
-  `LEATOS_BUILD_TIME`.
+  over a `proto_tcp` socket on the WAN (local ports 61000–64999, source address from the WAN's
+  `LocalLink`), opened on demand, 30 s idle close, backoff on failure, reconnect once SNTP sets the
+  clock. Strict: with `dns.tls` no UDP upstream query and UDP answers ignored. Entropy from
+  `entropy`, clock `wallclock`, build time floor `LEATOS_BUILD_TIME`.
 - `wan6.rs`: the WAN's IPv6 (docs/ipv6.md steps 3–5a).
   - The WAN's own address `config::wan_address6` (::1 in the prefix's last /64); the ISP's IPv6 DNS
     servers after the lease's (`LanServices::set_dns6`).

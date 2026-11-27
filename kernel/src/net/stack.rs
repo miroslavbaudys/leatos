@@ -3,7 +3,7 @@
 //! - WAN (first NIC: virtio-net or igb, in PCI order), LAN (second NIC).
 //! - [`bring_up`] creates per port: the NIC ([`Port`], datapath-owned), the
 //!   qdisc and `local_rx` queue (`net::shared::PortShared`), and the router
-//!   stack's smoltcp interface (`net::svc::HostIf`, services-owned).
+//!   stack's view of each link (`net::svc::HostIf`, services-owned).
 //! - [`run`], the datapath task (`Priority::Datapath`): NIC RX →
 //!   `net::datapath` (forward / local / drop) → qdiscs → NIC TX. The
 //!   router's own stack and services run in `net::svc::run`
@@ -17,9 +17,10 @@
 use crate::drivers::{self, Nic};
 use crate::irq::{self, IrqEvent, Trigger};
 use crate::net::datapath::{self, Datapath};
-use crate::net::device::{Aqm, PortDevice, PortQdisc};
+use crate::net::device::{Aqm, PortQdisc};
 use crate::net::mgmt::Action;
 use crate::net::shared::{self, CTRL_RX_MAX, LinkShared, PortShared, PortSnap, Shared};
+use core::net::{Ipv4Addr, Ipv6Addr};
 use crate::net::svc::HostIf;
 use crate::pci::Pci;
 use crate::{arch, println, timer};
@@ -30,9 +31,6 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use core::task::{Context, Poll};
 use core::time::Duration;
-use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::time::Instant as NetInstant;
-use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Cidr, Ipv6Cidr};
 use spin::Mutex;
 
 /// Qdisc hard limits, per port egress and for the WAN ingress stage
@@ -64,8 +62,8 @@ fn describe_limit(bytes: usize, rate: Option<qdisc::shaper::Rate>) -> alloc::str
     }
 }
 
-fn cidr(n: &crate::config::Lan) -> Ipv4Cidr {
-    Ipv4Cidr::new(n.addr, n.prefix)
+fn cidr(n: &crate::config::Lan) -> alloc::string::String {
+    alloc::format!("{}/{}", n.addr, n.prefix)
 }
 
 /// Times a direction task found a port's NIC lock held by the other
@@ -118,10 +116,6 @@ struct PortIrq {
 /// `vlan 848 (pcp 0)` for a port's tag.
 pub fn vlan_text(tci: u16) -> alloc::string::String {
     alloc::format!("vlan {} (pcp {})", tci & 0x0fff, tci >> 13)
-}
-
-pub fn now() -> NetInstant {
-    NetInstant::from_micros(timer::uptime().as_micros() as i64)
 }
 
 /// IRQ context: mask the (level-triggered, possibly shared) INTx line until
@@ -250,9 +244,7 @@ pub fn bring_up(
             let link = LinkShared::new(port_ix, true);
             let ip_only = crate::config::wan_ip_only(&crate::config::wan_link());
             link.set_ip_only(ip_only);
-            let iface = new_iface(&port, ip_only);
-            let sockets = SocketSet::new(Vec::new());
-            hosts.push(HostIf { iface, sockets, tap: Default::default(), mac: port.mac, ip_only });
+            hosts.push(HostIf::new(port.mac, ip_only, port.mtu()));
             links.push(link);
         } else if i == shared::FIRST_LAN_PORT {
             // Every network slot, with an interface without addresses (on
@@ -263,13 +255,7 @@ pub fn bring_up(
                 let ip_only = true;
                 link.set_ip_only(ip_only);
                 links.push(link);
-                hosts.push(HostIf {
-                    iface: new_iface(&port, ip_only),
-                    sockets: SocketSet::new(Vec::new()),
-                    tap: Default::default(),
-                    mac: port.mac,
-                    ip_only,
-                });
+                hosts.push(HostIf::new(port.mac, ip_only, port.mtu()));
             }
         }
         // Legacy INTx where the platform routes it (aarch64 DTB), otherwise
@@ -385,31 +371,6 @@ fn log_ingress(qos: &crate::config::Qos, rate: Option<qdisc::shaper::Rate>, what
         None if !qos.ingress => println!("  qos ingress    : off (shape_ingress=0: download shaped on lan0)"),
         None => println!("  qos ingress    : {now}unshaped (no download rate)"),
     }
-}
-
-/// The router stack's interface for a link on `port`: IP-only, always
-/// (`ip_only`: the datapath does its link layer, docs/lan-neighbors.md,
-/// docs/local-stack.md step 2; else a PPPoE port, [`PortShared::is_pppoe`]
-/// set before calling). smoltcp only reads the device's capabilities here.
-pub fn new_iface(port: &PortShared, ip_only: bool) -> Interface {
-    let link = &LinkShared::detached();
-    let mut config = Config::new(HardwareAddress::Ip);
-    // TCP initial sequence numbers, DHCP transaction IDs: from the entropy
-    // pool, not the tick count (docs/security-audit.md §5 item 7).
-    config.random_seed = crate::entropy::u64();
-    let mut queued = 0;
-    let mut device = PortDevice {
-        link,
-        port,
-        ifx: 0,
-        now_ns: datapath::now_ns(),
-        queued: &mut queued,
-        tap: None,
-        dp: None,
-        ip_only,
-        local_udp: false,
-    };
-    Interface::new(config, &mut device, now())
 }
 
 /// Wait until any of `events` fires or the sleep ends.
@@ -589,33 +550,13 @@ pub fn set_local_links(dp: SharedDatapath, sh: &Shared, nets: &[crate::config::L
 }
 
 /// The WAN's addresses and routes for the datapath ([`Datapath::send_local`],
-/// its ARP / ND answers), read back from the router stack's WAN interface,
-/// so both always agree (docs/local-stack.md step 2). After
-/// every change of the WAN's addresses or routes (`svc::publish_wan`,
-/// `svc::reapply_networks`).
+/// its ARP / ND answers, `net::local::source`): the router stack's view
+/// of the WAN (`HostIf::link`). After every change of the WAN's addresses
+/// or routes (`svc::publish_wan`, `svc::reapply_networks`). On PPPoE too:
+/// its addresses pick the router's source addresses; the datapath answers
+/// no ARP there.
 pub fn set_wan_local_link(dp: SharedDatapath, wan: &mut HostIf) {
-    use smoltcp::wire::IpAddress;
-    let mut l = fwd::local::LocalLink::default();
-    // On PPPoE too: its addresses pick the router's source addresses
-    // (`net::local::source`); the datapath answers no ARP there.
-    {
-        for c in wan.iface.ip_addrs() {
-            match c {
-                IpCidr::Ipv4(c) => l.v4 = Some((c.address(), c.prefix_len())),
-                IpCidr::Ipv6(c) => l.v6.push((c.address(), c.prefix_len())),
-            }
-        }
-        wan.iface.routes_mut().update(|routes| {
-            for r in routes.iter() {
-                match (r.cidr, r.via_router) {
-                    (IpCidr::Ipv4(c), IpAddress::Ipv4(gw)) => l.routes4.push((c.address(), c.prefix_len(), gw)),
-                    (IpCidr::Ipv6(c), IpAddress::Ipv6(gw)) => l.routes6.push((c.address(), c.prefix_len(), gw)),
-                    _ => {}
-                }
-            }
-        });
-    }
-    dp.set_local_link(datapath::WAN, l);
+    dp.set_local_link(datapath::WAN, wan.link.clone());
 }
 
 /// Per link (index = link; the WAN's left empty): the network's IPv4
@@ -696,17 +637,10 @@ pub fn port_macs(ports: &[PortShared]) -> Vec<[u8; 6]> {
 /// WAN's subnet), so the router answers hosts behind them.
 pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: &[usize], macs: &[[u8; 6]]) {
     if let Some(wan) = hosts.first_mut() {
-        set_host_routes(&mut wan.iface, &crate::config::wan_routes());
+        set_host_routes(&mut wan.link, &crate::config::wan_routes());
         // The router's own IPv6 traffic out (DNS to the ISP's IPv6
         // servers): a default route while the WAN has one.
-        match crate::config::wan6() {
-            Some(w) => {
-                let _ = wan.iface.routes_mut().add_default_ipv6_route(w.gateway);
-            }
-            None => {
-                wan.iface.routes_mut().remove_default_ipv6_route();
-            }
-        }
+        wan.set_default6(crate::config::wan6().map(|w| w.gateway));
         // IPv6 on the WAN: its link-local address (the MAC's on Ethernet,
         // IPv6CP's on PPPoE while it is up), which the DHCPv6 client and
         // router solicitations use, and a static global one (development:
@@ -714,26 +648,16 @@ pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: 
         let pppoe = matches!(crate::config::wan_link(), crate::config::WanLink::Pppoe(_));
         let ll = if pppoe { crate::net::wan6::ppp_link().map(|l| l.0) } else { macs.first().map(|&m| fwd::wire::link_local(m)) };
         if !pppoe || crate::config::ipv6() {
-            let mut want: Vec<IpCidr> = Vec::new();
+            let mut want: Vec<(Ipv6Addr, u8)> = Vec::new();
             if crate::config::ipv6()
                 && let Some(ll) = ll
             {
-                want.push(IpCidr::Ipv6(Ipv6Cidr::new(ll, 64)));
-                if let Some((ip, len)) = crate::config::wan6().and_then(|w| w.addr) {
-                    want.push(IpCidr::Ipv6(Ipv6Cidr::new(ip, len)));
+                want.push((ll, 64));
+                if let Some(a) = crate::config::wan6().and_then(|w| w.addr) {
+                    want.push(a);
                 }
             }
-            let have: Vec<IpCidr> = wan.iface.ip_addrs().iter().filter(|c| matches!(c, IpCidr::Ipv6(_))).copied().collect();
-            if have != want {
-                wan.iface.update_ip_addrs(|a| {
-                    a.retain(|c| matches!(c, IpCidr::Ipv4(_)));
-                    for c in &want {
-                        if a.push(*c).is_err() {
-                            no_room_for(c, "wan");
-                        }
-                    }
-                });
-            }
+            wan.link.v6 = want;
         }
     }
     let views = local_links(nets, links, macs, hosts.len());
@@ -742,77 +666,15 @@ pub fn set_host_addrs(hosts: &mut [HostIf], nets: &[crate::config::Lan], links: 
         if let Some(&mac) = k.and_then(|k| macs.get(nets[k].port)) {
             host.mac = mac;
         }
-        let view = &views[i];
-        set_host_routes46(&mut host.iface, &view.routes4, &view.routes6);
-        let mut want: Vec<IpCidr> = Vec::new();
-        if let Some((a, len)) = view.v4 {
-            want.push(IpCidr::Ipv4(Ipv4Cidr::new(a, len)));
-        }
-        for &(a, len) in &view.v6 {
-            want.push(IpCidr::Ipv6(Ipv6Cidr::new(a, len)));
-        }
-        if host.iface.ip_addrs() != want.as_slice() {
-            host.iface.update_ip_addrs(|a| {
-                a.clear();
-                for c in &want {
-                    // iface-max-addr-count-4 (kernel/Cargo.toml) holds
-                    // them today: IPv4, link-local, ULA, global.
-                    if a.push(*c).is_err() {
-                        no_room_for(c, k.map_or("-", |k| nets[k].name.as_str()));
-                    }
-                }
-            });
-        }
+        host.link = views[i].clone();
     }
 }
 
-/// An address that did not fit on a router-stack interface (smoltcp's
-/// `iface-max-addr-count`, kernel/Cargo.toml): logged, not dropped
-/// silently.
-fn no_room_for(c: &IpCidr, link: &str) {
-    println!("  net             : no room for {c} on {link} (iface-max-addr-count, kernel/Cargo.toml)");
-}
-
 /// An interface's routes: `routes`, plus the default route it has (the
-/// WAN's, from the lease or PPPoE). smoltcp holds at most
-/// `iface-max-route-count` (Cargo feature) of them.
-pub fn set_host_routes(iface: &mut Interface, routes: &[(core::net::Ipv4Addr, u8, core::net::Ipv4Addr)]) {
-    set_host_routes46(iface, routes, &[]);
-}
-
-/// [`set_host_routes`] with IPv6 routes too (a network's `[[route]]`s).
-pub fn set_host_routes46(
-    iface: &mut Interface,
-    routes: &[(core::net::Ipv4Addr, u8, core::net::Ipv4Addr)],
-    routes6: &[(core::net::Ipv6Addr, u8, core::net::Ipv6Addr)],
-) {
-    use smoltcp::iface::Route;
-    use smoltcp::wire::IpAddress;
-    iface.routes_mut().update(|table| {
-        table.retain(|r| r.cidr.prefix_len() == 0);
-        for &(dst, len, via) in routes {
-            let route = Route {
-                cidr: IpCidr::Ipv4(Ipv4Cidr::new(dst, len)),
-                via_router: IpAddress::Ipv4(via),
-                preferred_until: None,
-                expires_at: None,
-            };
-            if table.push(route).is_err() {
-                println!("  routes          : table full, {dst}/{len} via {via} left out");
-            }
-        }
-        for &(dst, len, via) in routes6 {
-            let route = Route {
-                cidr: IpCidr::Ipv6(Ipv6Cidr::new(dst, len)),
-                via_router: IpAddress::Ipv6(via),
-                preferred_until: None,
-                expires_at: None,
-            };
-            if table.push(route).is_err() {
-                println!("  routes          : table full, {dst}/{len} via {via} left out");
-            }
-        }
-    });
+/// WAN's, from the lease or PPPoE).
+pub fn set_host_routes(link: &mut fwd::local::LocalLink, routes: &[(Ipv4Addr, u8, Ipv4Addr)]) {
+    link.routes4.retain(|r| r.1 == 0);
+    link.routes4.extend(routes.iter().copied().filter(|r| r.1 != 0));
 }
 
 /// One line per network (boot, and after a change).

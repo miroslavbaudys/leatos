@@ -23,18 +23,18 @@ Keep them current when you change what they describe; keep this file to the map 
   CCP TRNG, CPU temperature); `src/config.rs` (boot-time `Config`), `store.rs`, `upgrade.rs`,
   `cli.rs`, `console.rs`, `fatal.rs`, `watchdog.rs`, `entropy.rs`, `wallclock.rs`.
 - `kernel/src/net/`: the datapath tasks `dp_down`/`dp_up` (`stack.rs`, `datapath.rs`), the services
-  task `svc` (`svc.rs`: WAN, LAN services, mgmt; the router's own UDP / ICMP in `local.rs`,
-  smoltcp for TCP only), `shared.rs` = the only coupling between them, `mgmt.rs` + `mgmt.html` = web
-  interface and API on :80.
+  task `svc` (`svc.rs`: WAN, LAN services, mgmt; the router's own UDP / ICMP in `local.rs`, its
+  TCP = `crates/proto-tcp` per link), `shared.rs` = the only coupling between them, `mgmt.rs` +
+  `mgmt.html` = web interface and API on :80. No host stack (smoltcp is gone, docs/own-tcp.md).
 - Ports: `wan0` + routed LAN ports `lan0`–`lan2` (NICs in PCI order), no bridge; networks (VLANs)
   are link slots on a port.
 - `crates/`: sans-IO protocol and policy crates: `fwd` (forwarder, conntrack/NAT, firewall, routes,
-  fragments), `qdisc` (CoDel, fq_codel, CAKE), `proto-{dhcp,dns,dot,pppoe,sntp,mdns,http}`, `auth`,
-  `cli`, `config` (`config.toml` schema v2, docs/config-v2.md), `config-store` (power-fail-safe
-  store), `boot-image`.
+  fragments), `qdisc` (CoDel, fq_codel, CAKE), `proto-{dhcp,dns,dot,pppoe,sntp,mdns,http,tcp}`,
+  `auth`, `cli`, `config` (`config.toml` schema v2, docs/config-v2.md), `config-store`
+  (power-fail-safe store), `boot-image`.
 - `fuzz/`: cargo-fuzz targets (own workspace, nightly; fuzz/README.md): `fwd`, `pppoe`, `dns`,
   `dhcp6`, `sntp`, `http`, `dhcp`, `dhcp_client`, `mdns`, `qdisc`, `ack_filter`, `boot_image`,
-  `cli`, `config` (seeds in `fuzz/seeds/config`), `store`, `dns_tcp`, `auth`, `dot`; shared
+  `cli`, `config` (seeds in `fuzz/seeds/config`), `store`, `dns_tcp`, `auth`, `dot`, `tcp`; shared
   builders in `fuzz/src/lib.rs`.
 - `tools/leatstore`: host tool for store images: `create`, `format`, `show`, `put` (refuses a clear
   `mgmt.password`), `get`, `corrupt`, `hash <password>`.
@@ -47,8 +47,8 @@ Keep them current when you change what they describe; keep this file to the map 
   **boot-arguments.md** (every kernel option), **lab-tests.md** (every test and its negative
   controls), safety-and-portability, smp, config-and-storage, config-v2, upgrades, ipv6,
   security-audit, lan-neighbors (done: one neighbor table, the datapath does ARP / ND),
-  local-stack (done in QEMU: smoltcp for TCP only), proxmox (plan: leatos as a KVM / Proxmox
-  guest), …
+  local-stack (done in QEMU: smoltcp for TCP only), own-tcp (done in QEMU: smoltcp removed),
+  proxmox (plan: leatos as a KVM / Proxmox guest), …
 
 ## Rules
 
@@ -65,8 +65,8 @@ Keep them current when you change what they describe; keep this file to the map 
   - `crates/*` are `#![forbid(unsafe_code)]`.
 - `crates/*` are `#![no_std]` + `alloc` and **sans-IO** (pass bytes and `now` in; return bytes and
   events). Protocol logic goes there, not in the kernel.
-- Dependencies must be `no_std`. Prefer audited crates (virtio-drivers, safe-mmio, smoltcp,
-  aarch64-cpu) over hand-written unsafe.
+- Dependencies must be `no_std`. Prefer audited crates (virtio-drivers, safe-mmio, aarch64-cpu)
+  over hand-written unsafe.
 - Edition 2024: `#[unsafe(no_mangle)]`, `unsafe extern "C"`, `&raw const`.
 - Kernel runtime options are **boot arguments**, parsed in `config.rs`; those with a config field
   override it. A new one gets a row in `docs/boot-arguments.md`, a new `LAB_*` variable a line in
@@ -80,7 +80,7 @@ Keep them current when you change what they describe; keep this file to the map 
   vectors from `arch::irqchip::msi_vector`). Never add IOAPIC/INTx routing that needs ACPI AML.
 - **Latency-first datapath (CAKE):** the qdisc is the only place packets may wait (no other
   FIFOs). TX is pull-based (`can_transmit` before `transmit`). Timers are tickless, so no periodic
-  tick. Datapath tasks run at `Priority::Datapath`; router-local work (smoltcp, DHCP, DNS, mgmt,
+  tick. Datapath tasks run at `Priority::Datapath`; router-local work (TCP, DHCP, DNS, mgmt,
   future services) runs in `Priority::Service` tasks and reaches the datapath only through
   `net::shared` (`spin::Mutex` + atomics, no `RefCell`, so tasks can move to other cores).
   Forwarded packets never leave the datapath task.
@@ -90,8 +90,9 @@ Keep them current when you change what they describe; keep this file to the map 
   `Policy::router_tcp_peers`) so replies are never mistaken for NAT or port-forward traffic. UDP
   from outside reaches only bound client ports (`net::shared::CLIENT_PORTS` →
   `fwd::forwarder::ClientPorts`; 68 only from 67, 546 only from 547), the rest is dropped
-  silently; UDP to any router port nobody bound is dropped silently by `net::local` too (smoltcp
-  has no UDP and would answer protocol unreachable), so the router answers no UDP scan. Port
+  silently; UDP to any router port nobody bound is dropped silently by `net::local` too, and so
+  is any other protocol but TCP, ICMP echo and IGMP / MLD queries (`local.other_dropped`), so the
+  router answers no UDP or protocol scan; TCP to a closed port gets a RST (`proto_tcp`). Port
   forwards may use anything below 60000
   (validated).
 - **Packet buffers** come only from `net::packet` (bounded pool, no allocation per packet). On

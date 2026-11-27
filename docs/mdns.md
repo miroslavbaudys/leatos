@@ -32,7 +32,8 @@ The starting point; §3–§5 describe what changed (smoltcp `multicast`,
   and nothing works.
 - NICs: igb accepts all multicast (`drivers/igb.rs`); virtio-net never
   negotiates `CTRL_RX`, so QEMU delivers everything. No driver work.
-- One smoltcp `Interface` + `SocketSet` per link (`net/svc.rs` `HostIf`),
+- One router-stack `HostIf` per link (`net/svc.rs`; smoltcp's `Interface` +
+  `SocketSet` when this was written),
   per-network service state in `net/services.rs` (`Net`): an mDNS socket
   per network fits the existing pattern.
 - IPv6 (since 2026-11-20, docs/ipv6.md step 5b): with `ipv6` on the router

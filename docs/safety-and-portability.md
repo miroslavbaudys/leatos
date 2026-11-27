@@ -61,7 +61,8 @@ page-table *construction*, PCI enumeration logic, driver state machines) can be 
 
 ### 2.3 Reuse audited crates instead of writing unsafe code
 `virtio-drivers` (virtqueues, PCI transport; used by several Rust OSes),
-`safe-mmio` (Google), `aarch64-cpu`, `smoltcp` (no unsafe in the stack itself), `fdt`.
+`safe-mmio` (Google), `aarch64-cpu`, `fdt`. (smoltcp was one until 2026-11-27; the router's TCP
+is now `crates/proto-tcp`, `#![forbid(unsafe_code)]`, docs/own-tcp.md.)
 Every dependency is reviewed for `no_std` support and its own unsafe surface before it's added.
 
 ### 2.4 Verification
@@ -111,7 +112,7 @@ kernel/src/
   irq.rs timer.rs executor.rs smp.rs console.rs pci.rs mmio.rs ...   (neutral)
   drivers/           Nic and Disk (one interface each), virtio_net, igb, virtio_blk, sdhci,
                      i6300esb, watchdog (neutral)
-  net/               packet buffers, datapath, smoltcp glue, services (neutral)
+  net/               packet buffers, datapath, router stack glue, services (neutral)
 ```
 **Rule:** nothing outside `arch/` may use `core::arch`, `asm!` or arch-specific
 crates. Neutral code calls only the `arch::` API.

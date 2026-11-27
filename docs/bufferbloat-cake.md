@@ -53,7 +53,8 @@ CAKE.
 - **Status (M2):** implemented in `drivers/virtio_net.rs` + `net/device.rs`:
   `can_transmit()` = free descriptor **and** in-flight bytes below
   `tx_byte_limit` (fixed, 8 × 1514 B; the igb driver uses the same limit).
-  smoltcp only gets a TX token when there is room. Adaptive (BQL) limits
+  (The router's own frames go into the same qdisc; smoltcp, which carried
+  them until 2026-11-27, got a TX token only when there was room.) Adaptive (BQL) limits
   are still open (fixed limits so far, also on the apu4). The bounded packet pool
   (`net/packet.rs`, 1024 × 2 KiB) carries `PacketMeta` and has 128 B of
   headroom on every received packet, for re-encapsulation without a copy.
@@ -116,7 +117,7 @@ Pool size: the packet buffer pools must be able to hold CAKE's memory limit
 ### 3.4 Pipeline position (M4)
 **Status (M4):** the egress hook exists. `crates/qdisc` defines the `Qdisc`
 trait, with `BFifo` (bounded tail-drop) as the placeholder. Every port's
-egress, including the router's own smoltcp traffic, goes through it, and
+egress, including the router's own traffic, goes through it, and
 the NIC pulls from it (`Datapath::flush_tx`). `PacketMeta` is filled from
 conntrack: a keyed flow hash of the **pre-NAT** original tuple (identical
 in both directions), pre-NAT host hashes, DSCP, ECN and pure-ACK. The
@@ -297,8 +298,8 @@ one implementation.
   packet.
 - **Memory:** a preallocated slab of `max_packets` slots with linked lists
   per flow, so nothing is allocated per packet.
-- **Kernel:** each port is `Shaper<FqCodel>`. Router-local frames (smoltcp:
-  DNS, DHCP, ping replies) have `flow_hash` 0 and share one sparse queue.
+- **Kernel:** each port is `Shaper<FqCodel>`. Router-local frames (DNS,
+  DHCP, ping replies, the router's TCP) have `flow_hash` 0 and share one sparse queue.
 - **A/B:** boot argument `qdisc=fq_codel`; `qdisc=codel` is a single CoDel queue (was `fq_flows=1`).
 - **Stats:** the `qdisc` console line shows active flows and activations.
 

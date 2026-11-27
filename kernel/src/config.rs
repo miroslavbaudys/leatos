@@ -1400,11 +1400,18 @@ pub fn fw_client_ports() -> bool {
 }
 
 /// UDP to a router port nobody bound is dropped silently (`net::local`);
-/// boot argument `udp_unbound_drop=0` hands it to smoltcp, which answers
-/// with ICMP protocol unreachable / parameter problem (the lab's negative
-/// control for its unbound-port checks).
+/// boot argument `udp_unbound_drop=0` answers it with an ICMP port
+/// unreachable instead (the lab's negative control for its unbound-port
+/// checks).
 pub fn udp_unbound_drop() -> bool {
     arg_u64(bootargs(), "udp_unbound_drop") != Some(0)
+}
+
+/// TCP to a router port nobody listens on gets a RST (`proto_tcp`, RFC
+/// 9293); boot argument `tcp_rst=0` drops it silently instead (the lab's
+/// negative control for its closed-port check).
+pub fn tcp_rst() -> bool {
+    arg_u64(bootargs(), "tcp_rst") != Some(0)
 }
 
 /// Upstream DNS queries over UDP leave from a fresh random port each

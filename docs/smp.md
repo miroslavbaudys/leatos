@@ -19,12 +19,12 @@ The boot argument `cores=N` caps the cores used, for A/B measurements
 (`cores=1` = the single-core layout).
 
 ## Step 1: services split ✅
-The datapath task (`net` at the time, now `dp_down`/`dp_up`, step 3;
-`Priority::Datapath`) owns the NICs and the forwarder. The services task `svc` (`Priority::Service`) owns smoltcp
-and everything on it (WAN DHCP client, LAN DHCP server, DNS, web
-interface). They share only `net::shared` (see `docs/architecture.md`
-"Tasks"). Forwarded packets never leave the datapath, and router-local
-TX goes straight into the qdisc, so no queue was added.
+The datapath task (`net` at the time, now `dp_down`/`dp_up`, step 3; `Priority::Datapath`) owns the
+NICs and the forwarder. The services task `svc` (`Priority::Service`) owns the router's own stack
+(smoltcp then, now `net::local` + `proto_tcp`) and everything on it (WAN DHCP client, LAN DHCP
+server, DNS, web interface). They share only `net::shared` (see `docs/architecture.md` "Tasks").
+Forwarded packets never leave the datapath, and router-local TX goes straight into the qdisc, so no
+queue was added.
 
 ## Step 2: SMP bring-up (aarch64 ✅, x86_64 ✅)
 - **Start:** `smp::start` (core 0, after the MMU, interrupt controller

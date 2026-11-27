@@ -40,6 +40,7 @@ reveals a bug gets a host regression test in its crate before the fix.
 | `store` | `crates/config-store` MBR, store header, A/B record slots, write plans | the SD card / disk at boot | header round trip, areas inside the partition; a planned write gives a valid slot that becomes current, the other slot untouched |
 | `dns_tcp` | `proto_dns::tcp` DNS-over-TCP framing | LAN clients on port 53 | queries 12..=`MAX_QUERY` and equal to a reference parse; outstanding and output bounds; output = framed answers in order |
 | `auth` | `crates/auth` hash strings, sessions, login throttle (PBKDF2 only with ≤ 64 iterations) | stored hashes, any client's tokens and logins | only issued tokens accepted; session and source caps; backoff ≤ `MAX_BLOCK_MS`; hash budget rate |
+| `tcp` | `crates/proto-tcp`: segments (checksum good or bad, sequence and ACK numbers absolute or relative to what the stack sent) to a listening and a connecting socket, user calls, time steps | LAN clients on :80 / :53, the WAN for the DoT client's connections | buffers within their sizes; every segment sent parses back with a valid checksum and fits the MSS; a deadline of "now" is followed by a segment (no livelock) |
 | `dot` | `crates/proto-dot` crypto provider (key exchange, signatures, AEAD), `verify::validity`, a client on an arbitrary server stream | DoT servers / the path before the certificate check | no all-zero shared secret accepted |
 
 The stateful targets generate operations rather than bytes: packets built from

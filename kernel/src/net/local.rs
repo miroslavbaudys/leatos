@@ -1,20 +1,19 @@
-//! The router's own UDP without smoltcp (docs/local-stack.md §3.1–3.2,
-//! started in step 2b for the WAN's DHCPv4 client; the other services
-//! follow in step 3).
+//! The router's own UDP and ICMP (docs/local-stack.md §3.1–3.2), and the
+//! send path its TCP shares (docs/own-tcp.md §3.3).
 //!
 //! - Receive: one port table per link ([`bind`], [`recv`]), owned here
-//!   (only the services task uses it). The router-stack device
-//!   (`net::device::PortDevice`) offers every frame of a link to [`take`]
-//!   before smoltcp; UDP (IPv4 or IPv6) to a bound port is parsed
+//!   (only the services task uses it). `net::svc` offers every frame for
+//!   the router to [`take`] first (TCP goes to the link's `proto_tcp`,
+//!   the rest to [`other`]); UDP (IPv4 or IPv6) to a bound port is parsed
 //!   (`fwd::udp::parse4` / `parse6`: lengths and checksums) and queued for
 //!   its service, bounded (the oldest is kept, a new one dropped and
 //!   counted). Cheap for the rest: the destination port is looked at
 //!   before any checksum. UDP to a port nobody bound is dropped silently
-//!   and counted ([`unbound`]): smoltcp, built without `socket-udp`,
-//!   would answer it with ICMP protocol unreachable (IPv6: parameter
-//!   problem), and the router answers no UDP scan (CLAUDE.md, ports).
-//!   Boot argument `udp_unbound_drop=0` hands it to smoltcp again (the
-//!   lab's negative control).
+//!   and counted ([`unbound`]): the router answers no UDP scan (CLAUDE.md,
+//!   ports). Boot argument `udp_unbound_drop=0` answers it with a port
+//!   unreachable instead (the lab's negative control, [`other`]). Other
+//!   IP protocols to the router are dropped silently and counted
+//!   ([`other_dropped`]).
 //! - Send: [`send`] builds the headers (`fwd::udp::build4` / `build6`)
 //!   into a pool buffer and hands it to `Datapath::send_local` (next hop
 //!   by `fwd::local`: broadcast, multicast, or a neighbor through the
@@ -84,8 +83,8 @@ struct Udp {
 
 static UDP: Mutex<Udp> = Mutex::new(Udp { bound: Vec::new(), dropped: 0, unbound: 0 });
 
-/// Unbound UDP is dropped here (`udp_unbound_drop=0`: smoltcp's, which
-/// answers it with protocol unreachable). Read once.
+/// Unbound UDP is dropped here (`udp_unbound_drop=0`: left to [`other`],
+/// which answers it with a port unreachable). Read once.
 fn unbound_drop() -> bool {
     static DROP: spin::Once<bool> = spin::Once::new();
     *DROP.call_once(crate::config::udp_unbound_drop)
@@ -199,7 +198,7 @@ pub fn unbound() -> u64 {
 /// A frame of link `ifx` for the router (Ethernet header, then IP):
 /// `true` if it was UDP (to a bound port: queued, or dropped when the
 /// queue is full or it is malformed; else dropped), ICMP echo or an
-/// IGMP / MLD query, else smoltcp's (TCP).
+/// IGMP / MLD query; else the caller's (TCP, or [`other`]).
 pub fn take(ifx: IfIndex, frame: &[u8]) -> bool {
     membership(ifx, frame) || echo(ifx, frame) || UDP.lock().take(ifx, frame)
 }
@@ -233,7 +232,7 @@ fn membership(ifx: IfIndex, frame: &[u8]) -> bool {
             }
             true
         }
-        // A Hop-by-Hop packet that is no query: smoltcp's, as before.
+        // A Hop-by-Hop packet that is no query: not ours (`other`).
         None => igmp,
     }
 }
@@ -269,7 +268,7 @@ impl Udp {
 
     /// The frame (Ethernet header, then IP) if it is UDP: to a port
     /// bound on `ifx` queued (or dropped when the queue is full), to any
-    /// other port dropped, both `true`; anything else `false` (smoltcp's).
+    /// other port dropped, both `true`; anything else `false` (the caller's).
     /// With `udp_unbound_drop=0` unbound UDP is `false` too.
     pub fn take(&mut self, ifx: IfIndex, frame: &[u8]) -> bool {
         // The port before any checksum: most frames are not for us.
@@ -308,7 +307,7 @@ impl Udp {
         if !self.bound.iter().any(|b| b.ifx == ifx && b.port == dport) {
             return self.unbound();
         }
-        // Bound: ours even if malformed (smoltcp has no socket there).
+        // Bound: ours even if malformed.
         let parsed = match fwd::wire::ethertype(frame) {
             Some(ETHERTYPE_IPV4) => fwd::udp::parse4(frame).map(|d| (Ends::V4(d.ends), d.payload)),
             _ => fwd::udp::parse6(frame).map(|d| (Ends::V6(d.ends), d.payload)),
@@ -331,7 +330,7 @@ impl Udp {
     }
 
     /// UDP nobody bound: dropped and counted (`true`), or with
-    /// `udp_unbound_drop=0` left to smoltcp (`false`).
+    /// `udp_unbound_drop=0` left to [`other`] (`false`).
     fn unbound(&mut self) -> bool {
         if !unbound_drop() {
             return false;
@@ -376,10 +375,38 @@ pub fn send(sh: &Shared, ifx: IfIndex, e: &Ends, ttl: u8, payload: &[u8]) -> boo
     send_frame(sh, ifx, pkt)
 }
 
+/// Frames for the router nobody took (`other`).
+static OTHER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Frames for the router dropped by [`other`] (status `local.other_dropped`).
+pub fn other_dropped() -> u64 {
+    OTHER.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// A frame for the router on link `ifx` that nobody took: not UDP to a
+/// bound port, ICMP echo, an IGMP / MLD query or TCP to one of the link's
+/// addresses. Dropped silently and counted (docs/own-tcp.md §3.4: no ICMP
+/// protocol unreachable). With `udp_unbound_drop=0`, UDP to an unbound
+/// port gets an ICMP port unreachable (the lab's negative control).
+pub fn other(sh: &Shared, ifx: IfIndex, frame: &[u8]) {
+    if !unbound_drop()
+        && let Some(mut pkt) = PacketBuf::alloc()
+    {
+        pkt.set_len(crate::net::packet::RX_AREA.min(1514));
+        if let Some(n) = fwd::udp::port_unreachable(frame, pkt.data_mut()) {
+            pkt.set_len(n);
+            send_frame(sh, ifx, pkt);
+            return;
+        }
+    }
+    OTHER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// A frame of the router's own (Ethernet header with zero addresses,
 /// then IP) out on link `ifx`: into the port's qdisc on PPPoE (the
 /// datapath adds the session), else through `Datapath::send_local`.
-fn send_frame(sh: &Shared, ifx: IfIndex, mut pkt: PacketBuf) -> bool {
+/// False when it was not queued (no next hop, queue full).
+pub fn send_frame(sh: &Shared, ifx: IfIndex, mut pkt: PacketBuf) -> bool {
     let Some(dp) = crate::net::stack::datapath() else { return false };
     let Some(link) = sh.links.get(ifx as usize) else { return false };
     let port = link.port();

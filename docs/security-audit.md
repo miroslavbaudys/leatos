@@ -92,7 +92,7 @@ Columns: **Parser** = where untrusted bytes are first interpreted.
 | mDNS 5353 (reflector) | `proto-mdns` parse/rebuild, `Reflector` | 128 hosts, 128 services, 64 recent, output ≤ 1472 B | `mdns` | compression loops in parse, rule bypass (service type spoofing), amplification between networks, rate limits |
 | RS → RA | `proto_dhcp::v6::ra` | solicited ≥ 3 s apart | — (RS side) | RS flood |
 | Web interface :80 | `proto-http` (head ≤ 8 KiB, small body ≤ 64 KiB), `mgmt.rs` (1560 lines) | 4 LAN sockets, 20 s request / 120 s upload timeout, 8 sessions, 12 h idle | `http` | see 4.3 |
-| Other router ports | smoltcp | — | — | what does smoltcp answer on closed ports per zone (RST/ICMP), and is `input` mask applied before smoltcp sees the packet? (2026-11-27: the zone input applies first; then UDP is dropped silently by `net::local`, TCP gets a RST from smoltcp, other protocols protocol unreachable) |
+| Other router ports | `net::local`, `proto_tcp` | — | `tcp` | what does the router answer on closed ports per zone (RST/ICMP), and is `input` mask applied before the router stack sees the packet? (2026-11-27: the zone input applies first; then UDP is dropped silently by `net::local`, TCP gets a RST (`proto_tcp`, since docs/own-tcp.md; smoltcp's before), other protocols are dropped silently (`local.other_dropped`; smoltcp answered protocol unreachable)) |
 
 #### Neighbor hints and cache poisoning (reviewed 2026-11-22; the hints were removed 2026-11-26)
 

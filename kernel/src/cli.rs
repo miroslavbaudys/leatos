@@ -424,11 +424,10 @@ fn status(ctx: &Ctx, wan: &str) {
             .zip(&ctx.sh.links)
             .filter(|(_, l)| l.port() == pi)
             .flat_map(|(h, l)| {
-                h.iface
-                    .ip_addrs()
-                    .iter()
+                h.addrs_text()
+                    .into_iter()
                     .map(|a| match l.vid() {
-                        0 => alloc::format!("{a}"),
+                        0 => a,
                         v => alloc::format!("{a} (vlan {v})"),
                     })
                     .collect::<Vec<_>>()

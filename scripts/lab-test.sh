@@ -18,8 +18,8 @@
 #   LAB_EXPECT_UP_CORE=N the core dp_up must run on (default 1 with
 #                        QEMU_SMP >= 3, else 0)
 #   LAB_SWARM_UP_KBIT=20000 the upload rate during a LAB_SWARM run
-#   Set by the script itself (internal): LAB_LAN_PORT, LAB_WAN_PORT and
-#                        LAB_LAN1_PORT (UDP link ports handed to
+#   Set by the script itself (internal): LAB_LAN_PORT, LAB_LAN_PEER,
+#                        LAB_WAN_PORT and LAB_LAN1_PORT (UDP link ports handed to
 #                        scripts/qemu-run.sh), LAB_INITRD_KEA (the ISP initrd
 #                        gets Kea, for LAB_IPV6)
 #   QEMU_ACCEL=tcg       run without hardware acceleration
@@ -298,6 +298,37 @@
 #                        LAB_EXPECT_DATES=expired: an RTC far ahead must not
 #                        break DNS (accepted until SNTP), and SNTP then
 #                        sets the RTC ("rtc ... was N s off, set").
+#   LAB_TCP_LOSS=N       a relay between the router's LAN and the client
+#                        (scripts/lab/relay.py) drops N % of the TCP frames
+#                        both ways (docs/own-tcp.md §5): the web page check
+#                        must still get the page byte-exact. Valid only when
+#                        the relay dropped frames and the router
+#                        retransmitted (else INVALID). Negative control
+#                        LAB_TCP_LOSS=100 (nothing gets through: it fails).
+#                        No shaping phase, ECN or queue checks (the relay
+#                        drops the forwarded TCP too).
+#                        Always (relay or not): the web page check (the page
+#                        against kernel/src/net/mgmt.html's SHA-256), a
+#                        closed router port refused at once (RST; negative
+#                        control LAB_ROUTER_ARGS=tcp_rst=0), and the other-
+#                        protocol check: the host injects 4 frames with IP
+#                        protocol LAB_OTHER_PROTO (253) from the client to
+#                        the router, which drops them (local.other_dropped
+#                        rises, no ICMP back in the LAN capture). Negative
+#                        control LAB_OTHER_PROTO=17 with LAB_ROUTER_ARGS=
+#                        udp_unbound_drop=0 (UDP to port 9: a port
+#                        unreachable comes back, nothing counted).
+#   LAB_OTHER_PROTO=253  the IP protocol of the other-protocol probes
+#   LAB_TCP_RST=blind    the blind-RST check (RFC 5961, docs/own-tcp.md §5):
+#                        the relay (as LAB_TCP_LOSS, 0 % unless that is set)
+#                        injects RSTs with the client's addresses and ports
+#                        into a half-sent request to the web interface, in
+#                        the window but off the exact sequence number (and
+#                        one outside it): the request must still be
+#                        answered and the router count challenge ACKs.
+#                        INVALID if the relay injected nothing. Negative
+#                        control LAB_TCP_RST=exact (one RST at the exact
+#                        number: the connection ends, the check fails).
 #   LAB_WAN_OPEN=1       (implies LAB_GUEST=1) negative control for the WAN
 #                        input check: a rule accepting wan -> router, so the
 #                        router answers the ISP's probes (RST, ping) again.
@@ -541,6 +572,13 @@ REDIRECT="${LAB_REDIRECT:-1}"
 GUEST_DOMAIN="${LAB_GUEST_DOMAIN:-1}"
 GUEST_IPV6="${LAB_GUEST_IPV6:-1}"
 DOT="${LAB_DOT:-}"
+TCP_LOSS="${LAB_TCP_LOSS:-}"
+TCP_RST="${LAB_TCP_RST:-}"
+case "$TCP_RST" in ""|blind|exact) ;; *) echo "LAB_TCP_RST must be blind or exact"; exit 2 ;; esac
+# The relay drops forwarded TCP too (and is slow): no shaping phase, no ECN /
+# queue checks.
+[[ -n "$TCP_LOSS$TCP_RST" ]] && EXPECT_KBIT=0
+OTHER_PROTO="${LAB_OTHER_PROTO:-253}"
 DOT_NAME="${LAB_DOT_NAME:-dns.isp.example}"
 DOT_CA="${LAB_DOT_CA:-1}"
 LAN_PORT="${LAB_LAN_PORT:-10003}"
@@ -804,8 +842,22 @@ CFG
 fi
 [[ -n "$DOT" ]] && echo "== router config: DNS over TLS to 203.0.113.1#$DOT_NAME$([[ "$DOT_CA" == 1 ]] && echo ", lab CA trusted" || echo ", Mozilla's roots only")"
 
+# LAB_TCP_LOSS: the relay between the router's LAN NIC and the client.
+CLIENT_PEER="$LAN_PORT"
+ROUTER_PEER=""
+INJECT_PORT="$LAN_PORT"
+if [[ -n "$TCP_LOSS$TCP_RST" ]]; then
+  ROUTER_PEER=$((LAN_PORT + 10))
+  CLIENT_PEER=$((LAN_PORT + 11))
+  INJECT_PORT=$((LAN_PORT + 12))
+  python3 -I scripts/lab/relay.py "$LAN_PORT" "$ROUTER_PEER" $((LAN_PORT + 1)) "$CLIENT_PEER" "${TCP_LOSS:-0}" 1 "$INJECT_PORT" "$WORK/relay.stats" &
+  PIDS+=($!)
+  echo "== relay: router LAN <-> client, ${TCP_LOSS:-0} % of the TCP frames dropped${TCP_RST:+, RST injection ($TCP_RST)}"
+fi
+PAGE_SHA=$(shasum -a 256 kernel/src/net/mgmt.html | cut -d' ' -f1)
+
 echo "== start leatos${ROUTER_ARGS:+ ($(echo "$ROUTER_ARGS" | sed 's/pppoe_pass=[^ ]*/pppoe_pass=***/'))}"
-QEMU_STORE="$ROUTER_STORE" QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_WAN_PORT="$WAN_PORT" LAB_LAN1_PORT="${PORTS:+$LAN1_PORT}" QEMU_PCAP_DIR="$PCAP_DIR" QEMU_ACCEL="$QEMU_ACCEL" QEMU_APPEND="$ROUTER_ARGS" \
+QEMU_STORE="$ROUTER_STORE" QEMU_NET=lab LAB_LAN_PORT="$LAN_PORT" LAB_LAN_PEER="$ROUTER_PEER" LAB_WAN_PORT="$WAN_PORT" LAB_LAN1_PORT="${PORTS:+$LAN1_PORT}" QEMU_PCAP_DIR="$PCAP_DIR" QEMU_ACCEL="$QEMU_ACCEL" QEMU_APPEND="$ROUTER_ARGS" \
   scripts/qemu-run.sh "target/$ARCH-unknown-none/debug/leatos" >"$WORK/router.log" 2>&1 &
 PIDS+=($!)
 wait_for "$WORK/router.log" "leatos: boot ok" 40 || { echo "router did not boot:"; cat "$WORK/router.log"; exit 1; }
@@ -817,7 +869,17 @@ PIDS+=($!)
 echo "== start client"
 VM_DISK="${GUEST:+$ALPINE_DIR/modloop-virt}" \
   VM_NIC2="${PORTS:+52:54:00:00:00:11 $((LAN1_PORT + 1)) $LAN1_PORT}" \
-  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$LAN_PORT" "$WORK/client.log" "lab_shape_kbit=$EXPECT_KBIT${NEIGH:+ lab_neigh=1 lab_neigh_hosts=$NEIGH_HOSTS lab_neigh_secs=$NEIGH_SECS}${ACK:+ lab_ack=1}${SWARM:+ lab_swarm=$SWARM lab_swarm_kbit=$SWARM_KBIT lab_swarm_secs=${LAB_SWARM_SECS:-15} lab_swarm_mtu=${LAB_SWARM_MTU:-680} lab_swarm_ovf=${LAB_SWARM_OVF:-10}}${UPLOAD:+ lab_upload=$UPLOAD lab_upload_secs=${LAB_UPLOAD_SECS:-30}}${BIDIR:+ lab_bidir=$BIDIR lab_bidir_secs=${LAB_BIDIR_SECS:-20}} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${ISP_LEASE:+ lab_wan_lease=$ISP_LEASE}${WAN_LEASE_STOP:+ lab_wan_lease_stop=1}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN lab_guest_v6=$GUEST_IPV6}${GUEST_LIVE:+ lab_guest_live=1}${LAB_MGMT_SAME_SOURCE:+ lab_mgmt_same=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}${ND_FLOOD:+ lab_nd_flood=1}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
+  linux_vm "$CLIENT_INITRD" 52:54:00:00:00:10 $((LAN_PORT + 1)) "$CLIENT_PEER" "$WORK/client.log" "lab_page_sha=$PAGE_SHA${TCP_LOSS:+ lab_tcp_loss=$TCP_LOSS}${TCP_RST:+ lab_tcp_rst=$TCP_RST} lab_shape_kbit=$EXPECT_KBIT${NEIGH:+ lab_neigh=1 lab_neigh_hosts=$NEIGH_HOSTS lab_neigh_secs=$NEIGH_SECS}${ACK:+ lab_ack=1}${SWARM:+ lab_swarm=$SWARM lab_swarm_kbit=$SWARM_KBIT lab_swarm_secs=${LAB_SWARM_SECS:-15} lab_swarm_mtu=${LAB_SWARM_MTU:-680} lab_swarm_ovf=${LAB_SWARM_OVF:-10}}${UPLOAD:+ lab_upload=$UPLOAD lab_upload_secs=${LAB_UPLOAD_SECS:-30}}${BIDIR:+ lab_bidir=$BIDIR lab_bidir_secs=${LAB_BIDIR_SECS:-20}} lab_big_ping=$BIG_PING${ISP_PPPOE:+ lab_pppoe_kick=${LAB_PPPOE_KICK:-kick}}${ISP_LEASE:+ lab_wan_lease=$ISP_LEASE}${WAN_LEASE_STOP:+ lab_wan_lease_stop=1}${GUEST:+ lab_guest=$GUEST_ZONE lab_guest_rules=$GUEST_RULES lab_forward=$FORWARD${FWD_CUT:+ lab_fwd_cut=1} lab_redirect=$REDIRECT lab_guest_domain=$GUEST_DOMAIN lab_guest_v6=$GUEST_IPV6}${GUEST_LIVE:+ lab_guest_live=1}${LAB_MGMT_SAME_SOURCE:+ lab_mgmt_same=1}${MDNS:+ lab_mdns=$MDNS_RULES}${DOT:+ lab_dot=1}${DNS_VIEWS:+ lab_dns_views=$DNS_VIEWS lab_dns_hosts=$DNS_HOSTS}${ROUTES:+ lab_routes=$ROUTES}${PORTS:+ lab_ports=$PORTS_NET}${IPV6:+ lab_ipv6=$IPV6}${ND_FLOOD:+ lab_nd_flood=1}$([[ "$IPV6" == pd && -n "$ROUTER_STORE" ]] && echo ' lab_pd_keep=1')"
+# The other-protocol check: the client says when (its counter read first).
+( wait_for "$WORK/client.log" "LAB other-proto: inject" "$TIMEOUT" \
+  && python3 -I scripts/lab/inject.py "$INJECT_PORT" "$OTHER_PROTO" 4 ) &
+PIDS+=($!)
+# The blind-RST check: the relay injects when the client says.
+if [[ -n "$TCP_RST" ]]; then
+  ( wait_for "$WORK/client.log" "LAB tcp-rst: inject" "$TIMEOUT" \
+    && python3 -I -c 'import socket,sys; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(("rst " + sys.argv[2]).encode(), ("127.0.0.1", int(sys.argv[1])))' "$INJECT_PORT" "$TCP_RST" ) &
+  PIDS+=($!)
+fi
 wait_for "$WORK/client.log" "LAB DONE" "$TIMEOUT" || echo "client did not finish within ${TIMEOUT}s"
 sleep 0.5
 # The router prints qdisc counters every 10 s: wait for one more round so
@@ -857,7 +919,7 @@ if [[ -n "$UPLOAD" ]]; then
   cat "$RLOG" | grep "qdisc wan0 " | sed -n 's/.*flows \([0-9]* new + [0-9]* old\).*overflow drops \([0-9]*\), backlog \([0-9]*\) pkts, max sojourn \(.*\)$/    \4, overflow \2, backlog \3, flows \1/p'
 fi
 # Swarm mode has no upload phase: its check is the client's.
-if [[ "$SHAPE_KBIT" != 0 && -z "$SWARM$UPLOAD$BIDIR" ]]; then
+if [[ "$SHAPE_KBIT" != 0 && -z "$SWARM$UPLOAD$BIDIR$TCP_LOSS$TCP_RST" ]]; then
   bootarg() { echo " $ROUTER_ARGS " | sed -n "s/.* $1=\([0-9]*\) .*/\1/p"; }
   all=$(bootarg ecn)
   up=$(bootarg ecn_up); up=${up:-${all:-0}}
@@ -1193,8 +1255,8 @@ if [[ -z "$SWARM$UPLOAD$BIDIR" ]]; then
     # Unbound UDP from the LAN (docs/local-stack.md): the client's probes
     # (source ports 40130-40133) to router ports nobody bound draw no ICMP
     # unreachable (IPv4: type 3, the inner UDP source port at icmp[28]).
-    # Negative control LAB_ROUTER_ARGS=udp_unbound_drop=0 (protocol
-    # unreachable from smoltcp).
+    # Negative control LAB_ROUTER_ARGS=udp_unbound_drop=0 (the router's
+    # port unreachable, net::local::other).
     if [[ -f "$PCAP_DIR/lan.pcap" ]]; then
       tl() { tcpdump -nr "$PCAP_DIR/lan.pcap" "$1" 2>/dev/null || true; }
       lprobes=$(tl "udp and src portrange 40130-40133" | grep -c . || true)
@@ -1208,6 +1270,22 @@ if [[ -z "$SWARM$UPLOAD$BIDIR" ]]; then
       fi
     else
       echo "  LAB FAIL: unbound udp: INVALID, no LAN capture"; router_fails=$((router_fails + 1))
+    fi
+    # Other protocols (docs/own-tcp.md §3.4): the host's 4 injected frames
+    # (IP protocol $OTHER_PROTO from 192.168.1.100) are in the LAN capture
+    # and draw no ICMP unreachable (type 3 quoting that protocol at
+    # icmp[17]). Negative control: LAB_OTHER_PROTO=17 with
+    # LAB_ROUTER_ARGS=udp_unbound_drop=0.
+    if [[ -f "$PCAP_DIR/lan.pcap" ]]; then
+      oprobes=$(tl "src host 192.168.1.100 and ip proto $OTHER_PROTO and ip[4:2] >= 0x4c00 and ip[4:2] <= 0x4c03" | grep -c . || true)
+      ounreach=$(tl "dst host 192.168.1.100 and icmp[icmptype] == 3 and icmp[17] == $OTHER_PROTO" | grep -c . || true)
+      if [[ "$oprobes" -lt 4 ]]; then
+        echo "  LAB FAIL: other protocol: INVALID, $oprobes of 4 injected frames in the LAN capture"; router_fails=$((router_fails + 1))
+      elif [[ "$ounreach" == 0 ]]; then
+        echo "  LAB PASS: other protocol: $oprobes frames with IP protocol $OTHER_PROTO to the router, no ICMP unreachable back"
+      else
+        echo "  LAB FAIL: other protocol: $ounreach ICMP unreachable answers to $oprobes frames with IP protocol $OTHER_PROTO"; router_fails=$((router_fails + 1))
+      fi
     fi
     if [[ -n "$DOT" ]]; then
       echo "  LAB INFO: dns upstream ports: not checked (DNS over TLS)"
@@ -1223,6 +1301,32 @@ if [[ -z "$SWARM$UPLOAD$BIDIR" ]]; then
         echo "  LAB FAIL: dns upstream ports: $distinct ports for $total queries"; router_fails=$((router_fails + 1))
       fi
     fi
+  fi
+fi
+
+# LAB_TCP_LOSS: the loss happened (the relay dropped TCP frames) and the
+# router recovered from it (it retransmitted); else the page check proves
+# nothing.
+if [[ -n "$TCP_LOSS" ]]; then
+  rs=$(cat "$WORK/relay.stats" 2>/dev/null || true)
+  dropped=$(echo "$rs" | sed -n 's/.*dropped=\([0-9]*\).*/\1/p')
+  rtx=$(tr -d '\r' <"$WORK/client.log" | sed -n 's/^LAB INFO: tcp: router retransmits \([0-9]*\).*/\1/p' | tail -1)
+  if [[ -z "$dropped" || "$dropped" == 0 ]]; then
+    echo "  LAB FAIL: tcp loss: INVALID, the relay dropped nothing ($rs)"; router_fails=$((router_fails + 1))
+  elif [[ -z "$rtx" || "$rtx" == 0 ]]; then
+    echo "  LAB FAIL: tcp loss: INVALID, the router retransmitted nothing (relay: $rs)"; router_fails=$((router_fails + 1))
+  else
+    echo "  LAB PASS: tcp loss: the relay dropped $dropped TCP frames ($rs), the router retransmitted $rtx segments"
+  fi
+fi
+# LAB_TCP_RST: the relay injected (the client judges the connection).
+if [[ -n "$TCP_RST" ]]; then
+  rs=$(cat "$WORK/relay.stats" 2>/dev/null || true)
+  nrst=$(echo "$rs" | sed -n 's/.*rst=\([0-9]*\).*/\1/p')
+  if [[ "${nrst:-0}" == 0 ]]; then
+    echo "  LAB FAIL: tcp blind rst: INVALID, the relay injected no RST ($rs)"; router_fails=$((router_fails + 1))
+  else
+    echo "  LAB PASS: tcp blind rst: the relay injected $nrst RSTs ($TCP_RST)"
   fi
 fi
 

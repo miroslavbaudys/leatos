@@ -1,0 +1,16 @@
+[package]
+name = "proto-tcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The router's own TCP (RFC 9293 with RFC 6298, 5961, 6528): sockets and segments, sans-IO."
+
+[dependencies]
+
+[dev-dependencies]
+# Interop tests only (src/tests/interop.rs): smoltcp's TCP as the peer on a
+# simulated link. The kernel does not use smoltcp (docs/own-tcp.md).
+smoltcp = { version = "0.14", default-features = false, features = ["alloc", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
+
+[lints]
+workspace = true

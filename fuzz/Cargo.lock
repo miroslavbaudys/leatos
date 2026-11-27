@@ -502,6 +502,7 @@ dependencies = [
  "proto-mdns",
  "proto-pppoe",
  "proto-sntp",
+ "proto-tcp",
  "qdisc",
 ]
 
@@ -719,6 +720,10 @@ dependencies = [
 
 [[package]]
 name = "proto-sntp"
+version = "0.1.0"
+
+[[package]]
+name = "proto-tcp"
 version = "0.1.0"
 
 [[package]]
