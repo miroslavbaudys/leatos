@@ -80,7 +80,9 @@ pub struct Config {
     pub dns: Dns,
     #[serde(skip_serializing_if = "Mdns::is_empty")]
     pub mdns: Mdns,
-    #[serde(skip_serializing_if = "Ipv6::is_default")]
+    /// Always written, `enabled` included: a kernel from before IPv6 was
+    /// on by default reads a missing section as off (a rollback, the
+    /// other slot).
     pub ipv6: Ipv6,
     pub shaping: Shaping,
     pub mgmt: Mgmt,
@@ -938,9 +940,10 @@ pub struct Mgmt {
     pub password: Option<String>,
 }
 
-/// IPv6 on the router's networks (docs/ipv6.md; M7 step 1: link-local
-/// and a ULA /64 per network, Router Advertisements, DNS and the web
-/// interface over IPv6; nothing forwarded yet).
+/// IPv6 on the router's networks (docs/ipv6.md, M7): link-local and a ULA
+/// /64 per network, a global /64 from the ISP's delegated prefix, Router
+/// Advertisements, DNS and the web interface over IPv6, forwarding with a
+/// stateful firewall. On by default since 2026-11-27.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Ipv6 {
@@ -960,7 +963,7 @@ pub struct Ipv6 {
 
 impl Default for Ipv6 {
     fn default() -> Self {
-        Ipv6 { enabled: false, ula_prefix: None, dhcpv6_pd: true, prefix_hint: 56 }
+        Ipv6 { enabled: true, ula_prefix: None, dhcpv6_pd: true, prefix_hint: 56 }
     }
 }
 
@@ -968,11 +971,6 @@ fn is_56(v: &u8) -> bool {
     *v == 56
 }
 
-impl Ipv6 {
-    pub fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-}
 
 /// The wall clock: SNTP servers, asked over the WAN.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -153,12 +153,13 @@
 #                        negative control: LAB_PPPOE=pap
 #                        LAB_PPPOE_ANON=1 (no user name against an ISP
 #                        requiring PAP: no session).
-#                        The ISP offers IPv6CP: the router logs the offer
-#                        (rejected with its IPv6 off); with LAB_IPV6=1 it
-#                        negotiates it and runs IPv6 over the session
-#                        (docs/ipv6.md step 4). Negative control
-#                        LAB_PPPOE_IPV6=0 (no offer: the offer check, or
-#                        with LAB_IPV6=1 the IPv6CP and IPv6 checks, fail).
+#                        The ISP offers IPv6CP: the router negotiates it
+#                        (IPv6 is on by default; with LAB_IPV6=1 it also
+#                        runs IPv6 over the session, docs/ipv6.md step 4);
+#                        with LAB_ROUTER_ARGS=ipv6=0 it logs the offer and
+#                        rejects it. Negative control LAB_PPPOE_IPV6=0 (no
+#                        offer: the IPv6CP check, or with ipv6=0 the offer
+#                        check, fails).
 #   LAB_WAN_LEASE=N      the ISP's DHCP leases last N s (e.g. 60): the router's
 #                        own DHCP client (docs/local-stack.md step 2b) must
 #                        renew during the run (client "wan_dhcp": a third
@@ -995,8 +996,8 @@ if [[ -n "$ISP_PPPOE" ]]; then
     cat "$RLOG" | grep "pppoe " | tail -3 | sed 's/^/    | /'
     router_fails=$((router_fails + 1))
   fi
-  if [[ -n "$IPV6" ]]; then
-    # IPv6CP negotiated (docs/ipv6.md step 4).
+  if [[ -n "$IPV6" || " $ROUTER_ARGS " != *" ipv6=0 "* ]]; then
+    # IPv6CP negotiated (docs/ipv6.md step 4; IPv6 is on by default).
     v6=$(cat "$RLOG" | grep "pppoe wan0 .*: IPv6CP up, fe80::" | head -1 || true)
     if [[ -n "$v6" ]]; then
       echo "  LAB PASS: pppoe ipv6: ${v6##*: }"
@@ -1005,7 +1006,7 @@ if [[ -n "$ISP_PPPOE" ]]; then
       router_fails=$((router_fails + 1))
     fi
   else
-    # The ISP's IPv6CP offer is logged (docs/ipv6.md step 0).
+    # ipv6=0: the ISP's IPv6CP offer is logged (docs/ipv6.md step 0).
     v6=$(cat "$RLOG" | grep "pppoe wan0 .*: the access concentrator offers IPv6 (IPv6CP, interface id " | head -1 || true)
     if [[ -n "$v6" ]]; then
       echo "  LAB PASS: pppoe ipv6 offer: ${v6##*: }"

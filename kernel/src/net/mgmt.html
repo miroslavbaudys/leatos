@@ -237,7 +237,7 @@
       <p class="hint">Adding, removing or changing a network (VLAN, address, zone) applies at once, without a reboot; changing the address of the network you use for this page boots as a trial. A VLAN needs a switch or access point that tags it on the LAN cable.</p>
     </form>
     <form class="card cfg" autocomplete="off"><h3>IPv6</h3>
-      <label class="check"><input data-path="ipv6.enabled" type="checkbox">IPv6: a unique local /64 per network and, with a prefix from the ISP (DHCPv6 prefix delegation, also over PPPoE), a global one; router advertisements (SLAAC), DNS and this page over IPv6, forwarding with a stateful firewall (inbound blocked unless a rule opens it).</label>
+      <label class="check"><input data-path="ipv6.enabled" data-default="true" type="checkbox">IPv6: a unique local /64 per network and, with a prefix from the ISP (DHCPv6 prefix delegation, also over PPPoE), a global one; router advertisements (SLAAC), DNS and this page over IPv6, forwarding with a stateful firewall (inbound blocked unless a rule opens it).</label>
       <div class="form">
         <label>Unique local /48 (empty = derived from the WAN MAC)<input data-path="ipv6.ula_prefix" data-opt placeholder="e.g. fd12:3456:789a::/48"></label>
       </div>

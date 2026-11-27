@@ -1005,9 +1005,12 @@ fn v2_document_parses_and_round_trips() {
     assert_eq!(parse(&text).unwrap(), c, "{text}");
     assert_eq!(parse_json(&c.to_json()).unwrap(), c);
     // Defaults stay out of the canonical form.
-    for absent in ["enabled = true", "hairpin = true", "proto = \"any\"", "proto = \"udp\"", "vlan = 0"] {
+    for absent in ["hairpin = true", "proto = \"any\"", "proto = \"udp\"", "vlan = 0"] {
         assert!(!text.contains(absent), "{absent} in {text}");
     }
+    // `enabled = true` only in `[ipv6]`, which is always written.
+    assert_eq!(text.matches("enabled = true").count(), 1, "{text}");
+    assert!(text.contains("[ipv6]\nenabled = true\n"), "{text}");
 }
 
 #[test]
@@ -1723,7 +1726,8 @@ fn routes_parse_round_trip_and_feed_option_121() {
     assert_eq!(c.routes.len(), 3);
     assert_eq!(c.routes[2].v4().unwrap().0.prefix, 32, "an address is a /32");
     assert_eq!(parse(&c.to_toml()).unwrap(), c, "{}", c.to_toml());
-    assert!(!c.to_toml().contains("enabled = true"));
+    assert!(!c.to_toml().contains("[[route]]\nname = \"lab\"\nenabled"), "{}", c.to_toml());
+    assert_eq!(c.to_toml().matches("enabled = true").count(), 1, "only [ipv6]'s");
     assert_eq!(c.route_via(&c.routes[0]), RouteVia::Network(&c.networks[0]));
     assert_eq!(c.route_via(&c.routes[2]), RouteVia::Wan);
     // Only enabled routes through this network's routers.
@@ -1847,8 +1851,16 @@ fn ack_filter_written_only_when_on() {
 
 #[test]
 fn ipv6_section_round_trips_and_validates_the_ula() {
-    // Off and unset: not written at all.
-    assert!(!Config::default().to_toml().contains("[ipv6]"));
+    // On by default, and always written with `enabled`: an older kernel
+    // (a rollback) reads a missing section as off.
+    let d = Config::default();
+    assert!(d.ipv6.enabled);
+    assert!(d.to_toml().contains("[ipv6]\nenabled = true\n"), "{}", d.to_toml());
+    assert!(parse(&lan_doc("10.10.0.1/24", "")).unwrap().ipv6.enabled, "missing = on");
+    let off = parse(&lan_doc("10.10.0.1/24", "[ipv6]\nenabled = false\n")).unwrap();
+    assert!(!off.ipv6.enabled);
+    assert!(off.to_toml().contains("enabled = false"));
+    assert_eq!(parse(&off.to_toml()).unwrap(), off);
     let c = parse(&lan_doc("10.10.0.1/24", "[ipv6]\nenabled = true\nula_prefix = \"fd12:3456:789a::/48\"\n")).unwrap();
     assert!(c.ipv6.enabled);
     assert_eq!(c.ipv6.ula_prefix.unwrap().to_string(), "fd12:3456:789a::/48");
@@ -1871,7 +1883,7 @@ fn ipv6_section_round_trips_and_validates_the_ula() {
 fn network_ipv6_switch() {
     let c = parse(&lan_doc("10.10.0.1/24", "")).unwrap();
     assert!(c.networks[0].ipv6);
-    assert!(!c.to_toml().contains("ipv6"), "on by default, not written");
+    assert!(!c.to_toml().contains("ipv6 ="), "on by default, not written");
     let mut d = c.clone();
     d.networks[0].ipv6 = false;
     let t = d.to_toml();
@@ -1897,9 +1909,7 @@ fn ipv6_prefix_delegation_settings() {
         assert_eq!(invalid(|c| c.ipv6.prefix_hint = bad), vec![String::from("ipv6.prefix_hint")], "{bad}");
     }
     // Defaults are not written out.
-    let mut d = Config::default();
-    d.ipv6.enabled = true;
-    let t = d.to_toml();
+    let t = Config::default().to_toml();
     assert!(!t.contains("dhcpv6_pd") && !t.contains("prefix_hint"), "{t}");
 }
 
