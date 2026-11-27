@@ -65,6 +65,27 @@
   .warn { color:var(--bad); font-weight:600; }
   .pill { display:inline-block; padding:0 7px; border-radius:10px; font-size:12px; border:1px solid var(--line); color:var(--muted); }
   .pill.ok { color:var(--ok); border-color:currentColor; } .pill.bad { color:var(--bad); border-color:currentColor; }
+  /* Clients: one baseline per row (IPv6 lines continue below), compact
+     buttons, sortable headings, copy buttons, "Reserved | ×". */
+  #leases td { vertical-align:baseline; }
+  #leases button.plain { padding:2px 8px; }
+  #leases th > button.sort { all:unset; cursor:pointer; white-space:nowrap; border-radius:4px; }
+  #leases th > button.sort:hover, #leases th[aria-sort] > button.sort { color:var(--fg); }
+  #leases th[aria-sort] > button.sort { font-weight:600; }
+  #leases th > button.sort:focus-visible { outline:2px solid var(--accent); }
+  #leases th > button.sort::after { content:"↕"; margin-left:4px; opacity:.35; font-size:11px; }
+  #leases th[aria-sort=ascending] > button.sort::after { content:"▲"; opacity:1; color:var(--accent); }
+  #leases th[aria-sort=descending] > button.sort::after { content:"▼"; opacity:1; color:var(--accent); }
+  #leases .addr { display:inline-flex; align-items:center; gap:2px; white-space:nowrap; }
+  #leases button.copy { background:none; border:1px solid transparent; color:var(--muted); padding:0 4px; line-height:18px; font-size:12px; border-radius:4px; opacity:.55; }
+  #leases tr:hover button.copy, #leases button.copy:focus-visible { opacity:1; border-color:var(--line); }
+  #leases button.copy:hover { color:var(--accent); }
+  #leases button.copy.done { opacity:1; color:var(--ok); border-color:currentColor; }
+  @media (hover:none) { #leases button.copy { opacity:1; } }
+  #leases .resv { display:inline-flex; border:1px solid var(--line); border-radius:6px; white-space:nowrap; }
+  #leases .resv > span { padding:2px 8px; color:var(--ok); }
+  #leases .resv > button.plain { border:none; border-left:1px solid var(--line); border-radius:0 6px 6px 0; color:var(--muted); }
+  #leases .resv > button.plain:hover { color:var(--bad); }
   /* ---- forms */
   input, button, select { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); max-width:100%; }
   button { background:var(--accent); color:#fff; border:none; cursor:pointer; }
@@ -221,8 +242,9 @@
     <h2>Clients</h2>
     <p class="lead">Devices with a DHCP lease from the router, with the IPv6 addresses they were seen using in the last 30 minutes.</p>
     <div class="card">
-      <div class="row"><input id="clientq" placeholder="Filter by name, IPv4/IPv6 address or MAC" style="flex:1; min-width:180px"></div>
+      <div class="row"><input id="clientq" placeholder="Filter by name, IPv4/IPv6 address or MAC" style="flex:1; min-width:180px"><span id="clientcount" class="muted"></span></div>
       <div class="tw"><table id="leases"></table></div>
+      <p class="hint">Click a column heading to sort, again to reverse. ⧉ copies the address. Reserve and × are pending changes until you save.</p>
     </div>
   </section>
 
@@ -1007,27 +1029,98 @@ async function refresh() {
 }
 
 // ================= Clients =================
+// MACs compared without separators or case (aa:bb:… and AA-BB-… alike).
+const macKey = (m) => (m ?? "").toLowerCase().replace(/[^0-9a-f]/g, "");
+// Sortable columns: a key per column; devices without a name sort last
+// either way, ties by IPv4 address so rows stay put between polls.
+const ip4 = (a) => (a ?? "").split(".").reduce((n, o) => n * 256 + (+o || 0), 0);
+const LEASE_COLS = [
+  { k: "name", label: "Name", key: (d) => d.hostname?.toLowerCase() ?? null },
+  { k: "ip", label: "IP address", key: (d) => ip4(d.ip) },
+  { k: "net", label: "Network", key: (d) => d.network ?? "" },
+  { k: "mac", label: "MAC", key: (d) => macKey(d.mac) },
+  { k: "state", label: "State", key: (d) => d.bound ? 0 : 1 },
+  { k: "exp", label: "Expires in", key: (d) => d.expires_in_s, desc: true },
+];
+let leaseSort = (() => {
+  const [k, dir] = (store.get("clients.sort") ?? "").split(":");
+  return LEASE_COLS.some((c) => c.k === k) ? { k, dir: +dir === -1 ? -1 : 1 } : { k: "ip", dir: 1 };
+})();
+// The page is plain http://, where navigator.clipboard is missing (secure
+// contexts only): fall back to a selected textarea and execCommand.
+let leaseCopied = { text: null, until: 0 };
+async function copyText(text) {
+  try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return true; } } catch {}
+  const ta = Object.assign(document.createElement("textarea"), { value: text, readOnly: true });
+  ta.style.cssText = "position:fixed; top:0; left:0; opacity:0";
+  document.body.append(ta); ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch {}
+  ta.remove();
+  return ok;
+}
+// The reservation rows (LAN page and every network's DHCP panel) for a MAC.
+const reservationRows = (mac) => [...document.querySelectorAll('#statics input[data-key="mac"], .netstatics input[data-skey="mac"]')]
+  .filter((i) => macKey(i.value) === macKey(mac)).map((i) => i.closest("tr"));
 function showLeases() {
   if (!st) return;
   const q = $("clientq").value.trim().toLowerCase();
-  // MACs compared without separators or case (aa:bb:… and AA-BB-… alike).
-  const macKey = (m) => (m ?? "").toLowerCase().replace(/[^0-9a-f]/g, "");
   const reserved = new Set([...readStatics(), ...(readNets() ?? []).flatMap((x) => x.dhcp?.static ?? [])].map((s) => macKey(s.mac)));
-  const ls = st.dhcp_leases.filter((d) => !q || [d.hostname, d.ip, d.mac, ...(d.ipv6 ?? [])].some((v) => (v ?? "").toLowerCase().includes(q)));
+  const c = LEASE_COLS.find((x) => x.k === leaseSort.k);
+  const ls = st.dhcp_leases.filter((d) => !q || [d.hostname, d.ip, d.mac, ...(d.ipv6 ?? [])].some((v) => (v ?? "").toLowerCase().includes(q)))
+    .map((d) => [c.key(d), ip4(d.ip), d])
+    .sort(([a, ta], [b, tb]) => a === b ? ta - tb : a === null ? 1 : b === null ? -1 : (a < b ? -1 : 1) * leaseSort.dir)
+    .map((x) => x[2]);
+  const copy = (a) => {
+    const done = leaseCopied.text === a && Date.now() < leaseCopied.until;
+    return `<button class="copy${done ? " done" : ""}" data-copy="${esc(a)}" title="Copy ${esc(a)}" aria-label="Copy ${esc(a)}">${done ? "Copied" : "⧉"}</button>`;
+  };
   // IPv6: the addresses the device's MAC was seen at in neighbor
   // discovery (global first, then unique local "ULA"; the last 30 min).
-  const v6 = (d) => (d.ipv6 ?? []).map((a) => `<br><small class="v6">${esc(a)}${/^f[cd]/i.test(a) ? " (ULA)" : ""}</small>`).join("");
+  const v6 = (d) => (d.ipv6 ?? []).map((a) => `<br><span class="addr"><small class="v6">${esc(a)}${/^f[cd]/i.test(a) ? " (ULA)" : ""}</small>${copy(a)}</span>`).join("");
+  const head = LEASE_COLS.map((x) => `<th${x.desc ? ' class="num"' : ""}${x.k === leaseSort.k ? ` aria-sort="${leaseSort.dir > 0 ? "ascending" : "descending"}"` : ""}><button class="sort" data-sort="${x.k}">${x.label}</button></th>`).join("");
+  const focus = document.activeElement?.closest?.("#leases") && document.activeElement.dataset.sort;
+  $("clientcount").textContent = !st.dhcp_leases.length ? "" : q ? `${ls.length} of ${st.dhcp_leases.length}` : `${ls.length} clients`;
   $("leases").innerHTML = st.dhcp_leases.length
-    ? "<tr><th>Name</th><th>IP address</th><th>Network</th><th>MAC</th><th>State</th><th>Expires in</th><th></th></tr>" + ls.map((d) =>
-        `<tr><td>${esc(d.hostname ?? "–")}</td><td>${esc(d.ip)}${v6(d)}</td><td>${esc(d.network ?? "")}</td><td>${esc(d.mac)}</td><td>${d.bound ? "bound" : "offered"}</td>` +
+    ? `<tr>${head}<th></th></tr>` + ls.map((d) =>
+        `<tr><td>${d.hostname ? esc(d.hostname) : '<span class="muted">–</span>'}</td><td><span class="addr">${esc(d.ip)}${copy(d.ip)}</span>${v6(d)}</td><td>${esc(d.network ?? "")}</td><td>${esc(d.mac)}</td><td>${d.bound ? "bound" : "offered"}</td>` +
         // Restored after a restart, not renewed since: the router's expiry
         // is an upper bound (a full lease time from the restart).
-        (d.restored ? `<td title="Restored after the router restarted; not renewed since. The device's own lease ends earlier and it renews at half its lease time.">≤ ${dur(d.expires_in_s)} <span class="muted">(restored)</span></td>` : `<td>${dur(d.expires_in_s)}</td>`) +
-        `<td>${reserved.has(macKey(d.mac)) ? '<span class="pill">reserved</span>' : `<button class="plain" data-reserve="${esc(d.mac)}">Reserve</button>`}</td></tr>`).join("")
+        (d.restored ? `<td class="num" title="Restored after the router restarted; not renewed since. The device's own lease ends earlier and it renews at half its lease time.">≤ ${dur(d.expires_in_s)} <span class="muted">(restored)</span></td>` : `<td class="num">${dur(d.expires_in_s)}</td>`) +
+        `<td>${reserved.has(macKey(d.mac))
+          ? `<span class="resv"><span>Reserved</span><button class="plain" data-unreserve="${esc(d.mac)}" title="Remove the reservation" aria-label="Remove the reservation for ${esc(d.mac)}">×</button></span>`
+          : `<button class="plain" data-reserve="${esc(d.mac)}">Reserve</button>`}</td></tr>`).join("")
     : rows([["Leases", "none"]]);
+  // Keep keyboard focus on a column heading across the 2 s redraw.
+  if (focus) $("leases").querySelector(`[data-sort="${focus}"]`)?.focus();
 }
 $("clientq").oninput = showLeases;
-$("leases").onclick = (ev) => {
+$("leases").onclick = async (ev) => {
+  const s = ev.target.closest("[data-sort]");
+  if (s) {
+    const k = s.dataset.sort;
+    leaseSort = k === leaseSort.k ? { k, dir: -leaseSort.dir } : { k, dir: LEASE_COLS.find((x) => x.k === k).desc ? -1 : 1 };
+    store.set("clients.sort", `${leaseSort.k}:${leaseSort.dir}`);
+    showLeases();
+    $("leases").querySelector(`[data-sort="${k}"]`)?.focus();
+    return;
+  }
+  const cp = ev.target.closest("[data-copy]");
+  if (cp) {
+    if (await copyText(cp.dataset.copy)) {
+      leaseCopied = { text: cp.dataset.copy, until: Date.now() + 1500 };
+      showLeases();
+      setTimeout(showLeases, 1600);
+    }
+    return;
+  }
+  // Removing goes through the reservation row's own Remove button, so it
+  // is a pending change like any other (renumbered, shown in the bar).
+  const un = ev.target.closest("[data-unreserve]");
+  if (un) {
+    reservationRows(un.dataset.unreserve).forEach((tr) => tr.querySelector("button")?.click());
+    return;
+  }
   const mac = ev.target.dataset?.reserve;
   const d = mac && st.dhcp_leases.find((x) => x.mac === mac);
   if (!d) return;
