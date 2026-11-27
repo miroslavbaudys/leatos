@@ -91,7 +91,8 @@ A client VM, the router and an ISP VM (Alpine; overlays in `lab/client/`, `lab/i
 - `LAB_PPPOE=pap|chap|none`: the ISP is rp-pppoe `pppoe-server` only (user mode). `none` = no
   authentication and no router user name (negative control `LAB_PPPOE=pap LAB_PPPOE_ANON=1`).
   - All checks run through the session, plus a reconnect after the ISP ends it.
-  - The ISP's IPv6CP offer is logged by the router (negative control `LAB_PPPOE_IPV6=0`).
+  - IPv6CP comes up (IPv6 is on by default); with `LAB_ROUTER_ARGS=ipv6=0` the ISP's offer is
+    logged and rejected instead (negative control for both `LAB_PPPOE_IPV6=0`).
   - With `LAB_IPV6=1`, IPv6 over the session instead (docs/ipv6.md step 4: pppd `ipv6-up` routes
     the prefixes over ppp0 and starts Kea there): IPv6CP line, PD, all IPv6 WAN checks, prefix
     change, IPv6 back after the reconnect. Negative controls `LAB_PPPOE_IPV6=0`, `LAB_IPV6_PD=0`.

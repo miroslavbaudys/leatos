@@ -74,7 +74,7 @@ PVH / Multiboot2 command line on x86_64, QEMU `-append` via `QEMU_APPEND`. They 
 
 | Argument | Config field | Meaning |
 |---|---|---|
-| `ipv6=0\|1` | `ipv6.enabled` | link-local + ULA /64 per network, RAs, DNS and web over IPv6 (step 1) |
+| `ipv6=0\|1` | `ipv6.enabled` | IPv6 (default 1): link-local + ULA and global /64 per network, RAs, DNS, web, forwarding |
 | `wan6_ip=addr/len` | – | development IPv6 WAN (step 2b; DHCPv6-PD replaces it): the WAN's address |
 | `wan6_gw=addr` | – | development IPv6 WAN: its gateway |
 | `lan6_prefix=prefix` | – | development IPv6 WAN: network `i` gets `<prefix>:<i>::/64` |

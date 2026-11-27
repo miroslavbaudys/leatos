@@ -18,7 +18,7 @@ author's home router (PC Engines apu4, PPPoE over VLAN). Expect breaking changes
   static routes (option 121)
 - **Forwarding:** NAT (NAPT), zone firewall with rules, port forwards, redirects,
   hairpin, IP fragments, MSS clamping, WAN anti-spoofing
-- **IPv6** (off by default: `[ipv6] enabled`; on or off per network):
+- **IPv6** (on by default, `[ipv6] enabled`; on or off per network):
   DHCPv6 prefix delegation on DHCP and PPPoE (IPv6CP) WANs, prefix kept
   across reboots, a ULA and a global /64 per network with RAs (SLAAC, RDNSS,
   DNSSL), unused parts of the prefix unreachable (no loop through the ISP),

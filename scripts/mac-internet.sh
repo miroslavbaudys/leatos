@@ -19,8 +19,8 @@
 #                    interface of the current default route). Ethernet is
 #                    strongly preferred: many Wi-Fi access points drop frames
 #                    from the extra MAC address of a bridged VM.
-#     --ipv4-only    turn IPv6 off on that service while running (leatos has
-#                    no IPv6 yet, so IPv6 traffic would bypass it); restored on exit
+#     --ipv4-only    turn IPv6 off on that service while running (this script
+#                    routes only IPv4 via leatos, so IPv6 would bypass it); restored on exit
 #     --release      run an optimised (release) build of leatos instead of
 #                    the debug build: much faster datapath (see bufferbloat.sh)
 #     --shape U:D    shape leatos's upload to U and download to D Mbit/s

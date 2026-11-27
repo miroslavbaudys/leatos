@@ -1,10 +1,12 @@
-# IPv6 (M7, plan)
+# IPv6 (M7, done)
 
-Status (2026-11-20): steps 0–5b done in QEMU (§3). On the apu4 against
-the home ISP (IPv6 over PPPoE): IPv6CP up at once, a /60 delegated, the
-ISP's RA seen, clients online over IPv6 and AAAA names for them; b3079ef
-persisted there with `[ipv6] enabled` in the stored config. IPv6 bufferbloat run there: A+/A+, like IPv4. Left: the soak, whether IPv6 becomes
-the default, optional stateful DHCPv6. First plan 2026-11-15 (checked at
+Status (2026-11-27): **done**. Steps 0–5b done in QEMU (§3). On the apu4
+against the home ISP (IPv6 over PPPoE): IPv6CP up at once, a /60
+delegated, the ISP's RA seen, clients online over IPv6 and AAAA names for
+them; b3079ef persisted there with `[ipv6] enabled` in the stored config.
+IPv6 bufferbloat run there: A+/A+, like IPv4. 72 h soak with IPv6 on
+passed (2026-11-22 → 25). **On by default since 2026-11-27** (`ipv6=0`
+turns it off). Left, optional: stateful DHCPv6. First plan 2026-11-15 (checked at
 2712911); **revised 2026-11-20 against 74cb3d1**, after 135 commits that
 added routed LAN ports and live link slots, the WAN ingress stage, IPv4
 fragments, anti-spoofing, redirects, static routes, DNS views, DoT, the
@@ -238,7 +240,10 @@ New or changed (2026-11-20):
   OpenWrt.
 - **Off by default** (`[ipv6] enabled = false`, boot argument `ipv6=0|1`)
   until step 4 runs on the apu4. Then on, with `ipv6=0` as the lab's
-  negative control throughout.
+  negative control throughout. Done 2026-11-27: on by default; the
+  `[ipv6]` section is always written with `enabled`, because a kernel
+  from before the switch (a rollback to the other slot) reads a missing
+  section as off.
 
 ## 3. Steps (each one testable on its own)
 
@@ -601,11 +606,16 @@ SNTP/DNS/DoT/routes, AAAA names) was built in 5a and 5b. Still open:
   20 B larger header. Download max 37–43 ms in both families (slow
   start). Valid: shaper drops in both directions (WAN egress ~500,
   ingress 1300–2200 per run), no pool failures.
-- apu4: `mac-internet.sh` without `--ipv4-only`, 72 h soak with IPv6 on
-  (also shows whether IPv6 multicast puts pressure on `local_rx` and the
-  packet pool, §4).
-- IPv6 on by default (`[ipv6] enabled`): §2 says on once step 4 runs on
-  the apu4, which it has; not switched yet.
+- ✅ apu4: 72 h soak with IPv6 on (2026-11-22 12:25 → 11-25 12:25,
+  457cb97, `[ipv6] enabled` in the stored config since b3079ef): no leak,
+  no reboot, no pool allocation failure, free pool 7936 → 7936, so IPv6
+  multicast puts no visible pressure on `local_rx` and the packet pool
+  (§4). (`mac-internet.sh` routes only the Mac's IPv4 through leatos, so
+  `--ipv4-only` stays a Mac-side choice, not an IPv6 check.)
+- ✅ IPv6 on by default (2026-11-27): `[ipv6] enabled` defaults to true,
+  always written; the web form's checkbox defaults to on; `ipv6=0` turns
+  it off (and is the lab's negative control). A PPPoE lab run without
+  `LAB_IPV6` now checks the IPv6CP line (with `ipv6=0`: the offer log).
 - Optional: stateful DHCPv6 server on the LAN (M flag).
 
 ## 4. Risks and open questions

@@ -156,7 +156,8 @@ and sparse senders. How the kernel uses it: kernel/src/net/CLAUDE.md.
     `Config::name_visibility` = who resolves which address's names from zones, `forward_to` and
     accept rules; `local_hosts` = records as domain + label or overrides of public names; refused on
     save, `leatstore put` and load.
-  - `[ipv6]`: `enabled`, `ula_prefix`, `dhcpv6_pd`, `prefix_hint`. The kernel's
+  - `[ipv6]`: `enabled` (default on; the section is always written, so an older kernel after a
+    rollback does not read it as off), `ula_prefix`, `dhcpv6_pd`, `prefix_hint`. The kernel's
     `config::ula_prefix` derives the /48 from the WAN MAC; network `i` gets `<ula>:<i>::/64` and
     `<delegated>:<i>::/64`.
   - `[wan]`: VLAN, `mode` = dhcp/pppoe/static, `[wan.pppoe]`, `[wan.static]` (kernel

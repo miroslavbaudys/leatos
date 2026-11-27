@@ -390,7 +390,7 @@ control `LAB_GUEST_DOMAIN=0`).
 ### `[ipv6]` (M7 step 1, docs/ipv6.md)
 ```toml
 [ipv6]
-enabled = true                       # default false; boot argument ipv6=0|1
+enabled = true                       # default true; boot argument ipv6=0|1
 ula_prefix = "fd12:3456:789a::/48"   # optional: else derived from the WAN MAC
 dhcpv6_pd = true                     # default: ask the ISP for a prefix (Ethernet WAN)
 prefix_hint = 56                     # 48–64: the length asked for

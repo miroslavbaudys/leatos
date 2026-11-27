@@ -169,7 +169,7 @@ MacBook ──bridgeN (vmnet-host, 192.168.1.2)── [leatos LAN 192.168.1.1]
 scripts/mac-internet.sh                  # confirm, switch, run checks, stay up (Ctrl-C restores)
 scripts/mac-internet.sh --check --yes    # switch, run checks, restore, exit code = result
 scripts/mac-internet.sh --wan-if en7     # bridge onto a specific interface (e.g. USB Ethernet)
-scripts/mac-internet.sh --ipv4-only      # turn IPv6 off while running (leatos has no IPv6 yet)
+scripts/mac-internet.sh --ipv4-only      # turn the Mac's IPv6 off (only IPv4 is routed via leatos)
 scripts/mac-internet.sh --release        # optimised leatos build (faster datapath)
 scripts/mac-internet.sh --release --shape 42:50   # shape upload/download (Mbit/s) below the line rate
 scripts/mac-internet.sh --restore        # undo a previous run (after a crash, kill -9, reboot)
