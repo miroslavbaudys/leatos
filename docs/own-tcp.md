@@ -224,9 +224,13 @@ over `proto_tcp` (slot B seq 24, confirmed), and a new soak (`apu4-owntcp-dcf83e
   ignored (RFC 1337), bare ACKs need nothing, a new SYN above `rcv_nxt` takes the pair;
   `local.tcp.time_wait` counts segments answered from it. Host tests with a control (the
   hand-off switched off: three of the four fail). On the apu4 (aaa0f7c): 20 requests add 3 to
-  `no_socket` (20 before) and 40 to `time_wait`. Left: ~2.5/s `no_socket` from elsewhere (all
-  of them RSTs for segments to no socket, none from aborts), likely LAN devices trying closed
-  router ports (443, 853?); a per-port counter would tell.
+  `no_socket` (20 before) and 40 to `time_wait`. The other ~2.5/s `no_socket`, found with
+  `local.tcp.no_socket_recent` (the last 32 segments no socket took per link, and
+  `time_wait_recent` for the table): SYNs to :8080 from the UniFi switches and access points,
+  still sending their inform to the old UCG controller address (192.168.1.1:8080); refused
+  correctly, home configuration, not a leatos fault. Also once per reboot a few retransmissions
+  from 1.1.1.1:853 to the previous kernel's DoT port, despite our RSTs (an interop test shows
+  smoltcp accepts that RST; Cloudflare's side unknown without a capture), harmless.
 - **The upgrade path runs on this TCP.** A bug that stalls large uploads cuts off remote
   upgrades; the RAM day includes uploading over the new TCP before anything is persisted.
 - **Internet-facing protocol code.** The DoT client always, mgmt with `mgmt-wan`: fuzzing and

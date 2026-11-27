@@ -278,3 +278,28 @@ fn smoltcp_aborts_our_server_sees_it() {
     }
     assert_eq!(p.ours.get(h).state(), State::Closed);
 }
+
+/// Our side forgets the connection (a reboot): the peer's next data gets
+/// our RST (seq = its ACK, no ACK flag), which must end its connection.
+#[test]
+fn forgotten_connection_rst_ends_smoltcp_peer() {
+    let mut p = Pair::new(0);
+    let mut s = Socket::new(4096, 4096);
+    s.listen(80).unwrap();
+    let h = p.ours.add(s);
+    let mut t = smol_socket();
+    t.connect(p.iface.context(), (IpAddress::v4(10, 0, 0, 2), 80), 50002).unwrap();
+    let th = p.sockets.add(t);
+    for _ in 0..1000 {
+        p.step();
+    }
+    assert_eq!(p.ours.get(h).state(), State::Established);
+    p.ours.remove(h);
+    p.theirs(th).send_slice(b"after the reboot").unwrap();
+    for _ in 0..200 {
+        p.step();
+    }
+    assert_eq!(p.ours.stats().no_socket, 1);
+    assert_eq!(p.ours.stats().resets_sent, 1);
+    assert_eq!(p.theirs(th).state(), tcp::State::Closed);
+}

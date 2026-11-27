@@ -1196,7 +1196,7 @@ fn tcp_json(ifs: &[HostIf]) -> String {
         t.time_wait += s.time_wait;
     }
     format!(
-        "{{\"segments_in\":{},\"segments_out\":{},\"bad_checksum\":{},\"malformed\":{},\"no_socket\":{},\"resets_sent\":{},\"resets_dropped\":{},\"resets_received\":{},\"refused\":{},\"challenge_acks\":{},\"retransmits\":{},\"fast_retransmits\":{},\"window_probes\":{},\"timeouts\":{},\"time_wait\":{},\"tx_drops\":{}}}",
+        "{{\"segments_in\":{},\"segments_out\":{},\"bad_checksum\":{},\"malformed\":{},\"no_socket\":{},\"resets_sent\":{},\"resets_dropped\":{},\"resets_received\":{},\"refused\":{},\"challenge_acks\":{},\"retransmits\":{},\"fast_retransmits\":{},\"window_probes\":{},\"timeouts\":{},\"time_wait\":{},\"tx_drops\":{},\"no_socket_recent\":[{}],\"time_wait_recent\":[{}]}}",
         t.segments_in,
         t.segments_out,
         t.bad_checksum,
@@ -1212,8 +1212,43 @@ fn tcp_json(ifs: &[HostIf]) -> String {
         t.window_probes,
         t.timeouts,
         t.time_wait,
-        crate::net::device::tx_drops()
+        crate::net::device::tx_drops(),
+        recent_json(ifs, false),
+        recent_json(ifs, true)
     )
+}
+
+/// The last segments the TCP stacks answered themselves (newest first, at
+/// most 32 per link): a closed port's RST, or the TIME-WAIT table.
+fn recent_json(ifs: &[HostIf], time_wait: bool) -> String {
+    let now = crate::timer::uptime().as_millis() as u64;
+    let mut all: Vec<(usize, &proto_tcp::Seen)> =
+        ifs.iter().enumerate().flat_map(|(i, h)| h.tcp.recent(time_wait).map(move |r| (i, r))).collect();
+    all.sort_by_key(|(_, r)| core::cmp::Reverse(r.at));
+    let flag = |f: u8, b: u8, c: char| if f & b != 0 { c } else { '.' };
+    all.iter()
+        .map(|(i, r)| {
+            let f: String = [
+                flag(r.flags, proto_tcp::wire::SYN, 'S'),
+                flag(r.flags, proto_tcp::wire::ACK, 'A'),
+                flag(r.flags, proto_tcp::wire::FIN, 'F'),
+                flag(r.flags, proto_tcp::wire::RST, 'R'),
+                flag(r.flags, proto_tcp::wire::PSH, 'P'),
+            ]
+            .iter()
+            .collect();
+            format!(
+                "{{\"link\":{},\"ago_ms\":{},\"from\":\"{}\",\"port\":{},\"flags\":\"{}\",\"len\":{}}}",
+                i,
+                now.saturating_sub(r.at),
+                r.remote,
+                r.local_port,
+                f,
+                r.len
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn status_json(

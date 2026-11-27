@@ -39,7 +39,7 @@ pub mod wire;
 mod tests;
 
 pub use socket::Socket;
-pub use stack::{Emit, Handle, Stats, Tcp};
+pub use stack::{Emit, Handle, Seen, Stats, Tcp};
 
 use core::net::SocketAddr;
 

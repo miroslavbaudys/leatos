@@ -15,6 +15,8 @@ const MAX_RESETS: usize = 16;
 /// TIME-WAITs kept for sockets that listen or connect again; the oldest
 /// goes first when full.
 const MAX_TIME_WAIT: usize = 64;
+/// Segments kept in [`Tcp::recent`] per kind.
+const RECENT: usize = 32;
 /// RFC 5961 §7: challenge ACKs per second for the whole link.
 const CHALLENGE_PER_SEC: u32 = 10;
 
@@ -46,6 +48,17 @@ pub struct Stats {
     /// Segments for a connection in the stack's TIME-WAIT table (the
     /// peer's repeated FIN: answered with an ACK, not a RST).
     pub time_wait: u64,
+}
+
+/// A segment the stack answered itself (diagnostics, `/api/status`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seen {
+    pub at: u64,
+    pub remote: SocketAddr,
+    pub local_port: u16,
+    pub flags: u8,
+    /// Payload bytes.
+    pub len: u16,
 }
 
 /// What a socket needs from its stack while it handles a segment or a
@@ -150,6 +163,10 @@ pub struct Tcp {
     /// Connections in TIME-WAIT whose socket moved on (RFC 9293 §3.10.7.4:
     /// a repeated FIN is acknowledged and restarts the timer).
     time_wait: VecDeque<TimeWait>,
+    /// The last segments no socket took, and the last ones the TIME-WAIT
+    /// table took.
+    recent_no_socket: VecDeque<Seen>,
+    recent_time_wait: VecDeque<Seen>,
     /// Segments no socket takes get a RST (RFC 9293); off: dropped
     /// silently (`set_rst_closed`).
     rst_closed: bool,
@@ -166,6 +183,8 @@ impl Tcp {
             challenge: (0, 0),
             stats: Stats::default(),
             time_wait: VecDeque::new(),
+            recent_no_socket: VecDeque::new(),
+            recent_time_wait: VecDeque::new(),
             rst_closed: true,
         }
     }
@@ -212,6 +231,19 @@ impl Tcp {
             self.keep_time_wait(tw);
         }
         Some(s)
+    }
+
+    /// The last segments no socket took (`false`) or the TIME-WAIT table
+    /// took (`true`), oldest first.
+    pub fn recent(&self, time_wait: bool) -> impl Iterator<Item = &Seen> {
+        if time_wait { self.recent_time_wait.iter() } else { self.recent_no_socket.iter() }
+    }
+
+    fn note(q: &mut VecDeque<Seen>, seen: Seen) {
+        if q.len() >= RECENT {
+            q.pop_front();
+        }
+        q.push_back(seen);
     }
 
     /// TIME-WAITs in the stack's table.
@@ -285,6 +317,13 @@ impl Tcp {
         self.stats.segments_in += 1;
         self.collect_time_waits(now);
         let t = Tuple { local: SocketAddr::new(dst, s.dport), remote: SocketAddr::new(src, s.sport) };
+        let seen = Seen {
+            at: now,
+            remote: t.remote,
+            local_port: s.dport,
+            flags: s.flags,
+            len: s.payload.len().min(usize::from(u16::MAX)) as u16,
+        };
         let live = self
             .sockets
             .iter()
@@ -297,6 +336,7 @@ impl Tcp {
                 self.time_wait.remove(i);
             } else {
                 self.stats.time_wait += 1;
+                Self::note(&mut self.recent_time_wait, seen);
                 // RFC 1337: RSTs ignored; a repeated FIN (or anything
                 // taking sequence space) is acknowledged and restarts the
                 // timer; a bare ACK needs nothing.
@@ -335,6 +375,7 @@ impl Tcp {
                 cx.reset(t, 0, Some(s.seq.wrapping_add(s.seq_len())));
             }
         }
+        Self::note(&mut self.recent_no_socket, seen);
     }
 
     /// Run the timers due at `now` and hand every segment due to `emit`,
