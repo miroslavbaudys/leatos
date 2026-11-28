@@ -29,6 +29,39 @@ Gaps found (2026-11-24, by reading the code):
 | Ports named in PCI order | docs/config-v2.md (`ports`) | adding a NIC can swap WAN and LAN |
 | Console on COM1 only | `kernel/src/arch/x86_64/console.rs` | noVNC stays blank after Limine; use `serial0` |
 
+### 1.1 Proxmox's device layout in QEMU (`QEMU_PROXMOX=1`, 2026-11-28)
+
+There is no Proxmox host to test on, and Proxmox VE is x86_64 only, so on an Apple Silicon Mac it
+would run fully emulated, with its guests emulated again inside it. Instead, `scripts/qemu-run.sh`
+reproduces the device layout Proxmox gives a q35 VM. It is taken from qemu-server's source at
+HEAD (2026-11-28): the `get_pci_addr_map` in `src/PVE/QemuServer/PCI.pm`,
+`src/usr/pve-q35-4.0.cfg`, `print_drivedevice_full` in `src/PVE/QemuServer/DriveDevice.pm`, and
+`config_to_command` / `Machine.pm`:
+
+- `-nodefaults`. `pcie.0` holds the ICH9 USB controllers (1d.x, 1a.x), audio (1b.0), four
+  `pcie-root-port`s `ich9-pcie-port-1..4` (1c.0–1c.3), and the DMI-to-PCI bridge `pcidmi`
+  (1e.0). Behind `pcidmi` sit four `pci-bridge`s `pci.0`–`pci.3`, so **every VM device is two
+  bridges down** (bus 06 in QEMU's numbering).
+- On `pci.0`: balloon 0x3 (on by default in Proxmox), watchdog i6300esb 0x4, `ahci0` 0x7,
+  `virtio0` 0xa, `net0`–`net2` 0x12–0x14. `QEMU_NIC=igb` puts the NICs on the root ports, as
+  passthrough with `pcie=1` does.
+- The CD is `ide2`, which on q35 is `ide-cd,bus=ide.1,unit=0` on the built-in controller. Disks
+  are `virtio0` (`virtio-blk-pci,...,id=virtio0,bus=pci.0,addr=0xa`) or `sata0`
+  (`ide-hd,bus=ahci0.0`). Boot is by `bootindex` (CD 100, disk 101) with `-boot strict=on`.
+- `ICH9-LPC.disable_s3=1` / `disable_s4=1`, as Proxmox sets for machines ≥ 9.2.
+- **Not reproduced:** Proxmox's own QEMU build (the `q35+pveN` machine types, its patches),
+  KVM, the `-global` lines from `Cfg2Cmd.pm` and the exact boot-order code (both unread),
+  OVMF.
+
+Results with it (2026-11-28, TCG):
+
+- The kernel finds everything behind the bridges: virtio-net at 06:12.0 / 06:13.0 on MSI-X,
+  the store on `virtio0` (06:0a.0), the watchdog, and a DHCP lease. igb on the root ports
+  (01:00.0, 02:00.0) works too.
+- `QEMU_PROXMOX=1 scripts/install-test.sh` passes for `virtio0` and `sata0` (06:07.0/0): the
+  ISO on `ide2`, installed, the disk boots by `bootindex`.
+- `QEMU_PROXMOX=1 LEATOS_ARCH=x86_64 scripts/lab-test.sh` passes.
+
 ## 2. Performance and latency rules for any VM
 
 - **KVM only.** TCG is for tests (docs/qemu.md: "functional, not performance").

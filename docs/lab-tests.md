@@ -17,6 +17,8 @@ Variables that work with any QEMU-based script:
   or as a SATA disk with `QEMU_STORE_BUS=ahci`
   (written in place).
 - `QEMU_DISK=img scripts/qemu-run.sh`: boot any disk image.
+- `QEMU_PROXMOX=1` (x86_64): the device layout of a Proxmox VE q35 VM (bridges, fixed addresses,
+  `ide2` CD, `virtio0` / `sata0`, bootindex; docs/proxmox.md §1.1). For install- and lab-test.
 - `QEMU_APPEND`: boot arguments (docs/boot-arguments.md).
 
 ## Smoke test: `scripts/smoke-test.sh`

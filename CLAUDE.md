@@ -197,4 +197,5 @@ where the table asks for them. Always: `cargo kcheck-x86`; for crates you change
 | console, CLI, config, `svc` | `cli-test.sh` (also x86_64, `QEMU_STORE_BUS=sd`) |
 | mgmt, upgrade, kexec, store, watchdog, boot, x86 NIC path | `upgrade-test.sh`, `persist-test.sh` (also `QEMU_STORE_BUS=sd`) |
 | installer, boot module, heap layout, store probe, `apu-image.sh` | `install-test.sh` (also `QEMU_STORE_BUS=sd`, `=ahci`) |
+| PCI, bridges, Proxmox / VM layout | `QEMU_PROXMOX=1` install-test (virtio, ahci), lab with `LEATOS_ARCH=x86_64` |
 | boot arguments, `LAB_*` variables, their docs | `scripts/doc-check.sh` |

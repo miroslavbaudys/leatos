@@ -58,14 +58,32 @@
 #                        scripts read log messages from the console; the
 #                        kernel's default is its RAM log once booted)
 #   QEMU_EXTRA="..."     extra QEMU arguments
+#   QEMU_PROXMOX=1       x86_64: the device layout of a Proxmox VE q35 VM (from qemu-server's
+#                        PCI.pm address map and pve-q35-4.0.cfg, docs/proxmox.md §1):
+#                        -nodefaults, pci-bridges pci.0..pci.3 behind a DMI-to-PCI bridge,
+#                        four PCIe root ports, ICH9 USB + audio on pcie.0; on pci.0: balloon
+#                        (0x3), watchdog (0x4), ahci0 (0x7), virtio0 (0xa), net0..net2
+#                        (0x12..0x14); the CD as ide2 (ide.1); boot by bootindex, strict.
+#                        QEMU_STORE is virtio0 or sata0 (QEMU_STORE_BUS=ahci); QEMU_NIC=igb
+#                        puts the NICs on the root ports (hostpci, pcie=1). Not Proxmox's
+#                        QEMU (no +pveN machine) and no KVM here: a layout test.
 set -euo pipefail
 
+PVE="${QEMU_PROXMOX:-0}"
+# Proxmox boots by bootindex (100, 101, ... in its boot order) with
+# `-boot strict=on`: the CD first when there is one, then the disk.
+STORE_BOOT=100
 # QEMU_DISK=img: boot a disk image through the firmware (x86_64 only; built
 # by scripts/apu-image.sh: SeaBIOS -> Limine -> Multiboot2), as on the apu4.
 if [[ -n "${QEMU_CDROM:-}" ]]; then
   KERNEL=
   ARCH=x86_64
   BOOT=(-drive "file=$QEMU_CDROM,media=cdrom,readonly=on" -boot d)
+  if [[ "$PVE" == 1 ]]; then
+    BOOT=(-drive "file=$QEMU_CDROM,if=none,id=drive-ide2,media=cdrom,readonly=on"
+      -device "ide-cd,bus=ide.1,unit=0,drive=drive-ide2,id=ide2,bootindex=100")
+    STORE_BOOT=101
+  fi
 elif [[ "${QEMU_DISK:-}" == store ]]; then
   KERNEL=
   ARCH=x86_64
@@ -76,6 +94,11 @@ elif [[ -n "${QEMU_DISK:-}" ]]; then
   KERNEL=
   ARCH=x86_64
   BOOT=(-drive "file=$QEMU_DISK,format=raw,snapshot=on")
+  if [[ "$PVE" == 1 ]]; then
+    BOOT=(-drive "file=$QEMU_DISK,format=raw,snapshot=on,if=none,id=drive-ide0"
+      -device "ide-hd,bus=ide.0,unit=0,drive=drive-ide0,id=ide0,bootindex=100")
+    STORE_BOOT=101
+  fi
 else
   KERNEL="${1:?usage: qemu-run.sh <kernel-elf> (or QEMU_DISK=image)}"
   shift || true
@@ -97,9 +120,32 @@ fi
 
 # An x86_64 guest can only use hardware acceleration on an x86_64 host.
 if [[ "$ARCH" == x86_64 && "$(uname -m)" != x86_64 && "$QEMU_ACCEL" != tcg ]]; then QEMU_ACCEL=tcg; fi
+if [[ "$PVE" == 1 && "$ARCH" != x86_64 ]]; then echo "QEMU_PROXMOX=1 is x86_64 only" >&2; exit 2; fi
 
 if [[ "$ARCH" == x86_64 ]]; then
   MACHINE=(-machine q35 -vga none)
+  if [[ "$PVE" == 1 ]]; then
+    # pve-q35-4.0.cfg as -device lines; the S3/S4 globals of machines >= 9.2.
+    MACHINE=(-machine q35 -nodefaults -serial mon:stdio -boot menu=on,strict=on
+      -global ICH9-LPC.disable_s3=1 -global ICH9-LPC.disable_s4=1
+      -device ich9-usb-ehci1,id=ehci,multifunction=on,bus=pcie.0,addr=1d.7
+      -device ich9-usb-uhci1,id=uhci-1,multifunction=on,bus=pcie.0,addr=1d.0,masterbus=ehci.0,firstport=0
+      -device ich9-usb-uhci2,id=uhci-2,multifunction=on,bus=pcie.0,addr=1d.1,masterbus=ehci.0,firstport=2
+      -device ich9-usb-uhci3,id=uhci-3,multifunction=on,bus=pcie.0,addr=1d.2,masterbus=ehci.0,firstport=4
+      -device ich9-usb-ehci2,id=ehci-2,multifunction=on,bus=pcie.0,addr=1a.7
+      -device ich9-usb-uhci4,id=uhci-4,multifunction=on,bus=pcie.0,addr=1a.0,masterbus=ehci-2.0,firstport=0
+      -device ich9-usb-uhci5,id=uhci-5,multifunction=on,bus=pcie.0,addr=1a.1,masterbus=ehci-2.0,firstport=2
+      -device ich9-usb-uhci6,id=uhci-6,multifunction=on,bus=pcie.0,addr=1a.2,masterbus=ehci-2.0,firstport=4
+      -device ich9-intel-hda,id=audio0,bus=pcie.0,addr=1b.0)
+    for i in 1 2 3 4; do
+      MACHINE+=(-device "pcie-root-port,id=ich9-pcie-port-$i,x-speed=16,x-width=32,multifunction=on,bus=pcie.0,addr=1c.$((i - 1)),port=$i,chassis=$i")
+    done
+    MACHINE+=(-device i82801b11-bridge,id=pcidmi,bus=pcie.0,addr=1e.0)
+    for i in 0 1 2 3; do
+      MACHINE+=(-device "pci-bridge,id=pci.$i,bus=pcidmi,addr=$((i + 1)).0,chassis_nr=$((i + 1))")
+    done
+    MACHINE+=(-device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x3)
+  fi
   # `max` gives TCG every feature it emulates (NX, x2APIC, invariant TSC).
   if [[ "$QEMU_ACCEL" == tcg ]]; then CPU=(-accel tcg -cpu max); else CPU=(-accel "$QEMU_ACCEL" -cpu host); fi
   DEFAULT_BIN=qemu-system-x86_64
@@ -123,6 +169,13 @@ case "${QEMU_NIC:-virtio}" in
   igb) NIC=igb WAN_ADDR=,addr=0x4 LAN_ADDR=,addr=0x6 LAN1_ADDR=,addr=0x8 ;;
   *) echo "QEMU_NIC must be virtio or igb" >&2; exit 2 ;;
 esac
+if [[ "$PVE" == 1 ]]; then
+  case "$NIC" in
+    # net0..net2 (PCI.pm); igb as passthrough (hostpci0..2 on the root ports).
+    virtio-net-pci) WAN_ADDR=,bus=pci.0,addr=0x12,id=net0 LAN_ADDR=,bus=pci.0,addr=0x13,id=net1 LAN1_ADDR=,bus=pci.0,addr=0x14,id=net2 ;;
+    igb) WAN_ADDR=,bus=ich9-pcie-port-1,addr=0x0 LAN_ADDR=,bus=ich9-pcie-port-2,addr=0x0 LAN1_ADDR=,bus=ich9-pcie-port-3,addr=0x0 ;;
+  esac
+fi
 
 NET=(-nic none)
 if [[ "${QEMU_NET:-none}" == "user" ]]; then
@@ -175,7 +228,17 @@ fi
 
 # After the NICs, so their PCI slots (and the WAN/LAN order) stay the same.
 STORE=()
-if [[ -n "${QEMU_STORE:-}" ]]; then
+if [[ -n "${QEMU_STORE:-}" && "$PVE" == 1 ]]; then
+  # virtio0 / sata0 (PCI.pm, DriveDevice.pm), always in the boot order.
+  case "${QEMU_STORE_BUS:-virtio}" in
+    virtio) STORE=(-drive "file=$QEMU_STORE,format=raw,if=none,id=drive-virtio0,cache=writethrough"
+      -device "virtio-blk-pci,drive=drive-virtio0,id=virtio0,bus=pci.0,addr=0xa,bootindex=$STORE_BOOT") ;;
+    ahci) STORE=(-drive "file=$QEMU_STORE,format=raw,if=none,id=drive-sata0,cache=writethrough"
+      -device ahci,id=ahci0,multifunction=on,bus=pci.0,addr=0x7
+      -device "ide-hd,bus=ahci0.0,drive=drive-sata0,id=sata0,bootindex=$STORE_BOOT") ;;
+    *) echo "QEMU_PROXMOX=1: QEMU_STORE_BUS must be virtio or ahci" >&2; exit 2 ;;
+  esac
+elif [[ -n "${QEMU_STORE:-}" ]]; then
   [[ "${QEMU_DISK:-}" == store ]] && BOOTIDX=",bootindex=0"
   case "${QEMU_STORE_BUS:-virtio}" in
     virtio) STORE=(-drive "file=$QEMU_STORE,format=raw,if=none,id=store,cache=writethrough" -device "virtio-blk-pci,drive=store${BOOTIDX:-}") ;;
@@ -189,6 +252,7 @@ fi
 # timeout resets the guest (QEMU's default action).
 WDT=()
 if [[ "${QEMU_WDT:-1}" == "1" ]]; then WDT=(-device i6300esb); fi
+if [[ "${QEMU_WDT:-1}" == "1" && "$PVE" == 1 ]]; then WDT=(-device i6300esb,bus=pci.0,addr=0x4); fi
 
 GDB=()
 if [[ "${QEMU_GDB:-0}" == "1" ]]; then
