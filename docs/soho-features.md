@@ -80,7 +80,7 @@ Pitfalls:
 
 ## DHCP
 Crate: `crates/proto-dhcp`. Status: v4 server done (M3), lease
-persistence done (M8); the WAN DHCPv4 client is smoltcp's; v6 pending (M7,
+persistence done (M8); the WAN DHCPv4 client is our own (`v4::client`); v6 pending (M7,
 docs/ipv6.md).
 
 ### DHCPv4 server (LAN), required
@@ -107,8 +107,8 @@ route (docs/config-v2.md `[[route]]`). Open: conflict probe, option 42
 - One pool per LAN or VLAN. ✅
 
 ### DHCPv4 client (WAN, non-PPPoE ISPs)
-**Status: implemented** with smoltcp's `dhcpv4` socket (`net/svc.rs`),
-since M2; the lease feeds the forwarder (WAN address, route) and the DNS
+**Status: implemented** in `proto_dhcp::v4::client` (`net/wan4.rs`; smoltcp's
+`dhcpv4` socket from M2 until M14); the lease feeds the forwarder (WAN address, route) and the DNS
 upstreams.
 - DISCOVER, OFFER, REQUEST, ACK, then renew, rebind and expire. Must work
   before the interface has an IP address (raw L2 frames).

@@ -7,8 +7,8 @@
 //!   source is the default route while its router lifetime lasts. Until one
 //!   comes, up to three Router Solicitations, 4 s apart.
 //! - DHCPv6: a UDP socket on the WAN's :546, messages to ff02::1:2:547
-//!   from the WAN's link-local address (smoltcp picks it for the
-//!   link-scope destination).
+//!   from the WAN's link-local address (`net::local::source` picks it for
+//!   the link-scope destination).
 //! - The result is [`State`], read by `config::wan6` and
 //!   `config::gua_router` (the datapath's default route, the networks'
 //!   global /64s, the RAs' router lifetime, status). [`Wan6::step`] says

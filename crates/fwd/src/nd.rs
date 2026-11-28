@@ -2,7 +2,7 @@
 //! ARP requests (RFC 826, probes RFC 5227) and Neighbor Solicitations
 //! (RFC 4861 §7.2.3–7.2.4, DAD §5.4.3), and claims of its addresses by
 //! another MAC. For links whose router stack runs without a link layer
-//! (smoltcp on `Medium::Ip`, docs/lan-neighbors.md): the datapath calls
+//! (the kernel's `net::local`, docs/lan-neighbors.md): the datapath calls
 //! [`answer`] on every ARP / ICMPv6 frame it receives on such a link and
 //! sends the reply itself. Learning neighbors stays in
 //! [`crate::neigh`] (the datapath snoops the same frames).

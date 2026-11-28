@@ -1,11 +1,11 @@
 //! The forwarding datapath: drivers ↔ `fwd::Forwarder` ↔ qdiscs.
 //!
 //! ```text
-//!  NIC RX ─► VLAN ─► shard_of ─► Forwarder shard ─┬─ Local ───► port.local_rx ─► smoltcp (router stack)
+//!  NIC RX ─► VLAN ─► shard_of ─► Forwarder shard ─┬─ Local ───► port.local_rx ─► svc (router stack)
 //!                                         ├─ Forward ─► neigh[egress] ─► egress qdisc
 //!                                         │  (from the WAN: ─► ingress qdisc ─► (shaper) ─► neigh[egress] ─► …)
 //!                                         └─ Drop
-//!  smoltcp TX ──────────────────────────────────────────────────────────► port qdisc
+//!  svc TX ──────────────────────────────────────────────────────────────► port qdisc
 //!  port qdisc ─► (pull, while the NIC has room) ─► VLAN ─► NIC TX
 //! ```
 //!
@@ -26,7 +26,8 @@
 //! untagged or on a VLAN. On RX a `lan0` frame's VID picks its link (no
 //! link for it: dropped, [`VLAN_DROPS`]); a frame for a network on a VLAN
 //! gets its tag when it is queued on the port (forwarded, ARP, or from
-//! smoltcp), so the qdisc holds tagged frames and counts the 4 bytes.
+//! the router stack), so the qdisc holds tagged frames and counts the 4
+//! bytes.
 //!
 //! The WAN's 802.1Q tag (the port's [`PortShared::vlan`]) exists only at
 //! the two ends: removed first thing on RX (`wire::vlan_rx`: wrong or
@@ -684,7 +685,7 @@ impl Datapath {
     }
 
     /// A packet from the router's own stack on link `ifx`, whose stack has
-    /// no link layer (smoltcp on `Medium::Ip`, docs/lan-neighbors.md):
+    /// no link layer (`net::local`, docs/lan-neighbors.md):
     /// `pkt` is 14 bytes of Ethernet header (EtherType set) and the IP
     /// packet. Broadcast and multicast go out at once; unicast goes to the
     /// destination or a `[[route]]`'s gateway through the neighbor table,

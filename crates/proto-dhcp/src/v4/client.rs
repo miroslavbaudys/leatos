@@ -49,7 +49,8 @@ const MIN_RENEW_RT_MS: u64 = 60_000;
 /// The first message waits up to this long (desynchronises routers after
 /// a power cut; RFC 2131 suggests 1–10 s, too long for an upgrade).
 const START_DELAY_MS: u64 = 1_000;
-/// An ACK without a lease time (RFC 2131 requires one): smoltcp's default.
+/// An ACK without a lease time (RFC 2131 requires one): 2 minutes, so the
+/// client soon asks again (smoltcp's old default).
 const DEFAULT_LEASE_SECS: u32 = 120;
 /// Leases shorter than this are treated as this long, so a server cannot
 /// make the client renew in a tight loop.

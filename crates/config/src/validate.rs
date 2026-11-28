@@ -24,7 +24,7 @@ pub const MAX_ZONES: usize = 16;
 pub const MAX_RULES: usize = 256;
 pub const MAX_FORWARDS: usize = 128;
 pub const MAX_REDIRECTS: usize = 32;
-/// Static routes (each smoltcp interface holds the ones of its link, and
+/// Static routes (each link's router stack holds the ones of its link, and
 /// DHCP option 121 must fit one option: 16 × 9 bytes + the default).
 pub const MAX_ROUTES: usize = 16;
 pub const MAX_DNS_HOSTS: usize = 256;

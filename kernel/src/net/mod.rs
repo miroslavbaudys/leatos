@@ -1,5 +1,5 @@
 //! Networking: packet buffers, network interfaces, the router's own IP
-//! stack (smoltcp) for local services.
+//! stack for local services (`local` for UDP / ICMP, `proto_tcp` for TCP).
 
 pub mod datapath;
 pub mod device;

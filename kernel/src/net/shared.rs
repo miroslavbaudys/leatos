@@ -2,8 +2,8 @@
 //! services task (`net::svc::run`), docs/architecture.md "Tasks".
 //!
 //! ```text
-//!  datapath ── Verdict::Local ──► LinkShared::local_rx ──► svc (smoltcp)   + svc_kick
-//!  svc (smoltcp TX) ─────────────► PortShared::qdisc (locked) ──► datapath + dp_kick
+//!  datapath ── Verdict::Local ──► LinkShared::local_rx ──► svc             + svc_kick
+//!  svc (router TX) ──────────────► PortShared::qdisc (locked) ──► datapath + dp_kick
 //!  svc ── Control (WAN lease, reboot/exec) ──────────────────► datapath   + dp_kick
 //!  datapath ── PPPoE discovery/LCP/auth/IPCP ► PortShared::ctrl_rx ► svc + svc_kick
 //!  svc ── PPPoE session (id, peer MAC) ► PortShared::pppoe_session ► datapath
@@ -15,8 +15,8 @@
 //! `lan0`.., `config::PORTS`); a **link** is a router interface on a
 //! port: the WAN on `wan0`, and one per network on its LAN port
 //! (untagged, or a VLAN; routed ports, no bridge: a network is on one
-//! port). The forwarder, ARP, smoltcp and the services work per link;
-//! tags exist only between the link and its port.
+//! port). The forwarder, ARP, the router stack and the services work per
+//! link; tags exist only between the link and its port.
 //!
 //! Forwarded packets never leave the datapath; the qdisc stays the only
 //! place they wait. Everything here is `spin::Mutex` or atomics, so the two

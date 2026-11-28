@@ -1,5 +1,5 @@
 //! Where a packet from the router's own stack goes on a link whose stack
-//! has no link layer (smoltcp on `Medium::Ip`, docs/lan-neighbors.md step
+//! has no link layer (the kernel's `net::local`, docs/lan-neighbors.md step
 //! 2): a fixed MAC (broadcast, multicast) or a neighbor to resolve through
 //! [`crate::neigh`], the destination itself or a `[[route]]`'s gateway on
 //! the link. The kernel's `Datapath::send_local` acts on the answer.
