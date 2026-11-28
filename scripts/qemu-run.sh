@@ -36,6 +36,10 @@
 #   QEMU_PCAP_DIR=dir    with QEMU_NET=user: dump WAN/LAN traffic to pcap files
 #   QEMU_DISK=img        boot a disk image via SeaBIOS + Limine instead of -kernel
 #                        (x86_64; scripts/apu-image.sh); QEMU_APPEND is ignored
+#   QEMU_DISK=store      boot QEMU_STORE itself through the firmware (virtio only, as
+#                        Proxmox boots virtio0): a disk the installer wrote
+#   QEMU_CDROM=iso       boot an ISO as a CD via SeaBIOS + Limine (x86_64; the
+#                        installer, scripts/apu-image.sh --iso), as Proxmox attaches it
 #   QEMU_STORE=img       attach img as a virtio-blk disk (the router's store; create
 #                        one with `cargo run -q -p leatstore -- create img`). Written
 #                        in place: pass a copy to keep the original
@@ -56,7 +60,17 @@ set -euo pipefail
 
 # QEMU_DISK=img: boot a disk image through the firmware (x86_64 only; built
 # by scripts/apu-image.sh: SeaBIOS -> Limine -> Multiboot2), as on the apu4.
-if [[ -n "${QEMU_DISK:-}" ]]; then
+if [[ -n "${QEMU_CDROM:-}" ]]; then
+  KERNEL=
+  ARCH=x86_64
+  BOOT=(-drive "file=$QEMU_CDROM,media=cdrom,readonly=on" -boot d)
+elif [[ "${QEMU_DISK:-}" == store ]]; then
+  KERNEL=
+  ARCH=x86_64
+  BOOT=(-boot c) # not empty: bash 3.2 calls an empty array unbound under set -u
+  [[ -n "${QEMU_STORE:-}" && "${QEMU_STORE_BUS:-virtio}" == virtio ]] \
+    || { echo "QEMU_DISK=store needs QEMU_STORE on virtio" >&2; exit 2; }
+elif [[ -n "${QEMU_DISK:-}" ]]; then
   KERNEL=
   ARCH=x86_64
   BOOT=(-drive "file=$QEMU_DISK,format=raw,snapshot=on")
@@ -160,8 +174,9 @@ fi
 # After the NICs, so their PCI slots (and the WAN/LAN order) stay the same.
 STORE=()
 if [[ -n "${QEMU_STORE:-}" ]]; then
+  [[ "${QEMU_DISK:-}" == store ]] && BOOTIDX=",bootindex=0"
   case "${QEMU_STORE_BUS:-virtio}" in
-    virtio) STORE=(-drive "file=$QEMU_STORE,format=raw,if=none,id=store,cache=writethrough" -device virtio-blk-pci,drive=store) ;;
+    virtio) STORE=(-drive "file=$QEMU_STORE,format=raw,if=none,id=store,cache=writethrough" -device "virtio-blk-pci,drive=store${BOOTIDX:-}") ;;
     sd) STORE=(-drive "file=$QEMU_STORE,format=raw,if=none,id=store,cache=writethrough" -device sdhci-pci,id=sdhci -device sd-card,drive=store,bus=sd-bus) ;;
     *) echo "QEMU_STORE_BUS must be virtio or sd" >&2; exit 2 ;;
   esac
@@ -182,7 +197,7 @@ fi
 EXTRA=(${QEMU_EXTRA:-})
 APPEND="${QEMU_APPEND:-}"
 case " $APPEND" in *" log="*) ;; *) APPEND="log=console${APPEND:+ $APPEND}" ;; esac
-if [[ -z "${QEMU_DISK:-}" ]]; then EXTRA+=(-append "$APPEND"); fi
+if [[ -z "${QEMU_DISK:-}${QEMU_CDROM:-}" ]]; then EXTRA+=(-append "$APPEND"); fi
 
 # QEMU_BIN (sudo callers) names the aarch64 binary; derive the x86 one from it.
 BIN="${QEMU_BIN:-$DEFAULT_BIN}"

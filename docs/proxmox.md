@@ -117,10 +117,10 @@ startup: order=1,down=10
 6. **Ports by MAC** (medium): optional mapping in `config.toml` (e.g. `wan0 = "bc:24:11:…"`),
    validated; PCI order stays the default. Helps bare metal too. Lab: NIC order swapped in
    QEMU, mapping holds; negative control: without it the ports swap.
-7. **VM image and docs** (small): install from the ISO (docs/install.md, M16 step 2: CD +
-   `virtio0`, no host shell), or `apu-image.sh --target vm`, raw or qcow2 with a VM command
-   line; optional `scripts/proxmox-create.sh` that only prints the `qm` commands. This file
-   becomes the setup guide.
+7. **VM image and docs** (small): install from the ISO (docs/install.md, M16 step 2, done in
+   QEMU: `apu-image.sh --iso`, CD + `virtio0`, no host shell), or `apu-image.sh --target vm`,
+   raw or qcow2 with a VM command line; optional `scripts/proxmox-create.sh` that only prints
+   the `qm` commands. This file becomes the setup guide.
 
 ### Tier 3: comfort and performance
 

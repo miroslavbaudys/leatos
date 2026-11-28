@@ -101,7 +101,11 @@ the old or exactly the new record.
 
 **Safety:** the kernel writes only a partition with type 0xda **and** a
 valid store header. It never formats; only the image and QEMU scripts
-do. A wrong disk or a foreign USB stick is never written.
+do. A wrong disk or a foreign USB stick is never written. The one
+exception is the installer (docs/install.md): only with `install=1`, an
+install image whose SHA-256 checks, and the target's PCI address typed on
+the console (or `install_target=`); the install medium itself is never
+seen by the kernel.
 
 **Wear:** one config save writes at most 513 sectors; areas alternate
 between two slots. Negligible for SD cards and SSDs.

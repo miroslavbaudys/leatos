@@ -323,6 +323,12 @@ direction moved under 1 Mbit/s.
   `VLAN_TEST_SKIP_SAVE=1`.
 - `scripts/upgrade-test.sh`: the in-RAM upgrade end to end in QEMU (401/422/404 negative controls,
   two chained upgrades, reboot).
+- `scripts/install-test.sh` (also `QEMU_STORE_BUS=sd`; x86_64, TCG): the installer ISO as a
+  CD, prompt answered on the console: fresh install (gaps zero, past the image untouched, GPT
+  backup zero, the disk boots with its config), config kept, `install_target=` +
+  `install_keep=0`, the ISO as a disk offers no disk. Negative controls: an unlisted address,
+  an unconfirmed trial, a flipped module byte: nothing written, target hash unchanged
+  (docs/install.md §4).
 - `scripts/persist-test.sh` (also `QEMU_STORE_BUS=sd`): persistent upgrades, confirm, rollbacks
   (panic, hang, no confirm, revert, kill), `image=golden`, corrupt record. Negative control
   `PERSIST_TEST_CONTROL=no-confirm`.

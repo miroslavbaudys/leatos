@@ -102,6 +102,11 @@ live with the VID; networks on a port the machine lacks are left out (`config::m
   - DHCP leases live in the `leases` area (`net/svc.rs` `LeaseStore`): restored at boot, written
     when the bound set changes (checked every 60 s) and before reboot/upgrade; format
     `proto_dhcp::v4::persist`.
+- `src/install.rs`: the installer (docs/install.md): `install=1` → `install::run` right after
+  PCI, instead of the router: disks listed, target by PCI address (typed or `install_target=`),
+  config kept (`store::probe` + `Store::into_disk`; an unconfirmed trial aborts,
+  `install_keep=0`), `install_image::Image::plan` written and read back, reset. The only code
+  that writes a whole disk. `check_module` logs the module's state on every boot.
 - `src/upgrade.rs`: kernel upgrades (docs/upgrades.md; x86_64 only).
   - In RAM: validate + flatten an uploaded kernel in the staging area at the top of RAM
     (`mm::heap::take_staging`); `arch::kexec` copies it into place and enters it like a Multiboot2

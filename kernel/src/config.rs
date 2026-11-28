@@ -1302,6 +1302,24 @@ pub fn heap_list() -> bool {
     bootargs().split_ascii_whitespace().any(|a| a == "heap=list")
 }
 
+/// `install=1`: run the installer (docs/install.md, `crate::install`)
+/// instead of the router.
+pub fn install() -> bool {
+    arg(bootargs(), "install") == Some("1")
+}
+
+/// `install_target=<PCI address>` (e.g. `00:04.0`): the installer writes
+/// that disk without asking (unattended installs, tests).
+pub fn install_target() -> Option<&'static str> {
+    arg(bootargs(), "install_target")
+}
+
+/// `install_keep=0`: the installer does not carry the target's config over
+/// (the image's config, or defaults, are used).
+pub fn install_keep() -> bool {
+    arg(bootargs(), "install_keep") != Some("0")
+}
+
 /// `module_carve=0`: the heap does not leave the boot module out
 /// (`mm::heap::region`), the negative control of docs/install.md §3.2:
 /// Limine puts the module right after the kernel, so the heap overwrites

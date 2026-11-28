@@ -136,14 +136,16 @@ Keep them current when you change what they describe; keep this file to the map 
 - `scripts/unsafe-report.sh`: the unsafe audit surface.
 - Tests, their options and negative controls: **docs/lab-tests.md**. `scripts/smoke-test.sh`,
   `scripts/lab-test.sh` (+ `LAB_*` modes), feature tests `store-`, `lease-`, `cli-`, `pppoe-`,
-  `vlan-`, `upgrade-`, `persist-test.sh`; `bufferbloat.sh`, `soak-test.sh`; fuzzing
+  `vlan-`, `upgrade-`, `persist-`, `install-test.sh`; `bufferbloat.sh`, `soak-test.sh`; fuzzing
   `cd fuzz && cargo +nightly fuzz run <target> -- -max_total_time=600`.
 - apu4:
   - `scripts/apu-image.sh [--debug] [--mgmt-pass | --mgmt-wan] [--config FILE] [--cmdline "..."]`:
     bootable SD image (`target/apu4/leatos-apu4.img`: MBR + FAT32 + Limine BIOS → Multiboot2, plus
     the 16 MiB store partition p2; needs `brew install limine mtools`). `--config` seeds the store
     (validated); the apu4's config lives in `target/apu4/config.toml`, so the command line needs
-    only `mgmt_pass=`.
+    only `mgmt_pass=`. `--iso [--install-args "..."]`: the installer ISO
+    (`target/apu4/leatos-install.iso`, docs/install.md; CD in a VM or `dd` to a USB stick, needs
+    `brew install xorriso`): boots with `install=1` and writes this image to a chosen disk.
   - `scripts/apu-upload.sh [--host H] [--tunnel CMD] [--cmdline "..."] [--debug] [--reboot]
     [--persist [--no-confirm]] [--confirm | --revert]`: build + strip the x86_64 kernel and upgrade
     a running leatos over HTTP, in RAM, or with `--persist` stored on the SD card as a trial,
@@ -191,4 +193,5 @@ where the table asks for them. Always: `cargo kcheck-x86`; for crates you change
 | DHCP, store, `svc` | `lease-test.sh` (also x86_64, `QEMU_STORE_BUS=sd`) |
 | console, CLI, config, `svc` | `cli-test.sh` (also x86_64, `QEMU_STORE_BUS=sd`) |
 | mgmt, upgrade, kexec, store, watchdog, boot, x86 NIC path | `upgrade-test.sh`, `persist-test.sh` (also `QEMU_STORE_BUS=sd`) |
+| installer, boot module, heap layout, store probe, `apu-image.sh` | `install-test.sh` (also `QEMU_STORE_BUS=sd`) |
 | boot arguments, `LAB_*` variables, their docs | `scripts/doc-check.sh` |

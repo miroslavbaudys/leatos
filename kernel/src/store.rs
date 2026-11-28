@@ -103,7 +103,7 @@ pub fn open(pci: &mut Pci) -> Option<Store> {
                         found = Some(s);
                         l
                     }
-                    Err(why) => format!("{} {what}: {why}, not used", dev.df),
+                    Err((why, _)) => format!("{} {what}: {why}, not used", dev.df),
                 }
             }
         };
@@ -117,7 +117,7 @@ pub fn open(pci: &mut Pci) -> Option<Store> {
 }
 
 /// The MBR's partitions for the log: `p1 0x0c 64 MiB, p2 0xda 16 MiB`.
-fn partitions(mbr: &[u8]) -> String {
+pub fn partitions(mbr: &[u8]) -> String {
     match mbr::partitions(mbr) {
         None => String::from("no MBR"),
         Some(ps) => {
@@ -135,26 +135,36 @@ fn partitions(mbr: &[u8]) -> String {
     }
 }
 
-fn probe(mut disk: Disk) -> Result<(Store, String), String> {
-    let mbr = block_on(disk.read(0, 1)).map_err(|e| format!("reading the MBR: {e}"))?;
+/// The store on `disk`, with its partitions for the log; else why not,
+/// and the disk back (the installer probes a disk it then writes).
+pub fn probe(mut disk: Disk) -> Result<(Store, String), (String, Disk)> {
+    let mbr = match block_on(disk.read(0, 1)) {
+        Ok(m) => m,
+        Err(e) => return Err((format!("reading the MBR: {e}"), disk)),
+    };
     let parts = partitions(&mbr);
-    let part = mbr::find_store(&mbr).ok_or_else(|| {
-        format!(
+    let Some(part) = mbr::find_store(&mbr) else {
+        let why = format!(
             "{parts}; no store partition (type {:#04x})",
             mbr::STORE_PARTITION_TYPE
-        )
-    })?;
+        );
+        return Err((why, disk));
+    };
     if disk.readonly() {
-        return Err(format!("{parts}; read-only"));
+        return Err((format!("{parts}; read-only"), disk));
     }
     let (base, sectors) = (part.first_lba as u64, part.sectors as u64);
     if base + sectors > disk.capacity() {
-        return Err(format!("{parts}; store partition extends past the disk"));
+        return Err((format!("{parts}; store partition extends past the disk"), disk));
     }
-    let hdr =
-        block_on(disk.read(base, 1)).map_err(|e| format!("reading the store header: {e}"))?;
-    let layout = Layout::parse(&hdr, sectors)
-        .map_err(|e| format!("{parts}; store header invalid ({e:?}): not formatted"))?;
+    let hdr = match block_on(disk.read(base, 1)) {
+        Ok(h) => h,
+        Err(e) => return Err((format!("reading the store header: {e}"), disk)),
+    };
+    let layout = match Layout::parse(&hdr, sectors) {
+        Ok(l) => l,
+        Err(e) => return Err((format!("{parts}; store header invalid ({e:?}): not formatted"), disk)),
+    };
     Ok((
         Store {
             disk,
@@ -167,6 +177,11 @@ fn probe(mut disk: Disk) -> Result<(Store, String), String> {
 }
 
 impl Store {
+    /// The disk back (the installer writes the disk after reading its store).
+    pub fn into_disk(self) -> Disk {
+        self.disk
+    }
+
     fn area(&self, name: &'static str) -> Result<Area, Error> {
         self.layout.area(name).copied().ok_or(Error::NoArea(name))
     }

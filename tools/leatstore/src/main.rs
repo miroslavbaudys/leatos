@@ -6,11 +6,14 @@
 //! leatstore create <img> [--mib N]        new disk image: MBR + one store partition, formatted
 //! leatstore format <img> [--force]        format the image's 0xda partition (standard layout)
 //! leatstore show <img>                    layout and slot states
-//! leatstore put <img> <area> <file> [--raw] [--version N]
-//!                                       write a record (config: validated unless --raw)
+//! leatstore put <img> <area> <file> [--raw] [--version N] [--trial]
+//!                                       write a record (config: validated unless --raw;
+//!                                       --trial: as an unconfirmed trial)
 //! leatstore get <img> <area>              current record's payload to stdout
 //! leatstore corrupt <img> <area> [--slot A|B]
 //!                                       flip a payload byte (default: of the current record)
+//! leatstore hash <password>               a mgmt.password_hash value
+//! leatstore install-image <raw> <out>     installer image of a raw disk image (docs/install.md)
 //! ```
 //!
 //! Writes follow the kernel's order (payload, then header), through the
@@ -206,7 +209,7 @@ fn show(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn put(path: &str, area: &str, file: &str, raw: bool, version: Option<u32>) -> Result<()> {
+fn put(path: &str, area: &str, file: &str, raw: bool, version: Option<u32>, trial: bool) -> Result<()> {
     let payload = std::fs::read(file).map_err(|e| format!("{file}: {e}"))?;
     let mut doc_version = 1;
     if area == "config" && !raw {
@@ -238,6 +241,8 @@ fn put(path: &str, area: &str, file: &str, raw: bool, version: Option<u32>) -> R
     let plan = st
         .plan_write(&a, current, version, &payload)
         .map_err(|e| format!("{e:?}"))?;
+    // --trial: an unconfirmed trial, as a save that needs one leaves it.
+    let plan = if trial { plan.with_flags(&a, config_store::FLAG_TRIAL) } else { plan };
     if !plan.payload.is_empty() {
         img.write(plan.payload_lba, &plan.payload)?;
     }
@@ -350,7 +355,7 @@ fn install_image(raw: &str, out: &str) -> Result<()> {
 
 fn usage() -> String {
     "usage: leatstore create <img> [--mib N] | format <img> [--force] | show <img> | \
-     put <img> <area> <file> [--raw] [--version N] | get <img> <area> | \
+     put <img> <area> <file> [--raw] [--version N] [--trial] | get <img> <area> | \
      corrupt <img> <area> [--slot A|B] | hash <password> | install-image <raw img> <out>"
         .into()
 }
@@ -393,6 +398,7 @@ fn run(args: &[String]) -> Result<()> {
             file,
             flag("--raw"),
             num("--version")?.map(|v| v as u32),
+            flag("--trial"),
         ),
         ["get", img, area] => get(img, area),
         ["hash", password] => hash(password),
@@ -446,8 +452,8 @@ mod tests {
         create(&img, 17).unwrap();
         assert!(format(&img, false).is_err(), "refuses to reformat");
         assert_eq!(current(&img), None);
-        put(&img, "config", &toml, false, None).unwrap();
-        put(&img, "config", &toml, false, None).unwrap();
+        put(&img, "config", &toml, false, None, false).unwrap();
+        put(&img, "config", &toml, false, None, false).unwrap();
         let (slot, h) = current(&img).unwrap();
         assert_eq!((slot, h.seq, h.version), (Slot::B, 2, config::VERSION));
         corrupt(&img, "config", None).unwrap();
@@ -456,11 +462,11 @@ mod tests {
         assert_eq!((slot, h.seq), (Slot::A, 1));
         // Invalid config is refused unless --raw.
         std::fs::write(&toml, "version = 2\nbogus = 3\n").unwrap();
-        assert!(put(&img, "config", &toml, false, None).is_err());
+        assert!(put(&img, "config", &toml, false, None, false).is_err());
         // So is a version 1 document.
         std::fs::write(&toml, "version = 1\n[lan]\nipv4 = \"10.20.0.1/24\"\n").unwrap();
-        assert!(put(&img, "config", &toml, false, None).unwrap_err().contains("no longer supported"));
-        put(&img, "config", &toml, true, None).unwrap();
+        assert!(put(&img, "config", &toml, false, None, false).unwrap_err().contains("no longer supported"));
+        put(&img, "config", &toml, true, None, false).unwrap();
         format(&img, true).unwrap();
         assert_eq!(current(&img), None, "format clears old records");
         let _ = std::fs::remove_file(&img);

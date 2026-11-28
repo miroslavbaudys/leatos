@@ -92,6 +92,11 @@ pub fn kmain(boot_arg: usize) -> ! {
     if let Some(pci) = pci.as_mut() {
         drivers::cputemp::probe(pci);
     }
+    // install=1 (docs/install.md): the installer runs instead of the
+    // router, before any store is opened or stored kernel entered.
+    if config::install() {
+        install::run(pci.as_mut());
+    }
     // The config may live on a disk, so it is loaded once PCI is up. Code
     // above this line reads only boot arguments, never `config::get`.
     let mut store = pci.as_mut().and_then(store::open);

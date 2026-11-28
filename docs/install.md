@@ -1,7 +1,8 @@
 # Installer: leatos installs itself from a USB stick or ISO (plan)
 
-Status (2026-11-28): step 1 done in QEMU (module, heap carve-out, image format); the rest is
-plan. Roadmap M16.
+Status (2026-11-28): steps 1 and 2 done in QEMU (module, heap carve-out, image format; install
+mode on virtio-blk and SD, the installer ISO, `scripts/install-test.sh`); AHCI, the store ID and
+the hardware checks are plan. Roadmap M16.
 
 Today leatos is installed by flashing `target/apu4/leatos-apu4.img` (`scripts/apu-image.sh`) to
 an SD card on the Mac; a Proxmox VM gets the same image with `qm importdisk`
@@ -16,7 +17,7 @@ install, but leatos still needs AHCI to *run* from mSATA, and it adds a second O
 release (kernel, initrd, a musl `leatstore` build to keep the config).
 
 Chosen: Limine on the ISO loads the leatos kernel **and the install image as a Multiboot2
-module**; the kernel, booted with `install`, writes the module to a disk it has a driver for.
+module**; the kernel, booted with `install=1`, writes the module to a disk it has a driver for.
 
 - **No USB, CD or ISO 9660 driver in leatos.** SeaBIOS reads the medium (int13 / El Torito);
   the image is in RAM when leatos starts.
@@ -29,19 +30,23 @@ module**; the kernel, booted with `install`, writes the module to a disk it has 
 
 ## 2. Flow
 
-1. SeaBIOS boots the ISO (CD in a VM, USB stick on the apu4). Limine entry `install`:
+1. SeaBIOS boots the ISO (CD in a VM, USB stick on the apu4). Limine entry "leatos installer":
    `protocol: multiboot2`, `path: boot():/boot/leatos`, `module_path: boot():/boot/install.lin`,
-   `cmdline: install`.
+   `cmdline: install=1` (+ `--install-args`).
 2. leatos discovers the module (§3.2), checks its hash, starts only the console and the disk
    drivers: no datapath, no services, no WAN. A box mid-install never forwards traffic.
-3. The console lists each disk with model, serial, size, partitions and whether it holds a
-   store (the `store.rs` probe lines). The user types the **serial** (or PCI address) of the
-   target; anything else aborts. `install_target=<serial>` skips the prompt (unattended,
-   tests).
+3. The console lists each disk with its PCI address, model, size and partitions
+   (`  00:01.0  virtio-blk 128 MiB, p1 0x0c 63 MiB, p2 0xda 16 MiB`). The user types the
+   target's **PCI address**; anything else aborts. `install_target=<PCI address>` skips the
+   prompt (unattended, tests). The PCI address, not a serial: every disk has one, virtio-blk
+   and SD cards do not always have a serial.
 4. If the target has a store, its current `config` record is read and kept (§3.4).
 5. The image is written (§3.3), read back and compared, flushed.
-6. "Installed; remove the stick / eject the ISO" and a reboot. A medium left in boots the
-   installer again, which writes nothing without step 3.
+6. The kept config is stored in the new store; "done. Remove the install medium" and a reset
+   after 5 s. A medium left in boots the installer again, which writes nothing without step 3
+   (`install_target=` on a medium left in would install again: for tests and one-off use).
+7. Any stop before the first write ends in `install: <why>: nothing written`; a failure after
+   it in `install: FAILED: …` (run the installer again). Then the installer waits for a reset.
 
 ## 3. Work
 
@@ -98,25 +103,34 @@ The raw image is 80 MiB of mostly zeros; the module is a list of extents instead
   every byte, forge tables with valid hashes; fuzz target `install_image`), `leatstore
   install-image <raw> <out>` (checks that the plan reproduces the raw image). An 80 MiB apu4
   image with a debug kernel: 5 extents.
-- Built by `scripts/apu-image.sh --iso`: the normal image as now, converted to the extent
-  format, plus a Limine **hybrid ISO** (`xorriso` + `limine bios-install`; `brew install
-  xorriso`) with the kernel, the module and two entries: `install` and "boot leatos from the
-  internal disk" (Limine chainloads it, so a forgotten stick still gets the router up).
+- Built by `scripts/apu-image.sh --iso [--install-args "…"]` (done 2026-11-28,
+  `target/apu4/leatos-install.iso`): the normal image (all of its options apply: `--config`,
+  `--cmdline`, `--mgmt-pass`, …), converted to the extent format, plus a Limine **hybrid ISO**
+  (`xorriso -as mkisofs` with `--protective-msdos-label -partition_offset 16`, so `limine
+  bios-install` accepts the MBR; `brew install xorriso`) with the kernel and the module. One
+  entry; a second one that chainloads the internal disk (a forgotten stick still gets the
+  router up) is not done.
 
 ### 3.4 Install mode in the kernel (`install.rs`)
 
-- Boot arguments `install` and `install_target=` (rows in docs/boot-arguments.md).
+- Boot arguments `install=1`, `install_target=`, `install_keep=0` (docs/boot-arguments.md).
+  `kmain` calls `install::run` right after PCI, before any store is opened or stored kernel
+  entered; no watchdog is armed.
 - Target checks: big enough, not read-only, confirmed (§2 step 3).
-- **Keeping the config:** before writing, `store::open` on the target alone; its current
-  `config` record is held in RAM and, after the image is written, stored through
-  `config-store` in the new store. Trials and stored kernels are not kept: the new boot
-  partition kernel is the installed version. `install_keep=0` installs with the image's config
-  (or defaults).
+- **Keeping the config:** before writing, `store::probe` on the target alone; its current
+  `config` record (the newest this kernel reads) is held in RAM if it parses and, after the
+  image is written, stored with `Store::write_record` in the new store (a newer seq than the
+  image's seeded config). An **unconfirmed trial** stops the install (nothing written): which
+  of the two the user wants is not the installer's to guess; confirm or revert it, or
+  `install_keep=0`. Leases, trials and stored kernels are not kept: the new boot partition
+  kernel is the installed version. `install_keep=0` installs with the image's config (or
+  defaults).
 - **Exception to "the kernel never formats"** (docs/config-and-storage.md, Safety): only with
   `install` on the command line, a module whose hash checks, and the confirmation. That
   section names this exception.
-- Progress on the console in MiB; the read-back compares against the module, not against what
-  was sent.
+- Progress on the console every 16 MiB; the read-back compares against the module, not
+  against what was sent. Waiting for input polls the console every 20 ms (`block_on` spins: one
+  core busy while the prompt waits).
 
 ### 3.5 Which store (needed once two disks can hold leatos)
 
@@ -133,18 +147,25 @@ has no identity to tell them apart.
 
 ## 4. Tests (`scripts/install-test.sh`)
 
-QEMU q35, SeaBIOS, the ISO as a CD (as Proxmox attaches it) and as a USB stick
-(`qemu-xhci` + `usb-storage`), target virtio-blk and AHCI (`LEATOS_ARCH=x86_64`; aarch64 has
-no SeaBIOS, so only the PVH `-initrd` path there).
+QEMU q35 under TCG, SeaBIOS, the ISO as a CD (`QEMU_CDROM`, as Proxmox attaches it) and as a
+disk (`QEMU_DISK`, what a USB stick is to the BIOS), target virtio-blk (default, ~1 min) or SD
+(`QEMU_STORE_BUS=sd`, ~4 min); x86_64 only (aarch64 has no SeaBIOS). Done 2026-11-28, both
+buses pass:
 
-| Check | Negative control |
-|---|---|
-| empty target: installed, reboot without the medium, store + seeded config used | wrong serial typed → target unchanged (hash before/after) |
-| image hash checked | one byte flipped in the module → nothing written |
-| reinstall over leatos: config kept, old slots zeroed | `install_keep=0` → image config; an old record planted in a skipped slot is gone |
-| module survives the heap (§3.2) | carve-out disabled (debug switch) → hash fails |
-| two stores + `store_id=` → the right one | no `store_id=` → warning in the log |
-| AHCI store, upgrades, persist (`QEMU_STORE_BUS=ahci`) | as the virtio and SD runs |
+| Case | Checks | Negative control |
+|---|---|---|
+| fresh | 0xff target: written + verified, image's config stored, a gap zero, sectors past the image still 0xff, last 33 zero; boots from the disk (`QEMU_DISK=store`, virtio only) with its config | – |
+| wrong | – | an address not listed typed → nothing written, target hash unchanged |
+| keep | another config carried over; a planted leases record gone | – |
+| trial | – | unconfirmed config trial on the target → nothing written, hash unchanged |
+| unattended | `install_target=` + `install_keep=0`: no prompt, the image's config wins | (the keep case) |
+| corrupt | – | one byte of the ISO's module flipped → SHA-256 mismatch, nothing written |
+| stick | the ISO boots as a disk; the installer offers no disk (never its own medium) | – |
+
+Not in the script: module vs heap (§3.2; `module_carve=0` control, by hand); a real USB stick
+(`qemu-xhci` + `usb-storage`, booted by hand 2026-11-28: SeaBIOS boots it, same result as
+`stick`). To come with steps 3 and 4: AHCI targets (`QEMU_STORE_BUS=ahci`), two stores with
+and without `store_id=`.
 
 On the hardware: apu4 boots the stick, installs to the mSATA, boots from it without the stick;
 SeaBIOS boot order (USB before mSATA?) noted here. Proxmox: VM from the GUI with the ISO as CD
@@ -155,7 +176,7 @@ and `virtio0`, installed, ISO ejected, boots.
 | Step | Size | Gives |
 |---|---|---|
 | 1. Module tag + heap carve-out, extent format crate ✅ (QEMU, 2026-11-28) | 2–3 days | image in RAM, checked |
-| 2. Install mode on virtio-blk / SD, `--iso`, `install-test.sh` | ~1 wk | **Proxmox install from ISO** |
+| 2. Install mode on virtio-blk / SD, `--iso`, `install-test.sh` ✅ (QEMU, 2026-11-28) | ~1 wk | **Proxmox install from ISO** |
 | 3. AHCI driver + `QEMU_STORE_BUS=ahci` tests | 1–1.5 wk | mSATA / `sata0` as boot + store |
 | 4. Store ID + `store_id=` | 2–3 days | safe with two leatos disks |
 | 5. apu4: AHCI at 00:11, USB stick install to mSATA, boot order | — | hardware check |

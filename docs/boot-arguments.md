@@ -123,6 +123,9 @@ PVH / Multiboot2 command line on x86_64, QEMU `-append` via `QEMU_APPEND`. They 
 | `watchdog_secs=N` | – | hardware watchdog timeout, default 30 |
 | `panic=halt` | – | halt instead of rebooting on panics and exceptions |
 | `log=console` | – | log messages stay on the serial console after boot instead of the RAM log |
+| `install=1` | – | run the installer instead of the router (docs/install.md): write the boot module (install image) to a disk after a confirmation, keeping its config; set by the ISO's Limine entry |
+| `install_target=<PCI address>` | – | with `install=1`: write this disk without asking (e.g. `00:04.0`, as the installer lists it) |
+| `install_keep=0` | – | with `install=1`: do not carry the target's stored config over |
 | `module_carve=0` | – | lab only: the heap does not leave the boot module (install image) out, so it overwrites it and the image's hash fails (docs/install.md §3.2: the negative control) |
 | `heap=list` | – | the old first-fit linked-list allocator: the heap bench's control, fallback |
 | `ct_bench=1` | – | time conntrack operations on a full synthetic table at boot (`selftest::conntrack_bench`) |
