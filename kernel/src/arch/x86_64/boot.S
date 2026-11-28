@@ -31,7 +31,12 @@
     .popsection
 
     /* Multiboot2 header: magic, architecture 0 (i386), length, checksum,
-     * then only the end tag (the ELF headers say where to load). */
+     * a framebuffer request, the end tag (the ELF headers say where to
+     * load). The framebuffer tag (5) is optional (flags bit 0): width and
+     * height 0 = the loader's choice (Limine: the display's preferred mode,
+     * QEMU / Proxmox `vga: std` 1280x800), 32 bits per pixel; without
+     * video (the apu4) the loader boots without one. drivers::screen draws
+     * the console there (boot information tag 8). */
     .section .multiboot2, "a"
     .balign 8
 mb2_header:
@@ -39,6 +44,10 @@ mb2_header:
     .long   0
     .long   mb2_header_end - mb2_header
     .long   0x100000000 - (0xe85250d6 + (mb2_header_end - mb2_header))
+    .word   5, 1            /* framebuffer, optional */
+    .long   20
+    .long   0, 0, 32        /* width, height, depth */
+    .long   0               /* pad to 8 */
     .word   0, 0
     .long   8
 mb2_header_end:

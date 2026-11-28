@@ -1,7 +1,7 @@
 //! Multiboot2 (specification 2.0): check that an image carries a header,
 //! and build the boot information a loader passes in `ebx`. The kernel's
 //! parser is `kernel/src/platform/multiboot2.rs`; [`build_info`] emits the
-//! tags it reads (command line, memory map, ACPI RSDP).
+//! tags it reads (command line, memory map, ACPI RSDP, framebuffer).
 
 use alloc::vec::Vec;
 
@@ -35,9 +35,79 @@ fn tag(out: &mut Vec<u8>, kind: u32, payload: &[u8]) {
     }
 }
 
+/// Boot information tag 8: the screen the loader set up (§3.6.12). The
+/// kernel's console screen uses it (`kernel/src/drivers/screen.rs`); a
+/// kernel entered by kexec gets it passed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Framebuffer {
+    pub addr: u64,
+    /// Bytes per line.
+    pub pitch: u32,
+    /// Pixels, or characters in EGA text mode.
+    pub width: u32,
+    pub height: u32,
+    pub bpp: u8,
+    /// 0 = indexed colour, 1 = direct RGB, 2 = EGA text.
+    pub kind: u8,
+    /// Direct RGB: (field position, mask size) of red, green and blue.
+    pub rgb: [(u8, u8); 3],
+}
+
+pub const TAG_FRAMEBUFFER: u32 = 8;
+pub const FB_RGB: u8 = 1;
+pub const FB_EGA_TEXT: u8 = 2;
+
+impl Framebuffer {
+    /// From a whole tag 8 (with its 8-byte type and size header).
+    pub fn parse(tag: &[u8]) -> Option<Self> {
+        let u32_at = |o: usize| Some(u32::from_le_bytes(tag.get(o..o + 4)?.try_into().ok()?));
+        if u32_at(0)? != TAG_FRAMEBUFFER || (u32_at(4)? as usize) > tag.len() {
+            return None;
+        }
+        let kind = *tag.get(29)?;
+        let rgb = if kind == FB_RGB {
+            let c = tag.get(32..38)?;
+            [(c[0], c[1]), (c[2], c[3]), (c[4], c[5])]
+        } else {
+            [(0, 0); 3]
+        };
+        Some(Self {
+            addr: u64::from_le_bytes(tag.get(8..16)?.try_into().ok()?),
+            pitch: u32_at(16)?,
+            width: u32_at(20)?,
+            height: u32_at(24)?,
+            bpp: tag[28],
+            kind,
+            rgb,
+        })
+    }
+
+    /// The tag's payload (after the type and size).
+    fn payload(&self) -> Vec<u8> {
+        let mut p = Vec::with_capacity(32);
+        p.extend_from_slice(&self.addr.to_le_bytes());
+        p.extend_from_slice(&self.pitch.to_le_bytes());
+        p.extend_from_slice(&self.width.to_le_bytes());
+        p.extend_from_slice(&self.height.to_le_bytes());
+        p.extend_from_slice(&[self.bpp, self.kind, 0, 0]);
+        if self.kind == FB_RGB {
+            for (pos, size) in self.rgb {
+                p.extend_from_slice(&[pos, size]);
+            }
+        }
+        p
+    }
+}
+
 /// Boot information: tags 1 (command line), 6 (memory map), 15 or 14
-/// (RSDP copy; v2 when `rsdp` is longer than 20 bytes), then the end tag.
-pub fn build_info(cmdline: &str, mmap: &[MmapEntry], rsdp: &[u8]) -> Vec<u8> {
+/// (RSDP copy; v2 when `rsdp` is longer than 20 bytes), 8 (framebuffer, if
+/// any), then the end tag.
+pub fn build_info(
+    cmdline: &str,
+    mmap: &[MmapEntry],
+    rsdp: &[u8],
+    fb: Option<&Framebuffer>,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + cmdline.len() + mmap.len() * 24 + rsdp.len());
     out.extend_from_slice(&[0; 8]); // total size, reserved
     let mut c = Vec::from(cmdline.as_bytes());
@@ -55,6 +125,9 @@ pub fn build_info(cmdline: &str, mmap: &[MmapEntry], rsdp: &[u8]) -> Vec<u8> {
     tag(&mut out, 6, &m);
     if !rsdp.is_empty() {
         tag(&mut out, if rsdp.len() > 20 { 15 } else { 14 }, rsdp);
+    }
+    if let Some(fb) = fb {
+        tag(&mut out, TAG_FRAMEBUFFER, &fb.payload());
     }
     tag(&mut out, 0, &[]);
     let total = out.len() as u32;
@@ -93,7 +166,21 @@ mod tests {
     #[test]
     fn info_layout() {
         let rsdp = [7u8; 36];
-        let info = build_info("lan=10.0.0.1/24", &[(0, 0x9fc00, 1), (0x100000, 0x7f00000, 1)], &rsdp);
+        let fb = Framebuffer {
+            addr: 0xfd00_0000,
+            pitch: 5120,
+            width: 1280,
+            height: 800,
+            bpp: 32,
+            kind: FB_RGB,
+            rgb: [(16, 8), (8, 8), (0, 8)],
+        };
+        let info = build_info(
+            "lan=10.0.0.1/24",
+            &[(0, 0x9fc00, 1), (0x100000, 0x7f00000, 1)],
+            &rsdp,
+            Some(&fb),
+        );
         let u32_at = |o: usize| u32::from_le_bytes(info[o..o + 4].try_into().unwrap());
         assert_eq!(u32_at(0) as usize, info.len());
         assert_eq!(info.len() % 8, 0);
@@ -115,11 +202,43 @@ mod tests {
             if k == 15 {
                 assert_eq!(&info[off + 8..off + 8 + 36], &rsdp);
             }
+            if k == TAG_FRAMEBUFFER {
+                assert_eq!(size, 38);
+                assert_eq!(Framebuffer::parse(&info[off..off + size]), Some(fb));
+            }
             if k == 0 {
                 break;
             }
             off += size.next_multiple_of(8);
         }
-        assert_eq!(kinds, [1, 6, 15, 0]);
+        assert_eq!(kinds, [1, 6, 15, 8, 0]);
+        let plain = build_info("", &[], &[], None);
+        assert_eq!(plain.len(), 8 + 16 + 16 + 8, "no framebuffer tag without one");
+    }
+
+    #[test]
+    fn framebuffer_tag_parse() {
+        // EGA text, as Limine reports it: no colour fields.
+        let mut t = vec![0u8; 32];
+        t[..4].copy_from_slice(&TAG_FRAMEBUFFER.to_le_bytes());
+        t[4..8].copy_from_slice(&32u32.to_le_bytes());
+        t[8..16].copy_from_slice(&0xb8000u64.to_le_bytes());
+        t[16..20].copy_from_slice(&160u32.to_le_bytes());
+        t[20..24].copy_from_slice(&80u32.to_le_bytes());
+        t[24..28].copy_from_slice(&25u32.to_le_bytes());
+        t[28] = 16;
+        t[29] = FB_EGA_TEXT;
+        let fb = Framebuffer::parse(&t).unwrap();
+        assert_eq!((fb.addr, fb.width, fb.height, fb.kind), (0xb8000, 80, 25, FB_EGA_TEXT));
+        // RGB needs its colour fields; wrong type or a size past the end: none.
+        t[29] = FB_RGB;
+        assert_eq!(Framebuffer::parse(&t), None);
+        t[29] = FB_EGA_TEXT;
+        t[4..8].copy_from_slice(&40u32.to_le_bytes());
+        assert_eq!(Framebuffer::parse(&t), None);
+        t[4..8].copy_from_slice(&32u32.to_le_bytes());
+        t[0] = 7;
+        assert_eq!(Framebuffer::parse(&t), None);
+        assert_eq!(Framebuffer::parse(&t[..20]), None);
     }
 }

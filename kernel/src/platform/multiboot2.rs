@@ -2,8 +2,9 @@
 //! SeaBIOS/coreboot on the apu4, enters `_start32` like PVH does (32-bit
 //! protected mode, paging off) with `eax` = [`MAGIC`] and `ebx` = the
 //! boot information. Used tags: command line (1), the first module (3: the
-//! install image, docs/install.md), memory map (6), and the ACPI RSDP copies
-//! (14 = v1, 15 = v2). See the Multiboot2 specification §3.6.
+//! install image, docs/install.md), memory map (6), framebuffer (8: the
+//! console screen, `drivers::screen`), and the ACPI RSDP copies (14 = v1,
+//! 15 = v2). See the Multiboot2 specification §3.6.
 
 use super::phys::{self, u32_at, u64_at};
 use super::pvh::{StartInfo, collect_mmap, copy_cmdline, module_range};
@@ -27,6 +28,7 @@ pub fn parse(info: usize, kernel_start: usize, kernel_end: usize) -> Result<Star
     let mb = phys::bytes(info as u64, total)?;
     let (mut cmdline, mut rsdp_v1, mut rsdp_v2, mut mmap) = ("", 0u64, 0u64, None);
     let mut module = None;
+    let mut framebuffer = None;
     let mut off = 8;
     while off + 8 <= total {
         let (Some(kind), Some(size)) = (u32_at(mb, off), u32_at(mb, off + 4)) else {
@@ -40,6 +42,9 @@ pub fn parse(info: usize, kernel_start: usize, kernel_end: usize) -> Result<Star
         match kind {
             TAG_CMDLINE => cmdline = copy_cmdline(&tag[8..]),
             TAG_MMAP => mmap = Some(tag),
+            boot_image::multiboot2::TAG_FRAMEBUFFER => {
+                framebuffer = boot_image::multiboot2::Framebuffer::parse(tag)
+            }
             // mod_start, mod_end (exclusive), then the module's string.
             TAG_MODULE if module.is_none() && size >= 16 => {
                 let (s, e) = (u32_at(tag, 8).unwrap_or(0), u32_at(tag, 12).unwrap_or(0));
@@ -94,5 +99,6 @@ pub fn parse(info: usize, kernel_start: usize, kernel_end: usize) -> Result<Star
         mmap,
         mmap_len,
         module,
+        framebuffer,
     })
 }

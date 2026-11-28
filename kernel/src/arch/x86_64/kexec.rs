@@ -3,8 +3,8 @@
 //! image into the staging area; [`exec`] then
 //!
 //! 1. builds Multiboot2 boot information from what this kernel was booted
-//!    with (memory map and RSDP, saved by [`save`] during discovery; the
-//!    current command line unless the upload gives a new one),
+//!    with (memory map, RSDP and framebuffer, saved by [`save`] during
+//!    discovery; the current command line unless the upload gives a new one),
 //! 2. builds an identity map of 0..4 GiB without NX (2 MiB pages) and copies
 //!    the trampoline (`kexec.S`) into the staging area's scratch page,
 //! 3. switches to that map and jumps to the trampoline, which copies the
@@ -24,6 +24,8 @@ struct BootFacts {
     mmap_len: usize,
     rsdp: [u8; 36],
     rsdp_len: usize,
+    /// The loader's screen: the next kernel draws its console there too.
+    framebuffer: Option<multiboot2::Framebuffer>,
 }
 
 static FACTS: Once<BootFacts> = Once::new();
@@ -44,13 +46,14 @@ unsafe extern "C" {
 
 /// During discovery: keep the memory map and a copy of the RSDP (firmware
 /// memory is unmapped later).
-pub(super) fn save(mmap: &[MmapEntry], rsdp: &[u8]) {
+pub(super) fn save(mmap: &[MmapEntry], rsdp: &[u8], framebuffer: Option<multiboot2::Framebuffer>) {
     FACTS.call_once(|| {
         let mut f = BootFacts {
             mmap: [(0, 0, 0); crate::platform::pvh::MAX_MMAP],
             mmap_len: mmap.len().min(crate::platform::pvh::MAX_MMAP),
             rsdp: [0; 36],
             rsdp_len: rsdp.len().min(36),
+            framebuffer,
         };
         f.mmap[..f.mmap_len].copy_from_slice(&mmap[..f.mmap_len]);
         f.rsdp[..f.rsdp_len].copy_from_slice(&rsdp[..f.rsdp_len]);
@@ -81,6 +84,7 @@ pub fn exec(flat: &[u8], dst: u64, entry: u64, cmdline: &str, scratch: &mut [u8]
         cmdline,
         &facts.mmap[..facts.mmap_len],
         &facts.rsdp[..facts.rsdp_len],
+        facts.framebuffer.as_ref(),
     );
     assert!(
         info.len() <= SCRATCH_SIZE - SCRATCH_INFO,

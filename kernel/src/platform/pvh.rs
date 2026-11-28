@@ -24,6 +24,8 @@ pub struct StartInfo {
     /// The first boot module (start, length): the install image
     /// (docs/install.md §3.2).
     pub module: Option<(usize, usize)>,
+    /// The screen the loader set up (Multiboot2 tag 8; PVH: none).
+    pub framebuffer: Option<boot_image::multiboot2::Framebuffer>,
 }
 
 /// Copy (base, length, type) entries into a fixed array (no heap yet).
@@ -90,6 +92,7 @@ pub fn parse(start_info: usize, kernel_start: usize) -> Result<StartInfo, &'stat
         mmap,
         mmap_len,
         module,
+        framebuffer: None,
     })
 }
 

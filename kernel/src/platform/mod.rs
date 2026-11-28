@@ -147,6 +147,10 @@ pub struct BootInfo {
     /// QEMU `-initrd` loaded (docs/install.md §3.2). Kept out of the heap
     /// (`mm::heap::region`), mapped read-only, read via `mm::heap::module`.
     pub module: Option<(usize, usize)>,
+    /// The screen the boot loader set up (x86_64 Multiboot2 tag 8: a
+    /// linear framebuffer, or EGA text): `drivers::screen` draws the
+    /// console there.
+    pub framebuffer: Option<boot_image::multiboot2::Framebuffer>,
 }
 
 impl BootInfo {
@@ -175,6 +179,12 @@ impl BootInfo {
         );
         if let Some((s, l)) = self.module {
             println!("  boot module     : {s:#x}..{:#x} ({} KiB)", s + l, l >> 10);
+        }
+        if let Some(fb) = self.framebuffer {
+            println!(
+                "  framebuffer     : {:#x} {}x{} {} bpp, type {}",
+                fb.addr, fb.width, fb.height, fb.bpp, fb.kind
+            );
         }
         if !self.bootargs.is_empty() {
             println!("  bootargs        : {}", crate::config::Redacted(self.bootargs));

@@ -34,7 +34,7 @@ reveals a bug gets a host regression test in its crate before the fix.
 | `mdns` | `crates/proto-mdns` wire + reflector | LAN multicast | rebuild = parse; reflects only along rules, never back |
 | `qdisc` | `crates/qdisc` CAKE / FQ-CoDel / CoDel + shaper, ACK filter on and off | every forwarded packet | backlog limits; packet conservation; no duplicates; drains |
 | `ack_filter` | `crates/qdisc` ACK filter decision on arbitrary bytes | pure TCP ACKs from the LAN | no panic; never supersedes itself; never mutual |
-| `boot_image` | `crates/boot-image` ELF / Multiboot2 | uploaded kernels (authenticated) | plan inside the allowed range; flatten fits |
+| `boot_image` | `crates/boot-image` ELF / Multiboot2, the framebuffer tag | uploaded kernels (authenticated) | plan inside the allowed range; flatten fits; a parsed framebuffer tag rebuilt by `build_info` parses back the same |
 | `install_image` | `crates/install-image` header, extents, write plan | the installer's boot module (hash-checked) | plan ascending, covers the image once + the GPT tail; `build` round-trips |
 | `cli` | `crates/cli` line editor + command parser | the serial console | lines ≤ `MAX_LINE`; whole and split feeds give the same lines |
 | `config` | `crates/config` TOML / JSON parse, validation, `with_assignment`, `without`, diffs, secrets | the store at boot, `POST /api/config`, CLI `config set` | a config that parses re-parses from its own TOML and JSON to itself |

@@ -48,7 +48,7 @@ pub fn discover(start_info: usize) -> Result<BootInfo, &'static str> {
     let rsdp = crate::platform::phys::bytes(a.rsdp_pa, 36)
         .map(|b| if b[15] >= 2 { b } else { &b[..20] })
         .unwrap_or(&[]);
-    kexec::save(&si.mmap[..si.mmap_len], rsdp);
+    kexec::save(&si.mmap[..si.mmap_len], rsdp, si.framebuffer);
     let (pm1a_cnt, slp) = match a.s5 {
         Some(s5) => (a.pm1a_cnt, s5),
         None => (0, (0, 0)), // power::off reports the failure
@@ -99,5 +99,6 @@ pub fn discover(start_info: usize) -> Result<BootInfo, &'static str> {
         virtual_machine: cpu::hypervisor(),
         bootargs: si.cmdline,
         module: si.module,
+        framebuffer: si.framebuffer,
     })
 }

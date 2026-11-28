@@ -135,7 +135,8 @@ and sparse senders. How the kernel uses it: kernel/src/net/CLAUDE.md.
 
 - `auth`: PBKDF2-SHA256 password hashes (stored ones ≤ `MAX_ITERATIONS` = 100000), SHA-256 entropy
   `Pool`, login `Sessions`, verify `Cache`, login `Throttle` per source + PBKDF2 budget.
-- `boot-image`: ELF64 validation/flattening, Multiboot2 header check + boot-info builder, CRC-32.
+- `boot-image`: ELF64 validation/flattening, Multiboot2 header check + boot-info builder
+  (framebuffer tag 8: `Framebuffer::parse`, passed on by kexec), CRC-32.
 - `install-image`: the installer's image (docs/install.md §3.3): `build` (non-zero sector runs,
   merged across short gaps) / `parse` (header, ascending disjoint extents, SHA-256 over all but
   the hash field) / `Image::plan` (every sector of the image once, gaps as zeros, then the

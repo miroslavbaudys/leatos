@@ -12,6 +12,12 @@ const MAX: u64 = 0x1000_0000;
 
 fuzz_target!(|data: &[u8]| {
     let _ = multiboot2::find_header(data);
+    // A framebuffer tag parsed and passed on by kexec reads back the same.
+    if let Some(fb) = multiboot2::Framebuffer::parse(data) {
+        let info = multiboot2::build_info("", &[], &[], Some(&fb));
+        let tag = &info[8 + 16 + 16..];
+        assert_eq!(multiboot2::Framebuffer::parse(tag), Some(fb));
+    }
     let _ = boot_image::crc32(0, data);
     for machine in [62u16, 183] {
         if let Ok(plan) = parse(data, machine, MIN, MAX) {
