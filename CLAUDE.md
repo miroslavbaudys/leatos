@@ -37,7 +37,8 @@ Keep them current when you change what they describe; keep this file to the map 
   `dhcp6`, `sntp`, `http`, `dhcp`, `dhcp_client`, `mdns`, `qdisc`, `ack_filter`, `boot_image`,
   `install_image`, `cli`, `config` (seeds in `fuzz/seeds/config`), `store`, `dns_tcp`, `auth`,
   `dot`, `tcp`; shared builders in `fuzz/src/lib.rs`.
-- `tools/leatstore`: host tool for store images: `create`, `format`, `show`, `put` (refuses a clear
+- `tools/leatstore`: host tool for store images: `create`, `format` (random store ID), `show`, `id`,
+  `put` (refuses a clear
   `mgmt.password`), `get`, `corrupt`, `hash <password>`, `install-image <raw> <out>`.
 - `lab/client/`, `lab/isp/`: overlays for the Alpine lab VMs (`/init`, configs, web/CGI);
   `lab/cache/` (gitignored) holds downloads and results.

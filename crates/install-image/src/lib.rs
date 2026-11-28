@@ -205,6 +205,23 @@ impl<'a> Image<'a> {
         })
     }
 
+    /// Sector `lba` of the disk image: its bytes if an extent holds it,
+    /// `None` if it lies in a gap (zeros) or past the image.
+    pub fn sector(&self, lba: u64) -> Option<&'a [u8]> {
+        let mut off = 0usize;
+        for e in self.extents() {
+            if lba < e.lba {
+                return None;
+            }
+            if lba < e.lba + e.sectors {
+                let at = off + (lba - e.lba) as usize * SECTOR;
+                return self.data.get(at..at + SECTOR);
+            }
+            off += e.sectors as usize * SECTOR;
+        }
+        None
+    }
+
     /// Bytes of data the extents hold (what is not zeros).
     pub fn data_len(&self) -> usize {
         self.data.len()
@@ -402,6 +419,14 @@ mod tests {
             assert!(disk[raw.len()..].iter().all(|&b| b == 0));
         }
         assert!(img.plan(999, 8).is_none(), "target smaller than the image");
+        for lba in 0..1000u64 {
+            let want = &raw[lba as usize * SECTOR..(lba as usize + 1) * SECTOR];
+            match img.sector(lba) {
+                Some(s) => assert_eq!(s, want, "sector {lba}"),
+                None => assert!(want.iter().all(|&b| b == 0), "sector {lba} in a gap but not zero"),
+            }
+        }
+        assert!(img.sector(1000).is_none());
         assert!(img.plan(1000, 0).is_none());
     }
 

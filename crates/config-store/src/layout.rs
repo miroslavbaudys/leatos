@@ -1,5 +1,13 @@
 //! The store header (sector 0 of the store partition): which areas exist
-//! and where their slots are.
+//! and where their slots are, and the store's ID.
+//!
+//! The **store ID** (bytes 280..288, u64, 0 = none) tells stores apart
+//! when one machine has several (an SD card and an mSATA, both with
+//! leatos): the boot partition passes `store_id=` and the kernel uses
+//! only that store (docs/install.md §3.5). It lives in bytes every earlier
+//! header has zero, under the same CRC, so the layout version stays 1: a
+//! kernel from before the ID (a rollback, the boot partition's) still
+//! reads the store.
 
 use crate::{Error, SECTOR, le16, le32, le64, seal_sector, sector_crc_ok};
 use alloc::vec::Vec;
@@ -9,6 +17,7 @@ pub const LAYOUT_VERSION: u16 = 1;
 pub const MAX_AREAS: usize = 16;
 const AREAS_AT: usize = 24;
 const AREA_LEN: usize = 16;
+const ID_AT: usize = AREAS_AT + AREA_LEN * MAX_AREAS; // 280
 
 /// Smallest partition [`Layout::standard`] accepts: 16 MiB.
 pub const STANDARD_MIN_SECTORS: u64 = 16 << 11;
@@ -81,6 +90,8 @@ pub struct Layout {
     /// Partition size in sectors when the store was formatted.
     pub sectors: u64,
     areas: Vec<Area>,
+    /// The store ID; 0 = none (a store formatted before IDs existed).
+    id: u64,
 }
 
 impl Layout {
@@ -109,7 +120,19 @@ impl Layout {
         Ok(Layout {
             sectors,
             areas: areas.to_vec(),
+            id: 0,
         })
+    }
+
+    /// The same layout with store ID `id` (0 = none).
+    pub fn with_id(mut self, id: u64) -> Self {
+        self.id = id;
+        self
+    }
+
+    /// The store ID; 0 = none.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// The layout `scripts/apu-image.sh` formats (partition ≥ 16 MiB):
@@ -184,7 +207,7 @@ impl Layout {
             name.copy_from_slice(&e[..8]);
             areas.push(Area::from_raw(name, le32(e, 8), le32(e, 12))?);
         }
-        Layout::new(sectors, &areas)
+        Ok(Layout::new(sectors, &areas)?.with_id(le64(s, ID_AT)))
     }
 
     /// Sector 0 of the store partition.
@@ -201,6 +224,7 @@ impl Layout {
             e[8..12].copy_from_slice(&a.first.to_le_bytes());
             e[12..16].copy_from_slice(&a.slot_sectors.to_le_bytes());
         }
+        s[ID_AT..ID_AT + 8].copy_from_slice(&self.id.to_le_bytes());
         seal_sector(&mut s);
         s
     }

@@ -75,30 +75,32 @@ pub fn probes() -> Vec<String> {
     PROBES.lock().clone()
 }
 
-/// Find the store: the first block device (virtio-blk or SD card) with a
-/// store partition and a valid store header. Logs what it finds on every
-/// block device.
+/// Find the store: a block device (virtio-blk, SD card, SATA disk) with
+/// a store partition and a valid store header. With `store_id=` (the boot
+/// partition passes it, docs/install.md §3.5) only the store with that ID,
+/// none if no disk has it; without, the first found, with a warning when
+/// there are several. Logs what it finds on every block device.
 pub fn open(pci: &mut Pci) -> Option<Store> {
     let devs: Vec<_> = pci.devices.clone();
-    let mut found = None;
+    let mut found: Vec<(String, Store)> = Vec::new();
     for dev in devs {
         // Not a block device: no disks. AHCI: one per port with a device.
         for (name, disk) in block_on(Disk::open(pci, &dev)) {
             let line = match disk {
                 Err(e) => format!("{name}: {e}"),
-                Ok(_) if found.is_some() => format!("{name}: not probed (store already found)"),
                 Ok(disk) => {
                     let what = disk.describe();
                     match probe(disk) {
                         Ok((s, parts)) => {
                             let names: Vec<_> = s.layout.areas().iter().map(|a| a.name()).collect();
                             let l = format!(
-                                "{name} {what}, {parts}: store at LBA {}, {} MiB, areas {}",
+                                "{name} {what}, {parts}: store at LBA {}, {} MiB, areas {}, id {}",
                                 s.base,
                                 s.sectors >> 11,
-                                names.join(", ")
+                                names.join(", "),
+                                id_text(s.id())
                             );
-                            found = Some(s);
+                            found.push((name, s));
                             l
                         }
                         Err((why, _)) => format!("{name} {what}: {why}, not used"),
@@ -112,7 +114,43 @@ pub fn open(pci: &mut Pci) -> Option<Store> {
     if PROBES.lock().is_empty() {
         println!("  store           : none (no block device)");
     }
-    found
+    let note = |line: String| {
+        println!("  store           : {line}");
+        PROBES.lock().push(line);
+    };
+    match crate::config::arg_of("store_id") {
+        Some(want) => {
+            let Some(id) = u64::from_str_radix(want, 16).ok().filter(|&i| i != 0) else {
+                note(format!("store_id={want} is not a store ID (hex, not 0): no store used"));
+                return None;
+            };
+            let n = found.iter().filter(|(_, s)| s.id() == id).count();
+            let Some(i) = found.iter().position(|(_, s)| s.id() == id) else {
+                note(format!("store_id={want} matches no disk's store: no store used"));
+                return None;
+            };
+            let (name, s) = found.swap_remove(i);
+            let also = if n > 1 { format!(" (WARNING: {} disks have this ID)", n) } else { String::new() };
+            note(format!("using {name} (store_id={want}){also}"));
+            Some(s)
+        }
+        None => {
+            if found.len() > 1 {
+                note(format!(
+                    "WARNING: {} stores found, using the first ({}); the boot partition should \
+                     pass store_id= (docs/install.md §3.5)",
+                    found.len(),
+                    found[0].0
+                ));
+            }
+            (!found.is_empty()).then(|| found.swap_remove(0).1)
+        }
+    }
+}
+
+/// A store ID for the log: 16 hex digits, or "none" (formatted before IDs).
+pub fn id_text(id: u64) -> String {
+    if id == 0 { String::from("none") } else { format!("{id:016x}") }
 }
 
 /// The MBR's partitions for the log: `p1 0x0c 64 MiB, p2 0xda 16 MiB`.
@@ -176,6 +214,11 @@ pub fn probe(mut disk: Disk) -> Result<(Store, String), (String, Disk)> {
 }
 
 impl Store {
+    /// The store ID from the header (0 = none; docs/install.md §3.5).
+    pub fn id(&self) -> u64 {
+        self.layout.id()
+    }
+
     /// The disk back (the installer writes the disk after reading its store).
     pub fn into_disk(self) -> Disk {
         self.disk

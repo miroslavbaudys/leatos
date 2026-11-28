@@ -28,6 +28,10 @@
 #   during the trial -> the next boot reverts it.
 # Negative controls for the store: corrupt the newest record -> the router
 #   falls back to the previous one; corrupt both -> defaults.
+# Two stores (a second virtio-blk disk, later in PCI order; docs/install.md
+#   §3.5): without store_id= the first, with a warning; store_id= of the
+#   second -> the second (the control: order alone would pick the first);
+#   an ID no disk has, or no ID at all -> no store.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -109,6 +113,39 @@ printf 'version = 1\n\n[lan]\nipv4 = "10.20.0.1/24"\n' >"$WORK/v1.toml"
 "$LEATSTORE" put "$IMG" config "$WORK/v1.toml" --raw --version 1 >/dev/null
 r="$(boot_config v1 "")"
 check "stored version 1 config -> defaults" "defaults (stored config slot A rejected" "${r%%:*}"
+
+echo "== two stores (store_id=)"
+"$LEATSTORE" create "$IMG" --mib "$STORE_MIB" >/dev/null
+"$LEATSTORE" put "$IMG" config "$WORK/a.toml" >/dev/null
+IMG2="$WORK/second.img"
+"$LEATSTORE" create "$IMG2" --mib 32 >/dev/null
+printf 'version = 2\n\n[[network]]\nname = "lan"\nipv4 = "10.21.0.1/24"\n' >"$WORK/b.toml"
+"$LEATSTORE" put "$IMG2" config "$WORK/b.toml" >/dev/null
+ID1="$("$LEATSTORE" id "$IMG")"
+ID2="$("$LEATSTORE" id "$IMG2")"
+SECOND="-drive file=$IMG2,format=raw,if=none,id=second -device virtio-blk-pci,drive=second"
+two() { # name append: boot with both disks, return the config line
+  boot "$1" "$2" QEMU_EXTRA="$SECOND"
+  wait_for 1 "$CFG_LINE" 90 || true
+  config_line 1
+  stop
+}
+r="$(two two-first "")"
+check "no store_id: the first store" "stored (slot A, seq 1), lan 10.20.0.1/24" "${r%%, dhcp*}"
+LOG="$WORK/two-first.log" # set in the $(...) subshell only
+check "  ... with a warning" 1 "$(count "WARNING: 2 stores found")"
+r="$(two two-second "store_id=$ID2")"
+check "store_id= of the second disk: its store" "stored (slot A, seq 1), lan 10.21.0.1/24" "${r%%, dhcp*}"
+LOG="$WORK/two-second.log"
+check "  ... named in the log" 1 "$(count "(store_id=$ID2)")"
+r="$(two two-own "store_id=$ID1")"
+check "store_id= of the first disk: its store" "stored (slot A, seq 1), lan 10.20.0.1/24" "${r%%, dhcp*}"
+r="$(two two-none "store_id=0123456789abcdef")"
+check "store_id= no disk has: no store" "defaults (no store)" "${r%%,*}"
+LOG="$WORK/two-none.log"
+check "  ... said so" 1 "$(count "matches no disk's store: no store used")"
+r="$(two two-bad "store_id=xyz")"
+check "store_id= not an ID: no store" "defaults (no store)" "${r%%,*}"
 
 echo "== save through the management interface"
 "$LEATSTORE" create "$IMG" --mib "$STORE_MIB" >/dev/null

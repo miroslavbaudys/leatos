@@ -48,6 +48,7 @@ layout without reformatting the logic. Sector size is 512 bytes.
 | 12..14 | number of areas (≤ 16) |
 | 16..24 | partition size in sectors when formatted |
 | 24..280 | areas, 16 bytes each: name (8, NUL-padded), first sector (u32), slot size in sectors (u32) |
+| 280..288 | store ID (u64, random, from `leatstore format`; 0 = none): `store_id=` picks the store by it (docs/install.md §3.5). Zero in every header from before it, so the layout version stayed 1 |
 | 508..512 | CRC-32 of bytes 0..508 |
 
 All integers little endian. Areas must lie inside the partition, after

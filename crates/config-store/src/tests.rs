@@ -115,6 +115,26 @@ fn standard_layout_round_trips() {
 }
 
 #[test]
+fn store_id_round_trips_without_a_version_bump() {
+    let l = Layout::standard(STANDARD_MIN_SECTORS).unwrap();
+    assert_eq!(l.id(), 0, "a new layout has no ID");
+    let with = l.clone().with_id(0x0123_4567_89ab_cdef);
+    let s = with.encode();
+    let back = Layout::parse(&s, STANDARD_MIN_SECTORS).unwrap();
+    assert_eq!(back.id(), 0x0123_4567_89ab_cdef);
+    assert_eq!(back, with);
+    // Layout version 1 still: kernels from before the ID read the store.
+    assert_eq!(u16::from_le_bytes([s[8], s[9]]), 1);
+    assert_eq!(&s[280..288], &0x0123_4567_89ab_cdef_u64.to_le_bytes());
+    // A header without an ID (zero there, as every earlier one) has ID 0.
+    assert_eq!(Layout::parse(&l.encode(), STANDARD_MIN_SECTORS).unwrap().id(), 0);
+    // The ID is under the CRC.
+    let mut bad = s;
+    bad[283] ^= 1;
+    assert_eq!(Layout::parse(&bad, STANDARD_MIN_SECTORS), Err(Error::BadChecksum));
+}
+
+#[test]
 fn layout_rejects_bad_headers() {
     let l = small_layout();
     let good = l.encode();

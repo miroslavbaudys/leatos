@@ -134,6 +134,23 @@ fn install(pci: Option<&mut Pci>) -> Result<(), Stop> {
         return Err(abort(format!("'{}' is not one of the disks listed", choice.trim())));
     };
     let (df, mut disk) = disks.swap_remove(i);
+    // The image's store ID must not be on another disk here already: two
+    // disks with the same ID in one machine cannot be told apart
+    // (docs/install.md §3.5). Installing the same ISO twice does that.
+    if let Some(id) = image_store_id(&img) {
+        for (name, other) in disks.drain(..) {
+            if let Ok((st, _)) = store::probe(other)
+                && st.id() == id
+            {
+                return Err(abort(format!(
+                    "{name} already holds a store with this image's ID {}: a machine with two \
+                     such disks cannot tell them apart; build a new ISO \
+                     (scripts/apu-image.sh --iso) for {df}",
+                    store::id_text(id)
+                )));
+            }
+        }
+    }
     drop(disks);
     if disk.readonly() {
         return Err(abort(format!("{df} is read-only")));
@@ -254,6 +271,15 @@ fn keep_config(st: &mut store::Store) -> Result<Option<(u32, Vec<u8>)>, Stop> {
         rec.payload.len()
     );
     Ok(Some((rec.header.version, rec.payload)))
+}
+
+/// The store ID the image's store header carries (`None`: no store in
+/// the image, or one without an ID).
+fn image_store_id(img: &Image) -> Option<u64> {
+    let part = config_store::mbr::find_store(img.sector(0)?)?;
+    let header = img.sector(part.first_lba as u64)?;
+    let layout = config_store::Layout::parse(header, part.sectors as u64).ok()?;
+    Some(layout.id()).filter(|&id| id != 0)
 }
 
 /// Does `disk` hold the installer ISO itself (`apu-image.sh --iso`: an

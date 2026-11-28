@@ -104,7 +104,9 @@ live with the VID; networks on a port the machine lacks are left out (`config::m
     added.
 - `src/store.rs`: the store partition (MBR type 0xda + valid store header, never formatted by the
   kernel) on a block device: async record read/write via `crates/config-store`; boot reads go
-  through `executor::block_on`; saves run in `svc`.
+  through `executor::block_on`; saves run in `svc`. `open` probes every disk; `store_id=` (from
+  the boot partition's `limine.conf`) picks the store with that ID, none if no disk has it;
+  without it the first, with a warning when there are several.
   - DHCP leases live in the `leases` area (`net/svc.rs` `LeaseStore`): restored at boot, written
     when the bound set changes (checked every 60 s) and before reboot/upgrade; format
     `proto_dhcp::v4::persist`.

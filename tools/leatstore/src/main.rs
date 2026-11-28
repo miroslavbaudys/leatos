@@ -5,7 +5,8 @@
 //! ```text
 //! leatstore create <img> [--mib N]        new disk image: MBR + one store partition, formatted
 //! leatstore format <img> [--force]        format the image's 0xda partition (standard layout)
-//! leatstore show <img>                    layout and slot states
+//! leatstore show <img>                    layout, store ID and slot states
+//! leatstore id <img>                      the store ID (16 hex digits) for `store_id=`
 //! leatstore put <img> <area> <file> [--raw] [--version N] [--trial]
 //!                                       write a record (config: validated unless --raw;
 //!                                       --trial: as an unconfirmed trial)
@@ -152,7 +153,19 @@ fn format(path: &str, force: bool) -> Result<()> {
             "{path}: already formatted (use --force to erase it)"
         ));
     }
-    let layout = Layout::standard(img.sectors).map_err(|e| format!("{e:?}"))?;
+    // A random, non-zero store ID (docs/install.md §3.5): the boot
+    // partition names it in `store_id=`.
+    let id = loop {
+        let mut b = [0u8; 8];
+        File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut b))
+            .map_err(|e| format!("/dev/urandom: {e}"))?;
+        let id = u64::from_le_bytes(b);
+        if id != 0 {
+            break id;
+        }
+    };
+    let layout = Layout::standard(img.sectors).map_err(|e| format!("{e:?}"))?.with_id(id);
     for a in layout.areas() {
         for s in [Slot::A, Slot::B] {
             img.write(a.slot_lba(s), &[0; SECTOR])?;
@@ -160,10 +173,17 @@ fn format(path: &str, force: bool) -> Result<()> {
     }
     img.write(0, &layout.encode())?;
     println!(
-        "{path}: store formatted, {} MiB at LBA {}",
+        "{path}: store formatted, {} MiB at LBA {}, id {id:016x}",
         img.sectors >> 11,
         img.base
     );
+    Ok(())
+}
+
+/// The store ID as `store_id=` takes it (16 hex digits; 0 = none).
+fn id(path: &str) -> Result<()> {
+    let mut img = Img::open(path)?;
+    println!("{:016x}", img.layout()?.id());
     Ok(())
 }
 
@@ -193,7 +213,11 @@ fn describe(s: &SlotState) -> String {
 fn show(path: &str) -> Result<()> {
     let mut img = Img::open(path)?;
     let layout = img.layout()?;
-    println!("store: LBA {}, {} sectors", img.base, img.sectors);
+    let id = match layout.id() {
+        0 => String::from("none"),
+        id => format!("{id:016x}"),
+    };
+    println!("store: LBA {}, {} sectors, id {id}", img.base, img.sectors);
     for a in layout.areas() {
         let [sa, sb] = img.slots(a)?;
         let st = AreaState::from_slots(a, &sa, &sb);
@@ -354,7 +378,7 @@ fn install_image(raw: &str, out: &str) -> Result<()> {
 }
 
 fn usage() -> String {
-    "usage: leatstore create <img> [--mib N] | format <img> [--force] | show <img> | \
+    "usage: leatstore create <img> [--mib N] | format <img> [--force] | show <img> | id <img> | \
      put <img> <area> <file> [--raw] [--version N] [--trial] | get <img> <area> | \
      corrupt <img> <area> [--slot A|B] | hash <password> | install-image <raw img> <out>"
         .into()
@@ -392,6 +416,7 @@ fn run(args: &[String]) -> Result<()> {
         ["create", img] => create(img, num("--mib")?.unwrap_or(17)),
         ["format", img] => format(img, flag("--force")),
         ["show", img] => show(img),
+        ["id", img] => id(img),
         ["put", img, area, file] => put(
             img,
             area,

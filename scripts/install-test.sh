@@ -15,6 +15,8 @@
 #               config stored, the image's gaps zero, sectors past it
 #               untouched, the last 33 (backup GPT) zero; it boots
 #   wrong       a disk that was not listed is typed: nothing written
+#   twice       the same ISO onto a second disk of the same machine: refused
+#               (both would carry one store ID, docs/install.md §3.5)
 #   keep        target with another config and a stale leases record:
 #               that config carried over, the stale record gone
 #   trial       the target's config is an unconfirmed trial: nothing written
@@ -123,6 +125,7 @@ if [[ "${QEMU_STORE_BUS:-virtio}" != sd ]]; then
   if wait_for "store config" "$T"; then pass "installed disk boots"; else fail "installed disk boots"; fi
   sleep 2
   if has "10.31.0.1"; then pass "installed disk uses the image's config"; else fail "installed disk uses the image's config"; fi
+  if has "(store_id=$("$LEATSTORE" id "$TGT"))"; then pass "  ... chosen by its store_id="; else fail "  ... chosen by its store_id="; fi
   stop_qemu
   rm -f "$WORK/boot.img"
 fi
@@ -132,6 +135,26 @@ before="$(sum "$TGT")"
 run "$WORK/install.iso" "99:99.9"
 if has "'99:99.9' is not one of the disks listed: nothing written"; then pass "refused"; else fail "refused"; fi
 check "target unchanged" "$before" "$(sum "$TGT")"
+
+echo "== twice (negative control)"
+# A blank second disk (64 MiB, virtio) next to the installed one.
+SECOND="$WORK/second.img"
+dd if=/dev/zero of="$SECOND" bs=1048576 count=64 2>/dev/null
+before="$(sum "$TGT") $(sum "$SECOND")"
+rm -f "$LOG" "$FIFO"; mkfifo "$FIFO"
+QEMU_CDROM="$WORK/install.iso" QEMU_STORE="$TGT" QEMU_ACCEL=tcg \
+  QEMU_EXTRA="-drive file=$SECOND,format=raw,if=none,id=second -device virtio-blk-pci,drive=second" \
+  scripts/qemu-run.sh <"$FIFO" >"$LOG" 2>&1 &
+QPID=$!
+exec 3>"$FIFO"
+wait_for "type the PCI address" "$T" || fail "installer prompt"
+DF2="$(tr -d '\r' <"$LOG" | grep -a 'virtio-blk 64 MiB' | sed -n 's/^  \([0-9a-f:.]*\)  .*/\1/p' | head -1)"
+[[ -n "$DF2" ]] && pass "second disk listed ($DF2)" || fail "second disk listed"
+printf '%s\r' "$DF2" >&3
+wait_for 'install: done\|nothing written\|install: FAILED' "$T" || true
+stop_qemu
+if has "already holds a store with this image's ID.*nothing written"; then pass "refused"; else fail "refused"; fi
+check "both disks unchanged" "$before" "$(sum "$TGT") $(sum "$SECOND")"
 
 echo "== keep"
 "$LEATSTORE" put "$TGT" config "$WORK/b.toml" >/dev/null

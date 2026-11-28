@@ -1,8 +1,8 @@
 # Installer: leatos installs itself from a USB stick or ISO (plan)
 
-Status (2026-11-28): steps 1–3 done in QEMU (module, heap carve-out, image format; install mode,
-the installer ISO, `scripts/install-test.sh`; the AHCI driver); the store ID and the hardware
-checks are plan. Roadmap M16.
+Status (2026-11-28): steps 1–4 done in QEMU (module, heap carve-out, image format; install mode,
+the installer ISO, `scripts/install-test.sh`; the AHCI driver; the store ID); the hardware checks
+(step 5) are left. Roadmap M16.
 
 Today leatos is installed by flashing `target/apu4/leatos-apu4.img` (`scripts/apu-image.sh`) to
 an SD card on the Mac; a Proxmox VM gets the same image with `qm importdisk`
@@ -159,6 +159,26 @@ has no identity to tell them apart.
   `store_id=` the old behaviour stays, with a warning when more than one store is found.
 - Do this together with the AHCI driver, before any apu4 has leatos on two disks.
 
+Done in QEMU (2026-11-28), with two changes to the plan:
+- **No layout version bump:** the ID is a u64 in header bytes 280..288, which every earlier
+  header has zero (0 = no ID), under the same CRC. A bump would make every kernel from before
+  it (a rollback target, the golden kernel of an older boot partition) refuse the store.
+- **The installer keeps the image's ID** instead of writing a new one: the ID is also in the
+  image's `limine.conf` on the FAT partition, which the installer would have to rewrite. Two
+  disks from one ISO in one machine would then share an ID, so the installer **refuses** a
+  target when another disk there already holds a store with the image's ID ("build a new ISO").
+  Every `apu-image.sh` run formats a new store, so a new ID.
+- `apu-image.sh` formats the store before writing `limine.conf`; both entries get
+  `store_id=`. `leatstore id <img>` prints it, `show` and the boot log name it.
+- `store::open` probes every disk now (it stopped at the first store). `store_id=` that no disk
+  has, or that is not an ID: no store (defaults), said in the log: a foreign disk's store is
+  never used in its place. Without `store_id=` (the apu4's current SD card, QEMU `-kernel`
+  boots): the first store, `WARNING: N stores found` when there are several.
+- Tests: `store-test.sh` "two stores" (a second virtio-blk later in PCI order: without the ID
+  the first + warning, the second's ID → the second, an unknown or bad ID → no store);
+  `install-test.sh` "twice" (refused, both disks unchanged) and the installed disk boots
+  choosing its store by `store_id=`.
+
 ## 4. Tests (`scripts/install-test.sh`)
 
 QEMU q35 under TCG, SeaBIOS, the ISO as a CD (`QEMU_CDROM`, as Proxmox attaches it) and as a
@@ -180,7 +200,8 @@ Not in the script: module vs heap (§3.2; `module_carve=0` control, by hand); a 
 (`qemu-xhci` + `usb-storage`, booted by hand 2026-11-28: SeaBIOS boots it, same result as
 `stick`). AHCI targets (`QEMU_STORE_BUS=ahci`, ~2.5 min) pass since step 3; on q35 the `stick`
 case's disk sits on the built-in AHCI controller and is skipped as the install medium. To come
-with step 4: two stores with and without `store_id=`.
+with step 4 (done): two stores with and without `store_id=` (store-test), the same ISO twice
+into one machine (install-test `twice`).
 
 On the hardware: apu4 boots the stick, installs to the mSATA, boots from it without the stick;
 SeaBIOS boot order (USB before mSATA?) noted here. Proxmox: VM from the GUI with the ISO as CD
@@ -193,7 +214,7 @@ and `virtio0`, installed, ISO ejected, boots.
 | 1. Module tag + heap carve-out, extent format crate ✅ (QEMU, 2026-11-28) | 2–3 days | image in RAM, checked |
 | 2. Install mode on virtio-blk / SD, `--iso`, `install-test.sh` ✅ (QEMU, 2026-11-28) | ~1 wk | **Proxmox install from ISO** |
 | 3. AHCI driver + `QEMU_STORE_BUS=ahci` tests ✅ (QEMU, 2026-11-28) | 1–1.5 wk | mSATA / `sata0` as boot + store |
-| 4. Store ID + `store_id=` | 2–3 days | safe with two leatos disks |
+| 4. Store ID + `store_id=` ✅ (QEMU, 2026-11-28) | 2–3 days | safe with two leatos disks |
 | 5. apu4: AHCI at 00:11, USB stick install to mSATA, boot order | — | hardware check |
 
 Step 2 serves Proxmox (M13 step 7) without AHCI; steps 3 and 4 go together before the apu4
