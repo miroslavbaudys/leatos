@@ -35,18 +35,21 @@ author's home router (PC Engines apu4, PPPoE over VLAN). Expect breaking changes
   sans-IO code; no host stack
 - **SNTP**, hardware and cross-core watchdogs, multicore datapath (download,
   upload and services on their own cores)
-- **Management:** web interface (with a live WAN throughput chart), serial
-  CLI, config in TOML with trial changes that revert unless confirmed, kernel
-  upgrades over HTTP with rollback
+- **Management:** web interface (with a live WAN throughput chart), CLI on
+  the serial console or on the screen and keyboard (framebuffer console, PS/2
+  keyboard: a Proxmox noVNC console works), config in TOML with trial changes
+  that revert unless confirmed, kernel upgrades over HTTP with rollback
 - **Hardening:** silent to scans from the WAN (no RST, no port unreachable),
   DNS-rebinding and cross-site request refusals and per-source login backoff
   on the web interface, a security audit
-  ([docs/security-audit.md](docs/security-audit.md)), 18 fuzz targets
+  ([docs/security-audit.md](docs/security-audit.md)), 22 fuzz targets
 
 IPv6 (M7) runs on the author's apu4 with its ISP (PPPoE, a delegated /60); it
-goes on by default after a long soak test. Planned
-([docs/roadmap.md](docs/roadmap.md)): a WireGuard server (M12) and leatos as a
-KVM / Proxmox VE guest (M13).
+goes on by default after a long soak test. In progress
+([docs/roadmap.md](docs/roadmap.md)): an installer ISO (M16). Planned: leatos
+as a KVM / Proxmox VE guest (M13; Proxmox's device layout, disks and screen
+console already work in QEMU, no real Proxmox host yet) and a WireGuard server
+(M12).
 
 ## Platforms
 
@@ -55,6 +58,7 @@ KVM / Proxmox VE guest (M13).
 | QEMU aarch64 `virt` (HVF on Apple Silicon) | `cargo krun` |
 | QEMU x86_64 q35 | `cargo krun-x86` |
 | PC Engines apu4 (4× Intel i211) | `scripts/apu-image.sh` → SD card image (Limine + Multiboot2) |
+| A Proxmox VE q35 VM's layout (emulated) | `QEMU_PROXMOX=1` with `QEMU_DISK=` an image, or `QEMU_CDROM=` the installer ISO (`scripts/apu-image.sh --iso`) |
 
 ## Building
 
