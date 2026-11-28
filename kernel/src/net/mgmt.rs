@@ -1354,11 +1354,12 @@ fn status_json(
             None => "null".into(),
         }
     };
+    let microcode = crate::smp::microcode_json();
     let _ = write!(
         s,
         "{{\"version\":{},\"build\":{},\"image\":{image},\"arch\":{},\"cmdline\":{},\"config\":{},\"overrides\":{{{}}},\"store\":{},\"disks\":[{}],\"trial\":{},\"uptime_s\":{},\"forwarded\":{},\"dropped\":{},\"tx_failed\":{},\"nic_lock_waits\":{{\"rx\":{},\"tx\":{},\"rx_us\":{},\"tx_us\":{}}},\"vlan_drops\":{},\"conntrack\":{},\"early_drops\":{},\"conntrack_pass_us\":{{\"last\":{},\"max\":{}}},\"housekeeping_us\":{{\"last\":{},\"max\":{}}},\"revoked\":{},\"rejected\":{},\"icmp_errors\":{},\"unreachable6\":{},\"neigh_probes\":{},\"lan_nd\":{{\"arp_replies\":{},\"na_sent\":{},\"conflicts\":{},\"local_no_route\":{},\"local_queued\":{},\"local_dropped\":{}}},\"wan_nd\":{{\"medium\":\"{}\",\"arp_replies\":{},\"na_sent\":{}}},\"wan_dhcp\":{},\"local\":{{\"udp_dropped\":{},\"udp_unbound\":{},\"echo_replies\":{},\"other_dropped\":{},\"tcp\":{}}},\
          \"pool\":{{\"free\":{pool_free},\"capacity\":{pool_cap},\"alloc_failures\":{pool_fail}}},\
-         \"heap\":{{\"used\":{heap_used},\"free\":{heap_free},{heap_ops}}},\"cpu\":{cpu},\"temp\":{temp},\"memory\":{memory},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
+         \"heap\":{{\"used\":{heap_used},\"free\":{heap_free},{heap_ops}}},\"cpu\":{cpu},\"temp\":{temp},\"memory\":{memory},\"microcode\":{microcode},\"wan_lease\":{wan_lease},\"pppoe\":{},\"pppoe_drops\":{},\
          \"fragments\":{{\"forwarded\":{},\"parked\":{},\"park_drops\":{},\"split\":{},\"split_drops\":{}}},\"drop_reasons\":{{{}}},\"entropy\":{},\"mgmt\":{{\"on_wan\":{},\"auth\":{},\"password\":{},\"upgrade\":{},\"persist\":{},\"origin_check\":{},\"refused\":{{\"host\":{},\"cross_site\":{}}},\"throttle\":{{\"sources\":{},\"throttled\":{},\"hash_busy\":{},\"evicted\":{}}}}},\"interfaces\":[",
         json_str(env!("CARGO_PKG_VERSION")),
         json_str(env!("LEATOS_BUILD")),

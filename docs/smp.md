@@ -56,7 +56,8 @@ queue was added.
     (MSR 0x8B: AMD family ≥ 10h patch level, Intel after the write-0 +
     CPUID sequence) before it counts as online, and `smp::start` prints
     `microcode : <cpu>, patch level … on all N cores`, or each core's
-    level when they differ. Nothing is loaded; under a hypervisor the
+    level when they differ; `/api/status` has the same as `microcode`
+    (`{"cpu", "levels": [...]}`). Nothing is loaded; under a hypervisor the
     value is the hypervisor's. Not shown for QEMU's default `qemu64` /
     `max` models (AMD family 0Fh); `QEMU_EXTRA="-cpu EPYC"` shows it.
 - **Stacks:** linker script `__ap_stacks`: per secondary core

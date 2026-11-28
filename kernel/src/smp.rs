@@ -33,6 +33,27 @@ fn record_microcode(core: usize) {
     }
 }
 
+/// `/api/status` `microcode`: `{"cpu":"…","levels":["0x…",…]}` (one per
+/// online core, `null` where unread), or `null` without a CPU signature.
+pub fn microcode_json() -> alloc::string::String {
+    use core::fmt::Write;
+    let Some(sig) = arch::cpu::cpu_signature() else {
+        return "null".into();
+    };
+    let mut s = alloc::format!("{{\"cpu\":\"{sig}\",\"levels\":[");
+    for (core, r) in MICROCODE[..online().min(MAX_CORES)].iter().enumerate() {
+        let r = r.load(Ordering::Acquire);
+        let sep = if core == 0 { "" } else { "," };
+        let _ = if r == 0 {
+            write!(s, "{sep}null")
+        } else {
+            write!(s, "{sep}\"{:#010x}\"", r as u32)
+        };
+    }
+    s.push_str("]}");
+    s
+}
+
 /// `microcode : <cpu>, patch level 0x… on all N cores` (or per core when
 /// they differ). Nothing on CPUs without a readable revision (aarch64).
 fn print_microcode(virtual_machine: bool) {
