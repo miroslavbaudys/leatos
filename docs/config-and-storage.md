@@ -419,7 +419,12 @@ For when the network is not an option: the console prompt `leatos> `.
   flush is a no-op there. Every wait yields. A transfer abandoned midway
   is cleaned up (line reset + CMD12) before the next one. Card detect
   that is not wired is overridden, and the commands decide whether a card
-  is there. AHCI if an mSATA SSD is used.
+  is there.
+- SATA (apu4 mSATA / SATA port, Proxmox `sata0`): `drivers::ahci` (AHCI 1.3.1, PCI class
+  01:06:01), one disk per port, named `<PCI address>/<port>`; DMA through driver-owned buffers,
+  polled, FLUSH CACHE as the store's flush. `QEMU_STORE_BUS=ahci` attaches the store image to
+  port 0 of a `-device ahci` (both arches); store-, lease-, cli-, persist- and install-test
+  pass over it (2026-11-28). Not yet checked on the apu4 (docs/install.md §3.1).
 - QEMU: `QEMU_STORE_BUS=sd` attaches the store image as an SD card behind
   `sdhci-pci` (image size a power of two; QEMU emulates SDSC up to 2 GiB
   and SDHC above). `scripts/store-test.sh` runs over it too.

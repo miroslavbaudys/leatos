@@ -36,15 +36,17 @@
 #   QEMU_PCAP_DIR=dir    with QEMU_NET=user: dump WAN/LAN traffic to pcap files
 #   QEMU_DISK=img        boot a disk image via SeaBIOS + Limine instead of -kernel
 #                        (x86_64; scripts/apu-image.sh); QEMU_APPEND is ignored
-#   QEMU_DISK=store      boot QEMU_STORE itself through the firmware (virtio only, as
-#                        Proxmox boots virtio0): a disk the installer wrote
+#   QEMU_DISK=store      boot QEMU_STORE itself through the firmware (virtio or ahci, as
+#                        Proxmox boots virtio0 / sata0): a disk the installer wrote
 #   QEMU_CDROM=iso       boot an ISO as a CD via SeaBIOS + Limine (x86_64; the
 #                        installer, scripts/apu-image.sh --iso), as Proxmox attaches it
 #   QEMU_STORE=img       attach img as a virtio-blk disk (the router's store; create
 #                        one with `cargo run -q -p leatstore -- create img`). Written
 #                        in place: pass a copy to keep the original
-#   QEMU_STORE_BUS=virtio|sd   how QEMU_STORE is attached: virtio-blk (default) or an
-#                        SD card behind QEMU's sdhci-pci (the apu4's SD driver).
+#   QEMU_STORE_BUS=virtio|sd|ahci   how QEMU_STORE is attached: virtio-blk (default), an
+#                        SD card behind QEMU's sdhci-pci (the apu4's SD driver), or a
+#                        SATA disk on port 0 of an AHCI controller of its own (-device ahci,
+#                        as Proxmox attaches sata0; the apu4's mSATA driver).
 #                        SD images must be a power of two in size (leatstore create --mib 32)
 #   QEMU_NIC=virtio|igb  NIC model for WAN and LAN (default virtio): igb = QEMU's
 #                        Intel 82576, driven by the same igb driver as the apu4's i211
@@ -68,8 +70,8 @@ elif [[ "${QEMU_DISK:-}" == store ]]; then
   KERNEL=
   ARCH=x86_64
   BOOT=(-boot c) # not empty: bash 3.2 calls an empty array unbound under set -u
-  [[ -n "${QEMU_STORE:-}" && "${QEMU_STORE_BUS:-virtio}" == virtio ]] \
-    || { echo "QEMU_DISK=store needs QEMU_STORE on virtio" >&2; exit 2; }
+  [[ -n "${QEMU_STORE:-}" && "${QEMU_STORE_BUS:-virtio}" != sd ]] \
+    || { echo "QEMU_DISK=store needs QEMU_STORE on virtio or ahci" >&2; exit 2; }
 elif [[ -n "${QEMU_DISK:-}" ]]; then
   KERNEL=
   ARCH=x86_64
@@ -178,7 +180,8 @@ if [[ -n "${QEMU_STORE:-}" ]]; then
   case "${QEMU_STORE_BUS:-virtio}" in
     virtio) STORE=(-drive "file=$QEMU_STORE,format=raw,if=none,id=store,cache=writethrough" -device "virtio-blk-pci,drive=store${BOOTIDX:-}") ;;
     sd) STORE=(-drive "file=$QEMU_STORE,format=raw,if=none,id=store,cache=writethrough" -device sdhci-pci,id=sdhci -device sd-card,drive=store,bus=sd-bus) ;;
-    *) echo "QEMU_STORE_BUS must be virtio or sd" >&2; exit 2 ;;
+    ahci) STORE=(-drive "file=$QEMU_STORE,format=raw,if=none,id=store,cache=writethrough" -device ahci,id=ahci0 -device "ide-hd,drive=store,bus=ahci0.0${BOOTIDX:-}") ;;
+    *) echo "QEMU_STORE_BUS must be virtio, sd or ahci" >&2; exit 2 ;;
   esac
 fi
 

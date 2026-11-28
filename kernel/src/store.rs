@@ -82,33 +82,32 @@ pub fn open(pci: &mut Pci) -> Option<Store> {
     let devs: Vec<_> = pci.devices.clone();
     let mut found = None;
     for dev in devs {
-        let Some(disk) = block_on(Disk::open(pci, &dev)) else {
-            continue; // not a block device
-        };
-        let line = match disk {
-            Err(e) => format!("{}: init failed: {e}", dev.df),
-            Ok(_) if found.is_some() => format!("{}: not probed (store already found)", dev.df),
-            Ok(disk) => {
-                let what = disk.describe();
-                match probe(disk) {
-                    Ok((s, parts)) => {
-                        let names: Vec<_> = s.layout.areas().iter().map(|a| a.name()).collect();
-                        let l = format!(
-                            "{} {what}, {parts}: store at LBA {}, {} MiB, areas {}",
-                            dev.df,
-                            s.base,
-                            s.sectors >> 11,
-                            names.join(", ")
-                        );
-                        found = Some(s);
-                        l
+        // Not a block device: no disks. AHCI: one per port with a device.
+        for (name, disk) in block_on(Disk::open(pci, &dev)) {
+            let line = match disk {
+                Err(e) => format!("{name}: {e}"),
+                Ok(_) if found.is_some() => format!("{name}: not probed (store already found)"),
+                Ok(disk) => {
+                    let what = disk.describe();
+                    match probe(disk) {
+                        Ok((s, parts)) => {
+                            let names: Vec<_> = s.layout.areas().iter().map(|a| a.name()).collect();
+                            let l = format!(
+                                "{name} {what}, {parts}: store at LBA {}, {} MiB, areas {}",
+                                s.base,
+                                s.sectors >> 11,
+                                names.join(", ")
+                            );
+                            found = Some(s);
+                            l
+                        }
+                        Err((why, _)) => format!("{name} {what}: {why}, not used"),
                     }
-                    Err((why, _)) => format!("{} {what}: {why}, not used", dev.df),
                 }
-            }
-        };
-        println!("  store           : {line}");
-        PROBES.lock().push(line);
+            };
+            println!("  store           : {line}");
+            PROBES.lock().push(line);
+        }
     }
     if PROBES.lock().is_empty() {
         println!("  store           : none (no block device)");
@@ -290,10 +289,10 @@ impl Store {
             .with_flags(&area, flags);
         if !plan.payload.is_empty() {
             self.write(plan.payload_lba, &plan.payload).await?;
-            self.disk.flush()?;
+            self.disk.flush().await?;
         }
         self.write(plan.header_lba, &plan.header_sector).await?;
-        self.disk.flush()?;
+        self.disk.flush().await?;
         let back = self.read_slot(&area, plan.slot).await?;
         match config_store::check_slot(&area, &back) {
             SlotState::Valid(h) if h == plan.header => Ok((plan.slot, plan.header)),
@@ -318,7 +317,7 @@ impl Store {
         }
         self.write(area.slot_lba(slot), &header.encode(&area))
             .await?;
-        self.disk.flush()?;
+        self.disk.flush().await?;
         let back = self.read_slot(&area, slot).await?;
         match config_store::check_slot(&area, &back) {
             SlotState::Valid(h) if h == header => Ok(()),
@@ -330,7 +329,7 @@ impl Store {
     pub async fn erase(&mut self, name: &'static str, slot: Slot) -> Result<(), Error> {
         let area = self.area(name)?;
         self.write(area.slot_lba(slot), &[0; SECTOR]).await?;
-        self.disk.flush()?;
+        self.disk.flush().await?;
         match config_store::check_slot(&area, &self.read(area.slot_lba(slot), 1).await?) {
             SlotState::Empty => Ok(()),
             _ => Err(Error::Verify),

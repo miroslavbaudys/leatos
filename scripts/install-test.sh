@@ -7,6 +7,7 @@
 #
 #   scripts/install-test.sh
 #   QEMU_STORE_BUS=sd scripts/install-test.sh    # the target is an SD card
+#   QEMU_STORE_BUS=ahci scripts/install-test.sh  # a SATA disk (Proxmox sata0, apu4 mSATA)
 #   INSTALL_TEST_VERBOSE=1 ...                   # print each console
 #
 # Cases (each negative control must leave the target unchanged):
@@ -20,8 +21,9 @@
 #   unattended  install_target= + install_keep=0: no prompt, the image's
 #               config wins over the target's
 #   corrupt     one byte of the ISO's install image flipped: nothing written
-#   stick       the ISO booted as a disk (a USB stick dd'ed from it): the
-#               installer runs and offers no disk (it never sees its medium)
+#   stick       the ISO booted as a disk (a USB stick dd'ed from it; on q35
+#               that disk is on the built-in AHCI controller, so leatos sees
+#               it): the installer runs and does not offer its own medium
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export LC_ALL=C
@@ -96,7 +98,9 @@ check "target prepared" "$((TGT_SECTORS * 512))" "$(wc -c <"$TGT" | tr -d ' ')"
 boot "$WORK/install.iso"
 wait_for "type the PCI address" "$T" || fail "installer prompt"
 # The target's PCI address, as the installer lists it.
-DF="$(tr -d '\r' <"$LOG" | sed -n 's/^  \([0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]\.[0-7]\)  .*/\1/p' | head -1)"
+# (An ATAPI CD on the same controller is listed as "not used": skipped.)
+DF="$(tr -d '\r' <"$LOG" | grep -a ' MiB' | grep -av 'not offered' \
+  | sed -n 's/^  \([0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]\.[0-7]\(\/[0-9]*\)\{0,1\}\)  .*/\1/p' | head -1)"
 [[ -n "$DF" ]] && pass "target listed ($DF)" || fail "target listed"
 printf '%s\r' "$DF" >&3
 wait_for 'install: done\|nothing written\|install: FAILED' "$T" || true
@@ -111,8 +115,8 @@ check "sectors past the image untouched" "ff" "$(sector_bytes "$IMG_SECTORS" 8)"
 check "sector before the GPT backup untouched" "ff" "$(sector_bytes $((TGT_SECTORS - 34)) 1)"
 check "last 33 sectors zero (backup GPT)" "00" "$(sector_bytes $((TGT_SECTORS - 33)) 33)"
 # The installed disk boots (SeaBIOS -> its own Limine) and uses its store;
-# SeaBIOS boots no SD card, so only on virtio. On a copy: booting writes.
-if [[ "${QEMU_STORE_BUS:-virtio}" == virtio ]]; then
+# SeaBIOS boots no SD card, so virtio and ahci only. On a copy: booting writes.
+if [[ "${QEMU_STORE_BUS:-virtio}" != sd ]]; then
   cp "$TGT" "$WORK/boot.img"
   QEMU_DISK=store QEMU_STORE="$WORK/boot.img" QEMU_ACCEL=tcg scripts/qemu-run.sh </dev/null >"$LOG" 2>&1 &
   QPID=$!
@@ -171,7 +175,7 @@ QEMU_DISK="$WORK/install.iso" QEMU_ACCEL=tcg scripts/qemu-run.sh </dev/null >"$L
 QPID=$!
 wait_for 'nothing written' "$T" || true
 if has "install image   : ok"; then pass "boots as a disk"; else fail "boots as a disk"; fi
-if has "no disk to install to: nothing written"; then pass "its own medium is not offered"; else fail "its own medium is not offered"; fi
+if has "the install medium, not offered" && has "no disk to install to: nothing written"; then pass "its own medium is not offered"; else fail "its own medium is not offered"; fi
 stop_qemu
 
 if [[ "$FAILED" == 0 ]]; then echo "INSTALL TEST: PASS"; else echo "INSTALL TEST: FAIL"; exit 1; fi

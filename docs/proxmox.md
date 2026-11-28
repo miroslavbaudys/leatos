@@ -21,7 +21,7 @@ Gaps found (2026-11-24, by reading the code):
 | Gap | Where | Effect on Proxmox |
 |---|---|---|
 | PCI only over ECAM (ACPI MCFG) | `kernel/src/pci.rs:1` | default machine `i440fx` has no MCFG: no devices at all |
-| Disk: virtio-blk only | `kernel/src/pci.rs:54` | default bus VirtIO SCSI boots (SeaBIOS) but the store is not found |
+| Disk: virtio-blk and SATA (AHCI, since 2026-11-28) | `kernel/src/drivers/mod.rs` `Disk` | default bus VirtIO SCSI boots (SeaBIOS) but the store is not found |
 | Entropy: CCP TRNG or timing only | `kernel/src/entropy.rs` | VM pool is timing only (DNS ports, DoT, mgmt secrets) |
 | Spin window 4 ms on any hypervisor | `kernel/src/config.rs:1595` | tuned for HVF; under KVM a host core spins near 100 % while shaping |
 | TSC calibrated against the PIT (10 ms) | `kernel/src/arch/x86_64/timer.rs:22` | a descheduled vCPU skews it, and with it the shaper rates (min of 3 runs mitigates) |

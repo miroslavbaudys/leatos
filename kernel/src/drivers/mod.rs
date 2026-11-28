@@ -2,6 +2,8 @@
 //! stack uses for every NIC model, and [`Disk`], the one the store uses
 //! for every block device.
 
+#[allow(unsafe_code)] // the register windows' constructor (DMA through driver-owned DmaRegions)
+pub mod ahci;
 pub mod cputemp;
 #[allow(unsafe_code)] // the register window's constructor (read-only TRNG registers)
 pub mod ccp;
@@ -19,6 +21,10 @@ pub mod watchdog;
 
 use crate::net::packet::PacketBuf;
 use crate::pci::{Pci, PciDevice};
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::{format, vec};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
@@ -205,18 +211,21 @@ impl Nic {
     }
 }
 
-/// A block device the store can live on: QEMU's virtio-blk, or an SD card
-/// behind an SD host controller (the apu4's slot). Both are polled and
+/// A block device the store can live on: QEMU's virtio-blk, an SD card
+/// behind an SD host controller (the apu4's slot), or a SATA disk on an
+/// AHCI port (the apu4's mSATA, Proxmox `sata0`). All are polled and
 /// yield while the device works; requests are at most 64 KiB.
 pub enum Disk {
     Virtio(alloc::boxed::Box<virtio_blk::VirtioBlk>),
     Sd(alloc::boxed::Box<sdhci::Sdhci>),
+    Ahci(alloc::boxed::Box<ahci::Ahci>),
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum DiskError {
     Virtio(virtio_blk::Error),
     Sd(sdhci::Error),
+    Ahci(ahci::Error),
 }
 
 impl core::fmt::Display for DiskError {
@@ -224,6 +233,7 @@ impl core::fmt::Display for DiskError {
         match self {
             Self::Virtio(e) => write!(f, "virtio-blk: {e:?}"),
             Self::Sd(e) => write!(f, "sd: {e:?}"),
+            Self::Ahci(e) => write!(f, "ahci: {e}"),
         }
     }
 }
@@ -233,28 +243,44 @@ pub const DISK_MAX_SECTORS: usize = 128;
 const _: () = assert!(
     virtio_blk::MAX_REQUEST_SECTORS == DISK_MAX_SECTORS
         && sdhci::MAX_REQUEST_SECTORS == DISK_MAX_SECTORS
+        && ahci::MAX_REQUEST_SECTORS == DISK_MAX_SECTORS
 );
 
 impl Disk {
-    /// The driver for `dev`, if it is a block device we drive: `None`
-    /// when not, else the initialised disk or why it failed. SD cards
-    /// are initialised here (yielding; at boot under `block_on`).
-    pub async fn open(pci: &mut Pci, dev: &PciDevice) -> Option<Result<Self, alloc::string::String>> {
+    /// The disks on `dev`, if it is a block device we drive (empty when
+    /// not): each with its name (the PCI address; `<address>/<port>` on an
+    /// AHCI controller, one per port with a device) and the initialised
+    /// disk or why it failed. SD cards and AHCI ports are initialised here
+    /// (yielding; at boot under `block_on`).
+    pub async fn open(pci: &mut Pci, dev: &PciDevice) -> Vec<(String, Result<Self, String>)> {
+        let df = format!("{}", dev.df);
         if dev.is_virtio_blk() {
-            Some(
-                virtio_blk::VirtioBlk::new(pci, dev)
-                    .map(|d| Self::Virtio(alloc::boxed::Box::new(d)))
-                    .map_err(|e| alloc::format!("virtio-blk: {e:?}")),
-            )
+            let d = virtio_blk::VirtioBlk::new(pci, dev)
+                .map(|d| Self::Virtio(Box::new(d)))
+                .map_err(|e| format!("virtio-blk init failed: {e:?}"));
+            vec![(df, d)]
         } else if sdhci::supports(dev) {
-            Some(
-                sdhci::Sdhci::new(dev)
-                    .await
-                    .map(|d| Self::Sd(alloc::boxed::Box::new(d)))
-                    .map_err(|e| alloc::format!("sd: {e:?}")),
-            )
+            let d = sdhci::Sdhci::new(dev)
+                .await
+                .map(|d| Self::Sd(Box::new(d)))
+                .map_err(|e| format!("sd init failed: {e:?}"));
+            vec![(df, d)]
+        } else if ahci::supports(dev) {
+            match ahci::open_ports(dev).await {
+                Err(e) => vec![(df, Err(format!("ahci init failed: {e}")))],
+                Ok(ports) => ports
+                    .into_iter()
+                    .map(|(p, d)| {
+                        let d = d.map(|d| Self::Ahci(Box::new(d))).map_err(|e| match e {
+                            ahci::Error::NotAta(_) => format!("ahci port {p}: {e}"),
+                            _ => format!("ahci port {p} init failed: {e}"),
+                        });
+                        (format!("{df}/{p}"), d)
+                    })
+                    .collect(),
+            }
         } else {
-            None
+            Vec::new()
         }
     }
 
@@ -263,6 +289,7 @@ impl Disk {
         match self {
             Self::Virtio(d) => alloc::format!("virtio-blk {} MiB", d.capacity() >> 11),
             Self::Sd(d) => alloc::format!("SD card: {}", d.desc),
+            Self::Ahci(d) => d.desc.clone(),
         }
     }
 
@@ -271,6 +298,7 @@ impl Disk {
         match self {
             Self::Virtio(d) => d.capacity(),
             Self::Sd(d) => d.capacity(),
+            Self::Ahci(d) => d.capacity(),
         }
     }
 
@@ -278,6 +306,7 @@ impl Disk {
         match self {
             Self::Virtio(d) => d.readonly(),
             Self::Sd(d) => d.readonly(),
+            Self::Ahci(d) => d.readonly(),
         }
     }
 
@@ -285,6 +314,7 @@ impl Disk {
         match self {
             Self::Virtio(d) => d.read(lba, sectors).await.map_err(DiskError::Virtio),
             Self::Sd(d) => d.read(lba, sectors).await.map_err(DiskError::Sd),
+            Self::Ahci(d) => d.read(lba, sectors).await.map_err(DiskError::Ahci),
         }
     }
 
@@ -292,15 +322,18 @@ impl Disk {
         match self {
             Self::Virtio(d) => d.write(lba, data).await.map_err(DiskError::Virtio),
             Self::Sd(d) => d.write(lba, &data).await.map_err(DiskError::Sd),
+            Self::Ahci(d) => d.write(lba, &data).await.map_err(DiskError::Ahci),
         }
     }
 
     /// Make completed writes durable. SD: a write completes only once the
-    /// card has programmed it, so there is nothing to flush.
-    pub fn flush(&mut self) -> Result<(), DiskError> {
+    /// card has programmed it, so there is nothing to flush. virtio-blk:
+    /// a blocking flush (`virtio-drivers` has no other). AHCI: FLUSH CACHE.
+    pub async fn flush(&mut self) -> Result<(), DiskError> {
         match self {
             Self::Virtio(d) => d.flush().map_err(DiskError::Virtio),
             Self::Sd(_) => Ok(()),
+            Self::Ahci(d) => d.flush().await.map_err(DiskError::Ahci),
         }
     }
 }

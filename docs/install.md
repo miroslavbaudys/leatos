@@ -1,8 +1,8 @@
 # Installer: leatos installs itself from a USB stick or ISO (plan)
 
-Status (2026-11-28): steps 1 and 2 done in QEMU (module, heap carve-out, image format; install
-mode on virtio-blk and SD, the installer ISO, `scripts/install-test.sh`); AHCI, the store ID and
-the hardware checks are plan. Roadmap M16.
+Status (2026-11-28): steps 1–3 done in QEMU (module, heap carve-out, image format; install mode,
+the installer ISO, `scripts/install-test.sh`; the AHCI driver); the store ID and the hardware
+checks are plan. Roadmap M16.
 
 Today leatos is installed by flashing `target/apu4/leatos-apu4.img` (`scripts/apu-image.sh`) to
 an SD card on the Mac; a Proxmox VM gets the same image with `qm importdisk`
@@ -69,6 +69,20 @@ module**; the kernel, booted with `install=1`, writes the module to a disk it ha
 
 Useful without the installer: an mSATA flashed in a USB adapter on the Mac with the normal
 image boots and keeps its store on the mSATA.
+
+Done in QEMU (2026-11-28), as above, plus:
+- No COMRESET on a port whose PHY sees no device (`DET` = 0 after 50 ms): q35's built-in
+  controller has six ports, and a 1 s link wait each slowed every boot by seconds (the smoke
+  test's two-boot watchdog case timed out). `DET` = 1 (device, no link) gets the COMRESET.
+- `Disk::open` gives one disk per port, named `<PCI address>/<port>` (`00:1f.2/0`): the name in
+  the store probe lines and the installer's list, and what `install_target=` takes. ATAPI
+  devices are listed as `ATAPI (CD/DVD): not used` (q35 has an empty CD drive by default).
+- The installer skips a disk that holds its own ISO (ISO 9660 volume ID `LEATOS_INSTALL` at
+  byte 32768): an ISO on a SATA disk is visible to leatos, a USB stick or a CD is not.
+- `Disk::flush` is async (FLUSH CACHE can take seconds on a disk).
+- Tests: `QEMU_STORE_BUS=ahci` (store image on port 0 of a `-device ahci`, as Proxmox attaches
+  `sata0`): store-, lease-, cli-test on aarch64 and x86_64, persist- and install-test pass;
+  the installed SATA disk boots through SeaBIOS (`QEMU_DISK=store`) and finds its store.
 
 ### 3.2 Multiboot2 module
 
@@ -164,8 +178,9 @@ buses pass:
 
 Not in the script: module vs heap (§3.2; `module_carve=0` control, by hand); a real USB stick
 (`qemu-xhci` + `usb-storage`, booted by hand 2026-11-28: SeaBIOS boots it, same result as
-`stick`). To come with steps 3 and 4: AHCI targets (`QEMU_STORE_BUS=ahci`), two stores with
-and without `store_id=`.
+`stick`). AHCI targets (`QEMU_STORE_BUS=ahci`, ~2.5 min) pass since step 3; on q35 the `stick`
+case's disk sits on the built-in AHCI controller and is skipped as the install medium. To come
+with step 4: two stores with and without `store_id=`.
 
 On the hardware: apu4 boots the stick, installs to the mSATA, boots from it without the stick;
 SeaBIOS boot order (USB before mSATA?) noted here. Proxmox: VM from the GUI with the ISO as CD
@@ -177,7 +192,7 @@ and `virtio0`, installed, ISO ejected, boots.
 |---|---|---|
 | 1. Module tag + heap carve-out, extent format crate ✅ (QEMU, 2026-11-28) | 2–3 days | image in RAM, checked |
 | 2. Install mode on virtio-blk / SD, `--iso`, `install-test.sh` ✅ (QEMU, 2026-11-28) | ~1 wk | **Proxmox install from ISO** |
-| 3. AHCI driver + `QEMU_STORE_BUS=ahci` tests | 1–1.5 wk | mSATA / `sata0` as boot + store |
+| 3. AHCI driver + `QEMU_STORE_BUS=ahci` tests ✅ (QEMU, 2026-11-28) | 1–1.5 wk | mSATA / `sata0` as boot + store |
 | 4. Store ID + `store_id=` | 2–3 days | safe with two leatos disks |
 | 5. apu4: AHCI at 00:11, USB stick install to mSATA, boot order | — | hardware check |
 

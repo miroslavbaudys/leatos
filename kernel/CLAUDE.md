@@ -71,7 +71,8 @@ live with the VID; networks on a port the machine lacks are left out (`config::m
 
 ## Drivers (`src/drivers/`)
 
-- `Nic`: the one NIC interface the stack uses. `Disk`: the one block interface the store uses.
+- `Nic`: the one NIC interface the stack uses. `Disk`: the one block interface the store uses
+  (`open` gives every disk of a PCI function: one, or one per AHCI port; `flush` is async).
 - `virtio_net.rs`: slot-owned DMA buffers, pull-based TX with a byte limit.
 - `igb.rs`: i210/i211 + QEMU's 82576, same TX contract.
   - Own descriptor rings in `mm::dma::DmaRegion`, 256-entry RX ring.
@@ -81,6 +82,11 @@ live with the VID; networks on a port the machine lacks are left out (`config::m
 - `virtio_blk.rs`: the store disk in QEMU: polled, one driver-owned request in flight, yields while
   waiting.
 - `sdhci.rs`: SD card behind a standard SDHCI (the apu4's slot at 00:14.7): PIO, polled, yields.
+- `ahci.rs`: SATA disks on AHCI ports (apu4 mSATA, Proxmox `sata0`, QEMU `-device ahci`): BIOS
+  hand-off, one `Ahci` per port with an ATA disk (ATAPI reported, not used), IDENTIFY, READ /
+  WRITE DMA (EXT), FLUSH CACHE (EXT); polled, slot 0, yields; DMA only through driver-owned
+  `DmaRegion`s (`copy_in` / `copy_out`); an abandoned command → port stop / restart (COMRESET if
+  busy). `Disk::open` returns one disk per port, named `<PCI address>/<port>`.
 - `ccp.rs`: AMD CCP TRNG, PCI 1022:1537.
 - `watchdog.rs` (`HwWatchdog` + probe), `i6300esb.rs` (QEMU's PCI watchdog).
 - `cputemp.rs`: AMD family 16h die temperature from PCI 00:18.3 D18F3xA4 + HTC limit x64 (k10temp's

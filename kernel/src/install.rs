@@ -97,20 +97,22 @@ fn install(pci: Option<&mut Pci>) -> Result<(), Stop> {
     let mut disks: Vec<(String, Disk)> = Vec::new();
     println!("install: disks:");
     for dev in pci.devices.clone() {
-        let Some(opened) = block_on(Disk::open(pci, &dev)) else {
-            continue;
-        };
-        let df = format!("{}", dev.df);
-        match opened {
-            Err(e) => println!("  {df}  init failed: {e}"),
-            Ok(mut disk) => {
-                let parts = match block_on(disk.read(0, 1)) {
-                    Ok(mbr) => store::partitions(&mbr),
-                    Err(e) => format!("unreadable ({e})"),
-                };
-                let ro = if disk.readonly() { ", read-only" } else { "" };
-                println!("  {df}  {}, {parts}{ro}", disk.describe());
-                disks.push((df, disk));
+        for (name, opened) in block_on(Disk::open(pci, &dev)) {
+            match opened {
+                Err(e) => println!("  {name}  {e}"),
+                Ok(mut disk) => {
+                    let parts = match block_on(disk.read(0, 1)) {
+                        Ok(mbr) => store::partitions(&mbr),
+                        Err(e) => format!("unreadable ({e})"),
+                    };
+                    let ro = if disk.readonly() { ", read-only" } else { "" };
+                    if is_install_medium(&mut disk) {
+                        println!("  {name}  {}, {parts}: the install medium, not offered", disk.describe());
+                        continue;
+                    }
+                    println!("  {name}  {}, {parts}{ro}", disk.describe());
+                    disks.push((name, disk));
+                }
             }
         }
     }
@@ -182,7 +184,7 @@ fn install(pci: Option<&mut Pci>) -> Result<(), Stop> {
             println!("install: written {} / {} MiB", mib(done), mib(total));
         }
     }
-    disk.flush().map_err(|e| Stop::Failed(format!("flush: {e}")))?;
+    block_on(disk.flush()).map_err(|e| Stop::Failed(format!("flush: {e}")))?;
     println!("install: reading back");
     for p in plan_of(&img).into_iter().flatten() {
         let back = block_on(disk.read(p.lba(), p.sectors() as usize))
@@ -252,6 +254,17 @@ fn keep_config(st: &mut store::Store) -> Result<Option<(u32, Vec<u8>)>, Stop> {
         rec.payload.len()
     );
     Ok(Some((rec.header.version, rec.payload)))
+}
+
+/// Does `disk` hold the installer ISO itself (`apu-image.sh --iso`: an
+/// ISO 9660 primary volume descriptor at byte 32768, volume ID
+/// `LEATOS_INSTALL`)? An ISO on a SATA disk or SD card is visible to
+/// leatos (a USB stick or a CD is not) and must never be offered.
+fn is_install_medium(disk: &mut Disk) -> bool {
+    match block_on(disk.read(64, 1)) {
+        Ok(pvd) => pvd[0] == 1 && &pvd[1..6] == b"CD001" && pvd[40..].starts_with(b"LEATOS_INSTALL"),
+        Err(_) => false,
+    }
 }
 
 /// A line typed on the console (echoed; Backspace edits).

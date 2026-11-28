@@ -13,7 +13,8 @@ Variables that work with any QEMU-based script:
   (negative control: `QEMU_APPEND=cores=1`).
 - `QEMU_NIC=igb`: router NICs are QEMU's 82576 instead of virtio-net.
 - `LEATOS_ARCH=x86_64`: the x86_64 kernel (TCG; the client and ISP VMs stay aarch64).
-- `QEMU_STORE=img`: attach a store image as virtio-blk, or as an SD card with `QEMU_STORE_BUS=sd`
+- `QEMU_STORE=img`: attach a store image as virtio-blk, as an SD card with `QEMU_STORE_BUS=sd`,
+  or as a SATA disk with `QEMU_STORE_BUS=ahci`
   (written in place).
 - `QEMU_DISK=img scripts/qemu-run.sh`: boot any disk image.
 - `QEMU_APPEND`: boot arguments (docs/boot-arguments.md).
@@ -305,7 +306,7 @@ direction moved under 1 Mbit/s.
 
 - `scripts/store-test.sh` (also `LEATOS_ARCH=x86_64`): store read at boot, config save via the web
   interface + reboot, trials (confirm, timeout, revert, kill during the trial), corruption negative
-  controls. Also with `QEMU_STORE_BUS=sd` (and `STORE_MIB=4096` for SDHC).
+  controls. Also with `QEMU_STORE_BUS=sd` (and `STORE_MIB=4096` for SDHC) and `=ahci`.
 - `scripts/lease-test.sh` (also `LEATOS_ARCH=x86_64`, `QEMU_STORE_BUS=sd`): router + lab client:
   leases listed and resolvable after a power cut (router killed after its periodic save) and after
   `POST /api/reboot`; each one `"restored":true` in `/api/status` (expiry an upper bound) until the
@@ -323,7 +324,7 @@ direction moved under 1 Mbit/s.
   `VLAN_TEST_SKIP_SAVE=1`.
 - `scripts/upgrade-test.sh`: the in-RAM upgrade end to end in QEMU (401/422/404 negative controls,
   two chained upgrades, reboot).
-- `scripts/install-test.sh` (also `QEMU_STORE_BUS=sd`; x86_64, TCG): the installer ISO as a
+- `scripts/install-test.sh` (also `QEMU_STORE_BUS=sd`, `=ahci`; x86_64, TCG): the installer ISO as a
   CD, prompt answered on the console: fresh install (gaps zero, past the image untouched, GPT
   backup zero, the disk boots with its config), config kept, `install_target=` +
   `install_keep=0`, the ISO as a disk offers no disk. Negative controls: an unlisted address,

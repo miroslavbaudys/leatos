@@ -19,9 +19,10 @@ Keep them current when you change what they describe; keep this file to the map 
   `src/arch/{aarch64,x86_64}/` = **all** CPU-specific code (API in `arch/mod.rs`);
   `src/platform/` = DTB / PVH / Multiboot2 / ACPI discovery into `BootInfo`; `src/mm/` (stacks,
   heap = `talc`, page tables, DMA); `src/smp.rs`, `irq.rs`, `timer.rs` (tickless), `executor.rs`
-  (priority async, pinned tasks); `src/drivers/` (virtio-net, igb, virtio-blk, sdhci, watchdogs,
-  CCP TRNG, CPU temperature); `src/config.rs` (boot-time `Config`), `store.rs`, `upgrade.rs`,
-  `cli.rs`, `console.rs`, `fatal.rs`, `watchdog.rs`, `entropy.rs`, `wallclock.rs`.
+  (priority async, pinned tasks); `src/drivers/` (virtio-net, igb, virtio-blk, sdhci, ahci,
+  watchdogs, CCP TRNG, CPU temperature); `src/config.rs` (boot-time `Config`), `store.rs`,
+  `upgrade.rs`, `install.rs`, `cli.rs`, `console.rs`, `fatal.rs`, `watchdog.rs`, `entropy.rs`,
+  `wallclock.rs`.
 - `kernel/src/net/`: the datapath tasks `dp_down`/`dp_up` (`stack.rs`, `datapath.rs`), the services
   task `svc` (`svc.rs`: WAN, LAN services, mgmt; the router's own UDP / ICMP in `local.rs`, its
   TCP = `crates/proto-tcp` per link), `shared.rs` = the only coupling between them, `mgmt.rs` +
@@ -188,10 +189,11 @@ where the table asks for them. Always: `cargo kcheck-x86`; for crates you change
 | qdisc, queue limits, packet pool | `LAB_SWARM=1` |
 | PPPoE, config apply, `svc` | `pppoe-test.sh` (also x86_64), `LAB_PPPOE=pap scripts/lab-test.sh` |
 | VLAN, config apply, `svc` | `vlan-test.sh` (also x86_64), `LAB_VLAN=848 scripts/lab-test.sh` |
-| store, virtio-blk, config loading, mgmt | `store-test.sh` (also x86_64, `QEMU_STORE_BUS=sd`) |
+| store, virtio-blk, config loading, mgmt | `store-test.sh` (also x86_64, `QEMU_STORE_BUS=sd`, `=ahci`) |
 | SD driver | `QEMU_STORE_BUS=sd scripts/store-test.sh` (and `STORE_MIB=4096`) |
+| AHCI driver | `QEMU_STORE_BUS=ahci` store-, lease-, cli- (also x86_64), persist-, install-test |
 | DHCP, store, `svc` | `lease-test.sh` (also x86_64, `QEMU_STORE_BUS=sd`) |
 | console, CLI, config, `svc` | `cli-test.sh` (also x86_64, `QEMU_STORE_BUS=sd`) |
 | mgmt, upgrade, kexec, store, watchdog, boot, x86 NIC path | `upgrade-test.sh`, `persist-test.sh` (also `QEMU_STORE_BUS=sd`) |
-| installer, boot module, heap layout, store probe, `apu-image.sh` | `install-test.sh` (also `QEMU_STORE_BUS=sd`) |
+| installer, boot module, heap layout, store probe, `apu-image.sh` | `install-test.sh` (also `QEMU_STORE_BUS=sd`, `=ahci`) |
 | boot arguments, `LAB_*` variables, their docs | `scripts/doc-check.sh` |

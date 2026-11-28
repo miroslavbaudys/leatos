@@ -81,6 +81,29 @@ impl DmaRegion {
         unsafe { self.at::<u64>(offset).write_volatile(value) }
     }
 
+    /// Copy `src` into the region at `offset` (8-byte aligned, a multiple
+    /// of 8 long): sector data the device then reads (AHCI).
+    pub fn copy_in(&mut self, offset: usize, src: &[u8]) {
+        assert!(offset.is_multiple_of(8) && src.len().is_multiple_of(8));
+        for (i, c) in src.as_chunks::<8>().0.iter().enumerate() {
+            self.write64(offset + i * 8, u64::from_ne_bytes(*c));
+        }
+    }
+
+    /// Copy `dst.len()` bytes out of the region at `offset` (both as in
+    /// [`Self::copy_in`]): sector data the device wrote.
+    pub fn copy_out(&self, offset: usize, dst: &mut [u8]) {
+        assert!(offset.is_multiple_of(8) && dst.len().is_multiple_of(8));
+        for (i, c) in dst.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            *c = self.read64(offset + i * 8).to_ne_bytes();
+        }
+    }
+
+    pub fn read64(&self, offset: usize) -> u64 {
+        // SAFETY: as in `read32`.
+        unsafe { self.at::<u64>(offset).read_volatile() }
+    }
+
     /// Write a buffer's bus address into a descriptor: the DMA hand-off.
     ///
     /// # Safety
