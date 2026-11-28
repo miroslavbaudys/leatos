@@ -27,6 +27,16 @@ pub fn hw_core_id() -> u64 {
     m & 0xff_00ff_ffff
 }
 
+/// No CPU signature or microcode to report: firmware updates the cores
+/// on Arm (the x86_64 one is printed by `smp::start`).
+pub fn cpu_signature() -> Option<&'static str> {
+    None
+}
+
+pub fn microcode_revision() -> Option<u32> {
+    None
+}
+
 /// Unmask IRQs on this core.
 #[inline]
 pub fn irq_enable() {

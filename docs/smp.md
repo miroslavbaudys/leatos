@@ -52,6 +52,13 @@ queue was added.
   - In-RAM upgrade with several cores: `upgrade::exec` stops the others
     and sends them INIT (wait-for-SIPI), so none runs in code that is
     being overwritten. The new kernel starts them again.
+  - Microcode (x86_64, report only): each core reads its revision
+    (MSR 0x8B: AMD family ≥ 10h patch level, Intel after the write-0 +
+    CPUID sequence) before it counts as online, and `smp::start` prints
+    `microcode : <cpu>, patch level … on all N cores`, or each core's
+    level when they differ. Nothing is loaded; under a hypervisor the
+    value is the hypervisor's. Not shown for QEMU's default `qemu64` /
+    `max` models (AMD family 0Fh); `QEMU_EXTRA="-cpu EPYC"` shows it.
 - **Stacks:** linker script `__ap_stacks`: per secondary core
   `[guard] 16 KiB exception stack [guard] 256 KiB kernel stack`.
   `mm::mmu::init` maps them and leaves the guard pages unmapped

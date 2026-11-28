@@ -14,7 +14,7 @@
 
 use crate::platform::BootInfo;
 use crate::{arch, executor, irq, mm, println, timer};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 
 /// Most cores leatos uses (the apu4 has 4).
@@ -22,6 +22,46 @@ pub const MAX_CORES: usize = 4;
 /// The wake/stop IPI: SGI 0 on aarch64, a fixed vector on x86_64.
 static ONLINE: AtomicUsize = AtomicUsize::new(1);
 static STOP: AtomicBool = AtomicBool::new(false);
+/// Each core's microcode revision as it came up (bit 32 set = read), for
+/// the boot line: Linux warns when cores differ, so this shows it too.
+static MICROCODE: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
+
+/// Note this core's microcode revision (before it counts as online).
+fn record_microcode(core: usize) {
+    if let (Some(rev), Some(slot)) = (arch::cpu::microcode_revision(), MICROCODE.get(core)) {
+        slot.store(1 << 32 | u64::from(rev), Ordering::Release);
+    }
+}
+
+/// `microcode : <cpu>, patch level 0x… on all N cores` (or per core when
+/// they differ). Nothing on CPUs without a readable revision (aarch64).
+fn print_microcode(virtual_machine: bool) {
+    let Some(sig) = arch::cpu::cpu_signature() else {
+        return;
+    };
+    let n = online().min(MAX_CORES);
+    let revs = || MICROCODE[..n].iter().map(|r| r.load(Ordering::Acquire));
+    if revs().all(|r| r == 0) {
+        return;
+    }
+    let vm = if virtual_machine { " (as the hypervisor reports it)" } else { "" };
+    let first = revs().next().unwrap_or(0);
+    if revs().all(|r| r == first) {
+        println!(
+            "  microcode       : {sig}, patch level {:#010x} on all {n} core(s){vm}",
+            first as u32
+        );
+        return;
+    }
+    println!("  microcode       : {sig}, patch levels DIFFER across cores{vm}:");
+    for (core, r) in revs().enumerate() {
+        if r == 0 {
+            println!("                    core {core}: unknown");
+        } else {
+            println!("                    core {core}: {:#010x}", r as u32);
+        }
+    }
+}
 
 /// This core's index (0 = the boot core).
 #[inline]
@@ -46,6 +86,7 @@ fn on_ipi(_intid: u32) {
 /// Start the other cores. Call once on core 0 after `irqchip::init` and
 /// `timer::init_irq`, before tasks are spawned on other cores.
 pub fn start(info: &BootInfo) {
+    record_microcode(0);
     let ipi = arch::irqchip::IPI_INTID;
     irq::register(ipi, on_ipi, irq::new_event());
     arch::irqchip::enable(ipi, irq::Trigger::Edge);
@@ -85,6 +126,7 @@ pub fn start(info: &BootInfo) {
             ""
         }
     );
+    print_microcode(info.virtual_machine);
 }
 
 /// Entry of every secondary core (called by the arch backend with the MMU
@@ -93,6 +135,7 @@ pub fn secondary_main(core: usize) -> ! {
     arch::irqchip::init_secondary();
     arch::irqchip::enable(arch::irqchip::IPI_INTID, irq::Trigger::Edge);
     timer::init_secondary();
+    record_microcode(core);
     ONLINE.fetch_add(1, Ordering::AcqRel);
     debug_assert_eq!(current(), core);
     irq::enable();
