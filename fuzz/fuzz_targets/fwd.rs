@@ -411,6 +411,13 @@ fn nd_frame(ifx: usize, kind: u8, target: u8, src: u8, mac: u8, hop: u8, edit: O
 /// asker; NA for the target from the target with our MAC, valid
 /// checksum, hop limit 255, to the solicitor or all nodes).
 fn nd_answer(ifx: usize, f: &[u8]) {
+    // The datapath's ND snoop: a DAD probe (its target noted for the
+    // Clients page at the frame's MAC) is never also a neighbor to learn.
+    if let Some((t, mac)) = wire::parse_dad(f) {
+        assert_eq!(wire::parse_nd(f), None, "DAD probe also parsed as ND");
+        assert_eq!(&f[6..12], &mac, "DAD probe's MAC is the frame's");
+        assert!(!t.is_unspecified() && !t.is_multicast() && !wire::is_multicast_mac(&mac));
+    }
     let mine6 = addrs6(ifx);
     let (a4, len) = addr4(ifx);
     let me = fwd::nd::Link { mac: MACS[ifx], v4: Some((a4, len)), v6: &mine6 };

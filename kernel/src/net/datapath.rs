@@ -303,6 +303,9 @@ pub struct Datapath {
     /// ARP / ND answers on links whose router stack is IP-only
     /// ([`crate::net::shared::LinkShared::ip_only`]), with these switches.
     nd_cfg: fwd::nd::Config,
+    /// Note the targets of duplicate address detection probes as the
+    /// clients' addresses (`client6_dad=0`: not; [`Self::snoop_nd`]).
+    client6_dad: bool,
     /// Which link a frame belongs to and what `shard_of` needs: replaced
     /// whole by [`Self::apply`], read once per batch.
     topo: Mutex<alloc::sync::Arc<Topo>>,
@@ -487,6 +490,7 @@ impl Datapath {
             local: ifaces.iter().map(|_| Mutex::new(fwd::local::LocalLink::default())).collect(),
             local_gen: AtomicU64::new(0),
             nd_cfg: crate::config::nd_config(),
+            client6_dad: crate::config::client6_dad(),
             topo: Mutex::new(alloc::sync::Arc::new(Topo::default())),
             hk: Mutex::new(Hk {
                 next_housekeeping: 0,
@@ -1220,9 +1224,19 @@ impl Datapath {
     }
 
     /// Learn IPv6 neighbors from neighbor discovery (NA, NS, RA with a
-    /// link-layer option) and release packets waiting for them.
+    /// link-layer option) and release packets waiting for them; note DAD
+    /// probes' targets as the clients' addresses.
     fn snoop_nd(&self, ifx: IfIndex, frame: &[u8], now: u64, touched: &mut Touched) {
         let Some((ip, mac)) = wire::parse_nd(frame) else {
+            // A host about to use an address (DAD): its only announcement
+            // of a SLAAC address it may never use through the router. Not
+            // a neighbor to send to yet; only for the Clients page and the
+            // AAAA names, which `net::services` keeps up by probing it.
+            if self.client6_dad
+                && let Some((ip, mac)) = wire::parse_dad(frame)
+            {
+                self.sh.links[ifx as usize].note_neigh6(ip, mac, now);
+            }
             return;
         };
         let waiting = self.neigh6[ifx as usize].lock().learn(ifx, ip, mac, now);

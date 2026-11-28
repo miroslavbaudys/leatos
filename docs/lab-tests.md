@@ -214,6 +214,11 @@ Modes that imply `LAB_GUEST=1`:
   interface on the ULA, RA counters. With `LAB_GUEST=1`: the guest's ULA, DNS over IPv6 allowed,
   web refused, RS answered. Negative controls `LAB_ROUTER_ARGS=ipv6=0` (every IPv6 check fails),
   `LAB_GUEST_ZONE=lan` (guest web-refused fails).
+- The clients' addresses (the Clients page), right after DHCP, before the client sends any IPv6:
+  its SLAAC ULA (made without DAD) listed on its lease from the router's probes of its EUI-64
+  address (`client6_probe=2` from the script; negative control
+  `LAB_ROUTER_ARGS=client6_probe=0`), and an address it adds with DAD and never uses, from its DAD
+  probe (negative control `LAB_ROUTER_ARGS=client6_dad=0`).
 - The WAN side (step 2b): the ISP VM gets 2001:db8:ffff::1/64 and routes 2001:db8:100::/56 to the
   router (`wan6_ip=… wan6_gw=… lan6_prefix=… wan_mtu=1400`, IPv4 big ping 1372).
   - Global SLAAC + default route, ping6/HTTP to the ISP, the ISP sees the client's own address,

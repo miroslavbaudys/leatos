@@ -582,6 +582,15 @@ at once, a /60 delegated, no RA seen yet), these were added:
   forgotten after 30 min unseen). Lab: `labclient.home.arpa` AAAA global + ULA,
   PTR; hidden from the guest with views. Negative control
   `dns_aaaa=0`.
+- **Clients that never use IPv6 through the router** (2026-11-28: a UniFi
+  switch listed its SLAAC address, the Clients page did not): the datapath
+  also notes the targets of DAD probes (`wire::parse_dad`, the frame's MAC;
+  not into the neighbor table), and the services solicit, every
+  `client6_probe=` s (300), each bound lease's EUI-64 address per /64 and
+  each known address not seen for a round (≤ 64 per network and round),
+  so an address stays listed while its host answers. A host with a
+  random address that never uses it is seen only at its DAD. Lab: checks
+  right after DHCP; negative controls `client6_probe=0`, `client6_dad=0`.
 - **Config addresses:** `dns.upstreams` take IPv6 servers (UDP and DoT;
   `Policy::router_tcp_peers6`); `time.ntp_servers` IPv6 literals;
   `[[route]]` with an IPv6 `dst` via a host in a network's ULA /64

@@ -99,12 +99,20 @@ pub struct LanServices {
     /// leases and reservations by MAC; refreshed every [`AAAA_EVERY_MS`].
     aaaa: Vec<(String, String, Ipv6Addr, View)>,
     next_aaaa: u64,
+    /// Probing the clients' IPv6 addresses ([`Self::probe_clients`]):
+    /// every this many ms (`client6_probe=`, 0 = never), next at
+    /// `next_probe`; `probe_round` turns the start of a round's list.
+    probe_every: u64,
+    next_probe: u64,
+    probe_round: usize,
 }
 
 /// How often the clients' AAAA records are compared with the neighbors.
 const AAAA_EVERY_MS: u64 = 5_000;
 /// A neighbor not seen for this long loses its AAAA record.
 const AAAA_FORGET_MS: u64 = 30 * 60_000;
+/// Neighbor solicitations per network and probe round at most.
+const PROBES_PER_ROUND: usize = 64;
 
 /// A network's RA settings: its ULA /64 (and global /64), the router's
 /// ULA as DNS server, its domain to search, the MAC of its link's
@@ -490,6 +498,9 @@ impl LanServices {
             retiring: Vec::new(),
             aaaa: Vec::new(),
             next_aaaa: 0,
+            probe_every: config::client6_probe_ms(),
+            next_probe: now_ms() + config::client6_probe_ms(),
+            probe_round: 0,
         };
         me.apply_upstreams(hosts);
         Some(me)
@@ -766,6 +777,61 @@ impl LanServices {
         }
     }
 
+    /// Solicit the clients' IPv6 addresses, so that their answers (NAs
+    /// with the target's MAC, `Datapath::snoop_nd`) keep
+    /// `LinkShared::neigh6` current for the Clients page and the AAAA
+    /// names: a host that never sends IPv6 through the router (a switch
+    /// or access point that talks to its controller over IPv4) is seen
+    /// no other way. Per network with IPv6: each known address not seen
+    /// for a round, until it is forgotten ([`AAAA_FORGET_MS`]; those from
+    /// DAD probes too), and the EUI-64 address of each bound lease's MAC
+    /// in each of the network's /64s (a host up since before the router).
+    /// At most [`PROBES_PER_ROUND`], the start of the list turning.
+    fn probe_clients(&mut self, sh: &Shared, now: u64) {
+        let fresh = self.probe_every;
+        self.probe_round = self.probe_round.wrapping_add(1);
+        for net in &self.nets {
+            let prefixes: Vec<Ipv6Addr> = [net.cfg.ula, net.cfg.gua].into_iter().flatten().collect();
+            if prefixes.is_empty() {
+                continue;
+            }
+            let in_net = |a: Ipv6Addr| prefixes.iter().any(|p| u128::from(*p) >> 64 == u128::from(a) >> 64);
+            let known: Vec<(Ipv6Addr, [u8; 6], u64)> = sh.links[net.host].neigh6.lock().clone();
+            let mut targets: Vec<Ipv6Addr> = known
+                .iter()
+                .filter(|e| in_net(e.0) && (fresh..=AAAA_FORGET_MS).contains(&now.saturating_sub(e.2)))
+                .map(|e| e.0)
+                .collect();
+            if let Some(s) = &net.dhcp {
+                for l in s.leases().filter(|l| l.state == dhcp::LeaseState::Bound) {
+                    for p in &prefixes {
+                        let a = fwd::wire::eui64(*p, l.mac);
+                        let recent = known.iter().any(|e| e.0 == a && now.saturating_sub(e.2) < fresh);
+                        if !recent && !targets.contains(&a) {
+                            targets.push(a);
+                        }
+                    }
+                }
+            }
+            if targets.is_empty() {
+                continue;
+            }
+            let mac = sh.ports[sh.links[net.host].port()].mac;
+            // From the network's ULA, not the link-local address: a
+            // client's entry for its default router (the RA's link-local
+            // source) stays as its own neighbor discovery keeps it (a
+            // solicitation from it every round kept Linux from ever
+            // probing the router: the lab's "ipv6 nd" check).
+            let src = net.cfg.ula.unwrap_or_else(|| fwd::wire::link_local(mac));
+            let start = self.probe_round.wrapping_mul(PROBES_PER_ROUND) % targets.len();
+            let mut ns = [0u8; fwd::wire::NS_LEN];
+            for &t in targets.iter().cycle().skip(start).take(targets.len().min(PROBES_PER_ROUND)) {
+                fwd::wire::build_ns(&mut ns, mac, src, t);
+                send_frame(sh, net.host, &ns);
+            }
+        }
+    }
+
     /// The WAN lease changed: its DNS servers, used unless the config
     /// names its own (`dns.upstreams`, `dns.tls`).
     pub fn set_upstreams(&mut self, servers: &[Ipv4Addr]) {
@@ -934,6 +1000,10 @@ impl LanServices {
             self.next_aaaa = now_aaaa + AAAA_EVERY_MS;
             self.refresh_aaaa(sh, now_aaaa);
         }
+        if self.probe_every > 0 && now_aaaa >= self.next_probe {
+            self.next_probe = now_aaaa + self.probe_every;
+            self.probe_clients(sh, now_aaaa);
+        }
         // Router Advertisements: solicited, periodic, last ones.
         let now = now_ms();
         for net in &mut self.nets {
@@ -1079,6 +1149,9 @@ impl LanServices {
         }
         if let Some(at) = self.nets.iter().filter_map(|n| n.dns_tcp.as_ref()?.next_deadline()).min() {
             wait_ms = wait_ms.min(at.saturating_sub(ms_now));
+        }
+        if self.probe_every > 0 {
+            wait_ms = wait_ms.min(self.next_probe.saturating_sub(ms_now));
         }
         if self.mdns.wants_soon() {
             wait_ms = wait_ms.min(MDNS_RECHECK_MS);

@@ -367,8 +367,8 @@ pub fn solicited_node(a: Ipv6Addr) -> Ipv6Addr {
 /// Bytes of a neighbor solicitation frame ([`build_ns`]).
 pub const NS_LEN: usize = ETH_HDR + 40 + 32;
 
-/// A Neighbor Solicitation for `target` from `src_ip` (the router's
-/// link-local address) at `src_mac`, to the target's solicited-node group
+/// A Neighbor Solicitation for `target` from `src_ip` (one of the
+/// router's addresses on the link) at `src_mac`, to the target's solicited-node group
 /// (RFC 4861 §7.2.2), with the source link-layer option.
 pub fn build_ns(out: &mut [u8; NS_LEN], src_mac: Mac, src_ip: Ipv6Addr, target: Ipv6Addr) {
     let group = solicited_node(target);
@@ -465,6 +465,51 @@ pub fn parse_nd(frame: &[u8]) -> Option<(Ipv6Addr, Mac)> {
         o = &o[len..];
     }
     None
+}
+
+/// A duplicate address detection probe (RFC 4862 §5.4.2): a Neighbor
+/// Solicitation from the unspecified address to its target's
+/// solicited-node group, without a source link-layer option (RFC 4861
+/// §7.1.1). Returns the tentative target and the frame's Ethernet source:
+/// the host about to use that address (a host's only announcement of a
+/// SLAAC address it may never use through the router). Hop limit 255, a
+/// valid checksum, no extension headers.
+pub fn parse_dad(frame: &[u8]) -> Option<(Ipv6Addr, Mac)> {
+    let ip = ETH_HDR;
+    let v = Ipv6View::parse(frame, ip)?;
+    if v.proto != PROTO_ICMPV6 || v.l4 != ip + 40 || v.hop_limit(frame) != 255 || v.l4_len < 24 {
+        return None;
+    }
+    let msg = &frame[v.l4..v.l4 + v.l4_len];
+    if msg[0] != 135 || msg[1] != 0 || !v.src(frame).is_unspecified() {
+        return None;
+    }
+    let target = get_ip6(msg, 8);
+    if target.is_unspecified() || target.is_multicast() || v.dst(frame) != solicited_node(target) {
+        return None;
+    }
+    if icmpv6_checksum(v.src(frame), v.dst(frame), msg) != 0 {
+        return None;
+    }
+    let mut o = &msg[24..];
+    while !o.is_empty() {
+        let len = *o.get(1)? as usize * 8;
+        if len == 0 || len > o.len() || o[0] == 1 {
+            return None;
+        }
+        o = &o[len..];
+    }
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(frame.get(6..12)?);
+    (!is_multicast_mac(&mac)).then_some((target, mac))
+}
+
+/// The modified EUI-64 address (RFC 4291 §2.5.1, RFC 4862 §5.5.3) of an
+/// interface with `mac` in the /64 of `prefix`: the SLAAC address of a
+/// host without stable-privacy or temporary addresses.
+pub fn eui64(prefix: Ipv6Addr, mac: Mac) -> Ipv6Addr {
+    let low = u128::from(u64::MAX);
+    Ipv6Addr::from((u128::from(prefix) & !low) | (u128::from(link_local(mac)) & low))
 }
 
 /// `ff02::1:ffXX:XXXX` (RFC 4291 §2.7.1).
@@ -1068,6 +1113,49 @@ mod tests {
         let c = icmpv6_checksum(gw, me, &bare);
         put16(&mut bare, 2, c);
         assert_eq!(parse_nd(&v6_frame(RMAC, CMAC, gw, me, PROTO_ICMPV6, &bare)), None);
+    }
+
+    /// A DAD probe for `target` from `smac` (`opts` appended, checksum fixed).
+    fn dad_frame(smac: Mac, target: Ipv6Addr, dst: Ipv6Addr, opts: &[u8]) -> Vec<u8> {
+        let mut ns = alloc::vec![135u8, 0, 0, 0, 0, 0, 0, 0];
+        ns.extend_from_slice(&target.octets());
+        ns.extend_from_slice(opts);
+        let c = icmpv6_checksum(Ipv6Addr::UNSPECIFIED, dst, &ns);
+        put16(&mut ns, 2, c);
+        v6_frame([0x33, 0x33, 0xff, 0, 0, 0x10], smac, Ipv6Addr::UNSPECIFIED, dst, PROTO_ICMPV6, &ns)
+    }
+
+    #[test]
+    fn dad_probe_parsed() {
+        let t: Ipv6Addr = "fd00::5054:ff:fe00:10".parse().unwrap();
+        let f = dad_frame(CMAC, t, solicited_node(t), &[]);
+        assert_eq!(parse_dad(&f), Some((t, CMAC)));
+        // Not an ordinary NS (parse_nd's), nor parse_nd a DAD probe.
+        assert_eq!(parse_nd(&f), None);
+        let mut ns = [0u8; NS_LEN];
+        build_ns(&mut ns, RMAC, link_local(RMAC), t);
+        assert_eq!(parse_dad(&ns), None);
+        // Not to another group, with a source link-layer option, a bad
+        // checksum, another hop limit or from a multicast MAC.
+        assert_eq!(parse_dad(&dad_frame(CMAC, t, "ff02::1".parse().unwrap(), &[])), None);
+        assert_eq!(parse_dad(&dad_frame(CMAC, t, solicited_node(t), &[1, 1, 0x52, 0x54, 0, 0, 0, 0x10])), None);
+        // Other options are fine (a nonce, RFC 7527), truncated ones not.
+        assert_eq!(parse_dad(&dad_frame(CMAC, t, solicited_node(t), &[14, 1, 1, 2, 3, 4, 5, 6])), Some((t, CMAC)));
+        assert_eq!(parse_dad(&dad_frame(CMAC, t, solicited_node(t), &[14, 2, 1, 2, 3, 4, 5, 6])), None);
+        let mut bad = f.clone();
+        bad[ETH_HDR + 40 + 2] ^= 1;
+        assert_eq!(parse_dad(&bad), None);
+        let mut hop = f.clone();
+        hop[ETH_HDR + 7] = 64;
+        assert_eq!(parse_dad(&hop), None);
+        assert_eq!(parse_dad(&dad_frame([0x33, 0x33, 0, 0, 0, 1], t, solicited_node(t), &[])), None);
+    }
+
+    #[test]
+    fn eui64_address() {
+        let mac = [0x6c, 0x63, 0xf8, 0x26, 0x92, 0xe3];
+        let p: Ipv6Addr = "2a03:ab00:1000:910:1:2:3:4".parse().unwrap();
+        assert_eq!(eui64(p, mac), "2a03:ab00:1000:910:6e63:f8ff:fe26:92e3".parse::<Ipv6Addr>().unwrap());
     }
 
 

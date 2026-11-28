@@ -393,6 +393,13 @@
 #                        addresses (`ipv6`, the Clients page); no run-time
 #                        negative control (ipv6=0 skips the section):
 #                        checked with a build listing none.
+#                        Right after DHCP, before any IPv6 traffic: the
+#                        client's SLAAC ULA, made without DAD, is listed on
+#                        its lease from the router's probes of its EUI-64
+#                        address (client6_probe=2; negative control
+#                        LAB_ROUTER_ARGS=client6_probe=0), and an address
+#                        it adds with DAD and never uses from its DAD probe
+#                        (negative control LAB_ROUTER_ARGS=client6_dad=0).
 #                        IPv6 on the router's networks (docs/ipv6.md step
 #                        1; router ipv6=1): the client gets a SLAAC
 #                        address from the main LAN's ULA /64, no default
@@ -546,6 +553,9 @@ elif [[ -n "$IPV6" ]]; then
   export LAB_INITRD_KEA=1 # the ISP's prefix delegation server
 fi
 [[ -n "$IPV6" && -z "$ISP_PPPOE" ]] && BIG_PING="${LAB_BIG_PING:-1372}"
+# The client's address check right after DHCP needs the router's probes of
+# its EUI-64 address within seconds (default every 300 s).
+[[ -n "$IPV6" && " ${LAB_ROUTER_ARGS:-} " != *" client6_probe="* ]] && ROUTER_ARGS="$ROUTER_ARGS client6_probe=2"
 GUEST="${LAB_GUEST:-}"
 GUEST_LIVE="${LAB_GUEST_LIVE:-}"
 [[ -n "$GUEST_LIVE" ]] && GUEST=1

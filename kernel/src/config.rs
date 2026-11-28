@@ -1402,6 +1402,22 @@ pub fn nd_config() -> fwd::nd::Config {
     }
 }
 
+/// The clients' IPv6 addresses for the Clients page and AAAA names
+/// (`net::services`): how often the router solicits each lease's EUI-64
+/// address and the known addresses about to be forgotten, in seconds
+/// (boot argument `client6_probe=`, default 300; `0` = never, the lab's
+/// negative control; the lab shortens it).
+pub fn client6_probe_ms() -> u64 {
+    arg_u64(bootargs(), "client6_probe").unwrap_or(300).saturating_mul(1000)
+}
+
+/// Addresses learned from duplicate address detection probes (the
+/// datapath's ND snoop); boot argument `client6_dad=0` ignores them, the
+/// lab's negative control.
+pub fn client6_dad() -> bool {
+    arg_u64(bootargs(), "client6_dad") != Some(0)
+}
+
 /// The management interface refuses DNS-rebound `Host`s and cross-site
 /// requests (`proto_http::check_browser_origin`, docs/security-audit.md);
 /// boot argument `mgmt_origin=0` turns that off (the lab's negative control).

@@ -67,6 +67,8 @@ PVH / Multiboot2 command line on x86_64, QEMU `-append` via `QEMU_APPEND`. They 
 | `dns_stale=SECS` | `dns.stale_secs` | serve-stale (RFC 8767), default 86400, `0` = off |
 | `dns_tcp=0` | – | no DNS over TCP from clients: the lab's negative control |
 | `dns_aaaa=0` | – | no AAAA names for DHCP clients from neighbor discovery: the lab's negative control |
+| `client6_probe=N` | – | every N s (default 300) the router solicits each lease's EUI-64 address and the clients' known IPv6 addresses not seen since the last round (`net::services`); `0` = never: the lab's negative control (the lab uses 2) |
+| `client6_dad=0` | – | the targets of DAD probes not noted as the clients' addresses: the lab's negative control |
 | `dns_port_random=0` | – | one upstream DNS port per boot: the lab's negative control for its port check |
 | `ntp=a,b` | `time.ntp_servers` | SNTP servers; `ntp=` = off |
 
