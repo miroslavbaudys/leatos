@@ -50,6 +50,7 @@ const BOHC: usize = 0x28;
 const CAP_S64A: u32 = 1 << 31;
 const GHC_AE: u32 = 1 << 31;
 const GHC_IE: u32 = 1 << 1;
+const GHC_HR: u32 = 1 << 0;
 const CAP2_BOH: u32 = 1 << 0;
 const BOHC_BOS: u32 = 1 << 0;
 const BOHC_OOS: u32 = 1 << 1;
@@ -73,6 +74,8 @@ const CMD_ST: u32 = 1 << 0;
 const CMD_SUD: u32 = 1 << 1;
 const CMD_POD: u32 = 1 << 2;
 const CMD_FRE: u32 = 1 << 4;
+/// Interface communication control = active (Linux's `ahci_power_up`).
+const CMD_ICC_ACTIVE: u32 = 1 << 28;
 const CMD_FR: u32 = 1 << 14;
 const CMD_CR: u32 = 1 << 15;
 /// Task file error, host bus fatal / data error, interface fatal error.
@@ -103,6 +106,9 @@ const DETECT_TIME: Duration = Duration::from_millis(50);
 const LINK_TIMEOUT: Duration = Duration::from_secs(1);
 /// A spinning disk may take seconds to spin up after power-on.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// A disk already linked shows ready at once if PxTFD is current; else
+/// PxTFD still holds a stale value (see `init`) and a COMRESET follows.
+const READY_STALE: Duration = Duration::from_millis(500);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -116,6 +122,10 @@ pub enum Error {
     Timeout(&'static str),
     /// The command failed: port interrupt status, task file data.
     Device { is: u32, tfd: u32 },
+    /// The device never showed ready, even after a COMRESET: PxTFD,
+    /// PxSSTS, PxSIG, PxCMD, PxIS, PxSERR as last read, and the status
+    /// byte of the D2H register FIS in the received-FIS area (0x40 + 2).
+    NotReady { tfd: u32, ssts: u32, sig: u32, cmd: u32, is: u32, serr: u32, d2h: u8 },
     BadRequest,
 }
 
@@ -128,6 +138,11 @@ impl core::fmt::Display for Error {
             Error::Unsupported(w) => write!(f, "unsupported: {w}"),
             Error::Timeout(w) => write!(f, "timeout ({w})"),
             Error::Device { is, tfd } => write!(f, "command failed (IS {is:#010x}, TFD {tfd:#06x})"),
+            Error::NotReady { tfd, ssts, sig, cmd, is, serr, d2h } => write!(
+                f,
+                "device not ready after COMRESET (TFD {tfd:#06x}, SSTS {ssts:#05x}, SIG {sig:#010x}, \
+                 CMD {cmd:#010x}, IS {is:#010x}, SERR {serr:#010x}, D2H status {d2h:#04x})"
+            ),
             Error::BadRequest => f.write_str("bad request"),
         }
     }
@@ -172,21 +187,45 @@ pub async fn open_ports(dev: &PciDevice) -> Result<Vec<(u32, Result<Ahci, Error>
     let implemented = hba.read32(PI);
     let ports = ((bar.size as usize - PORTS) / PORT_LEN).min(32);
     let mut out = Vec::new();
-    for p in 0..ports as u32 {
-        if implemented & (1 << p) == 0 {
-            continue;
+    for attempt in 0..2 {
+        for p in 0..ports as u32 {
+            if implemented & (1 << p) == 0 {
+                continue;
+            }
+            let base = abar + PORTS + p as usize * PORT_LEN;
+            // SAFETY: port `p`'s register window inside BAR5 (bounded by
+            // the BAR's size above), disjoint from the controller's and the
+            // other ports' windows; this Ahci is its only user (a second
+            // attempt drops the first one's before making its own).
+            let regs = unsafe { Region::new(base, PORT_LEN) };
+            let mut port = Ahci::new(regs, p, s64, vs);
+            match port.init().await {
+                Ok(true) => out.push((p, Ok(port))),
+                Ok(false) => {} // nothing attached
+                Err(e) => out.push((p, Err(e))),
+            }
         }
-        let base = abar + PORTS + p as usize * PORT_LEN;
-        // SAFETY: port `p`'s register window inside BAR5 (bounded by the
-        // BAR's size above), disjoint from the controller's and the other
-        // ports' windows; this Ahci is its only user.
-        let regs = unsafe { Region::new(base, PORT_LEN) };
-        let mut port = Ahci::new(regs, p, s64, vs);
-        match port.init().await {
-            Ok(true) => out.push((p, Ok(port))),
-            Ok(false) => {} // nothing attached
-            Err(e) => out.push((p, Err(e))),
+        let busy = out.iter().any(|(_, r)| matches!(r, Err(Error::NotReady { .. })));
+        if attempt > 0 || !busy {
+            break;
         }
+        // A port stays busy: reset the whole HBA (GHC.HR, §10.4.3), as
+        // Linux does at probe, keeping the firmware's CAP and PI (as
+        // Linux's ahci_restore_initial_config), and set every port up
+        // again.
+        crate::println!(
+            "  ahci: a port stays busy: HBA reset (CAP {cap:#010x} GHC {:#010x} PI {implemented:#x} VS {vs:#x})",
+            hba.read32(GHC)
+        );
+        out.clear();
+        hba.modify32(GHC, |v| v | GHC_HR);
+        let t0 = Instant::now();
+        while hba.read32(GHC) & GHC_HR != 0 && t0.elapsed() < Duration::from_secs(1) {
+            crate::executor::yield_now().await;
+        }
+        hba.modify32(GHC, |v| (v | GHC_AE) & !GHC_IE);
+        hba.write32(CAP, cap);
+        hba.write32(PI, implemented);
     }
     Ok(out)
 }
@@ -243,6 +282,50 @@ impl Ahci {
         Ok(())
     }
 
+    /// PxTFD shows neither BSY nor DRQ within `t`.
+    async fn ready(&mut self, t: Duration) -> bool {
+        self.wait(P_TFD, TFD_BSY | TFD_DRQ, 0, t, "device ready").await.is_ok()
+    }
+
+    /// The received D2H register FIS (offset 0x40 of the FIS area).
+    fn d2h(&self) -> [u8; 8] {
+        let mut b = [0u8; 8];
+        self.fis.copy_out(0x40, &mut b);
+        b
+    }
+
+    /// Mark the D2H area busy before a COMRESET (as Linux does), so what
+    /// arrives after it shows.
+    fn preset_d2h_busy(&mut self) {
+        let mut b = self.d2h();
+        b[2] = TFD_BSY as u8;
+        self.fis.copy_in(0x40, &b);
+    }
+
+    /// One line with the port's state, for a device that stays busy.
+    fn log_state(&mut self, what: &str) {
+        let [tfd, ssts, sctl, serr, is, cmd, sig] =
+            [P_TFD, P_SSTS, P_SCTL, P_SERR, P_IS, P_CMD, P_SIG].map(|r| self.regs.read32(r));
+        crate::println!(
+            "  ahci port {} {what}: TFD {tfd:#06x} SSTS {ssts:#05x} SCTL {sctl:#05x} SERR {serr:#010x} \
+             IS {is:#010x} CMD {cmd:#010x} SIG {sig:#010x} D2H {:02x?}",
+            self.port,
+            self.d2h()
+        );
+    }
+
+    fn not_ready(&mut self) -> Error {
+        Error::NotReady {
+            tfd: self.regs.read32(P_TFD),
+            ssts: self.regs.read32(P_SSTS),
+            sig: self.regs.read32(P_SIG),
+            cmd: self.regs.read32(P_CMD),
+            is: self.regs.read32(P_IS),
+            serr: self.regs.read32(P_SERR),
+            d2h: self.d2h()[2],
+        }
+    }
+
     /// Stop command processing and FIS reception (§10.1.2).
     async fn stop(&mut self) -> Result<(), Error> {
         self.regs.modify32(P_CMD, |v| v & !CMD_ST);
@@ -252,12 +335,26 @@ impl Ahci {
     }
 
     /// COMRESET (§10.4.2): DET = 1 for at least 1 ms, then wait for the
-    /// link to come back.
+    /// link to come back. As Linux's `sata_link_hardreset`: IPM = 3
+    /// (no partial / slumber) with the speed limit kept, and PxSERR
+    /// cleared once the link is back: the COMINIT sets DIAG.X there, and
+    /// some controllers hold the device's first D2H register FIS (its
+    /// signature, PxTFD) until it is cleared.
     async fn comreset(&mut self) -> Result<(), Error> {
-        self.regs.modify32(P_SCTL, |v| (v & !0xf) | 1);
+        self.comreset_at(0).await
+    }
+
+    /// [`Self::comreset`] with the link speed limited (SCTL.SPD: 1 =
+    /// 1.5, 2 = 3 Gb/s); 0 keeps the current limit.
+    async fn comreset_at(&mut self, spd: u32) -> Result<(), Error> {
+        let limit = |v: u32| if spd == 0 { v & 0x0f0 } else { spd << 4 };
+        self.regs.modify32(P_SCTL, |v| limit(v) | 0x301);
         crate::timer::sleep(Duration::from_millis(2)).await;
-        self.regs.modify32(P_SCTL, |v| v & !0xf);
-        self.wait(P_SSTS, 0xf, DET_PRESENT, LINK_TIMEOUT, "link after COMRESET").await
+        self.regs.modify32(P_SCTL, |v| limit(v) | 0x300);
+        self.wait(P_SSTS, 0xf, DET_PRESENT, LINK_TIMEOUT, "link after COMRESET").await?;
+        self.regs.write32(P_SERR, 0xffff_ffff);
+        self.regs.write32(P_IS, 0xffff_ffff);
+        Ok(())
     }
 
     /// Set the port up: `Ok(false)` if nothing is attached.
@@ -282,7 +379,7 @@ impl Ahci {
         self.regs.write32(P_IE, 0);
         self.regs.write32(P_SERR, 0xffff_ffff);
         self.regs.write32(P_IS, 0xffff_ffff);
-        self.regs.modify32(P_CMD, |v| v | CMD_FRE | CMD_SUD | CMD_POD);
+        self.regs.modify32(P_CMD, |v| v | CMD_FRE | CMD_SUD | CMD_POD | CMD_ICC_ACTIVE);
         // SStatus.DET: 0 = no device, 1 = device but no link, 3 = ready.
         // A device's presence shows within milliseconds of spin-up; an
         // empty port stays 0 and is left at once (no COMRESET: a
@@ -304,7 +401,40 @@ impl Ahci {
                 return Ok(false);
             }
         }
-        self.wait(P_TFD, TFD_BSY | TFD_DRQ, 0, READY_TIMEOUT, "device ready").await?;
+        // PxTFD and PxSIG hold what the device's last register FIS said.
+        // A link the firmware brought up (DET = 3 already) may have sent
+        // its signature FIS before FIS reception ran into our buffers: on
+        // real controllers (the apu4's FCH) PxTFD then stays at its reset
+        // value 0x7f (DRQ set) and never shows ready. A COMRESET makes the
+        // device send a fresh one (as Linux resets every port at probe).
+        // QEMU's disks are ready at once: no reset, no delay there.
+        //
+        // Still busy: the steps Linux takes, each logged with the port's
+        // state (the apu4's FCH with a Transcend MSA370 stayed at TFD 0x80
+        // and no signature after a plain COMRESET): a COMRESET with the
+        // D2H area preset to busy, then one at 3 Gb/s (Linux's slow-down),
+        // then the command engine on. `open_ports` resets the whole HBA
+        // if a port still stays busy.
+        if !self.ready(READY_STALE).await {
+            self.log_state("busy with the firmware's link");
+            let mut ready = false;
+            for (what, spd) in [("after COMRESET", 0), ("after COMRESET at 3 Gb/s", 2)] {
+                self.preset_d2h_busy();
+                if self.comreset_at(spd).await.is_ok() && self.ready(READY_TIMEOUT).await {
+                    ready = true;
+                    break;
+                }
+                self.log_state(what);
+            }
+            if !ready {
+                self.regs.modify32(P_CMD, |v| v | CMD_ST);
+                ready = self.ready(Duration::from_secs(2)).await;
+                if !ready {
+                    self.log_state("with the command engine on");
+                    return Err(self.not_ready());
+                }
+            }
+        }
         self.regs.write32(P_SERR, 0xffff_ffff);
         let sig = self.regs.read32(P_SIG);
         if sig != SIG_ATA {

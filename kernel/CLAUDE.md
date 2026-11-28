@@ -92,7 +92,8 @@ live with the VID; networks on a port the machine lacks are left out (`config::m
   hand-off, one `Ahci` per port with an ATA disk (ATAPI reported, not used), IDENTIFY, READ /
   WRITE DMA (EXT), FLUSH CACHE (EXT); polled, slot 0, yields; DMA only through driver-owned
   `DmaRegion`s (`copy_in` / `copy_out`); an abandoned command → port stop / restart (COMRESET if
-  busy). `Disk::open` returns one disk per port, named `<PCI address>/<port>`.
+  busy). A disk still busy at set-up gets Linux's steps, each logged with the port's registers:
+  COMRESET (SERR cleared after it), at 3 Gb/s, engine on, then an HBA reset (GHC.HR). `Disk::open` returns one disk per port, named `<PCI address>/<port>`.
 - `ccp.rs`: AMD CCP TRNG, PCI 1022:1537.
 - `screen.rs`: the console mirrored on the screen through `crates/text-screen`: the loader's
   framebuffer (Multiboot2 tag 8, requested in `boot.S`, 32 bpp, 7x16 glyphs: 182x50 at

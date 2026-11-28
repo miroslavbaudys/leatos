@@ -215,7 +215,7 @@ and `virtio0`, installed, ISO ejected, boots.
 | 2. Install mode on virtio-blk / SD, `--iso`, `install-test.sh` ✅ (QEMU, 2026-11-28) | ~1 wk | **Proxmox install from ISO** |
 | 3. AHCI driver + `QEMU_STORE_BUS=ahci` tests ✅ (QEMU, 2026-11-28) | 1–1.5 wk | mSATA / `sata0` as boot + store |
 | 4. Store ID + `store_id=` ✅ (QEMU, 2026-11-28) | 2–3 days | safe with two leatos disks |
-| 5. apu4: AHCI at 00:11, USB stick install to mSATA, boot order | — | hardware check |
+| 5. apu4: AHCI at 00:11, USB stick install to mSATA, boot order (⏳ 2026-11-28, below) | — | hardware check |
 
 Step 2 serves Proxmox (M13 step 7) without AHCI; steps 3 and 4 go together before the apu4
 gets an mSATA install.
@@ -225,7 +225,14 @@ gets an mSATA install.
 - UEFI: Proxmox `bios: ovmf` and newer boards. Limine can put a UEFI loader on the same ISO,
   but leatos has no UEFI entry (Multiboot2 from Limine UEFI hands over in 64-bit mode with a
   UEFI memory map): separate step.
-- Does SeaBIOS on the apu4 boot a hybrid ISO from USB as well as a plain MBR image (it should;
-  to verify)?
+- Does SeaBIOS on the apu4 boot a hybrid ISO from USB as well as a plain MBR image? **Yes**
+  (2026-11-28): with the stick in, SeaBIOS boots it first, Limine shows "leatos installer".
+
+On the apu4 (2026-11-28): FCH SATA `00:11.0 1022:7801 class 01.06`, AHCI 1.3, 2 ports (port 0 =
+the "mSATA / mPCIe 3" slot, port 1 = the SATA connector). The Transcend TS16GMSA370 in the mSATA
+slot links at 6 Gb/s but never sends its signature (TFD 0x80, SIG 0xffffffff) to leatos, SeaBIOS
+("No bootable device") or Linux (OpenWrt: `ata1: COMRESET failed ... reset failed, giving up`),
+also after reseating: a faulty SSD. An ADATA SU800 on port 1 works under Linux. The driver now
+logs each recovery step with the port's registers (`ahci port N ...: TFD .. SSTS .. SERR ..`).
 - Install over the network instead (upload the image to a running leatos and pick the target
   disk) reuses §3.3 / §3.4 without a stick: later, if wanted.
