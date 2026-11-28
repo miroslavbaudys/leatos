@@ -48,7 +48,8 @@ Keep them current when you change what they describe; keep this file to the map 
   controls), safety-and-portability, smp, config-and-storage, config-v2, upgrades, ipv6,
   security-audit, lan-neighbors (done: one neighbor table, the datapath does ARP / ND),
   local-stack (done in QEMU: smoltcp for TCP only), own-tcp (done in QEMU: smoltcp removed),
-  proxmox (plan: leatos as a KVM / Proxmox guest), …
+  proxmox (plan: leatos as a KVM / Proxmox guest), install (plan: ISO / USB installer, AHCI),
+  …
 
 ## Rules
 
