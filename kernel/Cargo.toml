@@ -35,6 +35,7 @@ proto-pppoe.workspace = true
 fwd.workspace = true
 qdisc.workspace = true
 boot-image.workspace = true
+install-image.workspace = true
 proto-http.workspace = true
 config.workspace = true
 auth.workspace = true

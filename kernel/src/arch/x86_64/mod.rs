@@ -98,5 +98,6 @@ pub fn discover(start_info: usize) -> Result<BootInfo, &'static str> {
         pcie,
         virtual_machine: cpu::hypervisor(),
         bootargs: si.cmdline,
+        module: si.module,
     })
 }

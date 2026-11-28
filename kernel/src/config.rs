@@ -1302,6 +1302,14 @@ pub fn heap_list() -> bool {
     bootargs().split_ascii_whitespace().any(|a| a == "heap=list")
 }
 
+/// `module_carve=0`: the heap does not leave the boot module out
+/// (`mm::heap::region`), the negative control of docs/install.md §3.2:
+/// Limine puts the module right after the kernel, so the heap overwrites
+/// it and its hash fails. Lab only. Read before the heap exists.
+pub fn module_carve() -> bool {
+    !bootargs().split_ascii_whitespace().any(|a| a == "module_carve=0")
+}
+
 /// `heap_bench=N` (N ≥ 1): time heap operations and a conntrack expiry
 /// pass on the fresh heap, then again with N small holes in front of the
 /// free space (`selftest::heap_bench`): what fragmentation costs on this

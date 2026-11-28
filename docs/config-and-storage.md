@@ -400,7 +400,8 @@ For when the network is not an option: the console prompt `leatos> `.
   Requests are at most 64 KiB (`crate::store` splits). Known limit:
   `virtio-drivers` has only a blocking flush, so each flush (two per
   record) spins until QEMU answers.
-- Host tool `tools/leatstore` (`cargo run -p leatstore -- create|format|show|put|get|corrupt|hash`):
+- Host tool `tools/leatstore`
+  (`cargo run -p leatstore -- create|format|show|put|get|corrupt|hash|install-image`):
   creates and formats store images, writes and reads records through the
   same `config-store` code, and flips payload bytes for negative controls.
   `QEMU_STORE=img scripts/qemu-run.sh` attaches an image as virtio-blk.

@@ -468,6 +468,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "install-image"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -494,6 +501,7 @@ dependencies = [
  "config",
  "config-store",
  "fwd",
+ "install-image",
  "libfuzzer-sys",
  "proto-dhcp",
  "proto-dns",

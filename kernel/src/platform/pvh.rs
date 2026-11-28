@@ -1,7 +1,7 @@
 //! PVH boot protocol (x86_64): the loader (QEMU `-kernel`, Xen, or a
 //! bootloader) enters the kernel in 32-bit protected mode with `ebx`
-//! pointing at an `hvm_start_info` structure: memory map, command line and
-//! the ACPI RSDP. See xen/include/public/arch-x86/hvm/start_info.h.
+//! pointing at an `hvm_start_info` structure: memory map, command line,
+//! the ACPI RSDP and modules (QEMU `-initrd`). See xen/include/public/arch-x86/hvm/start_info.h.
 
 use super::phys::{self, u32_at, u64_at};
 use spin::Once;
@@ -21,6 +21,9 @@ pub struct StartInfo {
     pub cmdline: &'static str,
     pub mmap: [MmapEntry; MAX_MMAP],
     pub mmap_len: usize,
+    /// The first boot module (start, length): the install image
+    /// (docs/install.md §3.2).
+    pub module: Option<(usize, usize)>,
 }
 
 /// Copy (base, length, type) entries into a fixed array (no heap yet).
@@ -65,6 +68,15 @@ pub fn parse(start_info: usize, kernel_start: usize) -> Result<StartInfo, &'stat
         .filter_map(|e| Some((u64_at(e, 0)?, u64_at(e, 8)?)))
         .find(|&(start, size)| start <= k && k < start + size)
         .ok_or("pvh: no RAM region contains the kernel")?;
+    // hvm_start_info: nr_modules at 12, modlist_paddr at 16; an entry is
+    // paddr, size, cmdline_paddr, reserved (8 bytes each).
+    let module = match (u32_at(si, 12).unwrap_or(0), u64_at(si, 16).unwrap_or(0)) {
+        (0, _) | (_, 0) => None,
+        (_, list) => {
+            let e = phys::bytes(list, 32)?;
+            module_range(u64_at(e, 0).unwrap_or(0), u64_at(e, 8).unwrap_or(0))?
+        }
+    };
     let (mmap, mmap_len) = collect_mmap(
         map.as_chunks::<24>()
             .0
@@ -77,7 +89,18 @@ pub fn parse(start_info: usize, kernel_start: usize) -> Result<StartInfo, &'stat
         cmdline,
         mmap,
         mmap_len,
+        module,
     })
+}
+
+/// A module's (start, length), checked to lie in the low 4 GiB (the boot
+/// map, and where `mm::mmu` maps it). Empty modules are ignored.
+pub(super) fn module_range(start: u64, len: u64) -> Result<Option<(usize, usize)>, &'static str> {
+    if len == 0 {
+        return Ok(None);
+    }
+    phys::bytes(start, len as usize).map_err(|_| "boot module outside the low 4 GiB")?;
+    Ok(Some((start as usize, len as usize)))
 }
 
 pub(super) fn copy_cmdline(src: &[u8]) -> &'static str {

@@ -26,6 +26,7 @@ mod drivers;
 mod entropy;
 mod executor;
 mod fatal;
+mod install;
 mod irq;
 mod mm;
 #[allow(unsafe_code)] // the one constructor that turns an address into a device region
@@ -81,6 +82,9 @@ pub fn kmain(boot_arg: usize) -> ! {
     smp::start(&info);
 
     net::packet::init_pool(net_pool_size());
+    // After the heap and the packet pool are in use: a module the heap
+    // overlapped fails its hash here (docs/install.md §3.2).
+    install::check_module();
     let mut pci = info.pcie.map(|p| pci::init(&p));
     if let Some(pci) = &pci {
         pci::print(pci);

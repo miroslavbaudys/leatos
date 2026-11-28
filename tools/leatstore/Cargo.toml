@@ -9,6 +9,7 @@ description = "Host tool for leatos store partitions: create, format, write/read
 config-store = { workspace = true }
 config = { workspace = true }
 auth = { workspace = true }
+install-image = { workspace = true }
 
 [lints]
 workspace = true

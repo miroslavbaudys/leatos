@@ -111,6 +111,7 @@ pub unsafe fn discover(x0: usize, kernel_start: usize) -> Result<BootInfo, &'sta
         pcie,
         virtual_machine,
         bootargs,
+        module: None,
     })
 }
 

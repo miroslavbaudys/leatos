@@ -1,6 +1,7 @@
 # Installer: leatos installs itself from a USB stick or ISO (plan)
 
-Status (2026-11-28): plan only, nothing implemented. Roadmap M16.
+Status (2026-11-28): step 1 done in QEMU (module, heap carve-out, image format); the rest is
+plan. Roadmap M16.
 
 Today leatos is installed by flashing `target/apu4/leatos-apu4.img` (`scripts/apu-image.sh`) to
 an SD card on the Mac; a Proxmox VM gets the same image with `qm importdisk`
@@ -73,6 +74,14 @@ image boots and keeps its store on the mSATA.
   Proof in the test: the hash check of §3.3 runs after the heap is in use.
 - PVH (`-kernel` in QEMU) has modules too (`modlist_paddr`): the same `BootInfo` field, so
   `-initrd` can feed the installer in quick tests.
+- Done (2026-11-28): `BootInfo.module`, `mm::heap::region` (the larger side of RAM around the
+  module, whole pages), `mmu` maps it read-only, `mm::heap::module`; `install::check_module`
+  logs `install image : ok …` or `invalid (…)` after the heap and the packet pool are in use.
+  Seen in QEMU: **Limine puts the module right after the kernel** (the heap went above it),
+  QEMU's `-initrd` at the top of RAM (the heap and staging below it). Negative controls: a
+  flipped byte → `invalid (SHA-256 mismatch)`; `module_carve=0` under Limine → the heap
+  overwrites the module, `invalid (not an install image (magic))`. Quick test:
+  `QEMU_EXTRA="-initrd img.lin" scripts/qemu-run.sh <x86_64 ELF>`.
 
 ### 3.3 Install image format (`crates/boot-image` or a new `crates/install-image`)
 
@@ -85,6 +94,10 @@ The raw image is 80 MiB of mostly zeros; the module is a list of extents instead
 - Also zeroed: the last 33 sectors of the target (a backup GPT from a previous OS would confuse
   Linux and some firmware).
 - Sans-IO parser (`#![forbid(unsafe_code)]`), host tests, a fuzz target `install_image`.
+- Done (2026-11-28): `crates/install-image` (`build`, `parse`, `Image::plan`; host tests flip
+  every byte, forge tables with valid hashes; fuzz target `install_image`), `leatstore
+  install-image <raw> <out>` (checks that the plan reproduces the raw image). An 80 MiB apu4
+  image with a debug kernel: 5 extents.
 - Built by `scripts/apu-image.sh --iso`: the normal image as now, converted to the extent
   format, plus a Limine **hybrid ISO** (`xorriso` + `limine bios-install`; `brew install
   xorriso`) with the kernel, the module and two entries: `install` and "boot leatos from the
@@ -141,7 +154,7 @@ and `virtio0`, installed, ISO ejected, boots.
 
 | Step | Size | Gives |
 |---|---|---|
-| 1. Module tag + heap carve-out, extent format crate | 2–3 days | image in RAM, checked |
+| 1. Module tag + heap carve-out, extent format crate ✅ (QEMU, 2026-11-28) | 2–3 days | image in RAM, checked |
 | 2. Install mode on virtio-blk / SD, `--iso`, `install-test.sh` | ~1 wk | **Proxmox install from ISO** |
 | 3. AHCI driver + `QEMU_STORE_BUS=ahci` tests | 1–1.5 wk | mSATA / `sata0` as boot + store |
 | 4. Store ID + `store_id=` | 2–3 days | safe with two leatos disks |

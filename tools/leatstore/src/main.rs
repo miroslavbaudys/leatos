@@ -318,10 +318,40 @@ fn hash(password: &str) -> Result<()> {
     Ok(())
 }
 
+/// Turn a raw disk image into an install image (docs/install.md §3.3) and
+/// check that it plans back to exactly the raw image.
+fn install_image(raw: &str, out: &str) -> Result<()> {
+    let bytes = std::fs::read(raw).map_err(|e| format!("{raw}: {e}"))?;
+    let built = install_image::build(&bytes);
+    let img = install_image::parse(&built).map_err(|e| format!("built image: {e}"))?;
+    let mut disk = vec![0xa5u8; img.sectors() as usize * install_image::SECTOR];
+    for p in img.plan(img.sectors(), 128).ok_or("built image: no plan")? {
+        let at = p.lba() as usize * install_image::SECTOR;
+        let len = p.sectors() as usize * install_image::SECTOR;
+        match p {
+            install_image::Piece::Data { data, .. } => disk[at..at + len].copy_from_slice(data),
+            install_image::Piece::Zero { .. } => disk[at..at + len].fill(0),
+        }
+    }
+    disk.truncate(bytes.len());
+    if disk != bytes {
+        return Err("built image does not reproduce the raw image".into());
+    }
+    std::fs::write(out, &built).map_err(|e| format!("{out}: {e}"))?;
+    let hex: String = img.sha256().iter().map(|b| format!("{b:02x}")).collect();
+    println!(
+        "{out}: {} extents, {} KiB of data for a {} MiB image, sha256 {hex}",
+        img.extents().count(),
+        img.data_len() >> 10,
+        img.sectors() >> 11
+    );
+    Ok(())
+}
+
 fn usage() -> String {
     "usage: leatstore create <img> [--mib N] | format <img> [--force] | show <img> | \
      put <img> <area> <file> [--raw] [--version N] | get <img> <area> | \
-     corrupt <img> <area> [--slot A|B] | hash <password>"
+     corrupt <img> <area> [--slot A|B] | hash <password> | install-image <raw img> <out>"
         .into()
 }
 
@@ -366,6 +396,7 @@ fn run(args: &[String]) -> Result<()> {
         ),
         ["get", img, area] => get(img, area),
         ["hash", password] => hash(password),
+        ["install-image", raw, out] => install_image(raw, out),
         ["corrupt", img, area] => {
             let slot = match opt("--slot") {
                 None => None,

@@ -1,0 +1,12 @@
+[package]
+name = "install-image"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Install images (docs/install.md): a disk image as sorted extents with a SHA-256, and the write plan that zeroes every sector not listed."
+
+[dependencies]
+sha2 = { version = "0.11", default-features = false }  # x86_64 kernel: software backend via --cfg (.cargo/config.toml)
+
+[lints]
+workspace = true

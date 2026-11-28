@@ -25,6 +25,7 @@ proto-dhcp = { path = "../crates/proto-dhcp" }
 proto-mdns = { path = "../crates/proto-mdns" }
 qdisc = { path = "../crates/qdisc" }
 boot-image = { path = "../crates/boot-image" }
+install-image = { path = "../crates/install-image" }
 cli = { path = "../crates/cli" }
 config = { path = "../crates/config" }
 config-store = { path = "../crates/config-store" }
@@ -97,6 +98,13 @@ bench = false
 [[bin]]
 name = "boot_image"
 path = "fuzz_targets/boot_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "install_image"
+path = "fuzz_targets/install_image.rs"
 test = false
 doc = false
 bench = false

@@ -26,11 +26,19 @@ use crate::platform::BootInfo;
 use crate::println;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 /// The active address space, kept so device MMIO found later (PCI BARs that
 /// firmware placed anywhere in the PCI hole) can be mapped: [`map_device`].
 static LIVE: Mutex<Option<AddressSpace>> = Mutex::new(None);
+/// The boot module is mapped read-only (`init`), so `mm::heap::module` may
+/// hand it out.
+static MODULE_MAPPED: AtomicBool = AtomicBool::new(false);
+
+pub fn module_mapped() -> bool {
+    MODULE_MAPPED.load(Ordering::Acquire)
+}
 
 pub const PAGE: usize = 4096;
 const ENTRIES: usize = 512;
@@ -165,8 +173,7 @@ fn align_up(x: usize) -> usize {
 /// Build the kernel address space and switch to it. Requires the heap.
 pub fn init(info: &BootInfo) {
     let mut space = AddressSpace::new();
-    let (ram_start, ram_size) = info.ram;
-    let ram_end = ram_start + ram_size;
+    let ram_start = info.ram.0;
 
     for &(start, end) in hw::PLATFORM_MMIO {
         space.map(start, end, Perm::Device);
@@ -193,11 +200,23 @@ pub fn init(info: &BootInfo) {
         space.map(s.exc.0, s.exc.1, Perm::Rw);
         space.map(s.stack.0, s.stack.1, Perm::Rw);
     }
-    // Heap: rest of RAM.
-    space.map(sym::kernel_end(), align_down(ram_end), Perm::Rw);
+    // Heap: rest of RAM, or the side of the boot module it got.
+    let (heap_start, heap_end) = crate::mm::heap::region(info);
+    space.map(align_up(heap_start), align_down(heap_end), Perm::Rw);
+    // The boot module, read-only (never executable): its pages that are
+    // not mapped yet (below the kernel they are, read-only already).
+    if let Some((m, len)) = info.module {
+        for page in (align_down(m)..align_up(m + len)).step_by(PAGE) {
+            if !space.is_mapped(page) {
+                space.map(page, page + PAGE, Perm::Ro);
+            }
+        }
+    }
 
-    // SAFETY: code, data, stacks, heap and all MMIO in use are mapped above.
+    // SAFETY: code, data, stacks, heap, the boot module and all MMIO in use
+    // are mapped above.
     let tables = unsafe { space.activate() };
+    MODULE_MAPPED.store(info.module.is_some(), Ordering::Release);
     println!("  mmu             : 4 KiB pages, W^X, guard pages ({tables} tables)");
 }
 

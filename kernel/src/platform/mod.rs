@@ -143,6 +143,10 @@ pub struct BootInfo {
     pub virtual_machine: bool,
     /// Kernel command line (DTB `/chosen/bootargs`; QEMU `-append`).
     pub bootargs: &'static str,
+    /// The first boot module (start, length): the install image Limine or
+    /// QEMU `-initrd` loaded (docs/install.md §3.2). Kept out of the heap
+    /// (`mm::heap::region`), mapped read-only, read via `mm::heap::module`.
+    pub module: Option<(usize, usize)>,
 }
 
 impl BootInfo {
@@ -169,6 +173,9 @@ impl BootInfo {
                 "physical"
             }
         );
+        if let Some((s, l)) = self.module {
+            println!("  boot module     : {s:#x}..{:#x} ({} KiB)", s + l, l >> 10);
+        }
         if !self.bootargs.is_empty() {
             println!("  bootargs        : {}", crate::config::Redacted(self.bootargs));
         }

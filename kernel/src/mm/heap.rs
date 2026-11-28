@@ -4,6 +4,11 @@
 //! copy into place must never overwrite it). Packet buffers come from
 //! `net::packet`'s pool, not ad-hoc allocations.
 //!
+//! A **boot module** (the install image, docs/install.md §3.2) lies in RAM
+//! the loader calls available, often inside that range: [`region`] gives
+//! the heap the larger side of the range around it, and [`module`] hands
+//! out the module's bytes (mapped read-only by `mm::mmu`).
+//!
 //! The allocator is `talc` (free blocks binned by size, boundary tags:
 //! allocation and free cost do not grow with fragmentation). Boot argument
 //! `heap=list` selects the first-fit linked list used before 2026-11-22,
@@ -29,6 +34,8 @@ use spin::{Mutex, Once};
 pub const STAGING_SIZE: usize = 32 << 20;
 static STAGING: Once<(usize, usize)> = Once::new();
 static STAGING_TAKEN: AtomicBool = AtomicBool::new(false);
+/// The boot module (start, length), kept out of the heap.
+static MODULE: Once<(usize, usize)> = Once::new();
 
 #[global_allocator]
 static HEAP: TimedHeap = TimedHeap(Mutex::new(Inner {
@@ -187,11 +194,39 @@ pub fn layout() -> Option<Layout> {
     LAYOUT.get().copied()
 }
 
+fn align_down(x: usize) -> usize {
+    x & !0xfff
+}
+fn align_up(x: usize) -> usize {
+    (x + 0xfff) & !0xfff
+}
+
+/// The heap's range before the staging area is taken off its top: from
+/// the kernel's end to the end of its RAM bank, or, when the boot module
+/// lies inside that, the larger side of the module (whole pages, so the
+/// module shares no page with the heap). Also used by `mm::mmu::init`.
+pub fn region(info: &BootInfo) -> (usize, usize) {
+    let (start, end) = (sym::kernel_end(), info.ram.0 + info.ram.1);
+    let Some((m, len)) = info.module.filter(|_| crate::config::module_carve()) else {
+        return (start, end);
+    };
+    let (lo, hi) = (align_down(m), align_up(m + len));
+    if hi <= start || lo >= end {
+        return (start, end);
+    }
+    let below = (start, lo.max(start));
+    let above = (hi.min(end), end);
+    let size = |(s, e): (usize, usize)| e - s;
+    if size(above) > size(below) { (align_up(above.0), above.1) } else { below }
+}
+
 pub fn init(info: &BootInfo) {
-    let start = sym::kernel_end();
-    let end = info.ram.0 + info.ram.1;
+    let (start, end) = region(info);
     assert!(end > start, "no RAM left for the heap");
     let mut end = end;
+    if let Some(m) = info.module {
+        MODULE.call_once(|| m);
+    }
     if crate::arch::kexec::SUPPORTED && end - start >= 4 * STAGING_SIZE {
         let s = (end - STAGING_SIZE) & !0xfff;
         STAGING.call_once(|| (s, end - s));
@@ -229,6 +264,20 @@ pub fn init(info: &BootInfo) {
             .map(|&(s, l)| alloc::format!(", upgrade staging {s:#x}..{:#x}", s + l))
             .unwrap_or_default()
     );
+}
+
+/// The boot module's bytes (docs/install.md §3.2): `None` without one, or
+/// before `mm::mmu::init` mapped it.
+pub fn module() -> Option<&'static [u8]> {
+    let &(start, len) = MODULE.get()?;
+    if !crate::mm::mmu::module_mapped() {
+        return None;
+    }
+    // SAFETY: [start, start + len) is the loader's module: kept out of the
+    // heap and the staging area by `region` (whole pages), mapped
+    // read-only by mm::mmu::init (checked above), never written or freed
+    // by the kernel, so shared references to it stay valid for ever.
+    Some(unsafe { core::slice::from_raw_parts(start as *const u8, len) })
 }
 
 /// The staging area, handed out once at a time (to the boot loader in

@@ -15,7 +15,8 @@ Boot arguments: docs/boot-arguments.md.
     registers only); smp = INIT-SIPI-SIPI; kexec (+ kexec.S); watchdog = AMD FCH.
 - `src/platform/`: the neutral `BootInfo` (no allocation); `dtb.rs` (aarch64); `pvh.rs` /
   `multiboot2.rs` + `acpi.rs` over `phys.rs` (x86_64: one unsafe byte-view constructor, safe
-  parsers).
+  parsers). `BootInfo.module`: the first boot module (Multiboot2 tag 3, PVH modlist = QEMU
+  `-initrd`), the installer's image (docs/install.md; `src/install.rs` checks it at boot).
 - `linker.ld` (aarch64, kernel at `0x4020_0000`) / `linker-x86_64.ld` (at 1 MiB, keeps the PVH
   note): page-aligned sections, guard pages, 16 KiB exception stack + 256 KiB kernel stack.
 
@@ -38,7 +39,9 @@ live with the VID; networks on a port the machine lacks are left out (`config::m
   - `stacks`: secondary cores' stacks from `__ap_stacks`, guard pages.
   - `heap`: `talc`; boot argument `heap=list` = the old first-fit linked list, whose alloc/free walk
     every hole. Every alloc/free is timed: `/api/status` `heap.allocator`/`fragments`/`live`/
-    `alloc`/`dealloc`/`lock_wait`, soak CSV columns.
+    `alloc`/`dealloc`/`lock_wait`, soak CSV columns. `heap::region`: the heap takes the larger
+    side of RAM around a boot module (Limine puts it right after the kernel; `module_carve=0` is
+    the negative control), `mmu` maps the module read-only, `heap::module` hands it out.
   - `mmu`: neutral page-table builder; arch supplies the encoding.
   - `dma`: virtio `Hal`. `sym`: linker symbols.
 - `src/mmio.rs`: `Region` = safe, bounds-checked MMIO over `safe-mmio`.

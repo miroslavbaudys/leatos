@@ -35,6 +35,7 @@ reveals a bug gets a host regression test in its crate before the fix.
 | `qdisc` | `crates/qdisc` CAKE / FQ-CoDel / CoDel + shaper, ACK filter on and off | every forwarded packet | backlog limits; packet conservation; no duplicates; drains |
 | `ack_filter` | `crates/qdisc` ACK filter decision on arbitrary bytes | pure TCP ACKs from the LAN | no panic; never supersedes itself; never mutual |
 | `boot_image` | `crates/boot-image` ELF / Multiboot2 | uploaded kernels (authenticated) | plan inside the allowed range; flatten fits |
+| `install_image` | `crates/install-image` header, extents, write plan | the installer's boot module (hash-checked) | plan ascending, covers the image once + the GPT tail; `build` round-trips |
 | `cli` | `crates/cli` line editor + command parser | the serial console | lines ≤ `MAX_LINE`; whole and split feeds give the same lines |
 | `config` | `crates/config` TOML / JSON parse, validation, `with_assignment`, `without`, diffs, secrets | the store at boot, `POST /api/config`, CLI `config set` | a config that parses re-parses from its own TOML and JSON to itself |
 | `store` | `crates/config-store` MBR, store header, A/B record slots, write plans | the SD card / disk at boot | header round trip, areas inside the partition; a planned write gives a valid slot that becomes current, the other slot untouched |

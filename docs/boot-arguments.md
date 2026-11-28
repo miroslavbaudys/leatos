@@ -123,6 +123,7 @@ PVH / Multiboot2 command line on x86_64, QEMU `-append` via `QEMU_APPEND`. They 
 | `watchdog_secs=N` | – | hardware watchdog timeout, default 30 |
 | `panic=halt` | – | halt instead of rebooting on panics and exceptions |
 | `log=console` | – | log messages stay on the serial console after boot instead of the RAM log |
+| `module_carve=0` | – | lab only: the heap does not leave the boot module (install image) out, so it overwrites it and the image's hash fails (docs/install.md §3.2: the negative control) |
 | `heap=list` | – | the old first-fit linked-list allocator: the heap bench's control, fallback |
 | `ct_bench=1` | – | time conntrack operations on a full synthetic table at boot (`selftest::conntrack_bench`) |
 | `heap_bench=N` | – | time alloc/free and a conntrack fill + expiry pass on the fresh heap, then with N 64-byte holes in front of the free space (`selftest::heap_bench`); `heap_bench=1` and `heap=list` are its controls |
