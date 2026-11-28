@@ -39,6 +39,11 @@ page-table *construction*, PCI enumeration logic, driver state machines) can be 
     two hand-offs (RX refill, TX post)
   - `drivers::sdhci`, `drivers::i6300esb`: the register window's
     constructor (PIO, no DMA)
+  - `drivers::ahci`: the register windows' constructor (DMA only through
+    driver-owned `DmaRegion`s); `drivers::ccp`: the register window's
+    constructor (read-only TRNG registers)
+  - `drivers::screen`: the video memory windows' constructor (the loader's
+    framebuffer or the VGA text buffer; no DMA)
   - `selftest`: deliberate faults, feature-gated
   - `arch::x86_64::kexec` (inside the arch backend): the in-RAM upgrade's CR3 switch + jump into the trampoline (`kexec.S`), and the view of the trampoline bytes
 - `crates/*`: `#![forbid(unsafe_code)]` (cannot be overridden).
@@ -83,8 +88,8 @@ Multiboot2), the developer's home router since 2026-11-15.
 |---|---|---|---|
 | Boot | QEMU `-kernel` ELF, DTB at RAM start | **PVH** (`XEN_ELFNOTE_PHYS32_ENTRY`): QEMU `-kernel`, 32-bit entry stub in `boot.S` → long mode; **Multiboot2** for Limine on the apu4 (`platform::multiboot2`) | arch + platform backend |
 | HW discovery | DTB | PVH start info (memory map, command line) + ACPI: MADT (LAPIC/IOAPIC), MCFG (ECAM), FADT + DSDT `\_S5` | neutral `BootInfo`, two backends |
-| Console | PL011 MMIO | 16550 UART (port I/O `0x3f8`) | `arch::console` |
-| Interrupt controller | GICv3, INTx from the DTB `interrupt-map` | local APIC, 8259 PICs remapped (224–239) and masked; devices via **MSI-X**; one IOAPIC entry for COM1's ISA IRQ 4 (from the MADT, no AML) | `arch::irqchip` API |
+| Console | PL011 MMIO | 16550 UART (port I/O `0x3f8`); the screen (framebuffer or VGA text, `drivers::screen`) and the PS/2 keyboard (i8042) | `arch::console`, `arch::kbd` |
+| Interrupt controller | GICv3, INTx from the DTB `interrupt-map` | local APIC, 8259 PICs remapped (224–239) and masked; devices via **MSI-X**; IOAPIC entries for COM1's ISA IRQ 4 and the keyboard's IRQ 1 (from the MADT, no AML) | `arch::irqchip` API |
 | Timer (tickless) | generic timer, CNTV_CVAL | TSC clock (calibrated on the 8254 PIT), **LAPIC one-shot** deadlines. TSC-deadline mode isn't used: the apu4's AMD GX-412TC lacks it | `arch::timer` API |
 | Page tables | 4 KiB granule, 512-entry levels | 4-level, 4 KiB × 512; NX via EFER.NXE, W^X enforced for ring 0 by CR0.WP | **neutral builder** + per-arch descriptor bits |
 | Exceptions | vector table, ESR decode | IDT, TSS with IST1 (exception stack) for #PF/#DF/NMI/#MC, error codes, CR2 | arch |
@@ -104,9 +109,9 @@ kernel/src/
   arch/aarch64/      boot.S, cpu, exceptions, irqchip (GICv3), timer, mmu bits, power (PSCI),
                      console (PL011), smp; stubs: kexec, rtc, watchdog
   arch/x86_64/       boot.S (PVH + Multiboot2 entry, AP trampoline), isr.S, cpu, exceptions
-                     (IDT/TSS), irqchip (LAPIC, MSI-X, COM1's IOAPIC entry), timer (TSC + LAPIC),
-                     mmu bits, power (ACPI S5), console (16550), port, smp, kexec (+ kexec.S),
-                     rtc (CMOS), watchdog (AMD FCH)
+                     (IDT/TSS), irqchip (LAPIC, MSI-X, IOAPIC entries for COM1 and the
+                     keyboard), timer (TSC + LAPIC), mmu bits, power (ACPI S5), console (16550),
+                     kbd (PS/2), port, smp, kexec (+ kexec.S), rtc (CMOS), watchdog (AMD FCH)
   platform/          neutral BootInfo; dtb (aarch64); pvh + multiboot2 + acpi + phys (x86_64)
   mm/                heap, page-table builder, dma, stacks, sym
   irq.rs timer.rs executor.rs smp.rs console.rs pci.rs mmio.rs ...   (neutral)

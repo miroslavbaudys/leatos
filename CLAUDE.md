@@ -16,11 +16,11 @@ Details live next to the code: `kernel/CLAUDE.md`, `kernel/src/net/CLAUDE.md`, `
 Keep them current when you change what they describe; keep this file to the map and the rules.
 
 - `kernel/` (`leatos-kernel`, binary `leatos`): `src/main.rs` = boot order (`kmain`);
-  `src/arch/{aarch64,x86_64}/` = **all** CPU-specific code (API in `arch/mod.rs`);
-  `src/platform/` = DTB / PVH / Multiboot2 / ACPI discovery into `BootInfo`; `src/mm/` (stacks,
-  heap = `talc`, page tables, DMA); `src/smp.rs`, `irq.rs`, `timer.rs` (tickless), `executor.rs`
-  (priority async, pinned tasks); `src/drivers/` (virtio-net, igb, virtio-blk, sdhci, ahci,
-  watchdogs, CCP TRNG, CPU temperature); `src/config.rs` (boot-time `Config`), `store.rs`,
+  `src/arch/{aarch64,x86_64}/` = **all** CPU-specific code (API in `arch/mod.rs`); `src/platform/` =
+  DTB / PVH / Multiboot2 / ACPI discovery into `BootInfo`; `src/mm/` (stacks, heap = `talc`, page
+  tables, DMA); `src/smp.rs`, `irq.rs`, `timer.rs` (tickless), `executor.rs` (priority async, pinned
+  tasks); `src/drivers/` (virtio-net, igb, virtio-blk, sdhci, ahci, watchdogs, CCP TRNG, CPU
+  temperature, the console on the screen); `src/config.rs` (boot-time `Config`), `store.rs`,
   `upgrade.rs`, `install.rs`, `cli.rs`, `console.rs`, `fatal.rs`, `watchdog.rs`, `entropy.rs`,
   `wallclock.rs`.
 - `kernel/src/net/`: the datapath tasks `dp_down`/`dp_up` (`stack.rs`, `datapath.rs`), the services
@@ -195,7 +195,8 @@ where the table asks for them. Always: `cargo kcheck-x86`; for crates you change
 | SD driver | `QEMU_STORE_BUS=sd scripts/store-test.sh` (and `STORE_MIB=4096`) |
 | AHCI driver | `QEMU_STORE_BUS=ahci` store-, lease-, cli- (also x86_64), persist-, install-test |
 | DHCP, store, `svc` | `lease-test.sh` (also x86_64, `QEMU_STORE_BUS=sd`) |
-| console, CLI, config, `svc` | `cli-test.sh` (also x86_64, `QEMU_STORE_BUS=sd`) |
+| console, CLI, config, `svc`, keyboard | `cli-test.sh` (also x86_64, `QEMU_STORE_BUS=sd`) |
+| screen, framebuffer, Multiboot2 header | `LEATOS_BOOT=limine` smoke; `QEMU_PROXMOX=1` + `-device VGA` and a disk image: screendump (docs/proxmox.md §8) |
 | mgmt, upgrade, kexec, store, watchdog, boot, x86 NIC path | `upgrade-test.sh`, `persist-test.sh` (also `QEMU_STORE_BUS=sd`) |
 | installer, boot module, heap layout, store probe, `apu-image.sh` | `install-test.sh` (also `QEMU_STORE_BUS=sd`, `=ahci`) |
 | PCI, bridges, Proxmox / VM layout | `QEMU_PROXMOX=1` install-test (virtio, ahci), lab with `LEATOS_ARCH=x86_64` |

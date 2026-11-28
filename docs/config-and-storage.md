@@ -389,9 +389,12 @@ For when the network is not an option: the console prompt `leatos> `.
   good and reboots: on the console nobody can lock themselves out.
 - No authentication: the serial port is physical access.
 - Input arrives by the UART RX interrupt (PL011; on x86_64 COM1's ISA IRQ
-  4 through one IOAPIC entry from the MADT) into a lock-free ring, so
+  4 through an IOAPIC entry from the MADT) into a lock-free ring, so
   pastes survive the 16-byte FIFO; the line is redrawn after other
-  output. The services task also polls the FIFO (every 50 ms, every 2 ms
+  output. On x86_64 the screen's PS/2 keyboard (ISA IRQ 1, `arch::kbd`,
+  US layout) types into the same ring, and the console is drawn on the
+  screen too (`drivers::screen`, docs/proxmox.md §8): the CLI works from
+  a Proxmox noVNC console. The services task also polls the FIFO (every 50 ms, every 2 ms
   for 2 s after input) as a fallback without the interrupt (`status`
   shows `interrupt` or `polled`).
 - The line editor handles Backspace, Ctrl-U, Ctrl-C and Up/Down history,

@@ -214,19 +214,23 @@ crates/proto-dot     DNS over TLS client (rustls, unbuffered)
 crates/proto-sntp    SNTP client
 crates/proto-mdns    mDNS reflector across networks
 crates/proto-http    incremental HTTP/1.1 parser
+crates/proto-tcp     the router's own TCP (sockets per link, RFC 9293 states, RTO)
 crates/fwd           LPM, neighbor cache, conntrack, NAT, zone firewall;
                      the router's own ARP / ND, UDP, ICMP echo, IGMP / MLD
 crates/qdisc         CoDel, FQ-CoDel, CAKE, shaper (simulation-tested with fake time)
 crates/config        config.toml schema, validation, migration
 crates/config-store  power-fail-safe store partition format
 crates/auth          password hashes, sessions, entropy pool
-crates/boot-image    ELF / Multiboot2 checks for upgrades
-crates/cli           serial line editor + command parser
+crates/boot-image    ELF / Multiboot2 checks for upgrades, boot information for kexec
+crates/install-image the installer's image format (extents, hash, write plan)
+crates/cli           console line editor + command parser
+crates/text-screen   the console on a screen: text grid, escape handling, glyphs
+crates/ps2-kbd       PS/2 scan codes to console bytes (US layout)
 kernel/              bare-metal platform that drives the crates
   arch/<target>/     all CPU-specific code (aarch64, x86_64)
   platform/          neutral BootInfo + firmware backends (DTB; PVH/Multiboot2 + ACPI)
   mm/ mmio.rs        memory, page tables, DMA, stacks; the safe MMIO abstraction
-  drivers/ net/      NICs, block devices, watchdogs; packet pool, datapath, services
+  drivers/ net/      NICs, block devices, watchdogs, the screen; packet pool, datapath, services
 tools/leatstore        host tool for store images (std)
 ```
 

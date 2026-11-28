@@ -10,7 +10,8 @@ Boot arguments: docs/boot-arguments.md.
   - `aarch64/`: boot.S, cpu, exceptions + IRQ entry, irqchip = GICv3, timer, mmu descriptors,
     power = PSCI, console = PL011, smp = PSCI `CPU_ON`; kexec, rtc and watchdog are stubs.
   - `x86_64/`: boot.S = PVH + Multiboot2 entry → long mode, AP trampoline; isr.S; exceptions =
-    IDT/TSS/IST; irqchip = local APIC + MSI-X (+ one IOAPIC entry: COM1's ISA IRQ 4, MADT only);
+    IDT/TSS/IST; irqchip = local APIC + MSI-X (+ IOAPIC entries for ISA IRQs from the MADT only:
+    COM1's IRQ 4, the keyboard's IRQ 1);
     timer = TSC + LAPIC one-shot; power = ACPI S5; console = 16550; port I/O; rtc = CMOS clock (time
     registers only); smp = INIT-SIPI-SIPI; kexec (+ kexec.S); watchdog = AMD FCH; kbd = PS/2 on
     the i8042 (ISA IRQ 1 → vector 35, decoded by `crates/ps2-kbd` into the console's receive
@@ -65,12 +66,14 @@ live with the VID; networks on a port the machine lacks are left out (`config::m
   input only). RDRAND is not used.
 - `src/wallclock.rs`: UTC from SNTP; the RTC is read at boot as a hint only and set after each sync
   (`arch::rtc`).
-- `src/console.rs`: `println!`, `fatal_println!`. The CLI's input line is redrawn after other
-  output; UART RX interrupt → lock-free ring. Once the CLI is up, log messages go to a 64 KiB RAM
-  log (`log=console` keeps them on the UART; fatal paths dump its tail).
-- `src/cli.rs`: serial CLI inside `svc`: reads `console`'s RX ring line by line. `status`,
-  `leases`, `routes`, `log [N|all|clear]`, `config show [running|stored|pending]`,
-  `config set/unset/diff/save/discard` as TOML assignments on a pending copy, `reboot`.
+- `src/console.rs`: `println!`, `fatal_println!` (also drawn by `drivers::screen`). The CLI's input
+  line is redrawn after other output; UART RX interrupt and the PS/2 keyboard (`arch::kbd`) → one
+  lock-free ring. Once the CLI is up, log messages go to a 64 KiB RAM log (`log=console` keeps them
+  on the UART; fatal paths dump its tail).
+- `src/cli.rs`: the console CLI inside `svc` (serial, or the screen's keyboard): reads `console`'s
+  RX ring line by line. `status`, `leases`, `routes`, `log [N|all|clear]`, `config show
+  [running|stored|pending]`, `config set/unset/diff/save/discard` as TOML assignments on a pending
+  copy, `reboot`.
 
 ## Drivers (`src/drivers/`)
 

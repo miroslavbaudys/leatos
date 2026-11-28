@@ -58,7 +58,8 @@ Entering = copy the payload into the staging area, `upgrade::prepare`,
 re-arm the hardware watchdog with its full timeout, then `upgrade::exec`
 (the other cores are parked, the image is copied into place and entered
 like a Multiboot2 loader would, with the same command line plus
-`image=<slot>:<seq>`). The loader runs before `config::load`, so a config
+`image=<slot>:<seq>`, and the loader's framebuffer, so the console stays on
+the screen). The loader runs before `config::load`, so a config
 trial is marked booted only by the kernel that will run it.
 
 `/api/status` has `build` (git commit of the running kernel,

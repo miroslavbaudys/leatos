@@ -34,7 +34,7 @@ checks `unbound udp` and `client ports`, negative control `udp_unbound_drop=0`).
 | **A4** | Guest/IoT client (non-`lan` zone) | as A3, limited by zone policy (`input` service mask, rules) | less than A3: zone policy is the boundary |
 | **A5** | Web page in a LAN client's browser | cross-site requests to `http://192.168.1.1` (CSRF), DNS rebinding, XSS through data shown on the mgmt page | none |
 | **A6** | Holder of the mgmt password or a session token | config, reboot, upgrades | full control by design: the question is only how hard the credential is to get |
-| **A7** | Physical access | serial CLI (no auth by design, `cli.rs`), SD card (store, boot partition), boot arguments | full: out of scope except where a stolen SD card leaks secrets |
+| **A7** | Physical access | serial CLI and, in a VM, the screen's keyboard (no auth by design, `cli.rs`, `arch::kbd`), SD card (store, boot partition), boot arguments | full: out of scope except where a stolen SD card leaks secrets |
 
 Out of scope: hardware/firmware attacks (coreboot, the CCP, the NIC's firmware),
 side channels between tasks (no untrusted code runs on the router),
@@ -151,7 +151,7 @@ docs/lan-neighbors.md replaces the hints on the LANs (smoltcp on `Medium::Ip`, t
 
 | Entry point | Parser | Review notes |
 |---|---|---|
-| Serial CLI | `crates/cli` line editor + parser, `kernel/src/cli.rs` | no auth by design; still must not panic on long lines/escape sequences (no fuzz target yet); secrets masked on `config show` |
+| Serial CLI, the screen's keyboard | `crates/cli` line editor + parser, `kernel/src/cli.rs`; `crates/ps2-kbd` (scan codes) | no auth by design; must not panic on long lines/escape sequences (fuzz targets `cli`, `ps2_kbd`); secrets masked on `config show` |
 | Store partition (SD / virtio-blk) | `crates/config-store` (MBR, header, A/B slots, CRC), `crates/config` TOML (`deny_unknown_fields`), `proto_dhcp::v4::persist` leases | P10; secrets on the card: `mgmt.password_hash` (PBKDF2, fine), **`wan.pppoe.password` in clear** (theft of the SD card leaks it; accepted, §5 item 8) |
 | Stored kernels (`images` area) | `boot-image` | the loader enters whatever the store says is current: an SD card written offline is a persistent compromise (A7, accepted unless signing is added) |
 | Boot arguments | `config.rs` parsers | from the bootloader config on the SD card (A7) or DTB; `mgmt_pass=` in clear there |
