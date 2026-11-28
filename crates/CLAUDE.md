@@ -142,6 +142,9 @@ and sparse senders. How the kernel uses it: kernel/src/net/CLAUDE.md.
   the hash field) / `Image::plan` (every sector of the image once, gaps as zeros, then the
   target's last 33 sectors); fuzz target `install_image`.
 - `cli`: line editor + command parser.
+- `ps2-kbd`: PS/2 scan codes (set 1) to the bytes a serial terminal sends (US layout, Shift,
+  Caps Lock, Ctrl-letter, arrows / Home / End / Delete as VT100 sequences, keypad with Num Lock);
+  the kernel's `arch::kbd`; fuzz target `ps2_kbd`.
 - `text-screen`: a text screen fed with console output (UTF-8 → CP437, `\r`, `\n`, backspace,
   tab, `ESC [ K`, deferred wrap, scrolling, dirty ranges), 80x25 until `resize` (fixed storage
   `MAX_CELLS`, no allocation, `const` constructor: used before the heap); `glyph`: 7x16 Noto Sans

@@ -19,6 +19,8 @@ pub struct Acpi {
     /// COM1's interrupt (ISA IRQ 4): (GSI, MPS INTI flags) after the
     /// MADT's interrupt source overrides; flags 0 = ISA default (edge, high).
     pub com1: (u32, u16),
+    /// The PS/2 keyboard's interrupt (ISA IRQ 1), the same way.
+    pub kbd: (u32, u16),
     pub cpus: usize,
     /// Local APIC IDs of the enabled cores, in MADT order (first `cpus.min(MAX_CORES)`).
     pub apic_ids: [u64; crate::smp::MAX_CORES],
@@ -120,6 +122,7 @@ pub fn parse(rsdp_pa: u64) -> Result<Acpi, &'static str> {
 fn madt(t: &[u8], acpi: &mut Acpi) {
     acpi.lapic = u32_at(t, 36).unwrap_or(0) as usize;
     acpi.com1 = (4, 0);
+    acpi.kbd = (1, 0);
     let mut off = 44;
     while let (Some(&kind), Some(&len)) = (t.get(off), t.get(off + 1)) {
         let len = len as usize;
@@ -140,10 +143,15 @@ fn madt(t: &[u8], acpi: &mut Acpi) {
                     acpi.ioapic = Some((addr as usize, gsi));
                 }
             }
-            // Interrupt source override: bus 0 (ISA), source IRQ 4.
-            2 if e.get(2..4) == Some(&[0, 4]) => {
+            // Interrupt source override: bus 0 (ISA), source IRQ 4 (COM1)
+            // or 1 (keyboard).
+            2 if matches!(e.get(2..4), Some(&[0, 4] | &[0, 1])) => {
                 if let (Some(gsi), Some(flags)) = (u32_at(e, 4), u16_at(e, 8)) {
-                    acpi.com1 = (gsi, flags);
+                    if e[3] == 4 {
+                        acpi.com1 = (gsi, flags);
+                    } else {
+                        acpi.kbd = (gsi, flags);
+                    }
                 }
             }
             5 => {

@@ -4,6 +4,7 @@ pub mod console;
 pub mod cpu;
 mod exceptions;
 pub mod irqchip;
+pub mod kbd;
 pub mod kexec;
 pub mod mmu;
 pub mod power;

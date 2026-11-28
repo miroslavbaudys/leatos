@@ -13,6 +13,10 @@
 //!   context: FIFO → `push`, try-lock only), `rx_drain_thread(push)` (the
 //!   polled fallback, IRQs masked); `TEXT_SCREEN` (the legacy VGA text
 //!   buffer's address, x86_64 only) and `text_cursor(pos)`
+//! - `kbd`: the screen's keyboard (x86_64: PS/2 on the i8042; aarch64: none):
+//!   `init() -> bool` (found), `irq_setup(&BootInfo)`, `irq_enable`,
+//!   `drain_irq(push)` / `drain_thread(push)` (typed bytes → `push`, as the
+//!   console's receive side)
 //! - `irqchip`: `init(&BootInfo)`, `enable(intid, Trigger)`, `disable(intid)`;
 //!   the backend's IRQ entry calls `crate::irq::dispatch(intid)`. MSI-X:
 //!   `msi_vector(n)` (the n-th device vector, if the platform delivers

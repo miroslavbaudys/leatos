@@ -1103,6 +1103,11 @@ pub fn panic_halts() -> bool {
     arg(bootargs(), "panic") == Some("halt")
 }
 
+/// `kbd=0`: no PS/2 keyboard (`arch::kbd`): the controller is left alone.
+pub fn kbd_off() -> bool {
+    arg(bootargs(), "kbd") == Some("0")
+}
+
 /// `screen=0`: no console mirror on the screen (`drivers::screen`).
 pub fn screen_off() -> bool {
     arg(bootargs(), "screen") == Some("0")

@@ -10,7 +10,9 @@
 //! - **Receive ring**: the UART's RX interrupt drains the hardware FIFO
 //!   (16 bytes on a 16550, 1.4 ms at 115200 baud) into a lock-free ring
 //!   ([`rx_push`]); the CLI reads it with [`read_byte`]. Without an
-//!   interrupt, [`poll_rx`] drains the FIFO from thread context.
+//!   interrupt, [`poll_rx`] drains the FIFO from thread context. The
+//!   screen's keyboard (`arch::kbd`, [`init_kbd`]) types into the same
+//!   ring, with its own interrupt and the same event.
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -340,7 +342,7 @@ pub fn rx_overrun() {
 /// Drain the hardware FIFO from thread context: the fallback without an
 /// RX interrupt (and a safety net with one). Returns the bytes taken.
 pub fn poll_rx() -> usize {
-    crate::arch::console::rx_drain_thread(rx_push)
+    crate::arch::console::rx_drain_thread(rx_push) + crate::arch::kbd::drain_thread(rx_push)
 }
 
 /// Is the RX interrupt in use?
@@ -356,6 +358,32 @@ pub fn rx_event() -> Option<&'static crate::irq::IrqEvent> {
 
 fn rx_irq_action(_intid: u32) {
     crate::arch::console::rx_drain_irq(rx_push);
+}
+
+fn kbd_irq_action(_intid: u32) {
+    crate::arch::kbd::drain_irq(rx_push);
+}
+
+/// The screen's keyboard (after [`init_rx`]): typed bytes go into the
+/// receive ring, its interrupt signals the same event. Boot argument
+/// `kbd=0` leaves the controller alone.
+pub fn init_kbd(info: &crate::platform::BootInfo) {
+    if crate::config::kbd_off() {
+        crate::println!("  keyboard        : off (kbd=0)");
+        return;
+    }
+    if !crate::arch::kbd::init() {
+        return; // no controller (aarch64, the apu4): nothing to say
+    }
+    let Some((intid, trigger)) = crate::arch::kbd::irq_setup(info) else {
+        crate::println!("  keyboard        : PS/2, polled (no interrupt)");
+        return;
+    };
+    let ev = *RX_EVENT.call_once(crate::irq::new_event);
+    crate::irq::register(intid, kbd_irq_action, ev);
+    crate::arch::irqchip::enable(intid, trigger);
+    crate::arch::kbd::irq_enable();
+    crate::println!("  keyboard        : PS/2, interrupt {intid} (US layout, into the CLI)");
 }
 
 /// Route the UART's receive interrupt (after `irqchip::init`), if the

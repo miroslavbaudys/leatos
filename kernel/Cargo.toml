@@ -56,5 +56,9 @@ safe-mmio = "0.4"
 fdt = "0.1.5"
 aarch64-cpu = "12"
 
+# The PS/2 keyboard decoder (arch/x86_64/kbd.rs).
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+ps2-kbd.workspace = true
+
 [lints]
 workspace = true

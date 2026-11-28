@@ -10,6 +10,10 @@
 #   CLI_TEST_LOG=console scripts/cli-test.sh   # negative control: log
 #                                              # messages stay on the console,
 #                                              # the RAM log checks must fail
+#   LEATOS_ARCH=x86_64 CLI_TEST_KBD=0 scripts/cli-test.sh  # negative control:
+#                                              # kbd=0, the keyboard check
+#                                              # (x86_64: keys typed through
+#                                              # QEMU's PS/2 keyboard) must fail
 #   CLI_TEST_VERBOSE=1 ...                     # print the console
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -23,12 +27,16 @@ WORK="$(mktemp -d -t leatos-cli.XXXXXX)"
 IMG="$WORK/store.img"
 LOG="$WORK/console.log"
 FIFO="$WORK/stdin"
+# QMP for the keyboard check (x86_64). Short path: macOS limits socket
+# paths to 104 bytes, and mktemp's directory is long.
+QMP="/tmp/leatos-cli-qmp.$$"
 QPID=
 cleanup() {
   exec 3>&- 2>/dev/null || true
   if [[ -n "$QPID" ]]; then kill "$QPID" 2>/dev/null || true; wait "$QPID" 2>/dev/null || true; fi
   if [[ "${CLI_TEST_VERBOSE:-0}" == 1 && -f "$LOG" ]]; then tr -d '\r' <"$LOG" | sed 's/^/  | /'; fi
   rm -rf "$WORK"
+  rm -f "$QMP"
 }
 trap cleanup EXIT
 FAILED=0
@@ -68,7 +76,9 @@ target/release/leatstore create "$IMG" --mib 32 >/dev/null
 mkfifo "$FIFO"
 
 # The kernel's default: log messages go to the RAM log once the CLI runs.
-QEMU_APPEND="log=${CLI_TEST_LOG:-ram}${QEMU_APPEND:+ $QEMU_APPEND}" \
+KBD_ARG=; [[ "${CLI_TEST_KBD:-1}" == 0 ]] && KBD_ARG=" kbd=0"
+EXTRA="${QEMU_EXTRA:-}"; [[ "$ARCH" == x86_64 ]] && EXTRA="$EXTRA -qmp unix:$QMP,server=on,wait=off"
+QEMU_APPEND="log=${CLI_TEST_LOG:-ram}$KBD_ARG${QEMU_APPEND:+ $QEMU_APPEND}" QEMU_EXTRA="$EXTRA" \
 QEMU_STORE="$IMG" QEMU_NET=user scripts/qemu-run.sh "$WORK/leatos.elf" <"$FIFO" >"$LOG" 2>&1 &
 QPID=$!
 exec 3>"$FIFO"
@@ -105,6 +115,16 @@ OUT=$(tail -c +$((before + 1)) "$LOG" | tr -d '\r')
 if echo "$OUT" | grep -a -e "no leases" -e "config set <setting>" -e "unknown command: bogus2" | tr '\n' '|' \
   | grep -aq "no leases|.*config set <setting>.*|.*unknown command: bogus2"; then pass "pasted lines run in order"
 else fail "pasted lines run in order ($(echo "$OUT" | grep -a -e leases -e "config set" -e bogus2 | tr '\n' '|'))"; fi
+
+if [[ "$ARCH" == x86_64 ]]; then
+  echo "== keyboard (PS/2, as a Proxmox noVNC console types)"
+  n=$(count "leatos> "); before=$(wc -c <"$LOG" | tr -d ' ')
+  python3 -I scripts/lab/qmp-type.py "$QMP" $'Leases\nleases\n' || fail "qmp send-key"
+  wait_count $((n + 2)) "leatos> " "$T" || true; sleep 0.2
+  OUT=$(tail -c +$((before + 1)) "$LOG" | tr -d '\r')
+  expect "keyboard: Shift types upper case" "unknown command: Leases"
+  expect "keyboard: a command typed on it runs" "no leases"
+fi
 
 echo "== config edit"
 send "config show stored"; expect "show stored" "cache_entries = 4096"

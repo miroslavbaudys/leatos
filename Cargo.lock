@@ -670,6 +670,7 @@ dependencies = [
  "proto-pppoe",
  "proto-sntp",
  "proto-tcp",
+ "ps2-kbd",
  "qdisc",
  "safe-mmio 0.4.0",
  "spin",
@@ -1008,6 +1009,10 @@ version = "0.1.0"
 dependencies = [
  "smoltcp",
 ]
+
+[[package]]
+name = "ps2-kbd"
+version = "0.1.0"
 
 [[package]]
 name = "qdisc"

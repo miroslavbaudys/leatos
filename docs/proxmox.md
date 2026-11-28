@@ -27,7 +27,7 @@ Gaps found (2026-11-24, by reading the code):
 | TSC calibrated against the PIT (10 ms) | `kernel/src/arch/x86_64/timer.rs:22` | a descheduled vCPU skews it, and with it the shaper rates (min of 3 runs mitigates) |
 | ACPI power button ignored | `kernel/src/arch/x86_64/power.rs` | "Shutdown" times out, Proxmox kills the VM (store survives, but slow and no PPPoE PADT) |
 | Ports named in PCI order | docs/config-v2.md (`ports`) | adding a NIC can swap WAN and LAN |
-| Console input on COM1 only | `kernel/src/drivers/screen.rs` | noVNC (`vga: std`) shows the console (182x50), output only (2026-11-28); type on `serial0` |
+| Console on the screen: US layout only | `kernel/src/drivers/screen.rs`, `arch/x86_64/kbd.rs` | noVNC (`vga: std`) shows the console (182x50) and types into the CLI through the PS/2 keyboard (2026-11-28); other layouts type US keys |
 
 ### 1.1 Proxmox's device layout in QEMU (`QEMU_PROXMOX=1`, 2026-11-28)
 
@@ -109,8 +109,8 @@ startup: order=1,down=10
 - Image: `scripts/apu-image.sh --config … --cmdline "mgmt_pass=… idle_spin_us=…"`, then
   `qm importdisk <vmid> leatos-apu4.img local-lvm` and `qm set <vmid> --virtio0 …`.
 - Console: `qm terminal <vmid>` (or xterm.js in the GUI). With `vga: std` instead of
-  `vga: serial0`, noVNC shows the same output (boot log, CLI), but typing works only on
-  `serial0`.
+  `vga: serial0`, noVNC shows the same console (boot log, CLI) and its keyboard types into the
+  CLI (US layout); both work at once with `serial0` kept.
 - PPPoE on VLAN 848: tagged in leatos through a non-VLAN-aware bridge, or `tag=848` on `net0`.
 - Passthrough instead of `net0`: `hostpci0: 0000:xx:00.0,pcie=1` (IOMMU on, i210/i211 only).
 - Live migration (virtio only): use a common CPU type instead of `host`.
@@ -167,8 +167,10 @@ startup: order=1,down=10
    display controller (class 03), `screen=0` off; kexec passes the framebuffer on.
    `QEMU_EXTRA="-device VGA,bus=pcie.0,addr=0x1 -display cocoa"` with `QEMU_PROXMOX=1` and a
    disk image shows it. Cost under TCG: ~120 ms of boot, ~11 ms per scrolled line (a redraw of
-   the changed cells); KVM writes video memory at memory speed. Still open: `VirtIOGpu` +
-   `VirtIOInput` for a full CLI (medium).
+   the changed cells); KVM writes video memory at memory speed. Input: the PS/2 keyboard
+   (i8042, ISA IRQ 1 via the MADT, `arch::kbd` + `crates/ps2-kbd`, scan code set 1, US layout)
+   types into the CLI like the serial port; `kbd=0` off. No USB keyboard or `VirtIOInput`
+   (Proxmox's keyboard is PS/2).
 9. **virtio-scsi** (medium, own driver: INQUIRY, READ CAPACITY(16), READ/WRITE(16), SYNCHRONIZE
    CACHE): only if "use VirtIO Block" proves not enough.
 10. **`VIRTIO_F_EVENT_IDX`** on virtio-net (small): fewer kicks and interrupts; measure CPU per

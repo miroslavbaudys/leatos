@@ -36,6 +36,8 @@ pub enum IrqChipInfo {
         ioapic: Option<(usize, u32)>,
         /// COM1's IRQ: (GSI, MPS INTI flags), see `acpi::Acpi::com1`.
         com1: (u32, u16),
+        /// The PS/2 keyboard's IRQ, the same way (`acpi::Acpi::kbd`).
+        kbd: (u32, u16),
     },
 }
 

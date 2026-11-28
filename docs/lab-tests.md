@@ -321,7 +321,9 @@ direction moved under 1 Mbit/s.
   leaves the flag clear fails the "marked restored" checks.
 - `scripts/cli-test.sh` (also `LEATOS_ARCH=x86_64`, `QEMU_STORE_BUS=sd`): types into the UART via a
   FIFO on QEMU's stdin. Runs with the RAM log (the other scripts get `log=console` from
-  `qemu-run.sh`). Negative controls `CLI_TEST_SKIP_SAVE=1`, `CLI_TEST_LOG=console`.
+  `qemu-run.sh`). x86_64 also types on the PS/2 keyboard through QMP `send-key`
+  (`scripts/lab/qmp-type.py`: Shift, a command runs). Negative controls `CLI_TEST_SKIP_SAVE=1`,
+  `CLI_TEST_LOG=console`, `CLI_TEST_KBD=0` (`kbd=0`: the keyboard checks fail).
 - `scripts/pppoe-test.sh` (also `LEATOS_ARCH=x86_64`): the ISP VM as a PPPoE-only AC, the router
   driven over the CLI: DHCP → PPPoE live (password never printed), PADT at reboot + PPPoE from the
   store, back to DHCP. Negative control `PPPOE_TEST_SKIP_SAVE=1`.

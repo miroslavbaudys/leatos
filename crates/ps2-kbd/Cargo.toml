@@ -1,0 +1,11 @@
+[package]
+name = "ps2-kbd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PS/2 keyboard scan codes (set 1) to console bytes (US layout), sans-IO."
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -31,13 +31,13 @@ Keep them current when you change what they describe; keep this file to the map 
   are link slots on a port.
 - `crates/`: sans-IO protocol and policy crates: `fwd` (forwarder, conntrack/NAT, firewall, routes,
   fragments), `qdisc` (CoDel, fq_codel, CAKE), `proto-{dhcp,dns,dot,pppoe,sntp,mdns,http,tcp}`,
-  `auth`, `cli`, `text-screen` (the console on a screen), `config` (`config.toml` schema
-  v2, docs/config-v2.md), `config-store` (power-fail-safe store), `boot-image`, `install-image`
-  (installer image format, docs/install.md).
+  `auth`, `cli`, `text-screen` (the console on a screen), `ps2-kbd` (its keyboard), `config`
+  (`config.toml` schema v2, docs/config-v2.md), `config-store` (power-fail-safe store),
+  `boot-image`, `install-image` (installer image format, docs/install.md).
 - `fuzz/`: cargo-fuzz targets (own workspace, nightly; fuzz/README.md): `fwd`, `pppoe`, `dns`,
   `dhcp6`, `sntp`, `http`, `dhcp`, `dhcp_client`, `mdns`, `qdisc`, `ack_filter`, `boot_image`,
   `install_image`, `cli`, `config` (seeds in `fuzz/seeds/config`), `store`, `dns_tcp`, `auth`,
-  `dot`, `tcp`, `text_screen`; shared builders in `fuzz/src/lib.rs`.
+  `dot`, `tcp`, `text_screen`, `ps2_kbd`; shared builders in `fuzz/src/lib.rs`.
 - `tools/leatstore`: host tool for store images: `create`, `format` (random store ID), `show`, `id`,
   `put` (refuses a clear
   `mgmt.password`), `get`, `corrupt`, `hash <password>`, `install-image <raw> <out>`.

@@ -124,6 +124,8 @@ pub fn exec(flat: &[u8], dst: u64, entry: u64, cmdline: &str, scratch: &mut [u8]
     // (the next kernel programs neither before taking interrupts).
     super::console::rx_irq_off();
     super::irqchip::disable(super::exceptions::COM1_VECTOR);
+    super::kbd::irq_off();
+    super::irqchip::disable(super::exceptions::KBD_VECTOR);
     crate::println!(
         "  upgrade         : jumping to {entry:#x} ({} bytes at {dst:#x})",
         flat.len()

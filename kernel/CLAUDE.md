@@ -12,7 +12,9 @@ Boot arguments: docs/boot-arguments.md.
   - `x86_64/`: boot.S = PVH + Multiboot2 entry → long mode, AP trampoline; isr.S; exceptions =
     IDT/TSS/IST; irqchip = local APIC + MSI-X (+ one IOAPIC entry: COM1's ISA IRQ 4, MADT only);
     timer = TSC + LAPIC one-shot; power = ACPI S5; console = 16550; port I/O; rtc = CMOS clock (time
-    registers only); smp = INIT-SIPI-SIPI; kexec (+ kexec.S); watchdog = AMD FCH.
+    registers only); smp = INIT-SIPI-SIPI; kexec (+ kexec.S); watchdog = AMD FCH; kbd = PS/2 on
+    the i8042 (ISA IRQ 1 → vector 35, decoded by `crates/ps2-kbd` into the console's receive
+    ring: the screen's keyboard types into the CLI; none where port 0x64 reads 0xff; `kbd=0`).
 - `src/platform/`: the neutral `BootInfo` (no allocation); `dtb.rs` (aarch64); `pvh.rs` /
   `multiboot2.rs` + `acpi.rs` over `phys.rs` (x86_64: one unsafe byte-view constructor, safe
   parsers). `BootInfo.framebuffer`: Multiboot2 tag 8 (`drivers::screen`). `BootInfo.module`:
@@ -94,8 +96,8 @@ live with the VID; networks on a port the machine lacks are left out (`config::m
   1280x800; `BootInfo.framebuffer`, passed on by kexec) or VGA text 80x25
   (`arch::console::TEXT_SCREEN`, cursor via `text_cursor`). Collected from the first boot line
   (`early` sizes it), drawn once `init` (after PCI) finds a display controller (class 03), else
-  off for good (the apu4); `screen=0`. Only changed cells are redrawn. Output only; Proxmox
-  noVNC (docs/proxmox.md §8).
+  off for good (the apu4); `screen=0`. Only changed cells are redrawn. Proxmox noVNC
+  (docs/proxmox.md §8); its input is `arch::kbd`.
 - `watchdog.rs` (`HwWatchdog` + probe), `i6300esb.rs` (QEMU's PCI watchdog).
 - `cputemp.rs`: AMD family 16h die temperature from PCI 00:18.3 D18F3xA4 + HTC limit x64 (k10temp's
   decoding); sampled with `cpuload`; `/api/status` `temp` (null without a sensor, e.g. QEMU),

@@ -32,6 +32,7 @@ config-store = { path = "../crates/config-store" }
 proto-dot = { path = "../crates/proto-dot" }
 proto-tcp = { path = "../crates/proto-tcp" }
 text-screen = { path = "../crates/text-screen" }
+ps2-kbd = { path = "../crates/ps2-kbd" }
 auth = { path = "../crates/auth" }
 
 [lib]
@@ -183,6 +184,13 @@ bench = false
 [[bin]]
 name = "text_screen"
 path = "fuzz_targets/text_screen.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ps2_kbd"
+path = "fuzz_targets/ps2_kbd.rs"
 test = false
 doc = false
 bench = false

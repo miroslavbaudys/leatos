@@ -511,6 +511,7 @@ dependencies = [
  "proto-pppoe",
  "proto-sntp",
  "proto-tcp",
+ "ps2-kbd",
  "qdisc",
  "text-screen",
 ]
@@ -739,6 +740,10 @@ version = "0.1.0"
 
 [[package]]
 name = "proto-tcp"
+version = "0.1.0"
+
+[[package]]
+name = "ps2-kbd"
 version = "0.1.0"
 
 [[package]]

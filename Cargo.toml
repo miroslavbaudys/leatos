@@ -30,6 +30,7 @@ proto-dot = { path = "crates/proto-dot" }
 proto-tcp = { path = "crates/proto-tcp" }
 install-image = { path = "crates/install-image" }
 text-screen = { path = "crates/text-screen" }
+ps2-kbd = { path = "crates/ps2-kbd" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

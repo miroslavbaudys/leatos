@@ -75,6 +75,7 @@ pub fn kmain(boot_arg: usize) -> ! {
     ));
     irq::enable();
     console::init_rx(&info);
+    console::init_kbd(&info);
     println!(
         "  timer           : {} Hz, tickless, hybrid-idle spin window {} us",
         timer::frequency(),

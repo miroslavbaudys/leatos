@@ -7,6 +7,7 @@ pub mod console;
 pub mod cpu;
 mod exceptions;
 pub mod irqchip;
+pub mod kbd;
 pub mod kexec;
 pub mod mmu;
 mod port;
@@ -93,6 +94,7 @@ pub fn discover(start_info: usize) -> Result<BootInfo, &'static str> {
             lapic: a.lapic,
             ioapic: a.ioapic,
             com1: a.com1,
+            kbd: a.kbd,
         }),
         timer_intid: exceptions::TIMER_VECTOR,
         pcie,
