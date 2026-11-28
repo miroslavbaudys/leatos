@@ -124,6 +124,7 @@ PVH / Multiboot2 command line on x86_64, QEMU `-append` via `QEMU_APPEND`. They 
 | `watchdog=0` | – | no watchdog (gdb) |
 | `watchdog_secs=N` | – | hardware watchdog timeout, default 30 |
 | `panic=halt` | – | halt instead of rebooting on panics and exceptions |
+| `screen=0` | – | no console on the screen (`drivers::screen`: otherwise drawn whenever a PCI display controller exists, e.g. Proxmox `vga: std`: the loader's framebuffer, or VGA text mode) |
 | `log=console` | – | log messages stay on the serial console after boot instead of the RAM log |
 | `store_id=<16 hex digits>` | – | use only the store with this ID (store header, `leatstore id`); none if no disk has it. `scripts/apu-image.sh` passes its store's: a machine with two leatos disks uses the one it booted from (docs/install.md §3.5). Without it: the first store found, with a warning when there are several |
 | `install=1` | – | run the installer instead of the router (docs/install.md): write the boot module (install image) to a disk after a confirmation, keeping its config; set by the ISO's Limine entry |

@@ -17,6 +17,8 @@ pub mod sdhci;
 pub mod virtio_blk;
 #[allow(unsafe_code)] // DMA buffer hand-off (begin/complete pairs)
 pub mod virtio_net;
+#[allow(unsafe_code)] // the video memory windows' constructor (no DMA)
+pub mod screen;
 pub mod watchdog;
 
 use crate::net::packet::PacketBuf;

@@ -119,6 +119,24 @@ pub(super) fn rx_irq_off() {
     outb(COM1 + MCR, 0x03);
 }
 
+/// The legacy VGA text buffer (80x25 colour text mode, mode 3): the
+/// kernel mirrors its console there when the loader left the display in
+/// text mode (`drivers::screen`; Proxmox's noVNC console).
+pub const TEXT_SCREEN: Option<usize> = Some(0xb8000);
+
+const CRTC_INDEX: u16 = 0x3d4;
+const CRTC_DATA: u16 = 0x3d5;
+
+/// Put the VGA text cursor on cell `pos` (row * 80 + column) through the
+/// CRTC's cursor location registers. Callers hold `drivers::screen`'s
+/// lock (or are on a fatal path).
+pub fn text_cursor(pos: u16) {
+    outb(CRTC_INDEX, 0x0f);
+    outb(CRTC_DATA, pos as u8);
+    outb(CRTC_INDEX, 0x0e);
+    outb(CRTC_DATA, (pos >> 8) as u8);
+}
+
 pub fn emergency_write_str(s: &str) {
     // SAFETY: fatal paths only, which never return to normal operation.
     unsafe { LOCK.force_unlock() };

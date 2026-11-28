@@ -1,0 +1,13 @@
+[package]
+name = "text-screen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A text screen fed with console output (VGA text mode or framebuffer console), sans-IO."
+
+[dependencies]
+# The framebuffer glyphs (no_std, no unsafe; MIT, font SIL OFL 1.1).
+noto-sans-mono-bitmap = { version = "0.4", default-features = false, features = ["regular", "size_16", "unicode-basic-latin", "unicode-latin-1-supplement"] }
+
+[lints]
+workspace = true

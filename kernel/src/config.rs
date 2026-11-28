@@ -1103,6 +1103,11 @@ pub fn panic_halts() -> bool {
     arg(bootargs(), "panic") == Some("halt")
 }
 
+/// `screen=0`: no console mirror on the screen (`drivers::screen`).
+pub fn screen_off() -> bool {
+    arg(bootargs(), "screen") == Some("0")
+}
+
 /// `log=console`: log messages keep going to the serial console after
 /// boot (tests read them there). Default: the RAM log (CLI `log`).
 pub fn log_to_console() -> bool {

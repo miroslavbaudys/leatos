@@ -114,6 +114,11 @@ pub fn rx_irq_enable() {
     uart.write32(UARTIMSC, INT_RX | INT_RT);
 }
 
+/// No legacy text screen on aarch64 (`drivers::screen`).
+pub const TEXT_SCREEN: Option<usize> = None;
+
+pub fn text_cursor(_pos: u16) {}
+
 /// Fatal paths only (panic, unhandled exception): never returns to normal
 /// operation, so taking the console from an interrupted holder is acceptable.
 pub fn emergency_write_str(s: &str) {

@@ -27,7 +27,7 @@ Gaps found (2026-11-24, by reading the code):
 | TSC calibrated against the PIT (10 ms) | `kernel/src/arch/x86_64/timer.rs:22` | a descheduled vCPU skews it, and with it the shaper rates (min of 3 runs mitigates) |
 | ACPI power button ignored | `kernel/src/arch/x86_64/power.rs` | "Shutdown" times out, Proxmox kills the VM (store survives, but slow and no PPPoE PADT) |
 | Ports named in PCI order | docs/config-v2.md (`ports`) | adding a NIC can swap WAN and LAN |
-| Console on COM1 only | `kernel/src/arch/x86_64/console.rs` | noVNC stays blank after Limine; use `serial0` |
+| Console input on COM1 only | `kernel/src/drivers/screen.rs` | noVNC (`vga: std`) shows the console (182x50), output only (2026-11-28); type on `serial0` |
 
 ### 1.1 Proxmox's device layout in QEMU (`QEMU_PROXMOX=1`, 2026-11-28)
 
@@ -108,7 +108,9 @@ startup: order=1,down=10
 - `net0` is `wan0` if PCI order follows the config: check the MACs in the boot log.
 - Image: `scripts/apu-image.sh --config … --cmdline "mgmt_pass=… idle_spin_us=…"`, then
   `qm importdisk <vmid> leatos-apu4.img local-lvm` and `qm set <vmid> --virtio0 …`.
-- Console: `qm terminal <vmid>` (or xterm.js in the GUI).
+- Console: `qm terminal <vmid>` (or xterm.js in the GUI). With `vga: std` instead of
+  `vga: serial0`, noVNC shows the same output (boot log, CLI), but typing works only on
+  `serial0`.
 - PPPoE on VLAN 848: tagged in leatos through a non-VLAN-aware bridge, or `tag=848` on `net0`.
 - Passthrough instead of `net0`: `hostpci0: 0000:xx:00.0,pcie=1` (IOMMU on, i210/i211 only).
 - Live migration (virtio only): use a common CPU type instead of `host`.
@@ -158,7 +160,15 @@ startup: order=1,down=10
 ### Tier 3: comfort and performance
 
 8. **Screen console** for noVNC: VGA text mode at 0xB8000 under SeaBIOS (`vga: std`,
-   output-only log mirror, small), or `VirtIOGpu` + `VirtIOInput` for a full CLI (medium).
+   output-only log mirror, small) ✅ in QEMU (2026-11-28): `drivers::screen` +
+   `crates/text-screen`. The Multiboot2 header asks for a framebuffer (optional, 32 bpp, the
+   display's preferred mode: 1280x800 in QEMU), drawn with 7x16 Noto Sans Mono glyphs =
+   182x50 characters; VGA text 80x25 when the loader left text mode (PVH). On only with a PCI
+   display controller (class 03), `screen=0` off; kexec passes the framebuffer on.
+   `QEMU_EXTRA="-device VGA,bus=pcie.0,addr=0x1 -display cocoa"` with `QEMU_PROXMOX=1` and a
+   disk image shows it. Cost under TCG: ~120 ms of boot, ~11 ms per scrolled line (a redraw of
+   the changed cells); KVM writes video memory at memory speed. Still open: `VirtIOGpu` +
+   `VirtIOInput` for a full CLI (medium).
 9. **virtio-scsi** (medium, own driver: INQUIRY, READ CAPACITY(16), READ/WRITE(16), SYNCHRONIZE
    CACHE): only if "use VirtIO Block" proves not enough.
 10. **`VIRTIO_F_EVENT_IDX`** on virtio-net (small): fewer kicks and interrupts; measure CPU per

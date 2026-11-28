@@ -27,8 +27,10 @@ impl fmt::Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         if self.fatal {
             crate::arch::console::emergency_write_str(s);
+            crate::drivers::screen::emergency_write(s);
         } else {
             crate::arch::console::write_str(s);
+            crate::drivers::screen::write(s);
         }
         if let Some(&b) = s.as_bytes().last() {
             self.last = b;
@@ -58,6 +60,7 @@ const ERASE_LINE: &str = "\r\x1b[K";
 
 fn raw(s: &str) {
     crate::arch::console::write_str(s);
+    crate::drivers::screen::write(s);
 }
 
 // ---- RAM log ------------------------------------------------------------

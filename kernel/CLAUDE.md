@@ -15,8 +15,9 @@ Boot arguments: docs/boot-arguments.md.
     registers only); smp = INIT-SIPI-SIPI; kexec (+ kexec.S); watchdog = AMD FCH.
 - `src/platform/`: the neutral `BootInfo` (no allocation); `dtb.rs` (aarch64); `pvh.rs` /
   `multiboot2.rs` + `acpi.rs` over `phys.rs` (x86_64: one unsafe byte-view constructor, safe
-  parsers). `BootInfo.module`: the first boot module (Multiboot2 tag 3, PVH modlist = QEMU
-  `-initrd`), the installer's image (docs/install.md; `src/install.rs` checks it at boot).
+  parsers). `BootInfo.framebuffer`: Multiboot2 tag 8 (`drivers::screen`). `BootInfo.module`:
+  the first boot module (Multiboot2 tag 3, PVH modlist = QEMU `-initrd`), the installer's image
+  (docs/install.md; `src/install.rs` checks it at boot).
 - `linker.ld` (aarch64, kernel at `0x4020_0000`) / `linker-x86_64.ld` (at 1 MiB, keeps the PVH
   note): page-aligned sections, guard pages, 16 KiB exception stack + 256 KiB kernel stack.
 
@@ -88,6 +89,13 @@ live with the VID; networks on a port the machine lacks are left out (`config::m
   `DmaRegion`s (`copy_in` / `copy_out`); an abandoned command → port stop / restart (COMRESET if
   busy). `Disk::open` returns one disk per port, named `<PCI address>/<port>`.
 - `ccp.rs`: AMD CCP TRNG, PCI 1022:1537.
+- `screen.rs`: the console mirrored on the screen through `crates/text-screen`: the loader's
+  framebuffer (Multiboot2 tag 8, requested in `boot.S`, 32 bpp, 7x16 glyphs: 182x50 at
+  1280x800; `BootInfo.framebuffer`, passed on by kexec) or VGA text 80x25
+  (`arch::console::TEXT_SCREEN`, cursor via `text_cursor`). Collected from the first boot line
+  (`early` sizes it), drawn once `init` (after PCI) finds a display controller (class 03), else
+  off for good (the apu4); `screen=0`. Only changed cells are redrawn. Output only; Proxmox
+  noVNC (docs/proxmox.md §8).
 - `watchdog.rs` (`HwWatchdog` + probe), `i6300esb.rs` (QEMU's PCI watchdog).
 - `cputemp.rs`: AMD family 16h die temperature from PCI 00:18.3 D18F3xA4 + HTC limit x64 (k10temp's
   decoding); sampled with `cpuload`; `/api/status` `temp` (null without a sensor, e.g. QEMU),

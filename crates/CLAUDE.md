@@ -142,6 +142,11 @@ and sparse senders. How the kernel uses it: kernel/src/net/CLAUDE.md.
   the hash field) / `Image::plan` (every sector of the image once, gaps as zeros, then the
   target's last 33 sectors); fuzz target `install_image`.
 - `cli`: line editor + command parser.
+- `text-screen`: a text screen fed with console output (UTF-8 → CP437, `\r`, `\n`, backspace,
+  tab, `ESC [ K`, deferred wrap, scrolling, dirty ranges), 80x25 until `resize` (fixed storage
+  `MAX_CELLS`, no allocation, `const` constructor: used before the heap); `glyph`: 7x16 Noto Sans
+  Mono (`noto-sans-mono-bitmap`, 8-bit intensities) for framebuffers. The kernel's
+  `drivers::screen`; fuzz target `text_screen`.
 - `config-store`: the power-fail-safe store partition: MBR lookup, store header with areas and a
   store ID (`Layout::id`, bytes 280..288, 0 = none; no layout version bump), A/B
   record slots, write plans, trial flags (docs/config-and-storage.md). Magics `RRSTORE1`/`RREC` keep

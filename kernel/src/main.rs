@@ -60,6 +60,7 @@ pub fn kmain(boot_arg: usize) -> ! {
 
     let info = arch::discover(boot_arg).unwrap_or_else(|e| panic!("platform discovery: {e}"));
     arch::console::init(info.console_base);
+    drivers::screen::early(&info);
     arch::power::init(info.power);
     info.print();
 
@@ -89,6 +90,7 @@ pub fn kmain(boot_arg: usize) -> ! {
     if let Some(pci) = &pci {
         pci::print(pci);
     }
+    drivers::screen::init(pci.as_ref());
     if let Some(pci) = pci.as_mut() {
         drivers::cputemp::probe(pci);
     }

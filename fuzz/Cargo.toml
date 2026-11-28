@@ -31,6 +31,7 @@ config = { path = "../crates/config" }
 config-store = { path = "../crates/config-store" }
 proto-dot = { path = "../crates/proto-dot" }
 proto-tcp = { path = "../crates/proto-tcp" }
+text-screen = { path = "../crates/text-screen" }
 auth = { path = "../crates/auth" }
 
 [lib]
@@ -175,6 +176,13 @@ bench = false
 [[bin]]
 name = "tcp"
 path = "fuzz_targets/tcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_screen"
+path = "fuzz_targets/text_screen.rs"
 test = false
 doc = false
 bench = false

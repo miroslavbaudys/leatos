@@ -29,6 +29,7 @@ proto-mdns = { path = "crates/proto-mdns" }
 proto-dot = { path = "crates/proto-dot" }
 proto-tcp = { path = "crates/proto-tcp" }
 install-image = { path = "crates/install-image" }
+text-screen = { path = "crates/text-screen" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -11,7 +11,8 @@
 //!   `rx_irq_setup(&BootInfo) -> Option<(intid, Trigger)>` (route the UART's
 //!   RX interrupt, masked), `rx_irq_enable`, `rx_drain_irq(push)` (IRQ
 //!   context: FIFO → `push`, try-lock only), `rx_drain_thread(push)` (the
-//!   polled fallback, IRQs masked)
+//!   polled fallback, IRQs masked); `TEXT_SCREEN` (the legacy VGA text
+//!   buffer's address, x86_64 only) and `text_cursor(pos)`
 //! - `irqchip`: `init(&BootInfo)`, `enable(intid, Trigger)`, `disable(intid)`;
 //!   the backend's IRQ entry calls `crate::irq::dispatch(intid)`. MSI-X:
 //!   `msi_vector(n)` (the n-th device vector, if the platform delivers

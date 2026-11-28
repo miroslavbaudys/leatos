@@ -674,6 +674,7 @@ dependencies = [
  "safe-mmio 0.4.0",
  "spin",
  "talc",
+ "text-screen",
  "virtio-drivers",
 ]
 
@@ -754,6 +755,12 @@ dependencies = [
  "memchr",
  "minimal-lexical",
 ]
+
+[[package]]
+name = "noto-sans-mono-bitmap"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09b7b72dee69e4110d1b91fb8d497c1b74a54082da5738dff84136142c4f767b"
 
 [[package]]
 name = "num-bigint"
@@ -1354,6 +1361,13 @@ name = "talc"
 version = "4.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a3ae828aa394de34c7de08f522d1b86bd1c182c668d27da69caadda00590f26d"
+
+[[package]]
+name = "text-screen"
+version = "0.1.0"
+dependencies = [
+ "noto-sans-mono-bitmap",
+]
 
 [[package]]
 name = "thiserror"
