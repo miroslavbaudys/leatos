@@ -46,7 +46,8 @@ events out), host-tested with `cargo test`. Fuzz targets in `fuzz/` (fuzz/README
   - A full table or a shard's NAT ports taken early-drops a sampled not-assured connection
     (`EVICT_SCAN`, `early_drops`).
   - TCP established only after the handshake's last ACK.
-  - `expire_some` bounded per pass; expired entries invisible via `lookup_live`.
+  - `expire_some` bounded per call (the kernel: ≤ 32 per shard, ≤ 256 per pass); expired entries
+    invisible via `lookup_live`.
 - `frag`: IP fragments without reassembly, IPv4 and IPv6 (`Key`/`Decision` enums): the first
   fragment's decision per datagram in a `Table` per ingress port, later fragments via
   `Forwarder::forward_fragment`, early ones held ≤ 16 / 250 ms; tiny and offset-1 TCP fragments

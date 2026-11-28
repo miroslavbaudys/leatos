@@ -168,7 +168,7 @@ async fn late_fault() {
 pub fn conntrack_bench() {
     use fwd::conntrack::{Budget, Conntrack, Dir, Tuple};
     use fwd::wire::{PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_SYN};
-    use net::datapath::{EXPIRE_PER_PASS, MAX_CONNS};
+    use net::datapath::{EXPIRE_PER_PASS, EXPIRE_PER_SHARD, MAX_CONNS};
     use core::net::Ipv4Addr;
     let wan = Ipv4Addr::new(203, 0, 113, 10);
     let us = |t0: timer::Instant| t0.elapsed().as_micros() as u64;
@@ -207,6 +207,15 @@ pub fn conntrack_bench() {
         assert!(ct.create(0, tuple(MAX_CONNS + i, PROTO_UDP), Some(wan), 0).is_none());
     }
     let refuse_ns = us(t0) * 1000 / TRIES as u64;
+    // One shard's share of a pass (its lock is held this long), then a
+    // whole pass's worth in one shard (the limit before EXPIRE_PER_SHARD).
+    // One removal first, untimed: under TCG the first run of the removal
+    // code also translates it.
+    assert_eq!(ct.expire_some(u64::MAX, 1), 1);
+    let t0 = timer::Instant::now();
+    let n = ct.expire_some(u64::MAX, EXPIRE_PER_SHARD);
+    let expire_shard_us = us(t0);
+    assert_eq!(n, EXPIRE_PER_SHARD);
     let t0 = timer::Instant::now();
     let n = ct.expire_some(u64::MAX, EXPIRE_PER_PASS);
     let expire_pass_us = us(t0);
@@ -214,7 +223,7 @@ pub fn conntrack_bench() {
     let t0 = timer::Instant::now();
     let n = ct.expire(u64::MAX);
     let expire_all_us = us(t0);
-    assert_eq!(n, MAX_CONNS - EXPIRE_PER_PASS);
+    assert_eq!(n, MAX_CONNS - 1 - EXPIRE_PER_SHARD - EXPIRE_PER_PASS);
     // Full of unanswered connections: every new one early-drops one.
     let (mut ct, _) = fill(false);
     let t0 = timer::Instant::now();
@@ -224,9 +233,9 @@ pub fn conntrack_bench() {
     let evict_ns = us(t0) * 1000 / TRIES as u64;
     println!(
         "  ct bench        : {MAX_CONNS} conns in one shard: fill {} ns/conn, pass {scan_us} us (none expired), \
-         expire {EXPIRE_PER_PASS} (a pass) {expire_pass_us} us, the other {} {expire_all_us} us; when full: refuse {refuse_ns} ns, early drop {evict_ns} ns",
+         expire {EXPIRE_PER_SHARD} (a shard's share) {expire_shard_us} us, {EXPIRE_PER_PASS} (a pass) {expire_pass_us} us, the other {} {expire_all_us} us; when full: refuse {refuse_ns} ns, early drop {evict_ns} ns",
         fill_us * 1000 / MAX_CONNS as u64,
-        MAX_CONNS - EXPIRE_PER_PASS
+        MAX_CONNS - 1 - EXPIRE_PER_SHARD - EXPIRE_PER_PASS
     );
 }
 

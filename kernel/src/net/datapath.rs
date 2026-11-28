@@ -85,6 +85,10 @@ const HOUSEKEEPING_MS: u64 = 1_000;
 /// milliseconds). More wait for the next pass: they are early-droppable
 /// and invisible to packets meanwhile (`Conntrack::lookup_live`).
 pub const EXPIRE_PER_PASS: usize = 256;
+/// ... and at most this many in one shard, so one shard's lock (packets of
+/// the other direction task wait on it) is held for an eighth of a full
+/// pass; the rotating first shard keeps the 256 per second.
+pub const EXPIRE_PER_SHARD: usize = 32;
 
 /// The WAN link (on port 0); the networks are links 1.. on port 1.
 pub const WAN: IfIndex = 0;
@@ -249,11 +253,23 @@ pub fn padt(port: &PortShared) -> Option<PacketBuf> {
 struct Hk {
     next_housekeeping: u64,
     next_stats: u64,
+    /// Buffers housekeeping reuses each second (no allocation in the
+    /// datapath task once they have grown).
+    scratch: HkScratch,
     /// Per port, then the ingress stage.
     last_dequeued: Vec<u64>,
     /// Per port.
     ecn_reported: Vec<u64>,
     vlan_reported: u64,
+}
+
+/// [`Hk::scratch`]: summed hit counters and expired fragments.
+#[derive(Default)]
+struct HkScratch {
+    hits: Vec<u64>,
+    fhits: Vec<u64>,
+    rhits: Vec<u64>,
+    stale: Vec<PacketBuf>,
 }
 
 /// The networks as the receive path needs them.
@@ -495,6 +511,7 @@ impl Datapath {
             hk: Mutex::new(Hk {
                 next_housekeeping: 0,
                 next_stats: STATS_MS,
+                scratch: HkScratch::default(),
                 last_dequeued: alloc::vec![0; n + 1],
                 ecn_reported: alloc::vec![0; n],
                 vlan_reported: 0,
@@ -1312,7 +1329,7 @@ impl Datapath {
     /// statistics. No NIC access.
     pub fn housekeeping(&self, touched: &mut Touched) {
         let now = now_ms();
-        let print = {
+        let (print, mut sc) = {
             let mut hk = self.hk.lock();
             if now < hk.next_housekeeping {
                 return;
@@ -1322,13 +1339,13 @@ impl Datapath {
             if p {
                 hk.next_stats = now + STATS_MS;
             }
-            p
+            (p, core::mem::take(&mut hk.scratch))
         };
         let started = timer::Instant::now();
         let mut conns = 0;
-        let mut hits: Vec<u64> = Vec::new();
-        let mut fhits: Vec<u64> = Vec::new();
-        let mut rhits: Vec<u64> = Vec::new();
+        sc.hits.clear();
+        sc.fhits.clear();
+        sc.rhits.clear();
         let mut rejected = 0;
         let mut icmp_errors = 0;
         let mut unreachable6 = 0;
@@ -1346,11 +1363,11 @@ impl Datapath {
             let s = &self.shards[(first + k) % self.shards.len()];
             let mut f = s.lock();
             let held = timer::Instant::now();
-            removals -= f.expire_some(now, removals);
+            removals -= f.expire_some(now, removals.min(EXPIRE_PER_SHARD));
             conns += f.ct.len();
-            add(&mut hits, &f.rule_hits);
-            add(&mut fhits, &f.forward_hits);
-            add(&mut rhits, &f.redirect_hits);
+            add(&mut sc.hits, &f.rule_hits);
+            add(&mut sc.fhits, &f.forward_hits);
+            add(&mut sc.rhits, &f.redirect_hits);
             rejected += f.stats.rejected;
             icmp_errors += f.stats.icmp_errors_sent;
             unreachable6 += f.stats.unreachable6;
@@ -1365,15 +1382,20 @@ impl Datapath {
         UNREACHABLE6.store(unreachable6, Ordering::Relaxed);
         EARLY_DROPS.store(early_drops, Ordering::Relaxed);
         self.sh.conntrack.store(conns, Ordering::Relaxed);
-        *self.sh.rule_hits.lock() = hits;
-        *self.sh.forward_hits.lock() = fhits;
-        *self.sh.redirect_hits.lock() = rhits;
+        // Copied into the shared vectors, which keep their capacity.
+        let publish = |to: &Mutex<Vec<u64>>, from: &[u64]| {
+            let mut to = to.lock();
+            to.clear();
+            to.extend_from_slice(from);
+        };
+        publish(&self.sh.rule_hits, &sc.hits);
+        publish(&self.sh.forward_hits, &sc.fhits);
+        publish(&self.sh.redirect_hits, &sc.rhits);
         // Fragments held too long for a first fragment that never came.
-        let mut stale = Vec::new();
         for t in &self.frags {
-            t.lock().expire(now, &mut stale);
+            t.lock().expire(now, &mut sc.stale);
         }
-        for _ in stale.drain(..) {
+        for _ in sc.stale.drain(..) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             DROP_REASONS[DropReason::Fragment.index()].fetch_add(1, Ordering::Relaxed);
             FRAGS_PARK_DROPS.fetch_add(1, Ordering::Relaxed);
@@ -1391,6 +1413,7 @@ impl Datapath {
                 self.send_ns(ifx, ip, touched);
             }
         }
+        self.hk.lock().scratch = sc;
         if print {
             self.print_qdisc_stats();
         }
